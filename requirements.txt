@@ -1,0 +1,11 @@
+# Stage 1 — minimum to run the smoke test.
+# More libs (pandas, jugaad-data, pandas-ta, vectorbt, streamlit) are added in later stages.
+python-dotenv==1.0.1
+google-auth==2.32.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.140.0
+# Stages 1-2a — Drive auth + universe build.
+# More libs (jugaad-data, pandas-ta, vectorbt, streamlit) come in later stages.
+pandas==2.2.2
+requests==2.32.3

@@ -1,0 +1,5 @@
+# Copy this file to `.env` and fill in real values.
+# `.env` is gitignored; .env.example is committed as a template.
+
+GDRIVE_FOLDER_ID=1V8o2nzkp24Zw8QcnSZHvv-lUUUNCIsR8
+GDRIVE_SERVICE_ACCOUNT_PATH=D:\EMA_Screener\claude\gdrive_service_account.json

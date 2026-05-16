@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Local data (synced separately to Drive)
+data/
+features/
+signals/
+logs/
+charts/
+
+# Secrets (never commit)
+*.json
+!package.json
+*.key
