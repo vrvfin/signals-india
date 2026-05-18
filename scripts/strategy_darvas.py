@@ -1,0 +1,297 @@
+"""
+Stage 6c — Darvas Box strategy.
+
+The core Darvas insight: stocks at or near new 52-week highs that form a tight
+"box" (sideways range bounded by a top and bottom over N days) and then break
+out above the box top on volume.
+
+Differs from Qullamaggie:
+  - Darvas requires the stock to be at/near 52w high (Qullamaggie just needs a
+    recent extended move; the stock might be a few months past the high).
+  - Pure box logic — no consolidation-pattern flexibility.
+
+Pre-filter (from features):
+  dist_from_52w_high_pct >= -5   (within 5% of 52w high)
+  above_200sma == True
+  adr_pct_20 >= 2                (some movement — not glacial)
+
+Per-candidate (downloads recent OHLCV):
+  Box = last `box_days` bars whose high-low range is ≤ box_max_range_pct of mean.
+  Box top    = max(high) over those bars
+  Box bottom = min(low) over those bars
+
+Zones:
+  buy  — close inside the box (box_bottom..box_top)
+  add  — today's close > box_top AND today's vol ≥ 1.5× 20d avg (breakout)
+  stop — box_bottom − 0.5 × ATR
+
+Outputs:
+  signals/per_strategy/darvas/<date>.csv
+  signals/per_strategy/darvas/latest.csv
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# Strategy params
+MAX_DIST_FROM_52W_HIGH_PCT = -5   # within 5% of 52w high
+MIN_ADR_PCT = 2
+BOX_MIN_DAYS = 5
+BOX_MAX_DAYS = 20
+BOX_MAX_RANGE_PCT = 10            # tighter than Qullamaggie (10% vs 15%)
+BREAKOUT_VOLUME_MULTIPLIER = 1.5
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ---------- Drive helpers ----------
+
+def get_drive():
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    cs_path = Path(os.environ["GDRIVE_OAUTH_CLIENT_SECRET_PATH"])
+    token_path = Path(os.environ["GDRIVE_OAUTH_TOKEN_PATH"])
+    creds = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(cs_path), SCOPES)
+            creds = flow.run_local_server(port=0)
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(creds.to_json())
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_or_create_subfolder(drive, parent_id, name):
+    q = (f"name='{name}' and '{parent_id}' in parents "
+         f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
+    found = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if found:
+        return found[0]["id"]
+    meta = {"name": name, "parents": [parent_id],
+            "mimeType": "application/vnd.google-apps.folder"}
+    return drive.files().create(body=meta, fields="id").execute()["id"]
+
+
+def list_files_in_folder(drive, folder_id):
+    out = {}
+    page_token = None
+    while True:
+        resp = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name)",
+            pageSize=1000, pageToken=page_token,
+        ).execute()
+        for f in resp.get("files", []):
+            out[f["name"]] = f["id"]
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def find_file(drive, folder_id, name):
+    q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
+    found = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    return found[0]["id"] if found else None
+
+
+def download_parquet(drive, file_id):
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    return pd.read_parquet(fh)
+
+
+def upload_csv(drive, folder_id, filename, df, existing_id=None):
+    media = MediaIoBaseUpload(io.BytesIO(df.to_csv(index=False).encode()),
+                              mimetype="text/csv", resumable=False)
+    if existing_id:
+        drive.files().update(fileId=existing_id, media_body=media).execute()
+        return existing_id
+    meta = {"name": filename, "parents": [folder_id]}
+    return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
+
+
+# ---------- Box detection ----------
+
+def find_darvas_box(ohlcv: pd.DataFrame) -> dict | None:
+    """Find the longest recent window where range/mean ≤ BOX_MAX_RANGE_PCT.
+    Returns dict with box info, or None."""
+    if len(ohlcv) < BOX_MIN_DAYS:
+        return None
+    highs = ohlcv["high"].astype(float).values
+    lows = ohlcv["low"].astype(float).values
+    closes = ohlcv["close"].astype(float).values
+
+    for n in range(min(BOX_MAX_DAYS, len(ohlcv)), BOX_MIN_DAYS - 1, -1):
+        h = highs[-n:].max()
+        l = lows[-n:].min()
+        avg = closes[-n:].mean()
+        if avg <= 0:
+            continue
+        range_pct = (h - l) / avg * 100
+        if range_pct <= BOX_MAX_RANGE_PCT:
+            return {
+                "box_days": n,
+                "box_top": h,
+                "box_bottom": l,
+                "range_pct": range_pct,
+            }
+    return None
+
+
+def darvas_signal(symbol: str, ohlcv: pd.DataFrame,
+                  feat: pd.Series) -> dict | None:
+    box = find_darvas_box(ohlcv)
+    if not box:
+        return None
+
+    last = ohlcv.iloc[-1]
+    close = float(last["close"])
+    today_vol = float(last["volume"])
+    vol_20d_avg = float(ohlcv["volume"].tail(20).mean())
+    vol_ratio = today_vol / vol_20d_avg if vol_20d_avg else 0.0
+
+    top = box["box_top"]
+    bot = box["box_bottom"]
+
+    if close > top and vol_ratio >= BREAKOUT_VOLUME_MULTIPLIER:
+        zone = "add"
+        reason = (f"Breakout > box top ₹{top:.2f} on vol {vol_ratio:.1f}× avg; "
+                  f"{box['box_days']}d box ({box['range_pct']:.1f}% range), "
+                  f"at 52w high ({feat['dist_from_52w_high_pct']:.1f}%)")
+    elif bot <= close <= top:
+        zone = "buy"
+        reason = (f"Inside {box['box_days']}d Darvas box "
+                  f"₹{bot:.2f}-{top:.2f} ({box['range_pct']:.1f}% range); "
+                  f"{feat['dist_from_52w_high_pct']:.1f}% from 52w high")
+    else:
+        return None
+
+    stop = bot - 0.5 * float(feat["atr_14"])
+    return {
+        "symbol": symbol,
+        "date": feat["date"],
+        "strategy": "darvas",
+        "zone_type": zone,
+        "score": -float(feat["dist_from_52w_high_pct"]),  # closer to high = higher score
+        "entry": round(close, 2),
+        "stop": round(stop, 2),
+        "box_top": round(top, 2),
+        "box_bottom": round(bot, 2),
+        "box_days": box["box_days"],
+        "range_pct": round(box["range_pct"], 2),
+        "vol_today_ratio": round(vol_ratio, 2),
+        "dist_from_52w_high_pct": round(float(feat["dist_from_52w_high_pct"]), 2),
+        "adr_pct": round(float(feat["adr_pct_20"]), 2),
+        "reason": reason,
+    }
+
+
+# ---------- Main ----------
+
+def main() -> None:
+    print("Stage 6c — Darvas Box signals")
+    print("-" * 50)
+
+    drive = get_drive()
+    folder_id = os.environ["GDRIVE_FOLDER_ID"]
+    features_id = get_or_create_subfolder(drive, folder_id, "features")
+    latest_id = find_file(drive, features_id, "latest.parquet")
+    if not latest_id:
+        print("features/latest.parquet missing — run compute_features.py first.")
+        return
+    features = download_parquet(drive, latest_id)
+    log(f"Features loaded: {len(features)} symbols")
+
+    candidates = features[
+        (features["dist_from_52w_high_pct"] >= MAX_DIST_FROM_52W_HIGH_PCT) &
+        (features["above_200sma"] == True) &
+        (features["adr_pct_20"] >= MIN_ADR_PCT)
+    ].copy()
+    log(f"Pre-filter candidates (within 5% of 52w high, above 200SMA, "
+        f"ADR>={MIN_ADR_PCT}%): {len(candidates)}")
+
+    if candidates.empty:
+        print("No candidates after pre-filter.")
+        return
+
+    data_id = get_or_create_subfolder(drive, folder_id, "data")
+    ohlcv_id = get_or_create_subfolder(drive, data_id, "ohlcv")
+    ohlcv_files = list_files_in_folder(drive, ohlcv_id)
+
+    signals = []
+    t_start = time.time()
+    for i, (_, feat) in enumerate(candidates.iterrows(), 1):
+        sym = feat["symbol"]
+        fname = f"{sym}.parquet"
+        if fname not in ohlcv_files:
+            continue
+        try:
+            ohlcv = download_parquet(drive, ohlcv_files[fname])
+            ohlcv = ohlcv.sort_values("date").tail(60).reset_index(drop=True)
+            sig = darvas_signal(sym, ohlcv, feat)
+            if sig:
+                signals.append(sig)
+        except Exception:
+            pass
+        if i % 25 == 0:
+            elapsed = time.time() - t_start
+            rate = i / elapsed
+            eta = (len(candidates) - i) / rate
+            log(f"  [{i}/{len(candidates)}] {len(signals)} setups | "
+                f"rate {rate:.1f}/s | ETA {eta:.0f}s")
+
+    if not signals:
+        print("\nNo Darvas setups today.")
+        return
+
+    sig_df = pd.DataFrame(signals).sort_values("score", ascending=False).reset_index(drop=True)
+
+    signals_id = get_or_create_subfolder(drive, folder_id, "signals")
+    per_strategy_id = get_or_create_subfolder(drive, signals_id, "per_strategy")
+    dv_id = get_or_create_subfolder(drive, per_strategy_id, "darvas")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    upload_csv(drive, dv_id, f"{today_str}.csv", sig_df,
+               find_file(drive, dv_id, f"{today_str}.csv"))
+    upload_csv(drive, dv_id, "latest.csv", sig_df,
+               find_file(drive, dv_id, "latest.csv"))
+
+    n_buy = (sig_df["zone_type"] == "buy").sum()
+    n_add = (sig_df["zone_type"] == "add").sum()
+    print()
+    print(f"BUY (inside box)         : {n_buy}")
+    print(f"ADD (breaking out today) : {n_add}")
+    print("\nTop 10 closest to 52w high:")
+    show = ["symbol", "zone_type", "dist_from_52w_high_pct", "box_days",
+            "range_pct", "entry", "stop", "vol_today_ratio"]
+    print(sig_df.head(10)[show].to_string(index=False))
+    print(f"\nElapsed: {(time.time()-t_start)/60:.1f} min")
+
+
+if __name__ == "__main__":
+    main()
