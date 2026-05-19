@@ -1,0 +1,53 @@
+name: Daily Pipeline
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'   # 17:30 IST, Mon-Fri (post-market)
+  workflow_dispatch:          # also manual trigger from GitHub UI
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+
+      - name: Write credentials from secrets
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON"        > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/cs.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+          } > .env
+
+      - name: Build universe
+        run: python scripts/build_universe.py
+      - name: Ingest OHLCV (incremental)
+        run: python scripts/ingest_ohlcv.py
+      - name: Ingest indices + macro
+        run: python scripts/ingest_indices_macro.py
+      - name: Ingest FII/DII
+        run: python scripts/ingest_fii_dii.py
+        continue-on-error: true   # NSE anti-bot can flake
+      - name: Compute features
+        run: python scripts/compute_features.py
+      - name: Strategies
+        run: |
+          python scripts/strategy_momentum.py
+          python scripts/strategy_ma_respect.py
+          python scripts/strategy_qullamaggie.py
+          python scripts/strategy_minervini.py
+          python scripts/strategy_darvas.py
+      - name: Aggregate
+        run: python scripts/aggregate_signals.py
+      - name: Market state
+        run: python scripts/market_state.py
