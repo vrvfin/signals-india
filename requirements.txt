@@ -1,3 +1,4 @@
+# Stages 1-8 — Drive auth, ingestion, features, strategies, dashboard.
 python-dotenv==1.0.1
 google-auth==2.32.0
 google-auth-oauthlib==1.2.1
@@ -5,5 +6,8 @@ google-auth-httplib2==0.2.0
 google-api-python-client==2.140.0
 pandas==2.2.2
 requests==2.32.3
-yfinance==0.2.43
+yfinance==0.2.50
 pyarrow==17.0.0
+streamlit==1.38.0
+plotly==5.24.0
+xlrd==2.0.1

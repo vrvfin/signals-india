@@ -35,8 +35,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-DEFAULT_BATCH_SIZE = 50
-DEFAULT_INCREMENTAL_PERIOD = "1mo"
+DEFAULT_BATCH_SIZE = 25
+DEFAULT_INCREMENTAL_PERIOD = "3mo"
 BACKFILL_PERIOD = "10y"
 
 
@@ -125,23 +125,13 @@ def upload_parquet(drive, folder_id, filename, df, existing_id=None):
 
 
 # ---------- Batched fetch ----------
-
 def fetch_ohlcv_batch(symbols: list[str], period: str) -> dict[str, pd.DataFrame]:
-    """Batched yf.download. Returns {symbol_without_suffix: normalized DataFrame}."""
+    """Minimal yf.download call matching the pattern that's known to work in cloud."""
     if not symbols:
         return {}
     suffixed = [f"{s}.NS" for s in symbols]
-    tickers_str = " ".join(suffixed)
-
     try:
-        df = yf.download(
-            tickers=tickers_str,
-            period=period,
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
+        df = yf.download(suffixed, period=period, group_by="ticker", progress=False)
     except Exception as e:
         log(f"  Batch fetch raised: {str(e)[:160]}")
         return {}
@@ -151,39 +141,35 @@ def fetch_ohlcv_batch(symbols: list[str], period: str) -> dict[str, pd.DataFrame
     out: dict[str, pd.DataFrame] = {}
 
     def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
-        f = frame.reset_index()
+        f = frame.reset_index().dropna(how="all")
         f.columns = [str(c).lower().replace(" ", "_") for c in f.columns]
         if "date" not in f.columns and "datetime" in f.columns:
             f = f.rename(columns={"datetime": "date"})
+        if "date" not in f.columns:
+            return pd.DataFrame()
         f["date"] = pd.to_datetime(f["date"]).dt.tz_localize(None).dt.normalize()
-        keep = [c for c in ["date", "open", "high", "low", "close", "volume"]
-                if c in f.columns]
-        f = f[keep].dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
-        return f
+        keep = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in f.columns]
+        return (f[keep].dropna(subset=["close"]).sort_values("date").reset_index(drop=True))
 
-    if len(symbols) == 1:
-        sym = symbols[0]
-        out[sym] = _normalize(df)
-    else:
-        # Multi-index columns: level 0 = ticker (e.g. "RELIANCE.NS"), level 1 = field
-        if not isinstance(df.columns, pd.MultiIndex):
-            return out  # unexpected shape, skip
-        present_tickers = set(df.columns.get_level_values(0))
+    if isinstance(df.columns, pd.MultiIndex):
+        present = set(df.columns.get_level_values(0))
         for sym in symbols:
             full = f"{sym}.NS"
-            if full not in present_tickers:
+            if full not in present:
                 continue
             try:
-                sub = df[full]
-                if sub is None or sub.empty:
-                    continue
-                normalized = _normalize(sub)
-                if not normalized.empty:
-                    out[sym] = normalized
+                sub = df[full].dropna(how="all")
+                if not sub.empty:
+                    norm = _normalize(sub)
+                    if not norm.empty:
+                        out[sym] = norm
             except Exception:
                 continue
+    elif len(symbols) == 1:
+        norm = _normalize(df)
+        if not norm.empty:
+            out[symbols[0]] = norm
     return out
-
 
 def merge_and_upload(drive, ohlcv_folder_id: str, symbol: str,
                      new_df: pd.DataFrame, existing_files: dict[str, str]) -> dict:
