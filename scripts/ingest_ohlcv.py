@@ -26,7 +26,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -126,13 +125,14 @@ def upload_parquet(drive, folder_id, filename, df, existing_id=None):
 
 
 # ---------- Batched fetch ----------
-def fetch_ohlcv_batch(symbols: list[str], period: str, session: requests.Session | None = None) -> dict[str, pd.DataFrame]:
-    """Minimal yf.download call with custom request session headers to pass Cloud/CI blocks."""
+def fetch_ohlcv_batch(symbols: list[str], period: str) -> dict[str, pd.DataFrame]:
+    """Minimal yf.download call relying entirely on yfinance's native curl_cffi wrapper."""
     if not symbols:
         return {}
     suffixed = [f"{s}.NS" for s in symbols]
     try:
-        df = yf.download(suffixed, period=period, group_by="ticker", progress=False, session=session)
+        # Let yfinance natively handle cookie extraction and browser fingerprinting
+        df = yf.download(suffixed, period=period, group_by="ticker", progress=False)
     except Exception as e:
         log(f"  Batch fetch raised: {str(e)[:160]}")
         return {}
@@ -256,17 +256,11 @@ def main():
                for i in range(0, len(symbols), args.batch_size)]
     log(f"Batches: {len(batches)} of size up to {args.batch_size}")
 
-    # Set up a requests session with browser headers to spoof yfinance endpoints
-    yf_session = requests.Session()
-    yf_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    })
-
     results: list[dict] = []
     t_start = time.time()
     for b_idx, batch in enumerate(batches, 1):
         b_start = time.time()
-        fetched = fetch_ohlcv_batch(batch, period=period, session=yf_session)
+        fetched = fetch_ohlcv_batch(batch, period=period)
         not_returned = [s for s in batch if s not in fetched]
 
         # Process each fetched symbol
@@ -293,7 +287,7 @@ def main():
             f"ok_so_far={ok_so_far}  rate={rate:.1f}/s  ETA={eta:.1f}m  "
             f"(batch took {time.time()-b_start:.1f}s)")
         
-        # Small delay between API batches to mitigate heavy cloud rate-limiting
+        # Keep a small safety pause between bulk downloads
         if b_idx < len(batches):
             time.sleep(1)
 
