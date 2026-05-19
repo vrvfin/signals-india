@@ -26,6 +26,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -125,13 +126,13 @@ def upload_parquet(drive, folder_id, filename, df, existing_id=None):
 
 
 # ---------- Batched fetch ----------
-def fetch_ohlcv_batch(symbols: list[str], period: str) -> dict[str, pd.DataFrame]:
-    """Minimal yf.download call matching the pattern that's known to work in cloud."""
+def fetch_ohlcv_batch(symbols: list[str], period: str, session: requests.Session | None = None) -> dict[str, pd.DataFrame]:
+    """Minimal yf.download call with custom request session headers to pass Cloud/CI blocks."""
     if not symbols:
         return {}
     suffixed = [f"{s}.NS" for s in symbols]
     try:
-        df = yf.download(suffixed, period=period, group_by="ticker", progress=False)
+        df = yf.download(suffixed, period=period, group_by="ticker", progress=False, session=session)
     except Exception as e:
         log(f"  Batch fetch raised: {str(e)[:160]}")
         return {}
@@ -255,11 +256,17 @@ def main():
                for i in range(0, len(symbols), args.batch_size)]
     log(f"Batches: {len(batches)} of size up to {args.batch_size}")
 
+    # Set up a requests session with browser headers to spoof yfinance endpoints
+    yf_session = requests.Session()
+    yf_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    })
+
     results: list[dict] = []
     t_start = time.time()
     for b_idx, batch in enumerate(batches, 1):
         b_start = time.time()
-        fetched = fetch_ohlcv_batch(batch, period=period)
+        fetched = fetch_ohlcv_batch(batch, period=period, session=yf_session)
         not_returned = [s for s in batch if s not in fetched]
 
         # Process each fetched symbol
@@ -274,9 +281,7 @@ def main():
             else:
                 r = {"symbol": sym, "status": "no_data_returned",
                      "rows_added": 0,
-                     "total_rows": (len(download_parquet(drive, existing_files[f"{sym}.parquet"]))
-                                    if f"{sym}.parquet" in existing_files else 0)
-                                    if False else 0}  # don't bother re-downloading just to count
+                     "total_rows": 0}
             results.append(r)
 
         elapsed = time.time() - t_start
@@ -287,6 +292,10 @@ def main():
         log(f"  Batch {b_idx}/{len(batches)}  fetched={len(fetched)}/{len(batch)}  "
             f"ok_so_far={ok_so_far}  rate={rate:.1f}/s  ETA={eta:.1f}m  "
             f"(batch took {time.time()-b_start:.1f}s)")
+        
+        # Small delay between API batches to mitigate heavy cloud rate-limiting
+        if b_idx < len(batches):
+            time.sleep(1)
 
     summary = pd.DataFrame(results)
     print()
@@ -296,6 +305,10 @@ def main():
     total_rows = summary["rows_added"].fillna(0).sum()
     print(f"\nTotal rows added: {int(total_rows)}")
     print(f"Elapsed: {(time.time()-t_start)/60:.1f} min")
+
+    # Refresh Google Drive client connection to prevent stale socket/SSLEOFError
+    log("Refreshing Drive connection for run logs...")
+    drive = get_drive_service()
 
     # Run log to Drive
     logs_id = get_or_create_subfolder(drive, folder_id, "logs")
