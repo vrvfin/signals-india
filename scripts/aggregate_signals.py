@@ -230,8 +230,13 @@ def compute_diff(today: pd.DataFrame, yday: pd.DataFrame) -> pd.DataFrame:
                          "today_n": int(rt["n_strategies"]),
                          "yday_n": int(ry["n_strategies"])})
 
-    return pd.DataFrame(rows).sort_values(
+    df_diff = pd.DataFrame(rows)
+    if df_diff.empty:
+        return df_diff
+    return df_diff.sort_values(
         ["change", "today_n"], ascending=[True, False]).reset_index(drop=True)
+
+    
 
 
 # ---------- Main ----------
