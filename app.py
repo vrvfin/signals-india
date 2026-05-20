@@ -639,51 +639,7 @@ def page_strategy_docs():
             st.markdown(f"**Best for:** {doc['best_for']}")
             st.markdown(f"**Caveat:** {doc['caveat']}")
 
-"""
-Stage 9b (v2) — "My Portfolio" page snippet for app.py.
 
-Reads the Screener.in "My Investments" export from your Drive `portfolio/` folder.
-Auto-detects the header row (Screener puts blank rows above it). Auto-picks the
-most-recently-modified file, so you can keep uploading fresh exports without
-renaming.
-
-The exporter hides P&L columns when the user has chosen to redact them, so this
-page does NOT compute P&L. Instead, it shows:
-  - Screener ★ rating per holding
-  - Latest price (from Screener) + 1D change %
-  - Our 3M return, RS rank, distance from 52w high, above-200SMA flag
-  - Today's strategy signal chips per holding
-  - A full chart per holding with today's zones overlaid
-
-HOW TO ADD THIS TO YOUR app.py:
-
-1. Pip install the xls reader (one-time):
-       pip install xlrd==2.0.1
-
-   Or add `xlrd==2.0.1` to requirements.txt and `pip install -r requirements.txt`.
-
-2. Paste the entire `page_portfolio` function below into app.py, anywhere between
-   `def page_strategy_docs():` and `def main():`.
-
-3. In main(), change the sidebar radio line to include "My Portfolio":
-       page = st.sidebar.radio("Page",
-                               ["Market Overview", "Today's Signals", "Graphs",
-                                "My Portfolio", "Stock Detail", "Strategy Docs"])
-
-4. Add this elif branch (before Strategy Docs):
-       elif page == "My Portfolio":
-           page_portfolio()
-
-5. Also paste the three helpers `_find_latest_portfolio_file`,
-   `_read_portfolio_table`, and `_resolve_isins` below into app.py — just above
-   `def page_portfolio()` is fine.
-
-The function uses helpers already in app.py: load_csv, load_parquet,
-load_all_strategy_signals, build_stock_chart, TIMEFRAME_DAYS, ZONE_COLORS,
-_find_subfolder, _list_folder, _download_bytes, drive_service.
-
-------- COPY FROM HERE -------
-"""
 
 
 def _find_latest_portfolio_file(drive, portfolio_folder_id):

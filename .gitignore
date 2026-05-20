@@ -10,7 +10,7 @@ features/
 signals/
 logs/
 charts/
-
+portfolio/
 # Secrets (never commit)
 *.json
 !package.json

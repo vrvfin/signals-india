@@ -314,6 +314,11 @@ def main() -> None:
     # Add RS rank + excess returns
     feat_df = add_relative_strength(feat_df, nifty500_df)
 
+    # Penny-stock filter — drop sub-₹10 names (untradeable noise)
+    before = len(feat_df)
+    feat_df = feat_df[feat_df["close"] >= 10].reset_index(drop=True)
+    log(f"Penny-stock filter: {before} -> {len(feat_df)} (dropped close < ₹10)")
+
     # Output
     features_folder_id = get_or_create_subfolder(drive, folder_id, "features")
     today_str = datetime.now().strftime("%Y-%m-%d")
