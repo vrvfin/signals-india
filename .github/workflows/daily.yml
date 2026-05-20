@@ -47,6 +47,22 @@ jobs:
           python scripts/strategy_qullamaggie.py
           python scripts/strategy_minervini.py
           python scripts/strategy_darvas.py
+
+      - name: Fundamentals (weekly)
+        if: github.event.schedule == '0 12 * * 1'   # Mondays only
+        env:
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: python scripts/ingest_fundamentals.py
+        continue-on-error: true
+
+      - name: CANSLIM
+        run: python scripts/strategy_canslim.py
+        continue-on-error: true
+
+      - name: PEAD
+        run: python scripts/strategy_pead.py
+        continue-on-error: true
+        
       - name: Aggregate
         run: python scripts/aggregate_signals.py
       - name: Market state
