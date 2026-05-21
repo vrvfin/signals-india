@@ -189,6 +189,108 @@ def get_drive():
         token_path.write_text(creds.to_json())
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+# ============================================================
+# Data freshness banner — renders logs/health/latest.json
+# (written by pipeline_healthcheck.py as the last workflow step)
+# ============================================================
+import json
+from datetime import datetime, timezone
+
+def _health_find_sub(drive, parent_id, name):
+    q = (f"name='{name}' and '{parent_id}' in parents and "
+         f"mimeType='application/vnd.google-apps.folder' and trashed=false")
+    f = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    return f[0]["id"] if f else None
+
+@st.cache_data(ttl=300)
+def load_health_report():
+    """Latest pipeline health report dict, or None if not found."""
+    try:
+        drive = get_drive()
+        folder_id = os.environ["GDRIVE_FOLDER_ID"]
+        logs_id = _health_find_sub(drive, folder_id, "logs")
+        health_id = _health_find_sub(drive, logs_id, "health") if logs_id else None
+        if not health_id:
+            return None
+        q = f"name='latest.json' and '{health_id}' in parents and trashed=false"
+        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        if not files:
+            return None
+        return json.loads(drive.files().get_media(fileId=files[0]["id"]).execute())
+    except Exception as e:
+        return {"_error": str(e)[:200]}
+
+def render_health_sidebar():
+    """Compact pipeline status line — call once in the sidebar, every page."""
+    rep = load_health_report()
+    if rep is None or "_error" in rep:
+        st.sidebar.error("Pipeline status: unknown")
+        return
+
+    run_at = rep.get("run_at")
+    age_h = None
+    if run_at:
+        try:
+            dt = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+        except Exception:
+            pass
+
+    overall = rep.get("overall", "UNKNOWN")
+    if age_h is not None and age_h > 30:
+        st.sidebar.error(f"Pipeline stale — last run {age_h:.0f}h ago")
+    elif overall == "HEALTHY":
+        st.sidebar.success("Data: HEALTHY")
+    elif overall == "DEGRADED":
+        st.sidebar.warning(f"Data: DEGRADED ({rep.get('warnings', 0)} warn)")
+    elif overall == "FAIL":
+        st.sidebar.error(f"Data: FAILED ({rep.get('critical_failures', 0)} critical)")
+    else:
+        st.sidebar.info(f"Data: {overall}")
+
+def render_health_banner():
+    rep = load_health_report()
+    if rep is None:
+        st.error("No pipeline health report found on Drive — "
+                 "the daily workflow may have never run.")
+        return
+    if "_error" in rep:
+        st.warning(f"Could not read health report: {rep['_error']}")
+        return
+
+    run_at = rep.get("run_at")
+    age_h = None
+    if run_at:
+        try:
+            dt = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+        except Exception:
+            pass
+
+    overall = rep.get("overall", "UNKNOWN")
+    age_txt = f" — checked {age_h:.0f}h ago" if age_h is not None else ""
+
+    if age_h is not None and age_h > 30:
+        st.error(f"Pipeline has not run for {age_h:.0f} hours "
+                 f"(last check: {run_at}). It may not be running at all — "
+                 f"data below is STALE.")
+    elif overall == "HEALTHY":
+        st.success(f"All data fresh — pipeline HEALTHY{age_txt}.")
+    elif overall == "DEGRADED":
+        st.warning(f"Pipeline DEGRADED — {rep.get('warnings', 0)} warning(s){age_txt}. "
+                   f"Some strategies below may be stale (see detail).")
+    elif overall == "FAIL":
+        st.error(f"Pipeline FAILED — {rep.get('critical_failures', 0)} critical "
+                 f"failure(s){age_txt}. Data below may be stale.")
+    else:
+        st.info(f"Pipeline status: {overall}{age_txt}")
+
+    checks = rep.get("checks", [])
+    if checks:
+        with st.expander("Data freshness detail (per strategy & data pull)"):
+            st.dataframe(pd.DataFrame(checks),
+                         use_container_width=True, hide_index=True)
+
 def _list_folder(drive, folder_id):
     out = {}
     page_token = None
@@ -390,6 +492,7 @@ def _breadth_panel(features):
 def page_market_overview():
     st.title("Market Overview")
 
+    render_health_banner()
     state = load_parquet(["data", "market_state", "latest.parquet"])
     if state.empty:
         st.error("market_state/latest.parquet not found. Run `python scripts/market_state.py`.")
@@ -905,6 +1008,7 @@ def main():
     page = st.sidebar.radio("Page",
                         ["Market Overview", "Today's Signals", "Graphs",
                          "My Portfolio", "Stock Detail", "Strategy Docs"])
+    render_health_sidebar()
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Loaded at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     st.sidebar.caption("Data refreshes from Drive every 5 min (cache TTL)")
