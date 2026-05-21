@@ -69,6 +69,10 @@ jobs:
         run: python scripts/strategy_darvas.py
         continue-on-error: true
 
+      - name: Strategy - Volume
+        run: python scripts/strategy_volume.py
+        continue-on-error: true
+        
       # ---- Fundamentals (Monday only) + fundamentals-dependent strategies ----
       - name: Fundamentals (weekly)
         if: github.event.schedule == '0 12 * * 1'
