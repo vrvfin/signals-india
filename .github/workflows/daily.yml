@@ -1,8 +1,9 @@
 name: Daily Pipeline
 on:
   schedule:
-    - cron: '0 12 * * 1-5'   # 17:30 IST, Mon-Fri (post-market)
-  workflow_dispatch:          # also manual trigger from GitHub UI
+    - cron: '0 12 * * 1'     # Monday 17:30 IST — weekly run, includes fundamentals
+    - cron: '0 12 * * 2-5'   # Tue-Fri 17:30 IST — daily run
+  workflow_dispatch:          # manual trigger from GitHub UI
 
 jobs:
   pipeline:
@@ -29,41 +30,67 @@ jobs:
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
           } > .env
 
+      # ---- Data pull (all best-effort; the health-check is the judge) ----
       - name: Build universe
         run: python scripts/build_universe.py
+        continue-on-error: true
       - name: Ingest OHLCV (incremental)
         run: python scripts/ingest_ohlcv.py
+        continue-on-error: true
       - name: Ingest indices + macro
         run: python scripts/ingest_indices_macro.py
+        continue-on-error: true
+      - name: Fix indices (NSE midcap/smallcap)
+        run: python scripts/fix_indices_nse.py
+        continue-on-error: true
       - name: Ingest FII/DII
         run: python scripts/ingest_fii_dii.py
-        continue-on-error: true   # NSE anti-bot can flake
+        continue-on-error: true
+
+      # ---- Features ----
       - name: Compute features
         run: python scripts/compute_features.py
-      - name: Strategies
-        run: |
-          python scripts/strategy_momentum.py
-          python scripts/strategy_ma_respect.py
-          python scripts/strategy_qullamaggie.py
-          python scripts/strategy_minervini.py
-          python scripts/strategy_darvas.py
+        continue-on-error: true
 
+      # ---- Strategies (each isolated; one failing won't stop the rest) ----
+      - name: Strategy - Momentum
+        run: python scripts/strategy_momentum.py
+        continue-on-error: true
+      - name: Strategy - MA respect
+        run: python scripts/strategy_ma_respect.py
+        continue-on-error: true
+      - name: Strategy - Qullamaggie
+        run: python scripts/strategy_qullamaggie.py
+        continue-on-error: true
+      - name: Strategy - Minervini
+        run: python scripts/strategy_minervini.py
+        continue-on-error: true
+      - name: Strategy - Darvas
+        run: python scripts/strategy_darvas.py
+        continue-on-error: true
+
+      # ---- Fundamentals (Monday only) + fundamentals-dependent strategies ----
       - name: Fundamentals (weekly)
-        if: github.event.schedule == '0 12 * * 1'   # Mondays only
+        if: github.event.schedule == '0 12 * * 1'
         env:
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: python scripts/ingest_fundamentals.py
         continue-on-error: true
-
-      - name: CANSLIM
+      - name: Strategy - CANSLIM
         run: python scripts/strategy_canslim.py
         continue-on-error: true
-
-      - name: PEAD
+      - name: Strategy - PEAD
         run: python scripts/strategy_pead.py
         continue-on-error: true
-        
-      - name: Aggregate
+
+      # ---- Aggregate + market state ----
+      - name: Aggregate signals
         run: python scripts/aggregate_signals.py
+        continue-on-error: true
       - name: Market state
         run: python scripts/market_state.py
+        continue-on-error: true
+
+      # ---- Truth gate: the ONLY step allowed to fail the run ----
+      - name: Health check (truth gate)
+        run: python scripts/pipeline_healthcheck.py
