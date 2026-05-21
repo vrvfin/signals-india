@@ -1,13 +1,28 @@
 """
-Stage cleanup — Fetch NIFTY MIDCAP 100 + NIFTY SMALLCAP 100 via NSE directly.
+Stage cleanup — Fetch NIFTY MIDCAP 100 + NIFTY SMALLCAP 100 via NSE index bhavcopy.
 
-yfinance tickers ^CNXMIDCAP / ^CNXSC are broken. NSE's own indicesHistory API
-works fine. This script backfills (and incrementally updates) those two indices
-into data/indices/, matching the schema produced by ingest_indices_macro.py.
+Why this version (v2):
+  - The old version used NSE's indicesHistory API (www.nseindia.com/api/...).
+    That API host is aggressively anti-bot and frequently returns 0 records
+    (blocked) — see the "(0 records)" runs.
+  - NSE also publishes a DAILY INDEX BHAVCOPY on the archives host:
+        https://archives.nseindia.com/content/indices/ind_close_all_DDMMYYYY.csv
+    One CSV per trading day holds OHLC for EVERY NSE index. The archives host
+    is the same one ingest_ohlcv_bhavcopy.py uses successfully — it works from
+    a laptop and from GitHub Actions runners.
+
+  yfinance tickers ^CNXMIDCAP / ^CNXSC are also broken, hence this script.
+  Output schema matches ingest_indices_macro.py: (date, open, high, low, close, volume).
+
+Behaviour:
+  - If a parquet already exists for an index, fetch only days AFTER its last
+    date (fast daily incremental — a handful of files).
+  - If not, backfill --years worth of trading days (default 3).
+  - Holidays/weekends 404 on the archives host and are skipped automatically.
 
 Usage:
-    python scripts/fix_indices_nse.py             # 10-year backfill or incremental
-    python scripts/fix_indices_nse.py --years 5
+    python scripts/fix_indices_nse.py              # incremental, or 3y backfill
+    python scripts/fix_indices_nse.py --years 5    # backfill window if no parquet
 """
 
 from __future__ import annotations
@@ -30,19 +45,20 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# Our filename -> NSE's official index name
+# Our parquet filename -> set of acceptable bhavcopy "Index Name" values
+# (matched case-insensitively, so casing differences don't matter).
 INDICES = {
-    "NIFTY_MIDCAP_100":   "NIFTY MIDCAP 100",
-    "NIFTY_SMALLCAP_100": "NIFTY SMALLCAP 100",
+    "NIFTY_MIDCAP_100":   {"nifty midcap 100"},
+    "NIFTY_SMALLCAP_100": {"nifty smallcap 100"},
 }
 
 NSE_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/120.0 Safari/537.36"),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept": "text/csv,*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/reports-indices-historical-index-data",
+    "Referer": "https://www.nseindia.com/",
 }
 
 
@@ -54,6 +70,14 @@ def log(msg):
 
 def get_drive():
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    cs_json = os.environ.get("GDRIVE_OAUTH_CLIENT_SECRET_JSON")
+    tk_json = os.environ.get("GDRIVE_OAUTH_TOKEN_JSON")
+    if cs_json and tk_json:
+        import json as _json
+        creds = Credentials.from_authorized_user_info(_json.loads(tk_json), SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
     cs_path = Path(os.environ["GDRIVE_OAUTH_CLIENT_SECRET_PATH"])
     tk_path = Path(os.environ["GDRIVE_OAUTH_TOKEN_PATH"])
     creds = None
@@ -109,93 +133,74 @@ def upload_parquet(drive, folder_id, filename, df, existing_id=None):
     return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
 
 
-# ---------- NSE index history ----------
+# ---------- NSE index bhavcopy ----------
 
-def nse_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(NSE_HEADERS)
+def fetch_index_bhavcopy(d: date, session: requests.Session) -> pd.DataFrame:
+    """One CSV per trading day, all indices. Empty DF on holiday/weekend (404)."""
+    dd = d.strftime("%d%m%Y")
+    url = f"https://archives.nseindia.com/content/indices/ind_close_all_{dd}.csv"
     try:
-        s.get("https://www.nseindia.com/", timeout=10)
-        time.sleep(0.5)
-        s.get("https://www.nseindia.com/reports-indices-historical-index-data",
-              timeout=10)
-        time.sleep(0.5)
-    except Exception:
-        pass
-    return s
-
-
-def fetch_chunk(session, index_name, from_d, to_d):
-    """NSE indicesHistory API. Returns list of record dicts."""
-    url = "https://www.nseindia.com/api/historical/indicesHistory"
-    params = {
-        "indexType": index_name,
-        "from": from_d.strftime("%d-%m-%Y"),
-        "to": to_d.strftime("%d-%m-%Y"),
-    }
-    for attempt in range(3):
-        try:
-            r = session.get(url, params=params, timeout=30)
-            if r.status_code != 200:
-                time.sleep(2)
-                continue
-            data = r.json()
-            return data.get("data", {}).get("indexCloseOnlineRecords", [])
-        except Exception:
-            time.sleep(2)
-    return []
-
-
-def parse_records(records) -> pd.DataFrame:
-    """NSE record fields -> our (date, open, high, low, close, volume) schema."""
-    rows = []
-    for rec in records:
-        ts = (rec.get("EOD_TIMESTAMP") or rec.get("TIMESTAMP")
-              or rec.get("HistoricalDate"))
-        d = pd.to_datetime(ts, errors="coerce", dayfirst=True)
-        rows.append({
-            "date": d,
-            "open": rec.get("EOD_OPEN_INDEX_VAL"),
-            "high": rec.get("EOD_HIGH_INDEX_VAL"),
-            "low": rec.get("EOD_LOW_INDEX_VAL"),
-            "close": rec.get("EOD_CLOSE_INDEX_VAL"),
-            "volume": 0,   # indices have no volume; downstream code only uses close
-        })
-    df = pd.DataFrame(rows).dropna(subset=["date", "close"])
-    if df.empty:
-        return df
-    for c in ["open", "high", "low", "close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
-
-
-def fetch_full_history(session, index_name, start: date, end: date) -> pd.DataFrame:
-    """Fetch year-by-year (NSE caps each call at ~1 year)."""
-    frames = []
-    cur = start
-    while cur < end:
-        chunk_end = min(cur + timedelta(days=360), end)
-        recs = fetch_chunk(session, index_name, cur, chunk_end)
-        if recs:
-            frames.append(parse_records(recs))
-        log(f"    {index_name}: {cur} -> {chunk_end}  ({len(recs)} records)")
-        time.sleep(1.0)
-        cur = chunk_end + timedelta(days=1)
-    if not frames:
+        r = session.get(url, headers=NSE_HEADERS, timeout=30)
+    except requests.RequestException as e:
+        log(f"  {d}: network error — {str(e)[:120]}")
         return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-    return out.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if r.status_code == 404:
+        return pd.DataFrame()
+    if r.status_code != 200:
+        log(f"  {d}: HTTP {r.status_code}")
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(io.StringIO(r.text))
+    except Exception as e:
+        log(f"  {d}: parse error — {str(e)[:120]}")
+        return pd.DataFrame()
+    df.columns = [c.strip() for c in df.columns]
+    if not any(c.lower() == "index name" for c in df.columns):
+        return pd.DataFrame()  # not the file we expected (e.g. HTML error page)
+    return df
+
+
+def extract_rows(bhav: pd.DataFrame, target_date: date) -> dict[str, dict]:
+    """From a day's index bhavcopy, pull one OHLC row per index we track."""
+    cols = {c.lower(): c for c in bhav.columns}
+    name_c = cols.get("index name")
+
+    def find(sub):
+        return next((c for c in bhav.columns if sub in c.lower()), None)
+
+    open_c, high_c, low_c = find("open index"), find("high index"), find("low index")
+    close_c = find("closing index") or find("close index")
+    if not (name_c and open_c and high_c and low_c and close_c):
+        return {}
+
+    out: dict[str, dict] = {}
+    norm = bhav.copy()
+    norm["_name_lc"] = norm[name_c].astype(str).str.strip().str.lower()
+    for our_name, accepted in INDICES.items():
+        match = norm[norm["_name_lc"].isin(accepted)]
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        out[our_name] = {
+            "date": pd.Timestamp(target_date),
+            "open": pd.to_numeric(row[open_c], errors="coerce"),
+            "high": pd.to_numeric(row[high_c], errors="coerce"),
+            "low": pd.to_numeric(row[low_c], errors="coerce"),
+            "close": pd.to_numeric(row[close_c], errors="coerce"),
+            "volume": 0,  # indices have no volume; downstream uses close only
+        }
+    return out
 
 
 # ---------- Main ----------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--years", type=int, default=10)
+    parser.add_argument("--years", type=int, default=3,
+                        help="Backfill window if an index has no parquet yet")
     args = parser.parse_args()
 
-    print("Cleanup — NSE Midcap/Smallcap index fetch")
+    print("Cleanup — NSE Midcap/Smallcap index fetch (bhavcopy)")
     print("-" * 50)
 
     today = date.today()
@@ -206,43 +211,90 @@ def main():
     data_id = get_or_create_subfolder(drive, folder_id, "data")
     indices_id = get_or_create_subfolder(drive, data_id, "indices")
 
-    session = nse_session()
-
-    for our_name, nse_name in INDICES.items():
-        filename = f"{our_name}.parquet"
-        existing_id = find_file(drive, indices_id, filename)
-
-        # Incremental: if a non-trivial parquet exists, only fetch recent days
+    # Load existing parquets; decide how far back we must fetch.
+    existing: dict[str, pd.DataFrame] = {}
+    existing_ids: dict[str, str] = {}
+    earliest_needed = today
+    for our_name in INDICES:
+        fname = f"{our_name}.parquet"
+        fid = find_file(drive, indices_id, fname)
         start = backfill_start
-        existing_df = None
-        if existing_id:
+        if fid:
+            existing_ids[our_name] = fid
             try:
-                existing_df = download_parquet(drive, existing_id)
-                if len(existing_df) > 5:
-                    last = pd.to_datetime(existing_df["date"]).max().date()
+                edf = download_parquet(drive, fid)
+                if len(edf) > 5:
+                    existing[our_name] = edf
+                    last = pd.to_datetime(edf["date"]).max().date()
                     start = last + timedelta(days=1)
             except Exception:
-                existing_df = None
+                pass
+        earliest_needed = min(earliest_needed, start)
+        log(f"{our_name}: will fetch from {start}")
 
-        if start > today:
-            log(f"{our_name}: already up to date.")
+    if earliest_needed > today:
+        print("-" * 50)
+        print("All indices already up to date. Nothing to do.")
+        return
+
+    # Build the list of trading-day candidates (weekdays) newest-first.
+    candidates = []
+    d = today
+    while d >= earliest_needed:
+        if d.weekday() < 5:  # Mon-Fri
+            candidates.append(d)
+        d -= timedelta(days=1)
+    log(f"Scanning {len(candidates)} candidate trading days "
+        f"({earliest_needed} -> {today})")
+
+    session = requests.Session()
+    try:
+        session.get("https://www.nseindia.com/", headers=NSE_HEADERS, timeout=10)
+    except Exception:
+        pass
+
+    # Fetch each day's bhavcopy once; collect rows per index.
+    collected: dict[str, list] = {k: [] for k in INDICES}
+    fetched_days = 0
+    for cd in candidates:
+        bhav = fetch_index_bhavcopy(cd, session)
+        if bhav.empty:
             continue
+        rows = extract_rows(bhav, cd)
+        if rows:
+            fetched_days += 1
+            for our_name, row in rows.items():
+                collected[our_name].append(row)
+        time.sleep(0.15)  # be polite to the archives host
+        if fetched_days and fetched_days % 100 == 0:
+            log(f"  ...{fetched_days} trading days fetched")
 
-        log(f"{our_name} ('{nse_name}'): fetching {start} -> {today}")
-        new_df = fetch_full_history(session, nse_name, start, today)
-        if new_df.empty:
-            log(f"{our_name}: NSE returned no data — skipping (will retry next run).")
+    log(f"Fetched {fetched_days} trading days of data")
+
+    # Merge per index and upload.
+    for our_name in INDICES:
+        new_rows = collected[our_name]
+        if not new_rows:
+            log(f"{our_name}: no new rows (already current or NSE returned nothing).")
             continue
+        new_df = (pd.DataFrame(new_rows)
+                  .dropna(subset=["close"])
+                  .sort_values("date").reset_index(drop=True))
+        new_df["date"] = pd.to_datetime(new_df["date"]).dt.normalize()
 
-        if existing_df is not None and len(existing_df) > 5:
-            merged = pd.concat([existing_df, new_df], ignore_index=True)
+        if our_name in existing:
+            merged = pd.concat([existing[our_name], new_df], ignore_index=True)
+            merged["date"] = pd.to_datetime(merged["date"]).dt.normalize()
             merged = (merged.drop_duplicates(subset=["date"], keep="last")
                       .sort_values("date").reset_index(drop=True))
         else:
             merged = new_df
 
-        upload_parquet(drive, indices_id, filename, merged, existing_id)
-        log(f"{our_name}: wrote {len(merged)} rows -> data/indices/{filename}")
+        merged = merged[["date", "open", "high", "low", "close", "volume"]]
+        upload_parquet(drive, indices_id, f"{our_name}.parquet", merged,
+                       existing_ids.get(our_name))
+        log(f"{our_name}: wrote {len(merged)} rows "
+            f"(+{len(new_df)} new) -> data/indices/{our_name}.parquet")
 
     print("-" * 50)
     print("Done.")
