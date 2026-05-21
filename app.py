@@ -17,7 +17,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 import json
-
+import ssl
+import socket
+import time
 
 st.set_page_config(page_title="Signals India", layout="wide",
                           initial_sidebar_state="expanded")
@@ -344,60 +346,83 @@ def _download_bytes(drive, file_id):
 def drive_service():
     return get_drive()
 
+_TRANSIENT_NET = (ssl.SSLError, socket.error, ConnectionError, OSError)
+
+def _drive_call(fn, attempts=4):
+    """Run a Drive operation. On ANY failure (stale TLS connection, httplib2
+    teardown quirks, truncated download), drop the cached Drive connection and
+    retry with a fresh one. Re-raises if every attempt fails."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if i == attempts - 1:
+                raise
+            try:
+                drive_service.clear()      # force a fresh connection next call
+            except Exception:
+                pass
+            time.sleep(1.5 * (i + 1))
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_csv(path_parts):
-    drive = drive_service()
-    parent = os.environ["GDRIVE_FOLDER_ID"]
-    for part in path_parts[:-1]:
-        parent = _find_subfolder(drive, parent, part)
-        if not parent:
+    def _do():
+        drive = drive_service()
+        parent = os.environ["GDRIVE_FOLDER_ID"]
+        for part in path_parts[:-1]:
+            parent = _find_subfolder(drive, parent, part)
+            if not parent:
+                return pd.DataFrame()
+        files = _list_folder(drive, parent)
+        fid = files.get(path_parts[-1])
+        if not fid:
             return pd.DataFrame()
-    files = _list_folder(drive, parent)
-    fid = files.get(path_parts[-1])
-    if not fid:
-        return pd.DataFrame()
-    return pd.read_csv(io.BytesIO(_download_bytes(drive, fid)))
+        return pd.read_csv(io.BytesIO(_download_bytes(drive, fid)))
+    return _drive_call(_do)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_parquet(path_parts):
-    drive = drive_service()
-    parent = os.environ["GDRIVE_FOLDER_ID"]
-    for part in path_parts[:-1]:
-        parent = _find_subfolder(drive, parent, part)
-        if not parent:
+    def _do():
+        drive = drive_service()
+        parent = os.environ["GDRIVE_FOLDER_ID"]
+        for part in path_parts[:-1]:
+            parent = _find_subfolder(drive, parent, part)
+            if not parent:
+                return pd.DataFrame()
+        files = _list_folder(drive, parent)
+        fid = files.get(path_parts[-1])
+        if not fid:
             return pd.DataFrame()
-    files = _list_folder(drive, parent)
-    fid = files.get(path_parts[-1])
-    if not fid:
-        return pd.DataFrame()
-    return pd.read_parquet(io.BytesIO(_download_bytes(drive, fid)))
+        return pd.read_parquet(io.BytesIO(_download_bytes(drive, fid)))
+    return _drive_call(_do)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_all_strategy_signals():
-    drive = drive_service()
-    folder_id = os.environ["GDRIVE_FOLDER_ID"]
-    signals_id = _find_subfolder(drive, folder_id, "signals")
-    if not signals_id:
-        return pd.DataFrame()
-    per_strat_id = _find_subfolder(drive, signals_id, "per_strategy")
-    if not per_strat_id:
-        return pd.DataFrame()
-    subs = drive.files().list(
-        q=f"'{per_strat_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-        fields="files(id,name)",
-    ).execute().get("files", [])
-    frames = []
-    for s in subs:
-        files = _list_folder(drive, s["id"])
-        latest_id = files.get("latest.csv")
-        if latest_id:
-            df = pd.read_csv(io.BytesIO(_download_bytes(drive, latest_id)))
-            df["strategy_group"] = s["name"]
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    def _do():
+        drive = drive_service()
+        folder_id = os.environ["GDRIVE_FOLDER_ID"]
+        signals_id = _find_subfolder(drive, folder_id, "signals")
+        if not signals_id:
+            return pd.DataFrame()
+        per_strat_id = _find_subfolder(drive, signals_id, "per_strategy")
+        if not per_strat_id:
+            return pd.DataFrame()
+        subs = drive.files().list(
+            q=f"'{per_strat_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields="files(id,name)",
+        ).execute().get("files", [])
+        frames = []
+        for s in subs:
+            files = _list_folder(drive, s["id"])
+            latest_id = files.get("latest.csv")
+            if latest_id:
+                df = pd.read_csv(io.BytesIO(_download_bytes(drive, latest_id)))
+                df["strategy_group"] = s["name"]
+                frames.append(df)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return _drive_call(_do)
 
 
 # ---------- Market Overview helpers ----------
@@ -758,56 +783,109 @@ def page_strategy_docs():
             st.markdown(f"**Caveat:** {doc['caveat']}")
 
 def page_graphs():
-    st.title("Graphs — per-strategy chart gallery")
+    st.title("Graphs — signal chart gallery")
     signals = load_all_strategy_signals()
     if signals.empty:
         st.error("No signals found. Run the strategy scripts first.")
         return
 
     strat_groups = sorted(signals["strategy_group"].unique())
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    zone_opts = sorted(signals["zone_type"].dropna().unique())
+
+    c1, c2 = st.columns([3, 2])
     with c1:
-        group = st.selectbox("Strategy", strat_groups)
+        chosen = st.multiselect("Strategies (add / remove)",
+                                strat_groups, default=strat_groups)
     with c2:
-        zones = st.multiselect("Zones", ["buy", "add", "hold"],
-                               default=["buy", "add"])
+        zones = st.multiselect("Zones", zone_opts, default=["buy", "add"])
+
+    c3, c4, c5 = st.columns(3)
     with c3:
-        top_n = st.number_input("How many charts", min_value=1, max_value=60,
-                                value=12, step=4)
+        min_strats = st.number_input("Min strategies a stock must satisfy",
+                                     min_value=1, max_value=10, value=2, step=1)
     with c4:
+        per_page = st.number_input("Charts per page", min_value=4,
+                                   max_value=40, value=12, step=4)
+    with c5:
         tf = st.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()), index=2)
 
-    sel = signals[signals["strategy_group"] == group]
+    sel = signals[signals["strategy_group"].isin(chosen)]
     if zones:
         sel = sel[sel["zone_type"].isin(zones)]
-    if "score" in sel.columns:
-        sel = sel.sort_values("score", ascending=False)
-    sel = sel.head(int(top_n))
     if sel.empty:
         st.info("No signals match this filter.")
         return
 
-    st.caption(f"Showing {len(sel)} of {group} — sorted by score")
-    for _, sig in sel.iterrows():
-        sym = sig["symbol"]
-        zt = sig.get("zone_type", "")
-        score = sig.get("score")
-        title = f"### {sym} — {zt}"
-        if pd.notna(score):
-            title += f"  (score {score:.1f})"
-        st.markdown(title)
-        reason = sig.get("reason", "")
-        if isinstance(reason, str) and reason:
-            st.caption(reason)
+    conv = (sel.groupby("symbol")["strategy_group"].nunique()
+            .reset_index(name="n_strategies"))
+    conv = conv[conv["n_strategies"] >= int(min_strats)]
+    if conv.empty:
+        st.info(f"No stock satisfies ≥ {int(min_strats)} of the selected "
+                f"strategies. Lower the threshold to see more.")
+        return
+
+    best = sel.groupby("symbol")["score"].max().reset_index(name="best_score")
+    conv = conv.merge(best, on="symbol", how="left")
+    conv = conv.sort_values(["n_strategies", "best_score"],
+                            ascending=[False, False]).reset_index(drop=True)
+
+    # --- Pagination ---
+    total = len(conv)
+    per_page = int(per_page)
+    n_pages = max(1, (total + per_page - 1) // per_page)
+
+    if "graphs_page" not in st.session_state:
+        st.session_state["graphs_page"] = 0
+    st.session_state["graphs_page"] = min(st.session_state["graphs_page"],
+                                          n_pages - 1)
+    page = st.session_state["graphs_page"]
+
+    def _nav(suffix):
+        n1, n2, n3 = st.columns([1, 2, 1])
+        with n1:
+            if st.button("◀ Prev", key=f"prev_{suffix}", disabled=(page <= 0),
+                         use_container_width=True):
+                st.session_state["graphs_page"] = page - 1
+                st.rerun()
+        with n2:
+            st.markdown(f"<div style='text-align:center;'>Page {page + 1} of "
+                        f"{n_pages} · {total} stock(s) "
+                        f"(≥ {int(min_strats)} strategies)</div>",
+                        unsafe_allow_html=True)
+        with n3:
+            if st.button("Next ▶", key=f"next_{suffix}",
+                         disabled=(page >= n_pages - 1),
+                         use_container_width=True):
+                st.session_state["graphs_page"] = page + 1
+                st.rerun()
+
+    _nav("top")
+    st.markdown("---")
+
+    start = page * per_page
+    for _, crow in conv.iloc[start:start + per_page].iterrows():
+        sym = crow["symbol"]
+        sym_sigs = sel[sel["symbol"] == sym]
+        st.markdown(f"### {sym}  ·  {int(crow['n_strategies'])} strategies")
+        chips = []
+        for _, sg in sym_sigs.iterrows():
+            z = sg.get("zone_type", "")
+            s = sg.get("strategy", sg.get("strategy_group", ""))
+            color = ZONE_COLORS.get(z, "#666")
+            chips.append(f'<span style="background:{color};color:white;'
+                         f'padding:2px 8px;border-radius:10px;font-size:12px;'
+                         f'margin-right:4px;">{s} · {z}</span>')
+        st.markdown(" ".join(chips), unsafe_allow_html=True)
         ohlcv = load_parquet(["data", "ohlcv", f"{sym}.parquet"])
         if ohlcv.empty:
             st.caption("No OHLCV available for this symbol.")
         else:
-            sym_sigs = signals[signals["symbol"] == sym]
             fig = build_stock_chart(sym, ohlcv, sym_sigs,
                                     TIMEFRAME_DAYS[tf], height=460)
             st.plotly_chart(fig, use_container_width=True, key=f"graphs_{sym}")
         st.markdown("---")
+
+    _nav("bottom")
 
 
 
