@@ -109,6 +109,21 @@ STRATEGY_DOCS = {
                   "Stop: box bottom − 0.5×ATR"],
         "best_for": "Trend continuation at new highs",
         "caveat": "Few setups in bearish regimes"},
+    "volume_breakout": {"title": "Volume Breakout",
+        "intent": "A volume surge confirming institutional accumulation — the stock trades far above its average volume while in an uptrend near its highs.",
+        "rules": ["Above 50 EMA and 200 SMA (uptrend)", "Within 25% of 52w high",
+                  "BUY: volume ≥ 2.5× its average",
+                  "ADD: BUY + within 5% of 52w high",
+                  "HOLD: volume 1.5–2.5× average (elevated, not a full spike)"],
+        "best_for": "Catching the day institutions step in",
+        "caveat": "A single freak-volume day can fire it — confirm the move looks real"},
+    "volume_vcp": {"title": "Volume VCP (dry-up)",
+        "intent": "A volume dry-up inside a tight base near the highs — the classic pre-breakout coil (Volatility Contraction Pattern).",
+        "rules": ["Above 50 EMA and 200 SMA (uptrend)", "Within 10% of 52w high",
+                  "BUY: volume ≤ 0.5× average (dry-up) + tight range (ADR ≤ 3%)",
+                  "ADD: an even tighter range / closer to the high"],
+        "best_for": "Spotting setups before they break out",
+        "caveat": "A setup, not a trigger — the breakout itself is caught by Volume Breakout"},
 }
 
 
@@ -742,6 +757,60 @@ def page_strategy_docs():
             st.markdown(f"**Best for:** {doc['best_for']}")
             st.markdown(f"**Caveat:** {doc['caveat']}")
 
+def page_graphs():
+    st.title("Graphs — per-strategy chart gallery")
+    signals = load_all_strategy_signals()
+    if signals.empty:
+        st.error("No signals found. Run the strategy scripts first.")
+        return
+
+    strat_groups = sorted(signals["strategy_group"].unique())
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        group = st.selectbox("Strategy", strat_groups)
+    with c2:
+        zones = st.multiselect("Zones", ["buy", "add", "hold"],
+                               default=["buy", "add"])
+    with c3:
+        top_n = st.number_input("How many charts", min_value=1, max_value=60,
+                                value=12, step=4)
+    with c4:
+        tf = st.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()), index=2)
+
+    sel = signals[signals["strategy_group"] == group]
+    if zones:
+        sel = sel[sel["zone_type"].isin(zones)]
+    if "score" in sel.columns:
+        sel = sel.sort_values("score", ascending=False)
+    sel = sel.head(int(top_n))
+    if sel.empty:
+        st.info("No signals match this filter.")
+        return
+
+    st.caption(f"Showing {len(sel)} of {group} — sorted by score")
+    for _, sig in sel.iterrows():
+        sym = sig["symbol"]
+        zt = sig.get("zone_type", "")
+        score = sig.get("score")
+        title = f"### {sym} — {zt}"
+        if pd.notna(score):
+            title += f"  (score {score:.1f})"
+        st.markdown(title)
+        reason = sig.get("reason", "")
+        if isinstance(reason, str) and reason:
+            st.caption(reason)
+        ohlcv = load_parquet(["data", "ohlcv", f"{sym}.parquet"])
+        if ohlcv.empty:
+            st.caption("No OHLCV available for this symbol.")
+        else:
+            sym_sigs = signals[signals["symbol"] == sym]
+            fig = build_stock_chart(sym, ohlcv, sym_sigs,
+                                    TIMEFRAME_DAYS[tf], height=460)
+            st.plotly_chart(fig, use_container_width=True, key=f"graphs_{sym}")
+        st.markdown("---")
+
+
+
 
 
 
@@ -1022,6 +1091,8 @@ def main():
         page_portfolio()
     elif page == "Strategy Docs":
         page_strategy_docs()
+    elif page == "Graphs":
+        page_graphs()
 
 
 
