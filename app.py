@@ -453,6 +453,42 @@ def _macro_strip():
         chg = (last / prev - 1) * 100 if prev else 0
         col.metric(label, f"{last:,.2f}", f"{chg:+.2f}% (5d)")
 
+def _fii_dii_panel():
+    df = load_csv(["data", "macro", "FII_DII.csv"])
+    if df.empty or "category" not in df.columns or "net" not in df.columns:
+        return
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    cat = df["category"].astype(str).str.upper()
+    df = df.assign(grp=pd.NA)
+    df.loc[cat.str.contains("FII") | cat.str.contains("FPI"), "grp"] = "FII"
+    df.loc[cat.str.contains("DII"), "grp"] = "DII"
+    df = df.dropna(subset=["grp"])
+    if df.empty:
+        return
+    pivot = df.groupby(["date", "grp"])["net"].sum().unstack("grp").sort_index()
+
+    st.subheader("FII / DII net cash flows (₹ cr)")
+    latest = pivot.iloc[-1]
+    c1, c2, c3 = st.columns(3)
+    fii, dii = latest.get("FII"), latest.get("DII")
+    c1.metric("FII net (latest)", f"₹{fii:,.0f} cr" if pd.notna(fii) else "—")
+    c2.metric("DII net (latest)", f"₹{dii:,.0f} cr" if pd.notna(dii) else "—")
+    c3.caption(f"as of {pivot.index[-1].date()}")
+
+    recent = pivot.tail(20)
+    fig = go.Figure()
+    if "FII" in recent.columns:
+        fig.add_trace(go.Bar(x=recent.index, y=recent["FII"], name="FII",
+                             marker_color="#2980b9"))
+    if "DII" in recent.columns:
+        fig.add_trace(go.Bar(x=recent.index, y=recent["DII"], name="DII",
+                             marker_color="#e67e22"))
+    fig.add_hline(y=0, line=dict(color="gray", dash="dot"))
+    fig.update_layout(barmode="group", height=300,
+                      margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig, use_container_width=True)
 
 def _breadth_panel(features):
     if features.empty:
@@ -606,6 +642,9 @@ def page_market_overview():
         fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("---")
+    _fii_dii_panel()
+    
     # Sector rotation
     st.subheader("Sector rotation (vs Nifty 500)")
     sec = load_csv(["data", "market_state", "sector_rotation_latest.csv"])

@@ -220,9 +220,12 @@ def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
     for n in [10, 20, 50]:
         feat[f"days_above_ema_{n}"] = days_above_ma(close, emas[n])
 
-    # Gap
+    # Gap + 1-day move
     if len(df) >= 2:
-        feat["gap_pct"] = (df["open"].iloc[-1] / close.iloc[-2] - 1) * 100
+        prior_close = close.iloc[-2]
+        feat["prior_close"] = prior_close
+        feat["gap_pct"] = (df["open"].iloc[-1] / prior_close - 1) * 100
+        feat["return_1d_pct"] = (close.iloc[-1] / prior_close - 1) * 100
 
     return feat
 
