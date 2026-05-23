@@ -1,4 +1,5 @@
-  name: Daily Pipeline
+name: Daily Pipeline Execution
+
 on:
   schedule:
     - cron: '0 12 * * 1'     # Monday 17:30 IST — weekly run, includes fundamentals
@@ -14,7 +15,6 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install -r requirements.txt
-
       - name: Write credentials from secrets
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -68,11 +68,10 @@ jobs:
       - name: Strategy - Darvas
         run: python scripts/strategy_darvas.py
         continue-on-error: true
-
       - name: Strategy - Volume
         run: python scripts/strategy_volume.py
         continue-on-error: true
-        
+              
       # ---- Fundamentals (Monday only) + fundamentals-dependent strategies ----
       - name: Fundamentals (weekly)
         if: github.event.schedule == '0 12 * * 1'
@@ -80,13 +79,11 @@ jobs:
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: python scripts/ingest_fundamentals.py
         continue-on-error: true
-
       - name: Enrich market cap (weekly)
         if: github.event.schedule == '0 12 * * 1'
         run: python scripts/enrich_market_cap.py
         continue-on-error: true
-
-        
+              
       - name: Strategy - CANSLIM
         run: python scripts/strategy_canslim.py
         continue-on-error: true
