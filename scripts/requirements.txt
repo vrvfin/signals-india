@@ -25,5 +25,8 @@ google-genai>=1.0
 # Config
 python-dotenv>=1.0
 
+# PDF page-splitting for annual report map-reduce (optional, falls back to byte-chunking)
+pypdf>=4.0
+
 # Excel (template.xlsx)
 openpyxl>=3.1

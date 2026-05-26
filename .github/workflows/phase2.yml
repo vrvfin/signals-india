@@ -9,6 +9,10 @@ name: Phase 2 — Company Intelligence
 #   12:00 IST — midday top-up
 #   17:00 IST — market close (results season peak)
 #   21:00 IST — evening concalls
+#
+# Stage B extractors (all doc types, in priority order):
+#   concall → results → rating → presentation → annual_report
+# Each extractor is independent; a rate-limit in one does not block the others.
 
 on:
   schedule:
@@ -54,12 +58,33 @@ jobs:
         run: python scripts/ingest_company_docs.py
         continue-on-error: true
 
-      # Stage B: process pending concalls through Gemini
+      # Stage B: Screener HTML results table (no LLM — structured numbers)
+      - name: Scrape results table
+        run: python scripts/scrape_results_table.py
+        continue-on-error: true
+
+      # Stage B: process pending docs through Gemini (priority order)
       - name: Extract concalls
         run: python scripts/extract_concall.py
         continue-on-error: true
 
-      # Housekeeping: delete raw PDFs older than 10 days
+      - name: Extract results PDFs
+        run: python scripts/extract_results.py
+        continue-on-error: true
+
+      - name: Extract credit ratings
+        run: python scripts/extract_rating.py
+        continue-on-error: true
+
+      - name: Extract investor presentations
+        run: python scripts/extract_presentation.py
+        continue-on-error: true
+
+      - name: Extract annual reports
+        run: python scripts/extract_annual_report.py
+        continue-on-error: true
+
+      # Housekeeping: delete raw PDFs > 10d and daily digests > 30d
       - name: Cleanup old docs
         run: python scripts/cleanup_company_docs.py
         continue-on-error: true

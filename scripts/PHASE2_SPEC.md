@@ -172,26 +172,56 @@ company_repo/
   _index/
     company_universe.csv      ISIN, symbol, exchange, name, aliases
     processing_queue.parquet  (isin, doc_id, doc_type) → status, drive_file_id
-    quarterly_facts.parquet   isin × quarter → financial actuals
+    quarterly_facts.parquet   isin × quarter → financial actuals (concall + AR + presentation)
     guidance_tracker.parquet  isin × quarter × metric × horizon → guidance
-    results.parquet           results-season structured numbers (daily upsert)
+    results.parquet           Screener HTML-scraped structured numbers (scrape_results_table.py)
+    results_gemini.parquet    Gemini-extracted financials from results PDFs (extract_results.py)
+    ratings.parquet           isin × source_doc_id → agency, rating, outlook, action
     deep_research_requests.csv  user-submitted companies for deep report [Stage E]
 ```
 
 ---
 
-## 8. P2 — Extractors for other doc types (Stage D / E)
+## 8. P2 — Extractors for other doc types (Stage D)
 
-All use the same queue-driven pattern as `extract_concall.py`:
+All extractors share identical design: queue-driven, dual output (company page +
+`_daily/` day digest with 30-day TTL), toggle flags, 3-path Drive auth, multi-key
+Gemini rotation. Shared infrastructure lives in `_extractor_base.py`.
 
-- `extract_annual_report.py` — uses `annual_report_prompt.txt`; map-reduce for
-  docs > 300 pages. Updates `company_page.md` with an AR section.
-- `extract_presentation.py` — uses `presentation_prompt.txt`.
-- `extract_rating.py` — uses `rating_prompt.txt`. Appends a credit section to
-  `company_page.md` and records rating + outlook in a new `_index/ratings.parquet`.
-- `extract_drhp.py` — uses `annual_report_prompt.txt` (forensic lens); map-reduce
-  mandatory. Produces a standalone `drhp_report.md` rather than appending to
-  `company_page.md` (a DRHP is a one-off pre-IPO document).
+**Shared infrastructure — `scripts/_extractor_base.py`**
+- `get_drive()` — 3-path auth (service account, saved token, OAuth flow)
+- `GeminiKeyPool` — inline PDF calls, round-robin key rotation, backoff
+- `load_queue / save_queue` — queue parquet R/W
+- `load_parquet / save_parquet` — generic parquet upsert helpers
+- `extract_md_tables` — fenced + unfenced pipe-table parser
+- `append_day_page(doc_type, ...)` — parameterised day digest writer
+- `append_company_page(doc_type_label, ...)` — parameterised company page writer
+- `load_api_keys()` — reads `GEMINI_API_KEY_1..N` and plain `GEMINI_API_KEY`
+
+**`extract_results.py`** *(Stage B — 94 pending)*
+- Uses `results_prompt.txt` (focused quarterly financials table)
+- Upserts into `_index/results_gemini.parquet` (complements HTML-scraped `results.parquet`)
+- Day files: `_daily/results_DD_MMMYYYY.md`
+
+**`extract_annual_report.py`** *(Stage D — 50 pending)*
+- Uses `annual_report_prompt.txt` (forensic lens)
+- Map-reduce for PDFs > 12 MB: chunk → per-chunk Gemini calls → synthesis pass
+  (uses `pypdf` for page-accurate splitting; falls back to byte-chunking)
+- Upserts into `_index/quarterly_facts.parquet` (annual totals stored as FY-labelled rows)
+- Day files: `_daily/annual_report_DD_MMMYYYY.md`
+
+**`extract_presentation.py`** *(Stage D — 37 pending)*
+- Uses `presentation_prompt.txt` (operational KPIs + narrative forensics)
+- Best-effort upsert into `_index/quarterly_facts.parquet`
+- Day files: `_daily/presentation_DD_MMMYYYY.md`
+
+**`extract_rating.py`** *(Stage D — 25 pending)*
+- Uses `rating_prompt.txt` (solvency + credit forensics)
+- Upserts into `_index/ratings.parquet` (agency, rating, outlook, action, instrument)
+- Day files: `_daily/rating_DD_MMMYYYY.md`
+
+**`extract_drhp.py`** — planned Stage G; map-reduce mandatory; produces standalone
+`drhp_report.md` (not appended to `company_page.md`).
 
 ---
 
@@ -325,8 +355,10 @@ Steps (all `continue-on-error: true`):
 
 - **Stage A** — `build_company_universe.py`, `ingest_company_docs.py`,
   `scrape_results_table.py`, `cleanup_company_docs.py`. **DONE 2026-05-23.**
-- **Stage B** — `extract_concall.py` + multi-key Gemini rotation helper.
-  **NEXT.** → daily MVP is live once this ships.
+- **Stage B** — `extract_concall.py` + multi-key Gemini rotation. **DONE 2026-05-26.**
+  `extract_results.py` + `_extractor_base.py`. **DONE 2026-05-26.**
+- **Stage D** — `extract_annual_report.py`, `extract_presentation.py`,
+  `extract_rating.py`. **DONE 2026-05-26.**
 - **Stage C** — `company_page_generator.py` (regenerates `.md` header/overview
   section) + Concall Feed dashboard page + Stock Detail Fundamentals strip.
 - **Stage D** — `build_guidance_scorecard.py` + Guidance dashboard page +
