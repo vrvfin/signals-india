@@ -1,17 +1,20 @@
 """
 Phase 2 / Stage A — Storage hygiene.
 
-Deletes raw document PDFs older than RETAIN_DAYS from every
-company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
-raw PDF is no longer needed — the company page and the structured indexes hold
-the lasting value. This keeps Google Drive lean.
+1. Deletes raw document PDFs older than RETAIN_DAYS (default 10) from every
+   company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
+   raw PDF is no longer needed — the company page and the structured indexes hold
+   the lasting value.
+
+2. Deletes daily digest markdown files older than DAILY_RETAIN_DAYS (default 30)
+   from company_repo/_daily/. These are ephemeral day-level concall digests.
 
 NEVER touches: company_page.md/.docx, deep_report.*, summaries, _index/*.
-Only files inside a folder literally named "documents" are eligible.
 
 Usage:
     python scripts/cleanup_company_docs.py
     python scripts/cleanup_company_docs.py --retain-days 14
+    python scripts/cleanup_company_docs.py --daily-retain-days 60
     python scripts/cleanup_company_docs.py --dry-run     # list, delete nothing
 """
 
@@ -30,6 +33,7 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 RETAIN_DAYS = 10
+DAILY_RETAIN_DAYS = 30
 
 
 def log(msg: str) -> None:
@@ -39,16 +43,39 @@ def log(msg: str) -> None:
 # ---------- Drive helpers ----------
 
 def get_drive():
+    import json
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     cs_path = Path(os.environ["GDRIVE_OAUTH_CLIENT_SECRET_PATH"])
+    cred_data = json.loads(cs_path.read_text())
+
+    # Service account key — used in GitHub Actions (no browser flow needed)
+    if cred_data.get("type") == "service_account":
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_file(
+            str(cs_path), scopes=SCOPES
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # Saved OAuth token (Credentials.to_json() format) — has refresh_token directly
+    if "refresh_token" in cred_data:
+        creds = Credentials.from_authorized_user_file(str(cs_path), SCOPES)
+        if not creds.valid:
+            creds.refresh(Request())
+            cs_path.write_text(creds.to_json())
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # Standard OAuth installed-app flow (proper client_secrets.json)
     token_path = Path(os.environ["GDRIVE_OAUTH_TOKEN_PATH"])
     creds = None
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(str(cs_path), SCOPES)
             creds = flow.run_local_server(port=0)
         token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,14 +117,18 @@ def hours_old(modified_time_iso: str) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--retain-days", type=int, default=RETAIN_DAYS)
+    parser.add_argument("--daily-retain-days", type=int, default=DAILY_RETAIN_DAYS)
     parser.add_argument("--dry-run", action="store_true",
                         help="List what would be deleted; delete nothing.")
     args = parser.parse_args()
 
-    print("Phase 2 / Stage A — Raw-document cleanup")
+    print("Phase 2 / Stage A — Storage hygiene")
     print("-" * 56)
     cutoff_h = args.retain_days * 24
-    log(f"Deleting raw PDFs older than {args.retain_days} days"
+    daily_cutoff_h = args.daily_retain_days * 24
+    log(f"Raw PDFs: delete older than {args.retain_days}d"
+        f"{'  (DRY RUN)' if args.dry_run else ''}")
+    log(f"Daily digests: delete older than {args.daily_retain_days}d"
         f"{'  (DRY RUN)' if args.dry_run else ''}")
 
     drive = get_drive()
@@ -109,7 +140,7 @@ def main() -> None:
         return
 
     company_folders = [f for f in list_children(drive, repo_id, only_folders=True)
-                       if f["name"] != "_index"]
+                       if f["name"] not in ("_index", "_daily")]
     log(f"Scanning {len(company_folders)} company folders...")
 
     scanned = deleted = kept = errors = 0
@@ -147,6 +178,42 @@ def main() -> None:
     print(f"{'Would delete' if args.dry_run else 'Deleted (trashed)'} : {deleted}")
     if errors:
         print(f"Errors           : {errors}")
+
+    # ---- Daily digest cleanup (_daily/ folder, 30-day TTL) ----
+    print()
+    log(f"Scanning _daily/ for files older than {args.daily_retain_days} days...")
+    daily_id = find_subfolder(drive, repo_id, "_daily")
+    d_scanned = d_deleted = d_kept = d_errors = 0
+    if daily_id:
+        for f in list_children(drive, daily_id):
+            if f.get("mimeType") == "application/vnd.google-apps.folder":
+                continue
+            d_scanned += 1
+            try:
+                age_h = hours_old(f["modifiedTime"])
+            except Exception:
+                continue
+            if age_h <= daily_cutoff_h:
+                d_kept += 1
+                continue
+            if args.dry_run:
+                log(f"  would delete: _daily/{f['name']} ({age_h/24:.0f}d old)")
+                d_deleted += 1
+                continue
+            try:
+                drive.files().update(fileId=f["id"], body={"trashed": True}).execute()
+                d_deleted += 1
+            except Exception as e:
+                d_errors += 1
+                log(f"  ERROR deleting _daily/{f['name']}: {str(e)[:100]}")
+    else:
+        log("  _daily/ folder not found — nothing to clean.")
+
+    print(f"Daily digests scanned : {d_scanned}")
+    print(f"Kept (<= {args.daily_retain_days}d)  : {d_kept}")
+    print(f"{'Would delete' if args.dry_run else 'Deleted (trashed)'}     : {d_deleted}")
+    if d_errors:
+        print(f"Errors                : {d_errors}")
 
 
 if __name__ == "__main__":

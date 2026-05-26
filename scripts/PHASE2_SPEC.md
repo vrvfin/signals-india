@@ -1,161 +1,359 @@
 # PHASE 2 SPEC — Company Repository & Concall Intelligence
 
-**Status:** spec for review · **Created:** 2026-05-22 · move to repo root after review.
+**Status:** active · **Created:** 2026-05-22 · **Last updated:** 2026-05-26
 Companion to `DESIGN.md` / `PROJECT_STATUS.md`.
 
 ---
 
 ## 1. Objective
 
-Automate the user's manual company-research loop: collect concalls (and later
-annual reports / research / ratings), summarise them with an LLM, keep a living
+Automate the user's manual company-research loop: collect corporate documents
+(concalls, annual reports, research reports, credit ratings, DRHPs), summarise
+them with Gemini, extract structured guidance & financial facts, keep a living
 per-company page on Google Drive, and surface selected views in Streamlit —
 without overrunning free-tier limits.
 
-## 2. Priority order (token-budget driven)
+---
 
-Everything is gated by daily LLM quota. Order, highest first:
+## 2. Document types in scope
 
-1. **P1 — Daily concall summariser (the MVP).** Each day, pick up every new
-   concall transcript from Screener's announcements feed, summarise it, update
-   the company page + structured indexes. *This is what we build and ship first.*
-2. **P2 — History backfill.** Once the daily loop runs comfortably and spare
-   quota exists, walk concalls backward from **2025-05-20**.
-3. **P2 — Deep-research reports.** The full forensic report (`prompt.txt`
-   Phase 1-4) for: (a) portfolio companies automatically; (b) any company the
-   user requests — via a Streamlit input (preferred) or a Drive-upload fallback.
-   The company's existing `company_page.md` is an input to the deep report.
+| doc_type        | Source feed / approach                          | Prompt file               | Size range   | Gemini strategy        |
+|-----------------|------------------------------------------------|---------------------------|--------------|------------------------|
+| `concall`       | Screener filter 76106                          | `concall_prompt.txt`      | 10–40 pages  | File API               |
+| `annual_report` | Screener filter 103635                         | `annual_report_prompt.txt`| 100–400 pages| File API + map-reduce  |
+| `presentation`  | Screener filter 76295                          | `presentation_prompt.txt` | 10–60 pages  | File API               |
+| `rating`        | Screener filter 215435                         | `rating_prompt.txt`       | 5–20 pages   | File API               |
+| `drhp`          | BSE/NSE DRHP filings (new — see §10.1)         | `annual_report_prompt.txt`| 200–600 pages| File API + map-reduce  |
+| `results`       | Screener `/results/latest/` (structured table) | No LLM — numbers only     | HTML table   | Direct scrape          |
 
-If quota is tight, P2 items become **on-demand**: backfill a company, then run
-its deep report.
+**Map-reduce rule:** if PDF > 300 pages (annual report or DRHP), split into
+~100-page chunks, summarise each chunk independently, then run a final synthesis
+pass over the chunk summaries. This avoids context-window overflow.
 
-## 3. Universe & documents
+**File API:** all PDFs (regardless of size) are uploaded to Gemini's File API
+as a temp file, then referenced in the prompt — not passed as inline base64.
+Gemini auto-deletes File API uploads after 48 hours; our Drive copy is the
+permanent record.
 
-- **Daily pipeline** needs no universe file — it processes whatever appears on
-  Screener's announcements feed (covers NSE + BSE alike).
-- `build_company_universe.py` builds an NSE + BSE master list keyed by **ISIN**
-  (handles renames; never orphans history). Used for identity mapping and the
-  Streamlit NSE-subset.
-- Documents in scope: concall transcripts (P1), then annual reports, research
-  reports, credit ratings, investor presentations (P2 / deep research).
-- Web / social / YouTube / EPFO sections of `prompt.txt` are **not API-automatable**
-  → marked `DATA_MISSING`; done manually by the user. ("Deep Research" is a
-  Gemini *app* feature, no API — cannot be scripted.)
+---
+
+## 3. Priority order (token-budget driven)
+
+1. **P1 — Daily concall summariser (MVP).** New concall transcripts → Gemini →
+   structured page note + guidance JSON. Ship first.
+2. **P1 — Daily results storage.** During results season, `scrape_results_table.py`
+   runs daily (already built in Stage A) and upserts rows into
+   `_index/results.parquet`. No LLM — pure structured scrape.
+3. **P2 — Guidance extraction.** From each processed concall, extract explicit
+   + derived guidance into `_index/guidance_tracker.parquet`.
+4. **P2 — Annual report & rating summariser.** Same pipeline as concall but with
+   the AR/rating prompts and map-reduce for large docs.
+5. **P2 — Research report & presentation summariser.** Lower volume, on-demand
+   or opportunistic.
+6. **P2 — DRHP summariser.** Triggered by new IPO filings. Map-reduce mandatory.
+7. **P2 — History backfill.** Walk concalls backward from 2025-05-20 overnight.
+8. **P2 — Deep research reports.** Full forensic report for portfolio companies
+   + on-demand via Streamlit or Drive upload.
+
+---
 
 ## 4. P1 — Daily concall pipeline (MVP)
 
 ```
-ingest_company_docs.py   scrape Screener announcements (filter: Transcript/
-                         Concall) for recent days → download new transcript
-                         PDFs to company_repo/<ISIN>/documents/ → add to
-                         _index/processing_queue.parquet (status=pending)
-extract_concall.py       take pending concalls → Gemini (prompt.txt #1, the
-                         detailed concall prompt) → produces (a) the detailed
-                         quarter note .md, (b) a structured JSON tail.
-                         Appends the note to company_repo/<SYMBOL>/company_page.md;
-                         writes JSON to _index/quarterly_facts.parquet +
-                         guidance_tracker.parquet. Marks queue entry done.
-                         On a Gemini rate-limit: stop gracefully, leave the
-                         rest pending — the next scheduled run resumes.
-extract_results.py       results season: pull quarterly result numbers →
-                         _index/results.parquet → "top results of the day".
-cleanup_company_docs.py  delete raw PDFs older than 10 days (keep page + facts).
+ingest_company_docs.py   [already built — Stage A]
+  scrape Screener announcements → download new PDFs to
+  company_repo/<ISIN>/documents/ → add to _index/processing_queue.parquet
+  (status=pending)
+
+extract_concall.py       [Stage B — build next]
+  for each pending concall in the queue:
+    1. download PDF bytes from Drive
+    2. upload to Gemini File API (temp)
+    3. call Gemini with concall_prompt.txt
+    4. parse response into:
+       (a) detailed markdown note  → append to company_repo/<ISIN>/company_page.md
+       (b) structured JSON tail    → upsert into _index/quarterly_facts.parquet
+                                     and _index/guidance_tracker.parquet
+    5. mark queue row status=done
+  on Gemini 429: stop cleanly, leave remaining rows pending (next run resumes)
+  on Gemini 500/503: retry once with exponential back-off, then mark status=error
+
+extract_results.py       [already built as scrape_results_table.py — Stage A]
+  results season: pull quarterly result numbers → _index/results.parquet
+
+cleanup_company_docs.py  [already built — Stage A]
+  delete raw PDFs older than 10 days (keeps company_page.md + index parquets)
 ```
 
 One Gemini call per concall produces **both** the detailed page note and the
 structured facts — no double spend.
 
-## 5. Storage layout (Google Drive)
+---
+
+## 5. Guidance extraction — schema
+
+The structured JSON tail produced by `extract_concall.py` feeds two parquets:
+
+**`_index/quarterly_facts.parquet`** — one row per (isin, quarter):
+```
+isin, symbol, company_name, quarter, fy_year,
+revenue_q, ebitda_q, pat_q, margin_pct,
+volume_q, capacity_q,
+revenue_12m, pat_12m,
+processed_at, source_doc_id
+```
+
+**`_index/guidance_tracker.parquet`** — one row per (isin, quarter, metric, horizon):
+```
+isin, symbol, company_name, quarter,
+metric,               # revenue / ebitda / pat / margin / volume / capacity
+guidance_type,        # explicit | derived
+horizon_fy,           # FY27 / FY28 / FY29 / FY30
+value, unit,          # absolute value + unit string (e.g. "cr", "%", "MT")
+cagr_pct,             # derived CAGR if guidance_type=derived
+notes,                # calc notes from prompt (annualisation method, etc.)
+processed_at, source_doc_id
+```
+
+`guidance_type=explicit` = management stated a direct number.
+`guidance_type=derived` = we computed a CAGR from absolute guidance following
+the concall prompt's calculation protocol.
+
+---
+
+## 6. Output format — dual write design
+
+Every processed document is written to **two places simultaneously**:
+
+### 6a. Company page (persisted forever)
+`company_repo/<ISIN>/company_page.md`
+- One file per company, summaries appended chronologically (newest at bottom)
+- Reliance Q4 FY26 concall → appended to Reliance's page forever
+- Optional: `company_page.docx` alongside (toggle `OUTPUT_COMPANY_DOCX`)
+
+### 6b. Day page (auto-deleted after 30 days)
+`company_repo/_daily/concall_26_may2026.md`
+- One file per calendar date, all companies with concalls that day
+- Reliance Q4 FY26 also appears here alongside the other 199 companies
+- Format: `## RELIANCE — Q4 FY26\n<full Gemini analysis>\n---\n`
+- Auto-deleted by `cleanup_company_docs.py` after 30 days
+- Optional: `concall_26_may2026.docx` alongside (toggle `OUTPUT_DAY_DOCX`)
+
+### 6c. Toggle flags (in each extractor script's CONFIG block)
+```python
+OUTPUT_COMPANY_MD   = True    # write company_page.md
+OUTPUT_DAY_MD       = True    # write _daily/concall_DD_MMMYYYY.md
+OUTPUT_COMPANY_DOCX = False   # .docx alongside company_page.md  [Stage C]
+OUTPUT_DAY_DOCX     = False   # .docx alongside day page          [Stage C]
+```
+Set any to False to skip that output. Both MD flags True = full dual write.
+
+### 6d. Day page naming convention
+`concall_DD_MMMYYYY.md` — e.g. `concall_26_may2026.md`, `concall_01_jan2027.md`
+(lowercase month, no leading zero suppression on day, full 4-digit year)
+
+---
+
+## 7. Storage layout (Google Drive)
 
 ```
 company_repo/
   <ISIN>/
-    documents/        raw PDFs — auto-deleted after 10 days
-    company_page.md   living page: Exec Summary + Business Overview (regenerated)
-                      + append-only Quarterly History
-    company_page.docx Drive-native copy (regenerated with the .md)
-    deep_report.md / .docx   the forensic report (P2, when generated)
+    documents/          raw PDFs — auto-deleted after 10 days
+    company_page.md     living page: per-doc summaries appended chronologically
+    company_page.docx   optional Drive-native copy [Stage C, toggle]
+    deep_report.md      full forensic report [Stage E]
+    deep_report.docx    Drive-native copy    [Stage E]
+  _daily/
+    concall_26_may2026.md    all concall summaries for 26 May 2026
+    concall_26_may2026.docx  optional [Stage C, toggle]
+    results_26_may2026.md    all results summaries for 26 May 2026 [future]
+    ...                      auto-deleted after 30 days by cleanup script
   _index/
     company_universe.csv      ISIN, symbol, exchange, name, aliases
-    processing_queue.parquet  what's pending / done, per (ISIN, quarter, doc)
-    quarterly_facts.parquet   symbol x quarter -> growth, margin, ...
-    guidance_tracker.parquet  symbol x quarter -> guidance, actual, met?
-    results.parquet           results-season numbers
+    processing_queue.parquet  (isin, doc_id, doc_type) → status, drive_file_id
+    quarterly_facts.parquet   isin × quarter → financial actuals
+    guidance_tracker.parquet  isin × quarter × metric × horizon → guidance
+    results.parquet           results-season structured numbers (daily upsert)
+    deep_research_requests.csv  user-submitted companies for deep report [Stage E]
 ```
 
-## 6. P2 — Deep-research reports
+---
 
-- `company_deep_report.py` — for a company: feed its collected documents +
-  `company_page.md` to Gemini using the `prompt.txt` forensic prompts (AR
-  chunked map-reduce) → `deep_report.md` + `.docx` on Drive.
-- **Triggers:** portfolio companies automatically; a user request list at
-  `_index/deep_research_requests.csv` (written by a Streamlit input — a company
-  multiselect) or, as a fallback, a file dropped in `company_repo/_requests/`.
-- The next scheduled run consumes the request list.
+## 8. P2 — Extractors for other doc types (Stage D / E)
 
-## 7. LLM & quota strategy
+All use the same queue-driven pattern as `extract_concall.py`:
 
-- **Primary:** Gemini free tier (`GEMINI_API_KEY` from Google AI Studio — a new
-  secret, same handling as the others).
-- **Resumable by design:** a persistent daily queue (`processing_queue.parquet`)
-  holds every pending task; each run keeps working through it subject to quota,
-  then the next run continues. Nothing is lost or re-done.
-- **Expected volume:** ~50 concalls/day, ~300-400/week in season — comfortably
-  within the daily free tier. The queue mostly absorbs the backfill surge and
-  catch-up after a quota hit.
-- **Multiple runs per day:** the workflow is scheduled several times daily plus
-  a **heavy-backfill window 00:00-05:00 IST** (quiet hours), so backfill chews
-  through history overnight.
-- **Optional second provider** (if you want more daily throughput): a paid
-  Gemini tier or an Anthropic Claude API key, behind a config flag, off by
-  default. NOTE: an automated pipeline can only use an LLM via an **API key** —
-  it cannot tap a Claude.ai / Gemini-app subscription. "Using Claude at night"
-  therefore means adding a (paid) Anthropic API key; the night *schedule* itself
-  is included regardless.
+- `extract_annual_report.py` — uses `annual_report_prompt.txt`; map-reduce for
+  docs > 300 pages. Updates `company_page.md` with an AR section.
+- `extract_presentation.py` — uses `presentation_prompt.txt`.
+- `extract_rating.py` — uses `rating_prompt.txt`. Appends a credit section to
+  `company_page.md` and records rating + outlook in a new `_index/ratings.parquet`.
+- `extract_drhp.py` — uses `annual_report_prompt.txt` (forensic lens); map-reduce
+  mandatory. Produces a standalone `drhp_report.md` rather than appending to
+  `company_page.md` (a DRHP is a one-off pre-IPO document).
 
-## 8. Scheduling / auto-run
+---
 
-All on GitHub Actions, all output to Drive — same as Phase 1. New workflow
-`company_repo.yml`: daily concall ingest+extract at a few fixed times; the
-backfill job in the 00:00-05:00 IST window; `continue-on-error` on every step;
-the existing health-check pattern extended to cover repo freshness.
+## 8. P2 — Deep-research reports (Stage E)
 
-## 9. Dashboard additions (light — NSE subset only)
+`company_deep_report.py` — for a given company:
+- Feeds all available documents + `company_page.md` to Gemini using the
+  `comapnydeepdive_prompt.txt` forensic chain (Phases 1–4).
+- Produces `deep_report.md` + `deep_report.docx` on Drive.
 
-- **Concall Feed** page: today's concall summaries, top results / top concall of
-  the day (definition of "top" decided at build).
-- **Guidance** page: best-guidance leaderboard, guidance-missed list, serial
-  over/under-promiser ranking (matures after ~4 quarters of data).
-- **Stock Detail:** a Fundamentals strip — latest quarter facts + a link to the
-  full `company_page` / `deep_report` on Drive.
-- A Streamlit input to request deep-research for one or more companies.
+**Two trigger paths (both supported):**
 
-## 10. Open items / decisions
+1. **Streamlit input (preferred):** a company multiselect on the dashboard
+   writes ISINs to `_index/deep_research_requests.csv`. The next scheduled run
+   consumes the list.
+2. **Drive upload fallback:** user drops a file (one ISIN per line) into
+   `company_repo/_requests/`. The script checks this folder each run.
+3. **Portfolio auto-trigger:** companies in the user's portfolio (My Portfolio
+   page) are automatically queued for a deep report on first encounter.
 
-1. **`GEMINI_API_KEY`** — user to create (free, AI Studio) and add as a secret.
-   Needed from the extraction step onward; not for document ingestion.
-2. **Second LLM provider?** Gemini-only (free) is the default. A paid Anthropic
-   key would add night-time throughput — decide later, not a blocker.
-3. **"Top of the day"** definition — deferred to build.
+---
+
+## 9. LLM & quota strategy
+
+- **Primary model:** `gemini-1.5-flash` — fast, handles PDF via File API,
+  generous free tier. Switch to `gemini-1.5-pro` for deep reports (more
+  reasoning depth) via a per-extractor config flag.
+- **Multi-key rotation:** support `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, …
+  `GEMINI_API_KEY_N` (as many as the user adds). The extractor round-robins
+  across keys and, on 429 from one key, immediately tries the next. Only stops
+  when all keys are rate-limited. This multiplies the effective free-tier quota
+  by the number of keys.
+- **Resumable by design:** the persistent queue holds every pending task; each
+  run keeps processing subject to quota, then the next run continues. Nothing is
+  lost or re-done.
+- **Expected volume:** ~50 concalls/day in peak season — comfortably within one
+  free key's daily limit. Multi-key absorbs backfill surges.
+- **Night backfill window:** 00:00–05:00 IST (GitHub Actions cron). Multi-key
+  rotation makes the most of this quiet window.
+- **Second provider (future option):** a paid Anthropic Claude API key, behind
+  a `LLM_PROVIDER` config flag, off by default. Automated pipelines can only
+  use API keys — not Claude.ai / Gemini app subscriptions.
+
+---
+
+## 10. Dashboard additions — what to show and what NOT to show
+
+### What to build (NSE subset only, load from Drive on 5-min cache)
+
+**Concall Feed page (Stage C)**
+- SHOW: today's concall summaries (company name, quarter, 2-line A-1 summary,
+  score card link, link to full `company_page.md` on Drive)
+- SHOW: "Top concall of the day" = highest conviction based on explicit guidance
+  beat vs. prior quarter (when enough history exists; else fallback to most
+  recent concall)
+- SHOW: "Top results of the day" = highest YoY PAT growth from `results.parquet`
+  (linked to the structured numbers table)
+- DO NOT SHOW: raw PDF links, internal doc IDs, processing queue internals
+
+**Guidance page (Stage D)**
+- SHOW: guidance leaderboard — companies with highest explicit FY guidance
+  upgrades vs. prior quarter
+- SHOW: guidance-missed list — companies where actuals came in below prior
+  explicit guidance
+- SHOW: serial over/under-promiser ranking (needs ≥ 4 quarters of history;
+  hide the widget entirely if < 4 quarters available — no empty tables)
+- DO NOT SHOW: derived guidance in the leaderboard (mark it visually as
+  "estimated" if shown at all; never mix with explicit guidance in rankings)
+
+**Stock Detail page — Fundamentals strip (Stage C)**
+- SHOW: latest quarter actuals (revenue, PAT, margin, YoY growth) from
+  `quarterly_facts.parquet`
+- SHOW: latest explicit guidance summary (1–2 rows, clearly labelled)
+- SHOW: link to `company_page.md` and `deep_report.md` on Drive (if they exist)
+- SHOW: "Request Deep Report" button (triggers Stage E pipeline)
+- DO NOT SHOW: derived guidance numbers without a clear "estimated" label
+- DO NOT SHOW: the Fundamentals strip at all if no quarterly_facts exist yet
+  for that company (hide gracefully, don't show empty cards)
+
+**My Portfolio page — additions**
+- SHOW: inline guidance status per holding (met / missed / pending)
+- DO NOT SHOW: cost price, P&L, or any personally identifiable position data
+  (existing constraint — unchanged)
+
+### What NOT to build in the dashboard
+- Raw processing queue viewer (internal plumbing — use Drive directly)
+- DRHP page (DRHPs are pre-IPO one-offs; link to `drhp_report.md` from Stock
+  Detail if it exists, no separate page)
+- Backfill progress bar (scheduled job internals — visible in GitHub Actions
+  logs, not the dashboard)
+- Research report feed (low volume; surface via Stock Detail link only)
+
+---
+
+## 11. DRHP source — open item §10.1
+
+Screener does not have a DRHP feed. DRHP PDFs must be sourced from:
+- **BSE:** `https://www.bseindia.com/markets/PublicIssues/DRHPs.aspx` (scrape)
+- **SEBI:** `https://www.sebi.gov.in/sebiweb/other/OtherAction.do?doRecent=yes` (scrape)
+- **Alternative:** NSE emerging companies page
+
+`ingest_company_docs.py` needs a new `drhp` feed entry pointing to one of the
+above. Build alongside Stage D (not a Stage B blocker).
+
+---
+
+## 12. Scheduling / auto-run (GitHub Actions)
+
+`company_repo.yml` — new workflow, separate from the Phase 1 `daily.yml`:
+
+```yaml
+# runs several times daily + a heavy backfill window overnight
+on:
+  schedule:
+    - cron: '30 4,7,10,13 * * 1-5'   # 10:00, 13:00, 16:00, 19:00 IST (Mon-Fri)
+    - cron: '30 18 * * 0'            # 00:00 IST Sun (backfill window start)
+```
+
+Steps (all `continue-on-error: true`):
+1. `ingest_company_docs.py` — refresh the queue
+2. `scrape_results_table.py` — daily results numbers
+3. `extract_concall.py` — consume pending concalls
+4. `extract_annual_report.py` — consume pending ARs (when built)
+5. `extract_rating.py` / `extract_presentation.py` (when built)
+6. `cleanup_company_docs.py` — purge old raw PDFs
+7. `company_healthcheck.py` — verify index freshness (to be built)
+
+---
+
+## 13. Build order
+
+- **Stage A** — `build_company_universe.py`, `ingest_company_docs.py`,
+  `scrape_results_table.py`, `cleanup_company_docs.py`. **DONE 2026-05-23.**
+- **Stage B** — `extract_concall.py` + multi-key Gemini rotation helper.
+  **NEXT.** → daily MVP is live once this ships.
+- **Stage C** — `company_page_generator.py` (regenerates `.md` header/overview
+  section) + Concall Feed dashboard page + Stock Detail Fundamentals strip.
+- **Stage D** — `build_guidance_scorecard.py` + Guidance dashboard page +
+  `extract_annual_report.py` + `extract_rating.py`.
+- **Stage E** — `company_deep_report.py` (portfolio + on-request via Streamlit
+  input or Drive upload) + `extract_presentation.py`.
+- **Stage F** — history backfill from 2025-05-20 (overnight cron window).
+- **Stage G** — DRHP ingestion + `extract_drhp.py` (needs source identified
+  per §11).
+
+---
+
+## 14. Open items / decisions
+
+1. **`GEMINI_API_KEY_1` … `_N`** — user to create (free, AI Studio) and add as
+   GitHub Actions + Streamlit Cloud secrets.
+2. **DRHP source URL** — BSE scrape is the most reliable path; needs a one-off
+   HTML inspection to confirm selectors. Deferred to Stage G.
+3. **"Top of the day" definition** — decided at Stage C build: highest YoY PAT
+   growth for results; most recent with explicit guidance upgrade for concalls.
 4. **Google Workspace account** — not required (10-day cleanup keeps Drive lean).
-5. **PENDING — insider buy/sell source.** Screener's insider buy/sell feeds
-   (filters 76296 / 76297) are NOT used here: insider trades are one-line facts,
-   not documents to LLM-summarise. An alternative structured source (NSE/BSE
-   insider-trading disclosures, or a data feed) is to be identified. Until then
-   the company page's promoter-activity section stays empty.
-6. **Screener feed pagination** — the announcement feeds ignore `?page=` and the
-   "SHOW MORE" button does nothing; each feed shows only its latest ~25–50.
-   Same-day completeness depends on running the pipeline several times a day,
-   not deep pagination. Peak-season risk noted.
-
-## 11. Build order
-
-- **Stage A** — `build_company_universe.py`, `ingest_company_docs.py` (5 feeds:
-  concall, annual_report, presentation, rating, results — scrape + download),
-  `scrape_results_table.py` (quarterly numbers), `cleanup_company_docs.py`.
-  *No Gemini key needed.* **DONE & verified — 2026-05-23.**
-- **Stage B** — `extract_concall.py` (Gemini) → the **daily MVP is live**.
-- **Stage C** — company page generator + Concall Feed dashboard page.
-- **Stage D** — `build_guidance_scorecard.py` + Guidance dashboard page.
-- **Stage E** — `company_deep_report.py` (portfolio + on-request).
-- **Stage F** — history backfill from 2025-05-20 (night window).
+5. **Insider buy/sell source** — Screener insider feeds (76296/76297) are
+   one-line facts, not documents. Alternative structured source (NSE/BSE insider
+   disclosures) is TBD. Company page promoter-activity section stays empty.
+6. **Screener feed pagination** — feeds show only ~25–50 items; same-day
+   completeness relies on running the pipeline several times daily. Peak-season
+   risk noted and mitigated by the multi-run schedule.
+7. **Model per doc type** — `gemini-1.5-flash` default for concall / rating /
+   presentation; `gemini-1.5-pro` for annual report / DRHP / deep report. Flag
+   in each extractor script's CONFIG block.

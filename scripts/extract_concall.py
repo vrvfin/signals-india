@@ -39,6 +39,12 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 GEMINI_MODEL = "gemini-2.5-flash"
 
+# ---- Output toggles ----
+OUTPUT_COMPANY_MD   = True   # append to company_repo/<ISIN>/company_page.md
+OUTPUT_DAY_MD       = True   # append to company_repo/_daily/concall_DD_MMMYYYY.md
+OUTPUT_COMPANY_DOCX = False  # .docx alongside company_page.md  [Stage C]
+OUTPUT_DAY_DOCX     = False  # .docx alongside day page          [Stage C]
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -236,6 +242,38 @@ def upsert_guidance(drive, index_id, guidance_rows: list[dict]) -> None:
 # ------------------------------------------------------------------ #
 #  company_page.md helper                                              #
 # ------------------------------------------------------------------ #
+
+def _day_filename(announcement_date: str) -> str:
+    """Return e.g. 'concall_26_may2026.md' from '2026-05-26'."""
+    try:
+        dt = datetime.strptime(str(announcement_date)[:10], "%Y-%m-%d")
+        return f"concall_{dt.day:02d}_{dt.strftime('%b').lower()}{dt.year}.md"
+    except Exception:
+        return f"concall_{str(announcement_date)[:10].replace('-', '_')}.md"
+
+
+def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
+                    company_name: str, quarter: str, content: str) -> None:
+    """Append this company's analysis to the daily digest file in _daily/."""
+    daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
+    fname = _day_filename(announcement_date)
+    entry = (
+        f"\n\n---\n## {symbol} — {company_name} | {quarter}\n\n"
+        + content
+    )
+    fid = find_file(drive, daily_id, fname)
+    if fid:
+        existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+        upload_bytes(drive, daily_id, fname,
+                     (existing + entry).encode("utf-8"), "text/markdown",
+                     existing_id=fid)
+    else:
+        header = (f"# Daily Concall Digest — "
+                  f"{str(announcement_date)[:10]}\n"
+                  f"*Auto-deleted after 30 days.*\n")
+        upload_bytes(drive, daily_id, fname,
+                     (header + entry).encode("utf-8"), "text/markdown")
+
 
 def append_company_page(drive, repo_id, key: str, content: str,
                         doc_title: str, quarter: str) -> None:
@@ -622,14 +660,26 @@ def main() -> None:
             log(f"  Parsed: quarter={facts['quarter'] or 'unknown'}, "
                 f"guidance_rows={len(guidance_rows)}")
 
-            # 5. Append to company_page.md
-            append_company_page(
-                drive, repo_id,
-                key=str(row.get("key") or row.get("isin") or row.get("symbol") or ""),
-                content=markdown_text,
-                doc_title=str(row.get("title", "")),
-                quarter=facts["quarter"],
-            )
+            # 5a. Company page (persisted forever)
+            if OUTPUT_COMPANY_MD:
+                append_company_page(
+                    drive, repo_id,
+                    key=str(row.get("key") or row.get("isin") or row.get("symbol") or ""),
+                    content=markdown_text,
+                    doc_title=str(row.get("title", "")),
+                    quarter=facts["quarter"],
+                )
+
+            # 5b. Day page (auto-deleted after 30 days)
+            if OUTPUT_DAY_MD:
+                append_day_page(
+                    drive, repo_id,
+                    announcement_date=str(row.get("announcement_date", "")),
+                    symbol=str(row.get("symbol", "")),
+                    company_name=str(row.get("company_name", "")),
+                    quarter=facts["quarter"],
+                    content=markdown_text,
+                )
 
             # 6-7. Upsert parquets
             upsert_facts(drive, index_id, facts)
