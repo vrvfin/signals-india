@@ -53,8 +53,10 @@ OUTPUT_DAY_MD       = True
 OUTPUT_COMPANY_DOCX = False  # [Stage C]
 OUTPUT_DAY_DOCX     = False  # [Stage C]
 
-# PDFs above this size are processed via map-reduce chunking
-MAP_REDUCE_THRESHOLD_MB = 12
+# PDFs above this size are processed via map-reduce chunking.
+# Gemini inline limit is ~20 MB total request; a 10 MB PDF → 13.3 MB base64
+# which stays safely under that ceiling.
+MAP_REDUCE_THRESHOLD_MB = 10
 
 SYNTHESIS_PROMPT_PREFIX = """You are given multiple section-level summaries of a single Annual Report.
 Synthesise them into one coherent final report following the same forensic structure.
@@ -121,9 +123,8 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
         return chunk_summaries[0]
 
     synthesis_prompt = SYNTHESIS_PROMPT_PREFIX + "\n\n".join(chunk_summaries)
-    # Synthesis call uses a tiny dummy PDF (prompt carries the real content)
-    dummy_pdf = b"%PDF-1.4\n%%EOF"
-    return gemini.call(dummy_pdf, synthesis_prompt, f"{display_name}_synthesis")
+    # Text-only call: all content is already in the prompt, no PDF needed
+    return gemini.call_text(synthesis_prompt, f"{display_name}_synthesis")
 
 
 # ------------------------------------------------------------------ #

@@ -216,29 +216,18 @@ class GeminiKeyPool:
         self.model = model
         self.idx = 0
 
-    def call(self, pdf_bytes: bytes, prompt: str, display_name: str) -> str:
-        """Generate content using inline PDF bytes. Rotates keys on 429."""
-        import base64
-        b64 = base64.standard_b64encode(pdf_bytes).decode()
+    def _run(self, contents: list, label: str) -> str:
+        """Internal: call Gemini with given contents, rotate keys on 429."""
         backoff = 30
         total_attempts = len(self.keys)
         attempted = 0
-
         while attempted < total_attempts:
             client = genai.Client(api_key=self.keys[self.idx])
             try:
-                log(f"  Generating response (key {self.idx + 1}/{len(self.keys)})...")
+                log(f"  {label} (key {self.idx + 1}/{len(self.keys)})...")
                 response = client.models.generate_content(
                     model=self.model,
-                    contents=[
-                        genai_types.Part(
-                            inline_data=genai_types.Blob(
-                                mime_type="application/pdf",
-                                data=b64,
-                            )
-                        ),
-                        genai_types.Part.from_text(text=prompt),
-                    ],
+                    contents=contents,
                     config=genai_types.GenerateContentConfig(temperature=0.1),
                 )
                 self.idx = (self.idx + 1) % len(self.keys)
@@ -258,6 +247,23 @@ class GeminiKeyPool:
         raise RateLimitExhausted(
             f"All {len(self.keys)} Gemini keys exhausted after backoff"
         )
+
+    def call(self, pdf_bytes: bytes, prompt: str, display_name: str) -> str:
+        """Generate content from inline PDF bytes + prompt. Rotates keys on 429."""
+        import base64
+        b64 = base64.standard_b64encode(pdf_bytes).decode()
+        contents = [
+            genai_types.Part(
+                inline_data=genai_types.Blob(mime_type="application/pdf", data=b64)
+            ),
+            genai_types.Part.from_text(text=prompt),
+        ]
+        return self._run(contents, f"Generating response [{display_name}]")
+
+    def call_text(self, prompt: str, display_name: str) -> str:
+        """Generate content from text prompt only (no PDF). Used for synthesis passes."""
+        contents = [genai_types.Part.from_text(text=prompt)]
+        return self._run(contents, f"Synthesising [{display_name}]")
 
 
 # ------------------------------------------------------------------ #
