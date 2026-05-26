@@ -1,0 +1,29 @@
+# signals-india pipeline dependencies
+# Generated from import analysis across all scripts/*.py
+
+# Data / numerics
+numpy>=1.26
+pandas>=2.2
+pyarrow>=15.0          # parquet read/write (results.parquet)
+
+# Market data
+yfinance>=0.2.38
+
+# HTTP / scraping
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Google Drive / Sheets API
+google-auth>=2.29
+google-auth-oauthlib>=1.2
+google-api-python-client>=2.126
+
+# Gemini AI
+google-genai>=1.0
+
+# Config
+python-dotenv>=1.0
+
+# Excel (template.xlsx)
+openpyxl>=3.1

@@ -1,0 +1,65 @@
+name: Phase 2 — Company Intelligence
+
+# Runs 4x/day Mon-Fri so the queue drains even on heavy results/concall days.
+# Each run processes whatever is pending; stops cleanly on Gemini rate limits
+# and the next run picks up where it left off.
+#
+# Run times (IST = UTC+5:30):
+#   08:30 IST — catches overnight filings
+#   12:00 IST — midday top-up
+#   17:00 IST — market close (results season peak)
+#   21:00 IST — evening concalls
+
+on:
+  schedule:
+    - cron: '0 3 * * 1-5'    # 08:30 IST
+    - cron: '30 6 * * 1-5'   # 12:00 IST
+    - cron: '30 11 * * 1-5'  # 17:00 IST
+    - cron: '30 15 * * 1-5'  # 21:00 IST
+  workflow_dispatch:          # manual trigger any time
+
+jobs:
+  phase2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90       # each run gets 90 min; Gemini limits will stop it earlier if needed
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Write credentials
+        env:
+          GDRIVE_FOLDER_ID:           ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          SCREENER_SESSION_COOKIE:    ${{ secrets.SCREENER_SESSION_COOKIE }}
+          GEMINI_API_KEY:             ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_SERVICE_ACCOUNT_JSON" > _sec/sa.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/sa.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+            echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+          } > .env
+
+      # Stage A: scrape new PDFs from Screener into Drive queue
+      - name: Ingest company docs
+        run: python scripts/ingest_company_docs.py
+        continue-on-error: true
+
+      # Stage B: process pending concalls through Gemini
+      - name: Extract concalls
+        run: python scripts/extract_concall.py
+        continue-on-error: true
+
+      # Housekeeping: delete raw PDFs older than 10 days
+      - name: Cleanup old docs
+        run: python scripts/cleanup_company_docs.py
+        continue-on-error: true

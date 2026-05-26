@@ -69,16 +69,39 @@ def log(msg: str) -> None:
 # ---------- Drive helpers ----------
 
 def get_drive():
+    import json
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     cs_path = Path(os.environ["GDRIVE_OAUTH_CLIENT_SECRET_PATH"])
+    cred_data = json.loads(cs_path.read_text())
+
+    # Service account key — no browser flow needed
+    if cred_data.get("type") == "service_account":
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_file(
+            str(cs_path), scopes=SCOPES
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # Saved OAuth token (Credentials.to_json() format) — has refresh_token directly
+    if "refresh_token" in cred_data:
+        creds = Credentials.from_authorized_user_file(str(cs_path), SCOPES)
+        if not creds.valid:
+            creds.refresh(Request())
+            cs_path.write_text(creds.to_json())
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    # Standard OAuth installed-app flow (proper client_secrets.json)
     token_path = Path(os.environ["GDRIVE_OAUTH_TOKEN_PATH"])
     creds = None
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(str(cs_path), SCOPES)
             creds = flow.run_local_server(port=0)
         token_path.parent.mkdir(parents=True, exist_ok=True)
