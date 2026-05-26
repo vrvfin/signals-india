@@ -1,25 +1,20 @@
 name: Phase 2 — Company Intelligence
 
-# Runs 4x/day Mon-Fri so the queue drains even on heavy results/concall days.
-# Each run processes whatever is pending; stops cleanly on Gemini rate limits
-# and the next run picks up where it left off.
+# Runs every 3 hours, 24/7 (8 runs/day, 7 days/week).
+# Each run: ingest new docs → process pending queue → cleanup.
+# Stops cleanly on Gemini rate limits; next run resumes where it left off.
+# Empty queue = each extractor exits in <5 s with "Processed: 0".
 #
-# Run times (IST = UTC+5:30):
-#   08:30 IST — catches overnight filings
-#   12:00 IST — midday top-up
-#   17:00 IST — market close (results season peak)
-#   21:00 IST — evening concalls
+# Run times (IST = UTC+5:30, every 3 h starting 02:30):
+#   02:30 / 05:30 / 08:30 / 11:30 / 14:30 / 17:30 / 20:30 / 23:30
 #
-# Stage B extractors (all doc types, in priority order):
+# Stage B extractors run in priority order each time:
 #   concall → results → rating → presentation → annual_report
 # Each extractor is independent; a rate-limit in one does not block the others.
 
 on:
   schedule:
-    - cron: '0 3 * * 1-5'    # 08:30 IST
-    - cron: '30 6 * * 1-5'   # 12:00 IST
-    - cron: '30 11 * * 1-5'  # 17:00 IST
-    - cron: '30 15 * * 1-5'  # 21:00 IST
+    - cron: '0 */3 * * *'    # every 3 hours UTC (02:30/05:30/08:30/... IST)
   workflow_dispatch:          # manual trigger any time
 
 jobs:
