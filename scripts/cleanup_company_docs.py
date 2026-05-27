@@ -1,20 +1,20 @@
 """
 Phase 2 / Stage A — Storage hygiene.
 
-1. Deletes raw document PDFs older than RETAIN_DAYS (default 10) from every
-   company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
-   raw PDF is no longer needed — the company page and the structured indexes hold
-   the lasting value.
+Deletes raw document PDFs older than RETAIN_DAYS (default 10) from every
+company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
+raw PDF is no longer needed — the company page and the structured indexes hold
+the lasting value.
 
-2. Deletes daily digest markdown files older than DAILY_RETAIN_DAYS (default 30)
-   from company_repo/_daily/. These are ephemeral day-level concall digests.
+NEVER touches: _daily/ digest .md files, company_page.md/.docx,
+               deep_report.*, summaries, _index/*.
 
-NEVER touches: company_page.md/.docx, deep_report.*, summaries, _index/*.
+Daily digest files (_daily/*.md) are persisted forever — only raw PDFs are
+transient.
 
 Usage:
     python scripts/cleanup_company_docs.py
     python scripts/cleanup_company_docs.py --retain-days 14
-    python scripts/cleanup_company_docs.py --daily-retain-days 60
     python scripts/cleanup_company_docs.py --dry-run     # list, delete nothing
 """
 
@@ -33,7 +33,6 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 RETAIN_DAYS = 10
-DAILY_RETAIN_DAYS = 30
 
 
 def log(msg: str) -> None:
@@ -117,7 +116,6 @@ def hours_old(modified_time_iso: str) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--retain-days", type=int, default=RETAIN_DAYS)
-    parser.add_argument("--daily-retain-days", type=int, default=DAILY_RETAIN_DAYS)
     parser.add_argument("--dry-run", action="store_true",
                         help="List what would be deleted; delete nothing.")
     args = parser.parse_args()
@@ -125,11 +123,9 @@ def main() -> None:
     print("Phase 2 / Stage A — Storage hygiene")
     print("-" * 56)
     cutoff_h = args.retain_days * 24
-    daily_cutoff_h = args.daily_retain_days * 24
     log(f"Raw PDFs: delete older than {args.retain_days}d"
         f"{'  (DRY RUN)' if args.dry_run else ''}")
-    log(f"Daily digests: delete older than {args.daily_retain_days}d"
-        f"{'  (DRY RUN)' if args.dry_run else ''}")
+    log("Daily digests (_daily/*.md): kept forever — not touched.")
 
     drive = get_drive()
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
@@ -178,42 +174,6 @@ def main() -> None:
     print(f"{'Would delete' if args.dry_run else 'Deleted (trashed)'} : {deleted}")
     if errors:
         print(f"Errors           : {errors}")
-
-    # ---- Daily digest cleanup (_daily/ folder, 30-day TTL) ----
-    print()
-    log(f"Scanning _daily/ for files older than {args.daily_retain_days} days...")
-    daily_id = find_subfolder(drive, repo_id, "_daily")
-    d_scanned = d_deleted = d_kept = d_errors = 0
-    if daily_id:
-        for f in list_children(drive, daily_id):
-            if f.get("mimeType") == "application/vnd.google-apps.folder":
-                continue
-            d_scanned += 1
-            try:
-                age_h = hours_old(f["modifiedTime"])
-            except Exception:
-                continue
-            if age_h <= daily_cutoff_h:
-                d_kept += 1
-                continue
-            if args.dry_run:
-                log(f"  would delete: _daily/{f['name']} ({age_h/24:.0f}d old)")
-                d_deleted += 1
-                continue
-            try:
-                drive.files().update(fileId=f["id"], body={"trashed": True}).execute()
-                d_deleted += 1
-            except Exception as e:
-                d_errors += 1
-                log(f"  ERROR deleting _daily/{f['name']}: {str(e)[:100]}")
-    else:
-        log("  _daily/ folder not found — nothing to clean.")
-
-    print(f"Daily digests scanned : {d_scanned}")
-    print(f"Kept (<= {args.daily_retain_days}d)  : {d_kept}")
-    print(f"{'Would delete' if args.dry_run else 'Deleted (trashed)'}     : {d_deleted}")
-    if d_errors:
-        print(f"Errors                : {d_errors}")
 
 
 if __name__ == "__main__":

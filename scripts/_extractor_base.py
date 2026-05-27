@@ -370,7 +370,7 @@ def day_filename(doc_type: str, announcement_date: str) -> str:
 def append_day_page(drive, repo_id: str, doc_type: str,
                     announcement_date: str, symbol: str,
                     company_name: str, quarter: str, content: str) -> None:
-    """Append analysis to _daily/<doc_type>_DD_MMMYYYY.md (auto-deleted after 30 days)."""
+    """Append analysis to _daily/<doc_type>_DD_MMMYYYY.md (persisted forever)."""
     daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
     fname = day_filename(doc_type, announcement_date)
     entry = f"\n\n---\n## {symbol} — {company_name} | {quarter}\n\n" + content
@@ -383,8 +383,7 @@ def append_day_page(drive, repo_id: str, doc_type: str,
     else:
         doc_label = doc_type.replace("_", " ").title()
         header = (f"# Daily {doc_label} Digest — "
-                  f"{str(announcement_date)[:10]}\n"
-                  f"*Auto-deleted after 30 days.*\n")
+                  f"{str(announcement_date)[:10]}\n")
         upload_bytes(drive, daily_id, fname,
                      (header + entry).encode("utf-8"), "text/markdown")
 

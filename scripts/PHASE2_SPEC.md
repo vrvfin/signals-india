@@ -131,12 +131,12 @@ Every processed document is written to **two places simultaneously**:
 - Reliance Q4 FY26 concall → appended to Reliance's page forever
 - Optional: `company_page.docx` alongside (toggle `OUTPUT_COMPANY_DOCX`)
 
-### 6b. Day page (auto-deleted after 30 days)
+### 6b. Day page (persisted forever)
 `company_repo/_daily/concall_26_may2026.md`
 - One file per calendar date, all companies with concalls that day
 - Reliance Q4 FY26 also appears here alongside the other 199 companies
 - Format: `## RELIANCE — Q4 FY26\n<full Gemini analysis>\n---\n`
-- Auto-deleted by `cleanup_company_docs.py` after 30 days
+- **Kept forever** — only raw PDFs in `<ISIN>/documents/` are transient
 - Optional: `concall_26_may2026.docx` alongside (toggle `OUTPUT_DAY_DOCX`)
 
 ### 6c. Toggle flags (in each extractor script's CONFIG block)
@@ -168,7 +168,7 @@ company_repo/
     concall_26_may2026.md    all concall summaries for 26 May 2026
     concall_26_may2026.docx  optional [Stage C, toggle]
     results_26_may2026.md    all results summaries for 26 May 2026 [future]
-    ...                      auto-deleted after 30 days by cleanup script
+    ...                      persisted forever (only raw PDFs are deleted)
   _index/
     company_universe.csv      ISIN, symbol, exchange, name, aliases
     processing_queue.parquet  (isin, doc_id, doc_type) → status, drive_file_id
