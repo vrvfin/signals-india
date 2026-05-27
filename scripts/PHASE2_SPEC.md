@@ -1,6 +1,6 @@
 # PHASE 2 SPEC — Company Repository & Concall Intelligence
 
-**Status:** active · **Created:** 2026-05-22 · **Last updated:** 2026-05-26
+**Status:** active · **Created:** 2026-05-22 · **Last updated:** 2026-05-27
 Companion to `DESIGN.md` / `PROJECT_STATUS.md`.
 
 ---
@@ -357,17 +357,26 @@ Steps (all `continue-on-error: true`):
   `scrape_results_table.py`, `cleanup_company_docs.py`. **DONE 2026-05-23.**
 - **Stage B** — `extract_concall.py` + multi-key Gemini rotation. **DONE 2026-05-26.**
   `extract_results.py` + `_extractor_base.py`. **DONE 2026-05-26.**
-- **Stage D** — `extract_annual_report.py`, `extract_presentation.py`,
+- **Stage D extractors** — `extract_annual_report.py`, `extract_presentation.py`,
   `extract_rating.py`. **DONE 2026-05-26.**
+- **Portfolio filter** — all Stage D extractors + `extract_results.py` restricted to
+  portfolio ISINs from Drive. **DONE 2026-05-27.** Reduces Phase 2 run time 51 → 5–8 min.
+- **Pipeline health dashboard** — `write_phase2_status.py` + `app.py` sidebar/banner
+  showing Phase 1 + Phase 2 status (queue counts, age, errors). **DONE 2026-05-27.**
+- **Streamlit fix** — yfinance removed from root `requirements.txt`; app.py crash
+  from `curl_cffi==0.15.0` resolved. **DONE 2026-05-27.**
 - **Stage C** — `company_page_generator.py` (regenerates `.md` header/overview
   section) + Concall Feed dashboard page + Stock Detail Fundamentals strip.
-- **Stage D** — `build_guidance_scorecard.py` + Guidance dashboard page +
-  `extract_annual_report.py` + `extract_rating.py`.
+  *Pending — next after Phase 2 running stably.*
+- **Stage D dashboard** — `build_guidance_scorecard.py` + Guidance dashboard page
+  (leaderboard, missed guidance).  *Pending.*
+- **Stage D results filter** — filterable YoY/QoQ results table in app.py.  *Pending.*
 - **Stage E** — `company_deep_report.py` (portfolio + on-request via Streamlit
-  input or Drive upload) + `extract_presentation.py`.
-- **Stage F** — history backfill from 2025-05-20 (overnight cron window).
+  input or Drive upload). Prompt `comapnydeepdive_prompt.txt` already exists.  *Pending.*
+- **Insider buy/sell** — source not identified (BSE/NSE feeds need evaluation).  *Blocked.*
+- **Stage F** — history backfill from 2025-05-20 (overnight cron window).  *Pending.*
 - **Stage G** — DRHP ingestion + `extract_drhp.py` (needs source identified
-  per §11).
+  per §11).  *Pending.*
 
 ---
 
@@ -389,10 +398,15 @@ Steps (all `continue-on-error: true`):
 7. **Model per doc type** — `gemini-1.5-flash` default for concall / rating /
    presentation; `gemini-1.5-pro` for annual report / DRHP / deep report. Flag
    in each extractor script's CONFIG block.
-8. **Schedule: 2h daytime vs 3h overnight** *(pending — revisit ~2026-05-28)*
-   Proposed: every 2h 8AM–9PM IST + every 3h 9PM–8AM IST = 11 runs/day (up from 8).
-   Blocked on: confirm whether the repo is **public or private** (public = unlimited
-   GitHub Actions minutes; private free tier = 2,000 min/month, 11 runs × ~10 min ×
-   30 days ≈ 3,300 min — would overshoot). Also confirm actual avg run time from
-   GitHub Actions billing tab before changing. Code change is ready in workflow file
-   but commit was held.
+8. **Schedule** ✅ **RESOLVED 2026-05-27.**
+   Final schedule: Mon–Fri every 3h (10:00/13:00/16:00/19:00 IST) + once 02:00 IST
+   overnight = 5 runs/day. Saturday 3 runs (10/13/16 IST). Sunday 1 run (13:00 IST).
+   = 29 runs/week. Combined Phase 1 + Phase 2 budget: ~1,360–1,710 min/month
+   (within 2,000 free). Portfolio filter reduced Phase 2 avg run time from ~51 min
+   to ~5–8 min — this is what made the schedule viable without hitting the quota.
+9. **Deep dive report script** *(pending — Stage E)* — `comapnydeepdive_prompt.txt`
+   exists. `company_deep_report.py` not yet written. Trigger paths: Streamlit button
+   on Stock Detail page + Drive upload fallback. Priority: after Phase 2 running stably.
+10. **Insider buy/sell** *(blocked)* — Screener feeds 76296/76297 are one-line facts,
+    not document PDFs. Need to evaluate BSE/NSE structured insider disclosure feeds.
+    Company page "buying/selling" section will remain empty until resolved.
