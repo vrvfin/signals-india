@@ -6,8 +6,10 @@ google-auth-httplib2==0.2.0
 google-api-python-client==2.140.0
 #pandas==2.2.2
 requests==2.32.3
-yfinance>=1.3.0
-curl-cffi<0.15        # pin: 0.15.0 causes malloc corruption on Streamlit Cloud Linux
+# yfinance is NOT needed here — app.py reads from Drive parquets only.
+# It is installed separately in daily.yml (Phase 1 pipeline) and scripts/requirements.txt (Phase 2).
+# curl-cffi is pulled in by yfinance and 0.15.x causes malloc corruption on Streamlit Cloud —
+# keeping yfinance out of this file keeps Streamlit Cloud healthy.
 #pyarrow==17.0.0
 streamlit==1.38.0
 plotly==5.24.0

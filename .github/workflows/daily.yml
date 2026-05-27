@@ -20,6 +20,10 @@ jobs:
           key: ${{ runner.os }}-pip-p1-${{ hashFiles('requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-p1-
       - run: pip install -r requirements.txt
+      # yfinance is excluded from root requirements.txt to keep Streamlit Cloud healthy
+      # (yfinance>=1.3 pulls curl-cffi>=0.15 which causes malloc corruption on Streamlit Cloud).
+      # Install it here for the pipeline only.
+      - run: pip install "yfinance>=1.3.0"
       - name: Write credentials from secrets
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
