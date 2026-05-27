@@ -43,7 +43,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 SAMPLE_SYMBOLS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "SBIN"]
 MIN_FEATURE_ROWS = 1500
-OHLCV_MAX_STALE_DAYS = 4
+OHLCV_MAX_STALE_DAYS = 6   # 4 calendar days too tight for India's long holiday weekends
 FRESH_WINDOW_HOURS = 24
 
 
