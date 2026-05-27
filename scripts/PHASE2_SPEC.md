@@ -389,3 +389,10 @@ Steps (all `continue-on-error: true`):
 7. **Model per doc type** — `gemini-1.5-flash` default for concall / rating /
    presentation; `gemini-1.5-pro` for annual report / DRHP / deep report. Flag
    in each extractor script's CONFIG block.
+8. **Schedule: 2h daytime vs 3h overnight** *(pending — revisit ~2026-05-28)*
+   Proposed: every 2h 8AM–9PM IST + every 3h 9PM–8AM IST = 11 runs/day (up from 8).
+   Blocked on: confirm whether the repo is **public or private** (public = unlimited
+   GitHub Actions minutes; private free tier = 2,000 min/month, 11 runs × ~10 min ×
+   30 days ≈ 3,300 min — would overshoot). Also confirm actual avg run time from
+   GitHub Actions billing tab before changing. Code change is ready in workflow file
+   but commit was held.
