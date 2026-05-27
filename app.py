@@ -1068,22 +1068,49 @@ def page_graphs():
     page = st.session_state["graphs_page"]
 
     def _nav(suffix):
-        n1, n2, n3 = st.columns([1, 2, 1])
+        at_first = page <= 0
+        at_last  = page >= n_pages - 1
+        n1, n2, n3, n4, n5 = st.columns([1, 1, 2, 1, 1])
         with n1:
-            if st.button("◀ Prev", key=f"prev_{suffix}", disabled=(page <= 0),
-                         use_container_width=True):
-                st.session_state["graphs_page"] = page - 1
+            if st.button("⏮ First", key=f"first_{suffix}",
+                         disabled=at_first, use_container_width=True):
+                st.session_state["graphs_page"] = 0
                 st.rerun()
         with n2:
-            st.markdown(f"<div style='text-align:center;'>Page {page + 1} of "
-                        f"{n_pages} · {total} stock(s) "
-                        f"(≥ {int(min_strats)} strategies)</div>",
-                        unsafe_allow_html=True)
+            if st.button("◀ Prev", key=f"prev_{suffix}",
+                         disabled=at_first, use_container_width=True):
+                st.session_state["graphs_page"] = page - 1
+                st.rerun()
         with n3:
+            if suffix == "top":
+                # Sync the jump widget to the current page so it stays in step
+                # with Prev/Next button navigation.
+                st.session_state["graphs_jump"] = page + 1
+                jump = st.number_input(
+                    f"Page (1–{n_pages})", min_value=1, max_value=n_pages,
+                    step=1, key="graphs_jump", label_visibility="collapsed",
+                )
+                st.caption(f"of {n_pages}  ·  {total} stock(s)  "
+                           f"(≥ {int(min_strats)} strategies)  "
+                           f"— type a page number and press Enter to jump")
+                if jump - 1 != page:
+                    st.session_state["graphs_page"] = jump - 1
+                    st.rerun()
+            else:
+                st.markdown(
+                    f"<div style='text-align:center;padding-top:8px;'>"
+                    f"Page {page + 1} of {n_pages}</div>",
+                    unsafe_allow_html=True,
+                )
+        with n4:
             if st.button("Next ▶", key=f"next_{suffix}",
-                         disabled=(page >= n_pages - 1),
-                         use_container_width=True):
+                         disabled=at_last, use_container_width=True):
                 st.session_state["graphs_page"] = page + 1
+                st.rerun()
+        with n5:
+            if st.button("Last ⏭", key=f"last_{suffix}",
+                         disabled=at_last, use_container_width=True):
+                st.session_state["graphs_page"] = n_pages - 1
                 st.rerun()
 
     _nav("top")
