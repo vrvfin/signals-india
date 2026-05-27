@@ -254,23 +254,64 @@ def _day_filename(announcement_date: str) -> str:
 
 def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
                     company_name: str, quarter: str, content: str) -> None:
-    """Append this company's analysis to the daily digest file in _daily/."""
+    """Append this company's analysis to the daily digest file in _daily/.
+
+    Format:
+        # Daily Concall Digest — 2026-05-26
+        *Total: 12 concalls — last updated 26 May 2026 14:30 IST*
+
+        ---
+        ## concall_1 — TCS · Tata Consultancy Services | Q4 FY26
+        ...
+        ---
+        ## concall_12 — INFY · Infosys | Q4 FY26
+        ...
+
+    The numbered heading (concall_N) lets you Ctrl+F / search for a specific
+    entry by number.  The Total line in the header is rewritten on every append.
+    """
     daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
     fname = _day_filename(announcement_date)
-    entry = (
-        f"\n\n---\n## {symbol} — {company_name} | {quarter}\n\n"
-        + content
-    )
+    now_str = datetime.now().strftime("%d %b %Y %H:%M")
+
     fid = find_file(drive, daily_id, fname)
     if fid:
         existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+
+        # Count existing numbered entries to assign the next number
+        existing_count = len(re.findall(r'^## concall_\d+', existing, re.MULTILINE))
+        new_num = existing_count + 1
+
+        # Rewrite the Total line in the header (handles both new and old format)
+        new_total = (f"*Total: {new_num} concall{'s' if new_num != 1 else ''}"
+                     f" — last updated {now_str} IST*")
+        updated = re.sub(r'\*Total: \d+ concalls?[^*]*\*', new_total, existing)
+        if updated == existing:
+            # Old format file (no Total line yet) — insert after the first line
+            first_nl = updated.find('\n')
+            if first_nl != -1:
+                updated = (updated[:first_nl + 1]
+                           + new_total + '\n'
+                           + updated[first_nl + 1:])
+
+        entry = (
+            f"\n\n---\n"
+            f"## concall_{new_num} — {symbol} · {company_name} | {quarter}\n\n"
+            + content
+        )
         upload_bytes(drive, daily_id, fname,
-                     (existing + entry).encode("utf-8"), "text/markdown",
+                     (updated + entry).encode("utf-8"), "text/markdown",
                      existing_id=fid)
     else:
-        header = (f"# Daily Concall Digest — "
-                  f"{str(announcement_date)[:10]}\n"
-                  f"*Auto-deleted after 30 days.*\n")
+        header = (
+            f"# Daily Concall Digest — {str(announcement_date)[:10]}\n"
+            f"*Total: 1 concall — last updated {now_str} IST*\n"
+        )
+        entry = (
+            f"\n\n---\n"
+            f"## concall_1 — {symbol} · {company_name} | {quarter}\n\n"
+            + content
+        )
         upload_bytes(drive, daily_id, fname,
                      (header + entry).encode("utf-8"), "text/markdown")
 
