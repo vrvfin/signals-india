@@ -45,6 +45,12 @@ OUTPUT_DAY_MD       = True   # append to company_repo/_daily/concall_DD_MMMYYYY.
 OUTPUT_COMPANY_DOCX = False  # .docx alongside company_page.md  [Stage C]
 OUTPUT_DAY_DOCX     = False  # .docx alongside day page          [Stage C]
 
+# ---- Time budget ----
+# Concalls are universal (no portfolio filter) and can accumulate during peak results
+# season. Cap this step so the downstream extractors (ratings, presentations, ARs)
+# always get their turn. Remaining pending rows are picked up on the next scheduled run.
+CONCALL_BUDGET_MINUTES = 25
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -626,8 +632,18 @@ def main() -> None:
         pending_idx = pending_idx[: args.limit]
 
     counts = {"processed": 0, "error": 0, "skipped": 0}
+    run_start = time.monotonic()
 
     for queue_idx in pending_idx:
+        # ── Time-budget guard ──────────────────────────────────────────────────
+        elapsed_min = (time.monotonic() - run_start) / 60
+        if elapsed_min >= CONCALL_BUDGET_MINUTES:
+            remaining = len(pending_idx) - pending_idx.index(queue_idx)
+            log(f"  Time budget reached ({elapsed_min:.1f} min >= {CONCALL_BUDGET_MINUTES} min). "
+                f"  {remaining} concall(s) left — will resume next run.")
+            break
+        # ──────────────────────────────────────────────────────────────────────
+
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
         log(f"Processing: {label}")

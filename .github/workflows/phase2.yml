@@ -32,7 +32,7 @@ concurrency:
 jobs:
   phase2:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 90   # concalls (universal) can take 35m+ in peak season; rest ~20m
 
     steps:
       - uses: actions/checkout@v4
