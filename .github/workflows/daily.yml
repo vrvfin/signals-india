@@ -33,10 +33,12 @@ jobs:
 
       # ── Skip check ── reads Drive health report; sets skip=true if Phase 1
       # already ran today (IST). Prevents redundant processing when duplicate
-      # cron slots queue up (e.g. manual trigger + scheduled overlap).
+      # cron slots queue up. Bypassed on manual trigger (workflow_dispatch) so
+      # you can always force a full rerun from the GitHub UI.
       # Fail-safe: Drive unreachable → skip=false (always proceed).
       - name: Skip check
         id: fresh
+        if: github.event_name != 'workflow_dispatch'
         env:
           GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
