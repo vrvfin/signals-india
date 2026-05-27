@@ -1,12 +1,13 @@
 name: Phase 2 — Company Intelligence
 
-# Runs every 3 hours, 24/7 (8 runs/day, 7 days/week).
-# Each run: ingest new docs → process pending queue → cleanup.
-# Stops cleanly on Gemini rate limits; next run resumes where it left off.
-# Empty queue = each extractor exits in <5 s with "Processed: 0".
+# Temporarily 4 runs/day (every 6h) to stay within GitHub Actions free tier.
+# Restore to 2h/3h split schedule once portfolio filter is live (reduces per-run
+# time from ~51 min to ~5 min, making 11 runs/day safe within the 2,000 min budget).
 #
-# Run times (IST = UTC+5:30, every 3 h starting 02:30):
-#   02:30 / 05:30 / 08:30 / 11:30 / 14:30 / 17:30 / 20:30 / 23:30
+# Run times UTC:  00:00 / 06:00 / 12:00 / 18:00
+# Run times IST:  05:30 / 11:30 / 17:30 / 23:30
+#
+# Concurrency group prevents two runs processing the same queue rows simultaneously.
 #
 # Stage B extractors run in priority order each time:
 #   concall → results → rating → presentation → annual_report
@@ -14,19 +15,30 @@ name: Phase 2 — Company Intelligence
 
 on:
   schedule:
-    - cron: '0 */3 * * *'    # every 3 hours UTC (02:30/05:30/08:30/... IST)
-  workflow_dispatch:          # manual trigger any time
+    - cron: '0 */6 * * *'     # every 6 hours UTC — 4 runs/day × ~15 min ≈ 1,800 min/month
+  workflow_dispatch:            # manual trigger any time
+
+concurrency:
+  group: phase2-pipeline
+  cancel-in-progress: false     # queue next run; never kill an active processing job
 
 jobs:
   phase2:
     runs-on: ubuntu-latest
-    timeout-minutes: 90       # each run gets 90 min; Gemini limits will stop it earlier if needed
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
+
+      # Cache pip packages — saves ~1.5 min per run (~180 min/month at 4 runs/day)
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
@@ -41,6 +53,9 @@ jobs:
           mkdir -p _sec
           # Write the saved OAuth token (contains refresh_token — auto-refreshes each run,
           # no browser needed). get_drive() detects the refresh_token field and uses it.
+          # Note: the refreshed token is NOT written back to the secret — it is refreshed
+          # from the same refresh_token each run, which stays valid indefinitely unless
+          # Google revoked (e.g. OAuth app deleted or access manually revoked).
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
           {
             echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
@@ -61,10 +76,13 @@ jobs:
         continue-on-error: true
 
       # Stage B: process pending docs through Gemini (priority order)
+      # Concall: universal — all companies, no portfolio filter
       - name: Extract concalls
         run: python scripts/extract_concall.py
         continue-on-error: true
 
+      # Results / rating / presentation / annual_report: portfolio-filtered
+      # (once portfolio.csv is live in _index, these skip non-portfolio companies)
       - name: Extract results PDFs
         run: python scripts/extract_results.py
         continue-on-error: true
