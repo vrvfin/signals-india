@@ -2,8 +2,11 @@ name: Daily Pipeline Execution
 
 on:
   schedule:
-    - cron: '0 12 * * 1'     # Monday 17:30 IST — weekly run, includes fundamentals
-    - cron: '0 12 * * 2-5'   # Tue-Fri 17:30 IST — daily run
+    - cron: '30 10 * * 1'    # Monday 16:00 IST — weekly run, includes fundamentals
+    - cron: '30 10 * * 2-5'  # Tue-Fri 16:00 IST — daily run
+    # Moved from UTC 12:00 → UTC 10:30 (IST 17:30 → 16:00).
+    # UTC 10:30 is pre-US-business-hours (off-peak GitHub), so runner queue wait
+    # drops from ~2.5h to ~15-30 min → data consistently ready by IST 17:00-17:30.
   workflow_dispatch:          # manual trigger from GitHub UI
 
 jobs:
@@ -85,13 +88,13 @@ jobs:
               
       # ---- Fundamentals (Monday only) + fundamentals-dependent strategies ----
       - name: Fundamentals (weekly)
-        if: github.event.schedule == '0 12 * * 1'
+        if: github.event.schedule == '30 10 * * 1'
         env:
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: python scripts/ingest_fundamentals.py
         continue-on-error: true
       - name: Enrich market cap (weekly)
-        if: github.event.schedule == '0 12 * * 1'
+        if: github.event.schedule == '30 10 * * 1'
         run: python scripts/enrich_market_cap.py
         continue-on-error: true
               
