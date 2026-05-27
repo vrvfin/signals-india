@@ -1,11 +1,14 @@
 name: Phase 2 — Company Intelligence
 
-# Temporarily 4 runs/day (every 6h) to stay within GitHub Actions free tier.
-# Restore to 2h/3h split schedule once portfolio filter is live (reduces per-run
-# time from ~51 min to ~5 min, making 11 runs/day safe within the 2,000 min budget).
+# 5 runs/day, 7 days/week.
+# Daytime (10 AM–7 PM IST) every 3 hours → 4 runs.
+# Overnight once at 2 AM IST → 1 run.
+# Portfolio filter keeps per-run time ~5-8 min → ≈1,200 min/month (60% of 2,000 free).
 #
-# Run times UTC:  00:00 / 06:00 / 12:00 / 18:00
-# Run times IST:  05:30 / 11:30 / 17:30 / 23:30
+# Daytime run times (IST = UTC+5:30):
+#   10:00 / 13:00 / 16:00 / 19:00
+# Overnight:
+#   02:00
 #
 # Concurrency group prevents two runs processing the same queue rows simultaneously.
 #
@@ -15,7 +18,10 @@ name: Phase 2 — Company Intelligence
 
 on:
   schedule:
-    - cron: '0 */6 * * *'     # every 6 hours UTC — 4 runs/day × ~15 min ≈ 1,800 min/month
+    # Daytime every 3h: UTC 04:30 / 07:30 / 10:30 / 13:30  (IST 10:00/13:00/16:00/19:00)
+    - cron: '30 4,7,10,13 * * *'
+    # Overnight once:   UTC 20:30                           (IST 02:00)
+    - cron: '30 20 * * *'
   workflow_dispatch:            # manual trigger any time
 
 concurrency:
