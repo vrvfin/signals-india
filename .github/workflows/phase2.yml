@@ -7,9 +7,7 @@ name: Phase 2 — Company Intelligence
 # Sunday:   1 run  — 13:00 IST only
 # Total: 29 runs/week
 #
-# On self-hosted runner: runs execute on your machine; consume 0 GitHub minutes.
-# When machine is off, jobs queue up; smart skip check prevents redundant runs
-# when multiple slots fire in a row after machine turns on.
+# Public repo → unlimited GitHub Actions minutes (no quota concern).
 #
 # Concurrency group prevents two runs processing the same queue rows simultaneously.
 #
@@ -32,13 +30,9 @@ concurrency:
   group: phase2-pipeline
   cancel-in-progress: false     # queue next run; never kill an active processing job
 
-defaults:
-  run:
-    shell: bash   # use Git Bash on Windows self-hosted runner
-
 jobs:
   phase2:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 180  # concalls are universal — all must complete; peak season can take 60-90m
 
     steps:
@@ -47,14 +41,19 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      # On self-hosted runner, packages persist between runs — this is fast (~5s).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
       # ── Skip check ── reads Drive phase2_latest.json; sets skip=true if queue
-      # is empty AND last run was < 45 min ago. Prevents N back-to-back redundant
-      # runs when the machine was off and cron slots accumulated.
-      # Fail-safe: if Drive unreachable → skip=false (always proceed).
+      # is empty AND last run was < 45 min ago. Prevents redundant back-to-back
+      # runs when multiple cron slots fire in quick succession.
+      # Fail-safe: Drive unreachable → skip=false (always proceed).
       - name: Skip check
         id: fresh
         env:
@@ -71,8 +70,6 @@ jobs:
           GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
         run: |
           mkdir -p _sec
-          # Write the saved OAuth token (contains refresh_token — auto-refreshes each run,
-          # no browser needed). get_drive() detects the refresh_token field and uses it.
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
           {
             echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
@@ -102,7 +99,6 @@ jobs:
         continue-on-error: true
 
       # Results / rating / presentation / annual_report: portfolio-filtered
-      # (once portfolio.csv is live in _index, these skip non-portfolio companies)
       - name: Extract results PDFs
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/extract_results.py
@@ -129,8 +125,7 @@ jobs:
         run: python scripts/cleanup_company_docs.py
         continue-on-error: true
 
-      # Status snapshot — writes logs/health/phase2_latest.json so app.py can
-      # show Phase 2 health alongside the Phase 1 health report
+      # Status snapshot — writes logs/health/phase2_latest.json for dashboard
       - name: Write Phase 2 status
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/write_phase2_status.py

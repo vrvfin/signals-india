@@ -4,19 +4,13 @@ on:
   schedule:
     - cron: '30 10 * * 1'    # Monday 16:00 IST — weekly run, includes fundamentals
     - cron: '30 10 * * 2-5'  # Tue-Fri 16:00 IST — daily run
-    # Moved from UTC 12:00 → UTC 10:30 (IST 17:30 → 16:00).
     # UTC 10:30 is pre-US-business-hours (off-peak GitHub), so runner queue wait
-    # drops from ~2.5h to ~15-30 min → data consistently ready by IST 17:00-17:30.
-    # On self-hosted runner: jobs fire immediately when machine is on; queue when off.
+    # is ~15-30 min → data consistently ready by IST 17:00-17:30.
   workflow_dispatch:          # manual trigger from GitHub UI
-
-defaults:
-  run:
-    shell: bash   # use Git Bash on Windows self-hosted runner
 
 jobs:
   pipeline:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
@@ -24,18 +18,23 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      # On self-hosted runner, packages persist between runs — this is fast (~5s).
-      # yfinance is excluded from root requirements.txt to keep Streamlit Cloud healthy
-      # (yfinance>=1.3 pulls curl-cffi>=0.15 which causes malloc corruption on Streamlit Cloud).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-p1-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-p1-
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          # yfinance excluded from root requirements.txt (causes malloc crash on Streamlit Cloud).
+          # Install it here for the pipeline only.
           pip install "yfinance>=1.3.0"
 
       # ── Skip check ── reads Drive health report; sets skip=true if Phase 1
-      # already ran today (IST). Prevents redundant processing when multiple
-      # queued cron slots fire in a row after the machine was off.
-      # Fail-safe: if Drive unreachable → skip=false (always proceed).
+      # already ran today (IST). Prevents redundant processing when duplicate
+      # cron slots queue up (e.g. manual trigger + scheduled overlap).
+      # Fail-safe: Drive unreachable → skip=false (always proceed).
       - name: Skip check
         id: fresh
         env:
@@ -46,10 +45,10 @@ jobs:
       - name: Write credentials from secrets
         if: steps.fresh.outputs.skip != 'true'
         env:
-          GDRIVE_FOLDER_ID:              ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_FOLDER_ID:                ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
-          GDRIVE_OAUTH_TOKEN_JSON:       ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
-          SCREENER_SESSION_COOKIE:       ${{ secrets.SCREENER_SESSION_COOKIE }}
+          GDRIVE_OAUTH_TOKEN_JSON:         ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          SCREENER_SESSION_COOKIE:         ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
