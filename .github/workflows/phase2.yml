@@ -110,3 +110,9 @@ jobs:
       - name: Cleanup old docs
         run: python scripts/cleanup_company_docs.py
         continue-on-error: true
+
+      # Status snapshot — writes logs/health/phase2_latest.json so app.py can
+      # show Phase 2 health alongside the Phase 1 health report
+      - name: Write Phase 2 status
+        run: python scripts/write_phase2_status.py
+        continue-on-error: true

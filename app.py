@@ -222,7 +222,7 @@ def _health_find_sub(drive, parent_id, name):
 
 @st.cache_data(ttl=300)
 def load_health_report():
-    """Latest pipeline health report dict, or None if not found."""
+    """Latest Phase 1 pipeline health report dict, or None if not found."""
     try:
         drive = get_drive()
         folder_id = os.environ["GDRIVE_FOLDER_ID"]
@@ -238,76 +238,163 @@ def load_health_report():
     except Exception as e:
         return {"_error": str(e)[:200]}
 
-def render_health_sidebar():
-    """Compact pipeline status line — call once in the sidebar, every page."""
-    rep = load_health_report()
-    if rep is None or "_error" in rep:
-        st.sidebar.error("Pipeline status: unknown")
-        return
 
-    run_at = rep.get("run_at")
-    age_h = None
-    if run_at:
+@st.cache_data(ttl=300)
+def load_phase2_status():
+    """Latest Phase 2 status dict (queue counts), or None if not found."""
+    try:
+        drive = get_drive()
+        folder_id = os.environ["GDRIVE_FOLDER_ID"]
+        logs_id = _health_find_sub(drive, folder_id, "logs")
+        health_id = _health_find_sub(drive, logs_id, "health") if logs_id else None
+        if not health_id:
+            return None
+        q = f"name='phase2_latest.json' and '{health_id}' in parents and trashed=false"
+        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        if not files:
+            return None
+        return json.loads(drive.files().get_media(fileId=files[0]["id"]).execute())
+    except Exception as e:
+        return {"_error": str(e)[:200]}
+
+def _age_str(run_at_iso: str | None) -> str:
+    """Return human-readable age like '2h ago' or 'unknown'."""
+    if not run_at_iso:
+        return "unknown"
+    try:
+        dt = datetime.fromisoformat(run_at_iso.replace("Z", "+00:00"))
+        h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+        if h < 1:
+            return f"{int(h*60)}m ago"
+        return f"{h:.0f}h ago"
+    except Exception:
+        return "unknown"
+
+
+def render_health_sidebar():
+    """Compact pipeline status in a sidebar expander — call once per page."""
+    rep  = load_health_report()
+    rep2 = load_phase2_status()
+
+    # ── Phase 1 label ─────────────────────────────────────────────────────────
+    if rep is None or "_error" in rep:
+        p1_icon, p1_txt = "❓", "unknown"
+    else:
+        overall = rep.get("overall", "UNKNOWN")
+        age_h = None
         try:
-            dt = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(rep["run_at"].replace("Z", "+00:00"))
             age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
         except Exception:
             pass
+        if age_h is not None and age_h > 30:
+            p1_icon, p1_txt = "🔴", f"stale ({age_h:.0f}h)"
+        elif overall == "HEALTHY":
+            p1_icon, p1_txt = "🟢", _age_str(rep.get("run_at"))
+        elif overall == "DEGRADED":
+            p1_icon, p1_txt = "🟡", f"degraded · {_age_str(rep.get('run_at'))}"
+        elif overall == "FAIL":
+            p1_icon, p1_txt = "🔴", f"FAILED · {_age_str(rep.get('run_at'))}"
+        else:
+            p1_icon, p1_txt = "❓", overall
 
-    overall = rep.get("overall", "UNKNOWN")
-    if age_h is not None and age_h > 30:
-        st.sidebar.error(f"Pipeline stale — last run {age_h:.0f}h ago")
-    elif overall == "HEALTHY":
-        st.sidebar.success("Data: HEALTHY")
-    elif overall == "DEGRADED":
-        st.sidebar.warning(f"Data: DEGRADED ({rep.get('warnings', 0)} warn)")
-    elif overall == "FAIL":
-        st.sidebar.error(f"Data: FAILED ({rep.get('critical_failures', 0)} critical)")
+    # ── Phase 2 label ─────────────────────────────────────────────────────────
+    if rep2 is None or "_error" in rep2:
+        p2_icon, p2_txt = "❓", "no status yet"
     else:
-        st.sidebar.info(f"Data: {overall}")
+        tot  = rep2.get("queue_totals", {})
+        pend = tot.get("pending", 0)
+        err  = tot.get("error", 0)
+        p2_icon = "🔴" if err > 0 else ("🟡" if pend > 0 else "🟢")
+        p2_txt  = f"{pend} pending · {err} err · {_age_str(rep2.get('run_at'))}"
+
+    with st.sidebar.expander(f"📡 Pipeline  {p1_icon}{p2_icon}", expanded=False):
+        st.markdown(f"**Phase 1 (data):** {p1_icon} {p1_txt}")
+        if rep and "_error" not in rep:
+            fails = rep.get("critical_failures", 0)
+            warns = rep.get("warnings", 0)
+            if fails or warns:
+                st.caption(f"  {fails} critical · {warns} warnings")
+        st.markdown(f"**Phase 2 (intel):** {p2_icon} {p2_txt}")
+        if rep2 and "_error" not in rep2:
+            by_type = rep2.get("by_doc_type", {})
+            if by_type:
+                rows = []
+                for dt, cnts in sorted(by_type.items()):
+                    rows.append({"type": dt,
+                                 "⏳": cnts.get("pending", 0),
+                                 "✅": cnts.get("done", 0),
+                                 "❌": cnts.get("error", 0)})
+                st.dataframe(pd.DataFrame(rows), hide_index=True,
+                             use_container_width=True)
 
 def render_health_banner():
-    rep = load_health_report()
+    rep  = load_health_report()
+    rep2 = load_phase2_status()
+
+    # ── Phase 1 banner ────────────────────────────────────────────────────────
     if rep is None:
-        st.error("No pipeline health report found on Drive — "
-                 "the daily workflow may have never run.")
-        return
-    if "_error" in rep:
-        st.warning(f"Could not read health report: {rep['_error']}")
-        return
-
-    run_at = rep.get("run_at")
-    age_h = None
-    if run_at:
-        try:
-            dt = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
-            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-        except Exception:
-            pass
-
-    overall = rep.get("overall", "UNKNOWN")
-    age_txt = f" — checked {age_h:.0f}h ago" if age_h is not None else ""
-
-    if age_h is not None and age_h > 30:
-        st.error(f"Pipeline has not run for {age_h:.0f} hours "
-                 f"(last check: {run_at}). It may not be running at all — "
-                 f"data below is STALE.")
-    elif overall == "HEALTHY":
-        st.success(f"All data fresh — pipeline HEALTHY{age_txt}.")
-    elif overall == "DEGRADED":
-        st.warning(f"Pipeline DEGRADED — {rep.get('warnings', 0)} warning(s){age_txt}. "
-                   f"Some strategies below may be stale (see detail).")
-    elif overall == "FAIL":
-        st.error(f"Pipeline FAILED — {rep.get('critical_failures', 0)} critical "
-                 f"failure(s){age_txt}. Data below may be stale.")
+        st.error("No Phase 1 health report on Drive — daily pipeline may never have run.")
+    elif "_error" in rep:
+        st.warning(f"Could not read Phase 1 health report: {rep['_error']}")
     else:
-        st.info(f"Pipeline status: {overall}{age_txt}")
+        run_at  = rep.get("run_at")
+        age_h   = None
+        age_txt = ""
+        if run_at:
+            try:
+                dt    = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+                age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                age_txt = f" — {_age_str(run_at)}"
+            except Exception:
+                pass
+        overall = rep.get("overall", "UNKNOWN")
+        if age_h is not None and age_h > 30:
+            st.error(f"⚠️ Phase 1 (data pipeline) has not run for {age_h:.0f}h — "
+                     f"signals below may be STALE.")
+        elif overall == "HEALTHY":
+            st.success(f"✅ Phase 1 HEALTHY{age_txt}")
+        elif overall == "DEGRADED":
+            st.warning(f"⚠️ Phase 1 DEGRADED — {rep.get('warnings', 0)} warning(s){age_txt}")
+        elif overall == "FAIL":
+            st.error(f"🔴 Phase 1 FAILED — {rep.get('critical_failures', 0)} critical{age_txt}")
+        else:
+            st.info(f"Phase 1: {overall}{age_txt}")
+        checks = rep.get("checks", [])
+        if checks:
+            with st.expander("Phase 1 — data freshness detail"):
+                st.dataframe(pd.DataFrame(checks),
+                             use_container_width=True, hide_index=True)
 
-    checks = rep.get("checks", [])
-    if checks:
-        with st.expander("Data freshness detail (per strategy & data pull)"):
-            st.dataframe(pd.DataFrame(checks),
-                         use_container_width=True, hide_index=True)
+    # ── Phase 2 banner ────────────────────────────────────────────────────────
+    if rep2 is None:
+        st.info("Phase 2 (Company Intel) has not written a status yet — "
+                "it will appear here after the next run.")
+    elif "_error" in rep2:
+        st.warning(f"Could not read Phase 2 status: {rep2['_error']}")
+    else:
+        tot  = rep2.get("queue_totals", {})
+        pend = tot.get("pending", 0)
+        done = tot.get("done",    0)
+        err  = tot.get("error",   0)
+        age  = _age_str(rep2.get("run_at"))
+        if err > 0:
+            st.warning(f"⚠️ Phase 2 (Company Intel) — {pend} pending · "
+                       f"{done} done · **{err} errors** · {age}")
+        elif pend > 0:
+            st.info(f"🟡 Phase 2 — {pend} pending · {done} done · {age}")
+        else:
+            st.success(f"✅ Phase 2 — queue clear ({done} done) · {age}")
+        by_type = rep2.get("by_doc_type", {})
+        if by_type:
+            with st.expander("Phase 2 — queue detail by document type"):
+                rows = [{"doc_type": dt,
+                         "⏳ pending": cnts.get("pending", 0),
+                         "✅ done":    cnts.get("done",    0),
+                         "❌ error":   cnts.get("error",   0)}
+                        for dt, cnts in sorted(by_type.items())]
+                st.dataframe(pd.DataFrame(rows), hide_index=True,
+                             use_container_width=True)
 
 def _list_folder(drive, folder_id):
     out = {}
