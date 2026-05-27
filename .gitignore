@@ -11,6 +11,8 @@ signals/
 logs/
 charts/
 portfolio/
+*.parquet
+*.csv
 # Secrets (never commit)
 *.json
 !package.json
