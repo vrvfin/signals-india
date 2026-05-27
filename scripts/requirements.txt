@@ -28,5 +28,6 @@ python-dotenv>=1.0
 # PDF page-splitting for annual report map-reduce (optional, falls back to byte-chunking)
 pypdf>=4.0
 
-# Excel (template.xlsx)
+# Excel (template.xlsx and Screener .xls portfolio export)
 openpyxl>=3.1
+xlrd>=2.0              # pandas needs this to read .xls (old Excel binary format)

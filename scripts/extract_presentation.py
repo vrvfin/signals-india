@@ -35,6 +35,7 @@ from _extractor_base import (
     download_bytes,
     extract_md_tables, clean_val, identify_metric,
     append_company_page, append_day_page,
+    load_portfolio_isins,
 )
 
 # ---- Config ----
@@ -187,6 +188,14 @@ def main() -> None:
     pending_mask = (queue["status"] == "pending") & (queue["doc_type"] == DOC_TYPE)
     pending_idx = queue.index[pending_mask].tolist()
     log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending {DOC_TYPE}")
+
+    # Portfolio filter: skip non-portfolio companies (rows stay pending for future runs)
+    portfolio_isins = load_portfolio_isins(drive, folder_id)
+    if portfolio_isins:
+        before = len(pending_idx)
+        pending_idx = [i for i in pending_idx
+                       if str(queue.loc[i, "isin"]).strip() in portfolio_isins]
+        log(f"  After portfolio filter: {len(pending_idx)}/{before} to process")
 
     if args.limit:
         pending_idx = pending_idx[: args.limit]

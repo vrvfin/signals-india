@@ -414,6 +414,86 @@ def append_company_page(drive, repo_id: str, key: str,
 
 
 # ------------------------------------------------------------------ #
+#  Portfolio filter                                                    #
+# ------------------------------------------------------------------ #
+
+def load_portfolio_isins(drive, folder_id: str) -> set[str] | None:
+    """Return ISIN set from the most-recent file in the portfolio/ Drive subfolder.
+
+    Mirrors app.py's _find_latest_portfolio_file + _read_portfolio_table:
+      - Locates <GDRIVE_FOLDER_ID>/portfolio/ (read-only, never created)
+      - Picks the most-recently-modified .xls / .xlsx / .csv (name changes per upload)
+      - Auto-detects header row: Screener exports have ~13 blank rows before the header
+      - Returns frozenset of ISIN strings, or None when no file found
+        (callers fall back to processing all companies when None is returned)
+
+    Called by extract_results, extract_rating, extract_presentation,
+    extract_annual_report — NOT by extract_concall (concall stays universal).
+    """
+    # Find portfolio/ subfolder — do NOT create it; absence means no filter
+    q = (f"name='portfolio' and '{folder_id}' in parents "
+         f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
+    folders = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if not folders:
+        log("  Portfolio filter: no 'portfolio' folder on Drive — processing all companies")
+        return None
+
+    pf_folder_id = folders[0]["id"]
+
+    # Most-recently-modified spreadsheet file (name varies per upload)
+    files = drive.files().list(
+        q=f"'{pf_folder_id}' in parents and trashed=false",
+        fields="files(id, name, modifiedTime)",
+        orderBy="modifiedTime desc",
+    ).execute().get("files", [])
+    target = next(
+        (f for f in files
+         if f["name"].lower().endswith((".xls", ".xlsx", ".csv"))),
+        None,
+    )
+    if not target:
+        log("  Portfolio filter: no .xls/.xlsx/.csv in portfolio/ — processing all companies")
+        return None
+
+    log(f"  Portfolio filter: reading '{target['name']}'")
+    raw = download_bytes(drive, target["id"])
+    fn = target["name"].lower()
+
+    try:
+        if fn.endswith(".csv"):
+            df_raw = pd.read_csv(io.BytesIO(raw), header=None)
+            engine = "csv"
+        else:
+            engine = "xlrd" if fn.endswith(".xls") else "openpyxl"
+            df_raw = pd.read_excel(io.BytesIO(raw), engine=engine, header=None)
+
+        # Find header row: first row containing an "ISIN" cell
+        header_row = None
+        for i, row in df_raw.iterrows():
+            if any(str(v).strip().upper() == "ISIN" for v in row.dropna()):
+                header_row = i
+                break
+        if header_row is None:
+            log("  Portfolio filter: ISIN column not found in file — processing all companies")
+            return None
+
+        if fn.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw), header=header_row)
+        else:
+            df = pd.read_excel(io.BytesIO(raw), engine=engine, header=header_row)
+
+        df = df.dropna(subset=["ISIN"]).copy()
+        isins: set[str] = set(df["ISIN"].astype(str).str.strip())
+        log(f"  Portfolio filter: {len(isins)} ISINs loaded — non-portfolio rows skipped "
+            f"(stay pending; processed if added to portfolio later)")
+        return isins
+
+    except Exception as exc:
+        log(f"  Portfolio filter: ERROR reading file ({str(exc)[:120]}) — processing all companies")
+        return None
+
+
+# ------------------------------------------------------------------ #
 #  Gemini key loader                                                   #
 # ------------------------------------------------------------------ #
 
