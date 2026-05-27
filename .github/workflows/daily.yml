@@ -7,32 +7,49 @@ on:
     # Moved from UTC 12:00 → UTC 10:30 (IST 17:30 → 16:00).
     # UTC 10:30 is pre-US-business-hours (off-peak GitHub), so runner queue wait
     # drops from ~2.5h to ~15-30 min → data consistently ready by IST 17:00-17:30.
+    # On self-hosted runner: jobs fire immediately when machine is on; queue when off.
   workflow_dispatch:          # manual trigger from GitHub UI
+
+defaults:
+  run:
+    shell: bash   # use Git Bash on Windows self-hosted runner
 
 jobs:
   pipeline:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-p1-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-p1-
-      - run: pip install -r requirements.txt
+
+      # On self-hosted runner, packages persist between runs — this is fast (~5s).
       # yfinance is excluded from root requirements.txt to keep Streamlit Cloud healthy
       # (yfinance>=1.3 pulls curl-cffi>=0.15 which causes malloc corruption on Streamlit Cloud).
-      # Install it here for the pipeline only.
-      - run: pip install "yfinance>=1.3.0"
-      - name: Write credentials from secrets
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install "yfinance>=1.3.0"
+
+      # ── Skip check ── reads Drive health report; sets skip=true if Phase 1
+      # already ran today (IST). Prevents redundant processing when multiple
+      # queued cron slots fire in a row after the machine was off.
+      # Fail-safe: if Drive unreachable → skip=false (always proceed).
+      - name: Skip check
+        id: fresh
         env:
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
-          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: python scripts/pipeline_skip_check.py --pipeline phase1
+
+      - name: Write credentials from secrets
+        if: steps.fresh.outputs.skip != 'true'
+        env:
+          GDRIVE_FOLDER_ID:              ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON:       ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          SCREENER_SESSION_COOKIE:       ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
@@ -46,73 +63,102 @@ jobs:
 
       # ---- Data pull (all best-effort; the health-check is the judge) ----
       - name: Build universe
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/build_universe.py
         continue-on-error: true
+
       - name: Ingest OHLCV (incremental)
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_ohlcv.py
         continue-on-error: true
+
       - name: Ingest indices + macro
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_indices_macro.py
         continue-on-error: true
+
       - name: Fix indices (NSE midcap/smallcap)
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/fix_indices_nse.py
         continue-on-error: true
+
       - name: Ingest FII/DII
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_fii_dii.py
         continue-on-error: true
 
       # ---- Features ----
       - name: Compute features
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/compute_features.py
         continue-on-error: true
 
       # ---- Strategies (each isolated; one failing won't stop the rest) ----
       - name: Strategy - Momentum
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_momentum.py
         continue-on-error: true
+
       - name: Strategy - MA respect
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_ma_respect.py
         continue-on-error: true
+
       - name: Strategy - Qullamaggie
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_qullamaggie.py
         continue-on-error: true
+
       - name: Strategy - Minervini
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_minervini.py
         continue-on-error: true
+
       - name: Strategy - Darvas
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_darvas.py
         continue-on-error: true
+
       - name: Strategy - Volume
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_volume.py
         continue-on-error: true
-              
+
       # ---- Fundamentals (Monday only) + fundamentals-dependent strategies ----
       - name: Fundamentals (weekly)
-        if: github.event.schedule == '30 10 * * 1'
+        if: steps.fresh.outputs.skip != 'true' && github.event.schedule == '30 10 * * 1'
         env:
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: python scripts/ingest_fundamentals.py
         continue-on-error: true
+
       - name: Enrich market cap (weekly)
-        if: github.event.schedule == '30 10 * * 1'
+        if: steps.fresh.outputs.skip != 'true' && github.event.schedule == '30 10 * * 1'
         run: python scripts/enrich_market_cap.py
         continue-on-error: true
-              
+
       - name: Strategy - CANSLIM
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_canslim.py
         continue-on-error: true
+
       - name: Strategy - PEAD
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_pead.py
         continue-on-error: true
 
       # ---- Aggregate + market state ----
       - name: Aggregate signals
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/aggregate_signals.py
         continue-on-error: true
+
       - name: Market state
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/market_state.py
         continue-on-error: true
 
       # ---- Truth gate: the ONLY step allowed to fail the run ----
       - name: Health check (truth gate)
+        if: steps.fresh.outputs.skip != 'true'
         run: python scripts/pipeline_healthcheck.py
