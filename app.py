@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -423,6 +424,193 @@ def load_all_strategy_signals():
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return _drive_call(_do)
+
+
+# ---------- Company Intel helpers ----------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_daily_index() -> pd.DataFrame:
+    """List all files in company_repo/_daily/ with parsed metadata."""
+    def _do():
+        drive = drive_service()
+        folder_id = os.environ["GDRIVE_FOLDER_ID"]
+        repo_id = _find_subfolder(drive, folder_id, "company_repo")
+        if not repo_id:
+            return pd.DataFrame()
+        daily_id = _find_subfolder(drive, repo_id, "_daily")
+        if not daily_id:
+            return pd.DataFrame()
+        files = drive.files().list(
+            q=f"'{daily_id}' in parents and trashed=false",
+            fields="files(id, name, modifiedTime)",
+            orderBy="modifiedTime desc",
+            pageSize=200,
+        ).execute().get("files", [])
+        rows = []
+        for f in files:
+            name = f["name"]
+            # Filename pattern: {doc_type}_{dd}_{mon}{yyyy}.md
+            # doc_type may contain underscores (annual_report), so match from the right
+            m = re.match(r"^(.+)_(\d{2})_([a-z]{3})(\d{4})\.md$", name, re.IGNORECASE)
+            if m:
+                doc_type, day, mon, year = m.groups()
+                try:
+                    dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
+                except ValueError:
+                    dt = None
+            else:
+                doc_type = name.replace(".md", "")
+                dt = None
+            rows.append({"file_id": f["id"], "filename": name,
+                         "doc_type": doc_type.replace("_", " ").title(),
+                         "doc_type_raw": doc_type,
+                         "date": dt})
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.sort_values("date", ascending=False)
+        return df
+    try:
+        return _drive_call(_do)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_md_content(file_id: str) -> str:
+    """Download and return markdown content of a Drive file."""
+    def _do():
+        return _download_bytes(drive_service(), file_id).decode("utf-8", errors="replace")
+    try:
+        return _drive_call(_do)
+    except Exception as e:
+        return f"*Could not load file: {e}*"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def find_company_page(key: str) -> str | None:
+    """Return company_page.md content for a given ISIN or symbol key, or None."""
+    if not key:
+        return None
+    def _do():
+        drive = drive_service()
+        folder_id = os.environ["GDRIVE_FOLDER_ID"]
+        repo_id = _find_subfolder(drive, folder_id, "company_repo")
+        if not repo_id:
+            return None
+        comp_id = _find_subfolder(drive, repo_id, key)
+        if not comp_id:
+            return None
+        q = f"name='company_page.md' and '{comp_id}' in parents and trashed=false"
+        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        if not files:
+            return None
+        return _download_bytes(drive, files[0]["id"]).decode("utf-8", errors="replace")
+    try:
+        return _drive_call(_do)
+    except Exception as e:
+        return f"*Error: {e}*"
+
+
+def page_company_intel():
+    st.title("Company Intelligence")
+    st.caption(
+        "Browse AI-generated summaries from concall transcripts, results PDFs, "
+        "ratings, presentations and annual reports."
+    )
+
+    tab_digests, tab_company = st.tabs(["📅 Daily Digests", "🏢 Company Page"])
+
+    # ── Tab 1: Daily Digests ──────────────────────────────────────────
+    with tab_digests:
+        with st.spinner("Loading digest index…"):
+            df = load_daily_index()
+
+        if df.empty:
+            st.info("No digest files yet. They appear after the pipeline runs.")
+            return
+
+        # ── Latest file per doc type (quick-access strip) ─────────────
+        st.subheader("Latest available")
+        latest = (df.dropna(subset=["date"])
+                    .sort_values("date", ascending=False)
+                    .groupby("doc_type").first().reset_index())
+        cols = st.columns(len(latest)) if len(latest) <= 5 else st.columns(5)
+        for i, (_, row) in enumerate(latest.iterrows()):
+            col = cols[i % len(cols)]
+            date_str = row["date"].strftime("%d %b") if pd.notna(row["date"]) else "?"
+            if col.button(f"📄 {row['doc_type']}\n{date_str}", key=f"lat_{i}",
+                          use_container_width=True):
+                st.session_state["intel_selected_file"] = row["file_id"]
+                st.session_state["intel_selected_name"] = row["filename"]
+
+        st.markdown("---")
+
+        # ── Browse by period ──────────────────────────────────────────
+        st.subheader("Browse")
+        c1, c2, c3 = st.columns(3)
+
+        all_types = ["All"] + sorted(df["doc_type"].dropna().unique().tolist())
+        sel_type = c1.selectbox("Document type", all_types)
+        view     = c2.selectbox("Group by", ["Day", "Week", "Month", "Quarter"])
+
+        dff = df if sel_type == "All" else df[df["doc_type"] == sel_type]
+        dff = dff.dropna(subset=["date"]).copy()
+
+        if dff.empty:
+            st.info("No files for this filter.")
+        else:
+            if view == "Day":
+                periods = sorted(dff["date"].dt.date.unique(), reverse=True)
+                sel = c3.selectbox("Date", [str(p) for p in periods])
+                matches = dff[dff["date"].dt.date.astype(str) == sel]
+            elif view == "Week":
+                dff["_period"] = dff["date"].dt.to_period("W").astype(str)
+                periods = sorted(dff["_period"].unique(), reverse=True)
+                sel = c3.selectbox("Week", periods)
+                matches = dff[dff["_period"] == sel]
+            elif view == "Month":
+                dff["_period"] = dff["date"].dt.to_period("M").dt.strftime("%b %Y")
+                periods = sorted(dff["_period"].unique(),
+                                 key=lambda x: datetime.strptime(x, "%b %Y"), reverse=True)
+                sel = c3.selectbox("Month", periods)
+                matches = dff[dff["_period"] == sel]
+            else:
+                dff["_period"] = dff["date"].dt.to_period("Q").astype(str)
+                periods = sorted(dff["_period"].unique(), reverse=True)
+                sel = c3.selectbox("Quarter", periods)
+                matches = dff[dff["_period"] == sel]
+
+            st.caption(f"{len(matches)} file(s)")
+            for _, row in matches.iterrows():
+                with st.expander(f"📄 {row['filename']}", expanded=(len(matches) == 1)):
+                    st.markdown(load_md_content(row["file_id"]))
+
+        # ── Show pre-selected file (from quick-access buttons) ────────
+        if "intel_selected_file" in st.session_state:
+            st.markdown("---")
+            st.subheader(f"📄 {st.session_state.get('intel_selected_name', '')}")
+            st.markdown(load_md_content(st.session_state["intel_selected_file"]))
+
+    # ── Tab 2: Company Page ───────────────────────────────────────────
+    with tab_company:
+        st.subheader("Company intelligence page")
+        st.caption("Permanent per-company log of all processed documents.")
+        key_input = st.text_input(
+            "ISIN or NSE symbol",
+            placeholder="e.g. INE002A01018  or  RELIANCE",
+        ).strip().upper()
+        if key_input:
+            with st.spinner(f"Loading {key_input}…"):
+                content = find_company_page(key_input)
+            if content is None:
+                st.warning(
+                    f"No company page found for **{key_input}**. "
+                    "It may not have been processed yet (company must be in your portfolio, "
+                    "or have at least one concall processed)."
+                )
+            else:
+                st.markdown(content)
 
 
 # ---------- Market Overview helpers ----------
@@ -1187,29 +1375,52 @@ def page_portfolio():
 
 # ---------- Main ----------
 
+def _safe_render(page_fn):
+    """Run a page function; show a recoverable error instead of crashing."""
+    try:
+        page_fn()
+    except Exception as exc:
+        st.error(f"⚠️ Page error: {str(exc)[:300]}")
+        st.caption(
+            "This is usually a temporary Drive connection issue. "
+            "Refresh the page (F5) or wait a moment and try again."
+        )
+        if st.button("🔄 Clear cache & retry"):
+            st.cache_data.clear()
+            st.rerun()
+
+
 def main():
-    
     st.sidebar.title("Signals India")
-    
-    page = st.sidebar.radio("Page",
-                        ["Market Overview", "Today's Signals", "Graphs",
-                         "My Portfolio", "Stock Detail", "Strategy Docs"])
+
+    page = st.sidebar.radio("Page", [
+        "Market Overview",
+        "Today's Signals",
+        "Company Intel",       # ← new
+        "My Portfolio",
+        "Graphs",
+        "Stock Detail",
+        "Strategy Docs",
+    ])
     render_health_sidebar()
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Loaded at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     st.sidebar.caption("Data refreshes from Drive every 5 min (cache TTL)")
+
     if page == "Market Overview":
-        page_market_overview()
+        _safe_render(page_market_overview)
     elif page == "Today's Signals":
-        page_signals()
-    elif page == "Stock Detail":
-        page_stock_detail()
+        _safe_render(page_signals)
+    elif page == "Company Intel":
+        _safe_render(page_company_intel)
     elif page == "My Portfolio":
-        page_portfolio()
-    elif page == "Strategy Docs":
-        page_strategy_docs()
+        _safe_render(page_portfolio)
     elif page == "Graphs":
-        page_graphs()
+        _safe_render(page_graphs)
+    elif page == "Stock Detail":
+        _safe_render(page_stock_detail)
+    elif page == "Strategy Docs":
+        _safe_render(page_strategy_docs)
 
 
 

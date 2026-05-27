@@ -1,14 +1,12 @@
 name: Phase 2 — Company Intelligence
 
-# 5 runs/day, 7 days/week.
-# Daytime (10 AM–7 PM IST) every 3 hours → 4 runs.
-# Overnight once at 2 AM IST → 1 run.
-# Portfolio filter keeps per-run time ~5-8 min → ≈1,200 min/month (60% of 2,000 free).
-#
-# Daytime run times (IST = UTC+5:30):
-#   10:00 / 13:00 / 16:00 / 19:00
-# Overnight:
-#   02:00
+# Weekday schedule (Mon–Fri): 5 runs/day  → 25 runs/week
+#   Daytime every 3h: 10:00 / 13:00 / 16:00 / 19:00 IST
+#   Overnight once:   02:00 IST
+# Saturday: 3 runs — 10:00 / 13:00 / 16:00 IST (no overnight)
+# Sunday:   1 run  — 13:00 IST only
+# Total: 29 runs/week × 8 min avg ≈ 930 min/month (Phase 2 alone).
+# Phase 1 (daily.yml, Mon–Fri) adds ~600 min/month → combined ~1,530 min < 2,000 free.
 #
 # Concurrency group prevents two runs processing the same queue rows simultaneously.
 #
@@ -18,10 +16,13 @@ name: Phase 2 — Company Intelligence
 
 on:
   schedule:
-    # Daytime every 3h: UTC 04:30 / 07:30 / 10:30 / 13:30  (IST 10:00/13:00/16:00/19:00)
-    - cron: '30 4,7,10,13 * * *'
-    # Overnight once:   UTC 20:30                           (IST 02:00)
-    - cron: '30 20 * * *'
+    # Mon–Fri: every 3h 10AM-7PM IST + once 2AM overnight
+    - cron: '30 4,7,10,13 * * 1-5'   # IST 10:00 / 13:00 / 16:00 / 19:00
+    - cron: '30 20 * * 1-5'           # IST 02:00 overnight
+    # Saturday: 10AM / 1PM / 4PM IST (no overnight)
+    - cron: '30 4,7,10 * * 6'
+    # Sunday: 1PM IST only
+    - cron: '30 7 * * 0'
   workflow_dispatch:            # manual trigger any time
 
 concurrency:
