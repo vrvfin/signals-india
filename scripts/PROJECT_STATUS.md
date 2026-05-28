@@ -42,12 +42,16 @@ PHASE 1 (daily.yml) — Mon–Fri UTC 10:30 (IST 16:00)
   → pipeline_healthcheck  (truth gate — exits non-zero on CRITICAL)
   weekly (Mon only): ingest_fundamentals, enrich_market_cap
 
-PHASE 2 (phase2.yml) — 47 runs/week  [updated 2026-05-28]
-  Mon–Fri: 7×/day (IST 10/12/14/16/18/20/22, every 2h) + 1 overnight (IST 03:00)
-  Sat: 5×/day (IST 10/12/14/16/18)   Sun: 2× (IST 10/14)
-  Reliability: (a) denser cron; (b) daily.yml triggers Phase 2 after Phase 1
-               via ACTIONS_PAT; (c) optional external cron via cron-job.org
-  skip_check (skip if queue empty AND last run < 45 min ago)
+PHASE 2 (phase2.yml) — seasonal schedule  [updated 2026-05-28]
+  PEAK season (17 Jan–28 Feb, 17 Apr–30 May, 17 Jul–30 Aug, 17 Oct–30 Nov):
+    Weekday: 6 daytime (IST 08/11/14/17/20/22) + overnight 03:00 = 7/day
+    Saturday: 5 daytime (IST 08/11:30/14/16:30/20) + overnight   = 6/day
+    Sunday: 3 daytime (IST 08/14/20)                             = 3/day
+  OFF-SEASON: 3 runs/day all day types (IST 08/14/20 ±75 min windows)
+  skip_check enforces seasonal thresholds (peak: 45 min; off-season window: 90 min;
+             outside off-season window → always skip)
+  Reliability: (a) seasonal cron; (b) daily.yml backup trigger (ACTIONS_PAT);
+               (c) optional external cron via cron-job.org
   ingest_company_docs → scrape_results_table
   → extract_concall → extract_results → extract_rating
   → extract_presentation → extract_annual_report
@@ -218,7 +222,8 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - `pipeline_skip_check.py` — `PHASE2_SKIP_MINUTES=45`
 - `extract_concall.py` — `INTER_CALL_SLEEP=6` (seconds between Gemini calls, RPM protection)
 - `daily.yml` — schedule crons; Monday cron triggers weekly steps
-- `phase2.yml` — 47-run/week schedule (every 2h, IST 10–22 + overnight 03:00); `timeout-minutes: 180`; `repository_dispatch: trigger-phase2` added
+- `phase2.yml` — seasonal schedule (peak: 6-7/day weekday, 3/day off-season); `timeout-minutes: 180`; `repository_dispatch: trigger-phase2` added
+- `pipeline_skip_check.py` — `PEAK_SEASONS` date ranges, `_is_peak_season()`, `_in_offseason_window()`; peak threshold 45 min, off-season 90 min; outside window → hard skip
 - `daily.yml` — Phase 2 backup trigger step at end of Phase 1 (uses `ACTIONS_PAT` secret); safe if secret not yet set
 
 ---

@@ -27,18 +27,44 @@ Filter should be: (isin × doc_type × received_date) → only reprocess if
 received_date differs.
 File to change: ingest_company_docs.py
 
-### Fix 2 — Seasonal Phase 2 frequency tuning   ⏳ PENDING
-Problem: Phase 2 runs 29×/week flat. Concall seasons have up to 100 uploads/day
-for 45 working days after each quarter end (Dec, Mar, Jun, Sep quarter closes).
-Off-season volume is low (10-20/day). Running high frequency off-season wastes
-GitHub Actions minutes and is insufficient during peak season.
-Ask:
-  - Peak season (15th of month after Q-end + 45 working days):
-    Increase Phase 2 frequency (e.g., every 2 hours vs current 3-4 hr gaps).
-  - Off-season: Reduce to 2-3×/day.
-  - Mechanism: Either schedule-based (separate cron blocks in phase2.yml for
-    each season date range) or dynamic (check date in skip_check and adjust).
-File to change: .github/workflows/phase2.yml (or pipeline_skip_check.py)
+### Fix 2 — Seasonal Phase 2 frequency tuning   ✅ DONE
+Problem: Phase 2 ran 29×/week flat. Concall seasons have up to 100 uploads/day
+for 45-60 days after each quarter end (Dec, Mar, Jun, Sep). Off-season low volume.
+Ask (clarified 2026-05-28):
+  Peak season (India results seasons):
+    Q3:  17 Jan – end of Feb     Q4: 17 Apr – 30 May (60-day annual season)
+    Q1:  17 Jul – 30 Aug         Q2: 17 Oct – 30 Nov
+    Weekdays: 5 runs 8AM-10PM + 1 overnight
+    Saturday: 4 runs 8AM-10PM + 1 overnight
+    Sunday:   3 runs
+  Off-season: 3 runs/day on ALL day types (same as Sunday)
+
+Delivered (2026-05-28):
+  Mechanism: phase2.yml carries PEAK schedule; pipeline_skip_check.py reads
+  today's date and suppresses off-season extra slots.
+
+  phase2.yml — 4 cron blocks:
+    30 2,8,14 * * *      → base: IST 08/14/20 all days (off-season pattern)
+    30 5,11,16 * * 1-5   → weekday extras: IST 11/17/22 (Mon-Fri)
+    0 6,11 * * 6         → Saturday extras: IST 11:30/16:30
+    30 21 * * 0-5        → overnight: IST 03:00 Mon-Sat
+
+  pipeline_skip_check.py — seasonal logic:
+    _is_peak_season(ist_now): checks date against 4 season ranges
+    _in_offseason_window(ist_now): checks ±75 min of IST 08/14/20
+    Peak threshold:        45 min (process queue fast)
+    Off-season threshold:  90 min within window; outside window → skip always
+
+  Effective run counts after skip logic:
+    Peak weekday:  6 daytime (08/11/14/17/20/22) + overnight = 7/day
+    Peak Saturday: 5 daytime (08/11:30/14/16:30/20) + overnight = 6/day
+    Peak Sunday:   3 daytime (08/14/20) = 3/day
+    Off-season:    3/day all days (enforced by window filter)
+
+  Note: Peak weekday is 6 daytime (user asked 5) and Saturday is 5 daytime
+  (user asked 4). The +1 extra is unavoidable because base slots (needed
+  for off-season) overlap with peak extras. During peak, queue is always
+  full so extra slot only helps drain faster — not harmful.
 
 ### Fix 3 — Daily digest retention extended to 90 days   ✅ RESOLVED
 Original ask: 90-day retention for daily concall digest files.

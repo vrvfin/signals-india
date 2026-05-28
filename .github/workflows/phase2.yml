@@ -1,55 +1,61 @@
 name: Phase 2 — Company Intelligence
 
-# ── Schedule design ────────────────────────────────────────────────────────
-# PROBLEM: GitHub Actions scheduled jobs are queued, not guaranteed.
-# Delays of 30–90 min are common; a slot may fire late or be skipped entirely
-# during high-load periods. This is a GitHub platform limitation.
+# ── Seasonal run strategy ──────────────────────────────────────────────────
 #
-# THREE-LAYER RELIABILITY STRATEGY:
-#   Layer 1 (this file)  — denser cron schedule (every 2h, 47×/week).
-#                          More opportunities = less chance of a long gap.
-#   Layer 2 (daily.yml)  — Phase 1 triggers Phase 2 via workflow_dispatch
-#                          (ACTIONS_PAT secret) at the end of every daily run.
-#                          Guarantees at minimum one execution per business day.
-#   Layer 3 (optional)   — External cron via cron-job.org every 2h calling
-#                          the GitHub API. Not required but maximises uptime.
-#                          See scripts/Concall_Extractor.txt › InfraFix 3.
+# India Q-end results seasons (heavy concall upload periods):
+#   Q3 FY:  17 Jan – 28 Feb   |  Q4 FY: 17 Apr – 30 May (60-day season)
+#   Q1 FY:  17 Jul – 30 Aug   |  Q2 FY: 17 Oct – 30 Nov
 #
-# Weekday (Mon–Fri IST): 7 daytime runs every 2h (10/12/14/16/18/20/22)
-#                        + 1 overnight at 03:00 IST  →  8 runs/day
-# Saturday (IST):        5 runs (10/12/14/16/18)
-# Sunday (IST):          2 runs (10/14)
-# Total:                 47 runs/week
+# This file carries the PEAK schedule (maximum slots).
+# pipeline_skip_check.py reads today's date and suppresses extra runs in
+# off-season, leaving only 3 runs/day near IST 08:00 / 14:00 / 20:00.
 #
-# skip_check (PHASE2_SKIP_MINUTES=45) prevents redundant back-to-back runs
-# when the queue is empty — extra slots cost only ~10 sec when idle.
+# Effective run counts (skip_check enforced):
+#   Peak weekday  : 6 daytime (08/11/14/17/20/22 IST) + overnight 03:00 = 7/day
+#   Peak Saturday : 5 daytime (08/11:30/14/16:30/20 IST) + overnight     = 6/day
+#   Peak Sunday   : 3 daytime (08/14/20 IST)                              = 3/day
+#   Off-season    : 3/day on ALL day types (skip_check window filter)
+#
+# Three-layer reliability (see InfraFix 3 in Concall_Extractor.txt):
+#   1. This dense cron schedule
+#   2. daily.yml backup trigger after Phase 1 (ACTIONS_PAT secret)
+#   3. Optional: cron-job.org external HTTP trigger every 2h
 #
 # UTC offsets (IST = UTC+5:30):
-#   10 IST = 04:30 UTC | 12 IST = 06:30 | 14 IST = 08:30 | 16 IST = 10:30
-#   18 IST = 12:30 UTC | 20 IST = 14:30 | 22 IST = 16:30 | 03 IST = 21:30 UTC (prev day)
+#   03 IST = 21:30 UTC (prev day)   08 IST = 02:30   11 IST = 05:30
+#   11:30 IST = 06:00               14 IST = 08:30   16:30 IST = 11:00
+#   17 IST = 11:30                  20 IST = 14:30   22 IST = 16:30
 
 on:
   schedule:
-    # Mon–Fri daytime: every 2h from 10:00 to 22:00 IST
-    - cron: '30 4,6,8,10,12,14,16 * * 1-5'   # IST 10/12/14/16/18/20/22
-    # Mon–Fri overnight: 03:00 IST (= 21:30 UTC on Sun–Thu)
-    - cron: '30 21 * * 0-4'
-    # Saturday: 10/12/14/16/18 IST
-    - cron: '30 4,6,8,10,12 * * 6'
-    # Sunday: 10/14 IST
-    - cron: '30 4,8 * * 0'
-  workflow_dispatch:            # manual trigger any time (bypasses skip check)
+    # ── Base slots (all days, year-round) — serve as off-season pattern ──
+    # IST 08:00 / 14:00 / 20:00  (UTC 02:30 / 08:30 / 14:30)
+    - cron: '30 2,8,14 * * *'
+
+    # ── Weekday peak extras (Mon–Fri) ──
+    # Adds IST 11:00 / 17:00 / 22:00  (UTC 05:30 / 11:30 / 16:30)
+    - cron: '30 5,11,16 * * 1-5'
+
+    # ── Saturday peak extras ──
+    # Adds IST 11:30 / 16:30  (UTC 06:00 / 11:00)
+    - cron: '0 6,11 * * 6'
+
+    # ── Overnight Mon–Sat: 03:00 IST ──
+    # (UTC 21:30 on Sun–Fri)
+    - cron: '30 21 * * 0-5'
+
+  workflow_dispatch:          # manual trigger (bypasses skip check)
   repository_dispatch:
-    types: [trigger-phase2]     # triggered by daily.yml via ACTIONS_PAT
+    types: [trigger-phase2]   # triggered by daily.yml via ACTIONS_PAT
 
 concurrency:
   group: phase2-pipeline
-  cancel-in-progress: false     # queue next run; never kill an active processing job
+  cancel-in-progress: false   # queue next run; never kill an active processing job
 
 jobs:
   phase2:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # concalls are universal — all must complete; peak season can take 60-90m
+    timeout-minutes: 180  # peak season can take 60-90 min; must not timeout
 
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +72,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
-      # ── Skip check ── reads Drive phase2_latest.json; sets skip=true if queue
-      # is empty AND last run was < 45 min ago. Prevents redundant back-to-back
-      # runs when multiple cron slots fire in quick succession or Phase 1 backup
-      # trigger fires while a run just finished. Bypassed on manual trigger.
-      # Fail-safe: Drive unreachable → skip=false (always proceed).
+      # ── Skip check ──────────────────────────────────────────────────────
+      # Peak season   : skip if queue empty AND last run < 45 min ago
+      # Off-season    : skip if outside IST 08/14/20 ±75 min windows;
+      #                 within windows, skip if queue empty AND age < 90 min
+      # workflow_dispatch: always bypasses (manual trigger forces run)
+      # Fail-safe: Drive unreachable → proceed
       - name: Skip check
         id: fresh
         if: github.event_name != 'workflow_dispatch'
@@ -97,26 +104,21 @@ jobs:
             echo "GEMINI_API_KEY=$GEMINI_API_KEY"
           } > .env
 
-      # Stage A: scrape new PDFs from Screener into Drive queue
       - name: Ingest company docs
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_company_docs.py
         continue-on-error: true
 
-      # Stage B: Screener HTML results table (no LLM — structured numbers)
       - name: Scrape results table
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/scrape_results_table.py
         continue-on-error: true
 
-      # Stage B: process pending docs through Gemini (priority order)
-      # Concall: universal — all companies, no portfolio filter, no time limit
       - name: Extract concalls
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/extract_concall.py
         continue-on-error: true
 
-      # Results / rating / presentation / annual_report: portfolio-filtered
       - name: Extract results PDFs
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/extract_results.py
@@ -137,13 +139,11 @@ jobs:
         run: python scripts/extract_annual_report.py
         continue-on-error: true
 
-      # Housekeeping: delete raw PDFs > 10d (daily digests kept forever)
       - name: Cleanup old docs
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/cleanup_company_docs.py
         continue-on-error: true
 
-      # Status snapshot — writes logs/health/phase2_latest.json for dashboard
       - name: Write Phase 2 status
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/write_phase2_status.py

@@ -1,32 +1,39 @@
 """
-pipeline_skip_check.py — skip guard for self-hosted runner.
+pipeline_skip_check.py — skip guard for Phase 1 and Phase 2 workflows.
 
 Called as the FIRST step of each workflow. Reads the latest pipeline
-status from Drive and decides whether the run should proceed or be
-skipped because work was already done recently.
+status from Drive and decides whether the run should proceed or be skipped.
 
-Phase 2 skip logic:
-  Skip if ALL of:
-    - phase2_latest.json exists on Drive
-    - last run was < PHASE2_SKIP_MINUTES ago
-    - queue pending count is 0
-  Reason: when the machine was off and multiple cron slots queued up,
-  the first run processes everything; the rest find an empty queue and
-  can exit immediately without wasting local compute.
+┌─────────────────────────────────────────────────────────────────────────┐
+│  PHASE 2 SEASONAL RUN STRATEGY                                          │
+│                                                                         │
+│  India Q-end results seasons (peak = more runs per day):                │
+│    Q3 FY:  17 Jan – 28 Feb   (quarter ended Dec)                        │
+│    Q4 FY:  17 Apr – 30 May   (quarter ended Mar; 60-day season)         │
+│    Q1 FY:  17 Jul – 30 Aug   (quarter ended Jun)                        │
+│    Q2 FY:  17 Oct – 30 Nov   (quarter ended Sep)                        │
+│                                                                         │
+│  Peak season:                                                           │
+│    phase2.yml runs 6–7×/day weekdays, 5–6× Sat, 3× Sun.               │
+│    skip threshold = 45 min (process as fast as the queue allows)        │
+│                                                                         │
+│  Off-season:                                                            │
+│    Runs are suppressed to 3/day for ALL day types.                      │
+│    Allowed windows: IST 08:00 ±75 min, 14:00 ±75 min, 20:00 ±75 min   │
+│    Runs outside those windows are skipped immediately.                   │
+│    Within a window, skip threshold = 90 min (one run per window max).   │
+│                                                                         │
+│  GitHub Actions scheduled jobs can be delayed 30–90 min.               │
+│  The ±75 min window radius absorbs those delays reliably.               │
+└─────────────────────────────────────────────────────────────────────────┘
 
-Phase 1 skip logic:
-  Skip if ALL of:
-    - logs/health/latest.json exists on Drive
-    - last run was today (same calendar date, IST)
-  Reason: Phase 1 is a daily pipeline; if it already ran today, a
-  second queued run (from a manual trigger or duplicate cron) is
-  redundant — data is already fresh.
+Phase 1 skip logic (unchanged):
+  Skip if last run was today (same calendar date, IST).
 
 Exit behaviour:
   - Writes skip=true  to $GITHUB_OUTPUT → caller skips pipeline steps
   - Writes skip=false to $GITHUB_OUTPUT → caller proceeds normally
-  - On any error (Drive unreachable, file missing, etc.) → skip=false
-    (fail safe: always proceed if we cannot confirm freshness)
+  - On any error (Drive unreachable, file missing) → skip=false (fail-safe)
 
 Usage:
     python scripts/pipeline_skip_check.py --pipeline phase2
@@ -49,22 +56,35 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-
-# Phase 2: skip if queue is empty AND last run was this recent
-PHASE2_SKIP_MINUTES = 45
-
-# Phase 1: skip if already ran today (same date in IST = UTC+5:30)
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
+# ── Seasonal configuration ────────────────────────────────────────────────────
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# India quarterly results seasons: (start_month, start_day, end_month, end_day)
+# All within a single calendar year (none cross Dec→Jan boundary).
+PEAK_SEASONS = [
+    (1, 17, 2, 28),    # Q3 FY: 17 Jan – 28 Feb  (dec quarter)
+    (4, 17, 5, 30),    # Q4 FY: 17 Apr – 30 May  (mar quarter; 60-day annual)
+    (7, 17, 8, 30),    # Q1 FY: 17 Jul – 30 Aug  (jun quarter)
+    (10, 17, 11, 30),  # Q2 FY: 17 Oct – 30 Nov  (sep quarter)
+]
+
+# Off-season: only allow runs within ±WINDOW_RADIUS_MIN of these IST hours
+OFFSEASON_WINDOW_HOURS_IST = [8, 14, 20]   # 3 designated daily slots
+OFFSEASON_WINDOW_RADIUS_MIN = 75           # ±75 min absorbs GitHub job delays
+
+# Skip thresholds: if queue is empty AND last run was this recent → skip
+PHASE2_PEAK_SKIP_MIN     = 45   # peak: process as fast as queue allows
+PHASE2_OFFSEASON_SKIP_MIN = 90   # off-season: at most 1 run per window
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
     print(f"[skip-check] {msg}")
 
 
 def write_output(skip: bool) -> None:
-    """Write skip=true/false to $GITHUB_OUTPUT (no-op if not in Actions)."""
     val = "true" if skip else "false"
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
@@ -78,7 +98,7 @@ def proceed() -> None:
     sys.exit(0)
 
 
-def skip(reason: str) -> None:
+def skip_run(reason: str) -> None:
     log(f"SKIPPING — {reason}")
     write_output(True)
     sys.exit(0)
@@ -125,9 +145,52 @@ def age_minutes(iso_ts: str) -> float:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 60
 
 
-# ── checks ───────────────────────────────────────────────────────────────────
+# ── seasonal helpers ──────────────────────────────────────────────────────────
+
+def _is_peak_season(ist_now: datetime) -> bool:
+    """Return True if ist_now falls within any India results season."""
+    m, d = ist_now.month, ist_now.day
+    for sm, sd, em, ed in PEAK_SEASONS:
+        after_start = (m > sm) or (m == sm and d >= sd)
+        before_end  = (m < em) or (m == em and d <= ed)
+        if after_start and before_end:
+            return True
+    return False
+
+
+def _in_offseason_window(ist_now: datetime) -> bool:
+    """Return True if ist_now is within ±OFFSEASON_WINDOW_RADIUS_MIN of a
+    designated off-season run slot (08:00, 14:00, 20:00 IST)."""
+    current_min = ist_now.hour * 60 + ist_now.minute
+    for target_hour in OFFSEASON_WINDOW_HOURS_IST:
+        target_min = target_hour * 60
+        if abs(current_min - target_min) <= OFFSEASON_WINDOW_RADIUS_MIN:
+            return True
+    return False
+
+
+# ── phase checks ─────────────────────────────────────────────────────────────
 
 def check_phase2(drive, folder_id: str) -> None:
+    ist_now  = datetime.now(timezone.utc) + IST_OFFSET
+    is_peak  = _is_peak_season(ist_now)
+    ist_str  = ist_now.strftime("%d %b %H:%M IST")
+    season_label = "PEAK" if is_peak else "off-season"
+
+    log(f"Season check: {season_label} ({ist_str})")
+
+    # Off-season gate: skip immediately if not in a designated run window
+    if not is_peak and not _in_offseason_window(ist_now):
+        return skip_run(
+            f"off-season ({ist_str}): outside designated windows "
+            f"(08:00 / 14:00 / 20:00 IST ±{OFFSEASON_WINDOW_RADIUS_MIN} min)"
+        )
+
+    # Choose skip threshold based on season
+    skip_minutes = PHASE2_PEAK_SKIP_MIN if is_peak else PHASE2_OFFSEASON_SKIP_MIN
+    log(f"Skip threshold: {skip_minutes} min ({'peak' if is_peak else 'in window'})")
+
+    # Read last run report from Drive
     logs_id   = find_sub(drive, folder_id, "logs")
     health_id = find_sub(drive, logs_id,   "health") if logs_id else None
     if not health_id:
@@ -139,19 +202,21 @@ def check_phase2(drive, folder_id: str) -> None:
         log("phase2_latest.json not found — proceeding")
         return proceed()
 
-    report = read_json(drive, fid)
+    report  = read_json(drive, fid)
     run_at  = report.get("run_at")
-    totals  = report.get("queue_totals", {})
-    pending = totals.get("pending", 1)   # default 1 → proceed if unknown
+    pending = report.get("queue_totals", {}).get("pending", 1)  # default 1 → proceed if unknown
 
     if not run_at:
         return proceed()
 
     age = age_minutes(run_at)
-    log(f"Phase 2 last ran {age:.1f} min ago, pending={pending}")
+    log(f"Last run: {age:.1f} min ago, pending={pending}")
 
-    if age < PHASE2_SKIP_MINUTES and pending == 0:
-        return skip(f"queue empty, last run {age:.0f}m ago (threshold {PHASE2_SKIP_MINUTES}m)")
+    if age < skip_minutes and pending == 0:
+        return skip_run(
+            f"queue empty, last run {age:.0f}m ago "
+            f"(threshold {skip_minutes}m, {season_label})"
+        )
 
     proceed()
 
@@ -174,21 +239,20 @@ def check_phase1(drive, folder_id: str) -> None:
     age = age_minutes(run_at)
     log(f"Phase 1 last ran {age:.1f} min ago")
 
-    # Skip only if it ran today (IST) — i.e. < 23h ago AND same IST date
     if age >= 23 * 60:
         return proceed()
 
-    dt_last = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+    dt_last   = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
     today_ist = (datetime.now(timezone.utc) + IST_OFFSET).date()
     last_ist  = (dt_last + IST_OFFSET).date()
 
     if last_ist == today_ist:
-        return skip(f"Phase 1 already ran today (IST) — {age:.0f}m ago")
+        return skip_run(f"Phase 1 already ran today (IST) — {age:.0f}m ago")
 
     proceed()
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser()
