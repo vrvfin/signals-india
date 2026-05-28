@@ -191,6 +191,48 @@ Split regex `r'\n---\n## concall_'` unchanged. Pre-feature Drive files work as-i
 
 ## OPEN TASKS — PENDING
 
+### Fix 2B — BSE Direct API as secondary ingestion source   ⏳ PENDING
+Problem (observed 2026-05-28): Screener's announcement filter is hard-capped at 25
+items per page and ?page= does not work (repeats page 1). In peak season (Q4 results
+especially), 30-50 concall transcripts can be uploaded in a single 2-hour window.
+Any company past position 25 in that window is NEVER ingested, regardless of run
+frequency. Run frequency is not a fix — even 30-min intervals are vulnerable when
+30+ companies file simultaneously at 9AM.
+
+Root cause: MAX_PAGES = 1 with comment "Screener feeds ignore ?page=". Confirmed
+by user (saw 4-5 companies in second page after 4h gap that would have been missed).
+
+Recommended fix: BSE Direct API as a secondary ingestion source (no auth required).
+
+BSE endpoint:
+  GET https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w
+  Params: strCat=-1, strPrevDate=YYYYMMDD, strToDate=YYYYMMDD, strType=C,
+          strSearch=P, strScrip=, subcategory=-1
+  Returns: JSON list of announcements with ISIN, scripcode, headline, attachments.
+  No pagination cap — returns ALL announcements in date range.
+
+Implementation plan:
+  File: scripts/ingest_company_docs.py — add _scrape_bse_api() function
+  1. At run start, read last run timestamp from phase2_latest.json
+     (or fall back to: now - lookback_hours).
+  2. Query BSE API for announcements from last_run_time to now.
+  3. Filter by headline: title contains "Transcript" / "Con Call" / "Earnings Call"
+     / "Concall" (case-insensitive).
+  4. Cross-reference returned ISIN against company_universe.csv → only keep matches.
+  5. For each match, build a row dict identical to what parse_feed_html() returns.
+  6. Merge into existing Screener-sourced rows, dedup by (doc_id, date).
+  7. Download PDF + enqueue same as Screener path.
+
+  NSE API: add later (more fragile, requires session cookies).
+
+  Short-term mitigation (low effort, add before BSE fix):
+  Add extra cron slots at 8:45 / 9:30 / 10:15 IST during peak season only,
+  specifically to catch the 9AM morning bulk-filing wave. These are the highest-
+  risk minutes of each peak weekday.
+
+Effort: medium (BSE API response format needs inspection first).
+Priority: HIGH — core coverage gap during peak season.
+
 ### OT3 — Mgmt said vs delivered tracker   ⏳ PENDING
 Ask: Since GF2 (historical guidance references) is now captured per concall,
 build a view comparing what management guided vs what they actually delivered.
