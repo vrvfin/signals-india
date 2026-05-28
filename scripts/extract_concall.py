@@ -349,6 +349,51 @@ def write_csv_exports(drive, index_id) -> None:
 #  Markdown output helpers                                             #
 # ------------------------------------------------------------------ #
 
+# Regex to detect the *(Run HH:MM IST)* suffix embedded in ## concall_N headings.
+# Used by _build_index_with_runs to reconstruct run grouping on every Index rebuild.
+_RUN_SUFFIX = re.compile(r'\s*\*\(Run (.+?)\)\*$')
+
+
+def _build_index_with_runs(entries: list[tuple[str, str]]) -> list[str]:
+    """Build the **Index:** body lines, grouping consecutive entries by run time.
+
+    entries: list of (number_str, full_heading_description).
+             Descriptions produced by append_day_page end with *(Run HH:MM IST)*.
+             Pre-feature entries without that suffix are shown ungrouped (no header).
+
+    Returns a flat list of strings ready for '\\n'.join().
+    Example output:
+        ['*Run 1 — 08:12 IST*',
+         '- concall_1: TCS · Tata Consultancy Services | Q4 FY26',
+         '*Run 2 — 11:05 IST*',
+         '- concall_2: INFY · Infosys | Q4 FY26']
+    """
+    # Parse each entry into (num, clean_description, run_ts)
+    parsed: list[tuple[str, str, str]] = []
+    for n, desc in entries:
+        m = _RUN_SUFFIX.search(desc)
+        rt = m.group(1) if m else ""
+        parsed.append((n, _RUN_SUFFIX.sub("", desc).strip(), rt))
+
+    # Collect run-time labels in order of first appearance (for numbering)
+    seen_rts: list[str] = []
+    for _, _, rt in parsed:
+        if rt and rt not in seen_rts:
+            seen_rts.append(rt)
+
+    lines: list[str] = []
+    current_rt = "__unset__"
+    for n, clean, rt in parsed:
+        if rt != current_rt:
+            if rt:
+                run_num = seen_rts.index(rt) + 1
+                lines.append(f"*Run {run_num} — {rt}*")
+            # empty rt = legacy entry written before this feature — no run header
+            current_rt = rt
+        lines.append(f"- concall_{n}: {clean}")
+    return lines
+
+
 def _day_filename(announcement_date: str) -> str:
     """Return e.g. 'concall_26_may2026.md' from '2026-05-26'."""
     try:
@@ -368,7 +413,8 @@ def _quarter_filename(quarter: str) -> str:
 
 
 def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
-                    company_name: str, quarter: str, content: str) -> None:
+                    company_name: str, quarter: str, content: str,
+                    run_time: str = "") -> None:
     """Append this company's analysis to the daily digest file in _daily/.
 
     File format (header rebuilt on every append):
@@ -377,14 +423,19 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
         *Total: 3 concalls — last updated 26 May 2026 14:30 IST*
 
         **Index:**
+        *Run 1 — 08:12 IST*
         - concall_1: TCS · Tata Consultancy Services | Q4 FY26
         - concall_2: RELIANCE · Reliance Industries | Q4 FY26
+        *Run 2 — 11:05 IST*
         - concall_3: INFY · Infosys | Q4 FY26
 
         ---
-        ## concall_1 — TCS · Tata Consultancy Services | Q4 FY26
+        ## concall_1 — TCS · Tata Consultancy Services | Q4 FY26 *(Run 08:12 IST)*
         ...content...
 
+    Run time is embedded in the ## heading as *(Run HH:MM IST)* for reconstruction
+    on subsequent appends. The Index shows a clean description under a run-group header.
+    Entries written before this feature have no suffix and appear ungrouped.
     Ctrl+F / search "concall_3" jumps directly to the third entry.
     The Index list and Total count are fully rewritten on every append.
     """
@@ -392,6 +443,11 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
     fname = _day_filename(announcement_date)
     now_str = datetime.now().strftime("%d %b %Y %H:%M")
     date_str = str(announcement_date)[:10]
+
+    # Description stored in ## heading includes run suffix (for index reconstruction).
+    # Index lines show the clean version; run group headers show the time.
+    entry_clean  = f"{symbol} · {company_name} | {quarter}"
+    entry_stored = f"{entry_clean} *(Run {run_time})*" if run_time else entry_clean
 
     fid = find_file(drive, daily_id, fname)
     if fid:
@@ -402,10 +458,10 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
         )
         new_num = len(existing_entries) + 1
 
-        index_lines = [f"- concall_{n}: {desc}" for n, desc in existing_entries]
-        index_lines.append(
-            f"- concall_{new_num}: {symbol} · {company_name} | {quarter}"
-        )
+        # Build index including the new entry; _build_index_with_runs groups by run
+        all_entries = existing_entries + [(str(new_num), entry_stored)]
+        index_lines = _build_index_with_runs(all_entries)
+
         total = (f"*Total: {new_num} concall{'s' if new_num != 1 else ''}"
                  f" — last updated {now_str} IST*")
         new_header = (
@@ -424,22 +480,25 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
 
         new_entry = (
             f"\n---\n"
-            f"## concall_{new_num} — {symbol} · {company_name} | {quarter}\n\n"
+            f"## concall_{new_num} — {entry_stored}\n\n"
             + content
         )
         upload_bytes(drive, daily_id, fname,
                      (new_header + entries_part + new_entry).encode("utf-8"),
                      "text/markdown", existing_id=fid)
     else:
+        # First entry of the day — write fresh file
+        index_run_header = f"*Run 1 — {run_time}*\n" if run_time else ""
         header = (
             f"# Daily Concall Digest — {date_str}\n"
             f"*Total: 1 concall — last updated {now_str} IST*\n\n"
             f"**Index:**\n"
-            f"- concall_1: {symbol} · {company_name} | {quarter}\n"
+            f"{index_run_header}"
+            f"- concall_1: {entry_clean}\n"
         )
         entry = (
             f"\n---\n"
-            f"## concall_1 — {symbol} · {company_name} | {quarter}\n\n"
+            f"## concall_1 — {entry_stored}\n\n"
             + content
         )
         upload_bytes(drive, daily_id, fname,
@@ -1066,6 +1125,10 @@ def main() -> None:
 
     counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0, "gf3": 0, "gf4": 0}
 
+    # Fixed run-time label for this execution — used to group today's digest entries
+    # by run (Run 1 / Run 2 / …) so the user can see what each scheduled slot added.
+    run_time = datetime.now().strftime("%H:%M IST")
+
     for queue_idx in pending_idx:
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
@@ -1132,6 +1195,7 @@ def main() -> None:
                     company_name=str(row.get("company_name", "")),
                     quarter=quarter,
                     content=markdown_text,
+                    run_time=run_time,
                 )
 
             # 5c. Quarterly guidance tracker

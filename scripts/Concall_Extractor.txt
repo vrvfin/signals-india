@@ -17,7 +17,7 @@ B/C/E1 (growth drivers, management commentary, forward visibility).
 
 ## SESSION: 2026-05-26 — Operational setup + prompt review
 
-### Fix 1 — MP3 dedup / date-based queue filtering   ⏳ PENDING
+### Fix 1 — MP3 dedup / date-based queue filtering   ✅ DONE
 Problem: Some companies upload an MP3 first; transcript PDF comes a day later.
 Same company-doc appears twice in the queue. Current queue dedup is by
 content-hash only, not by (company × date).
@@ -26,6 +26,14 @@ same company arrives on 12-Jan, treat as a new document and process both.
 Filter should be: (isin × doc_type × received_date) → only reprocess if
 received_date differs.
 File to change: ingest_company_docs.py
+
+Delivered (2026-05-28):
+  Dedup key changed from `doc_id` alone to `f"{doc_id}__{announcement_date[:10]}"`.
+  `known_keys` set built as (doc_id + "__" + announcement_date[:10]) composite.
+  Same URL reappearing on a different date is now treated as a new document and
+  processed. MP3-then-PDF scenario: both entries have different dates → both queue.
+  Backward compatible: existing queue rows retain their old dedup key on reload
+  (announcement_date is already stored in the parquet).
 
 ### Fix 2 — Seasonal Phase 2 frequency tuning   ✅ DONE
 Problem: Phase 2 ran 29×/week flat. Concall seasons have up to 100 uploads/day
@@ -76,12 +84,20 @@ are explicitly excluded from cleanup. 90-day ask is superseded — better.
 Ask: Each run should group its concalls under a run label (Run1_concall_XXX).
 If code runs 5 times in a day, the latest run's entries appear first and
 user can stop at the previous run marker.
-Delivered: Daily digest uses numbered entries (concall_1, concall_2 … concall_N)
-with a live **Index:** list and *Total: N concalls — last updated HH:MM IST*
-header rebuilt on every append. Searching "concall_30" jumps to entry 30.
-Note: Per-run grouping label (Run1/Run2 block separator) not yet added — the
-current sequential numbering across runs is live. Full run-block separator
-is deferred as low priority.
+Delivered (2026-05-28 — per-run grouping completed):
+  Daily digest Index now groups entries under run-time headers:
+    *Run 1 — 08:12 IST*
+    - concall_1: TCS · Tata Consultancy Services | Q4 FY26
+    *Run 2 — 11:05 IST*
+    - concall_2: INFY · Infosys | Q4 FY26
+  Implementation:
+    - `run_time = datetime.now().strftime("%H:%M IST")` set once at start of main()
+    - Entry headings store run_time as `*(Run HH:MM IST)*` suffix for reconstruction
+    - `_build_index_with_runs()` helper groups entries by run on every Index rebuild
+    - Clean display (no suffix) in index lines; run group header shows time
+    - Backward compatible: entries without suffix (pre-feature files) shown ungrouped
+    - Split regex `\n---\n## concall_` unchanged; entry heading format unchanged
+  Searching "concall_30" still jumps to entry 30 within any run group.
 
 ### OT1 — Review concall_prompt.txt for quality + clarity   ✅ DONE
 Review done (2026-05-27). Issues found and fixed:
@@ -146,6 +162,33 @@ Delivered (extract_concall.py rewrite, committed 2026-05-28):
 
 ---
 
+---
+
+## SESSION: 2026-05-28 (continued) — Fix 1 + InfraFix 1 / Confirmation 1
+
+### Fix 1 delivered — MP3 dedup in ingest_company_docs.py   ✅ DONE
+File: scripts/ingest_company_docs.py  (lines ~318, ~348, ~371)
+Change: dedup key was `doc_id` alone → now `f"{doc_id}__{announcement_date[:10]}"`.
+`known_keys` set built from composite; dedup check and set-add use `dedup_key`.
+Effect: same Screener announcement URL reappearing on a different date is ingested
+as a new document. MP3 on day 1 + PDF on day 2 → both queued + processed.
+
+### InfraFix 1 / Confirmation 1 delivered — run-block separator   ✅ DONE
+File: scripts/extract_concall.py
+New helper: _RUN_SUFFIX regex + _build_index_with_runs() before append_day_page().
+New param: run_time: str = "" on append_day_page().
+In main(): run_time = datetime.now().strftime("%H:%M IST") before loop.
+Entry headings: now embed *(Run HH:MM IST)* suffix for reconstruction.
+Index: _build_index_with_runs groups entries by run_time, inserts *Run N — HH:MM IST*
+       section headers. Clean display in index lines.
+Backward compat: old entries without suffix shown ungrouped; split regex unchanged.
+
+Risk assessment (low): heading format ## concall_N — desc *(Run HH:MM IST)* still
+matches existing parse regex `r'^## concall_(\d+) — (.+)$'` (captures everything).
+Split regex `r'\n---\n## concall_'` unchanged. Pre-feature Drive files work as-is.
+
+---
+
 ## OPEN TASKS — PENDING
 
 ### OT3 — Mgmt said vs delivered tracker   ⏳ PENDING
@@ -204,16 +247,12 @@ Dependency: OT7 must be built first.
 
 ## OPEN INFRASTRUCTURE FIXES — PENDING
 
-### InfraFix 1 — Run-block separator in daily digest   ⏳ PENDING (low priority)
-Current state: concall_N numbering is sequential across all runs in a day.
-Ask: Group entries by run (Run1: concall_1…concall_8 | Run2: concall_9…) so
-user can quickly identify what each scheduled run added. Add "Run1_concall_X"
-style markers to the index.
-File: scripts/extract_concall.py → append_day_page()
+### InfraFix 1 — Run-block separator in daily digest   ✅ DONE
+(Same as Confirmation 1 above — delivered together 2026-05-28.
+ See Confirmation 1 for full delivery notes.)
 
-### InfraFix 2 — Phase 2 seasonal frequency scheduling   ⏳ PENDING
-(Same as Fix 2 above — Q-end seasons need higher run frequency.)
-Estimated effort: medium. Requires cron table changes + date-range logic.
+### InfraFix 2 — Phase 2 seasonal frequency scheduling   ✅ DONE
+(Same as Fix 2 above — delivered 2026-05-28. See Fix 2 for full delivery notes.)
 
 ### InfraFix 3 — Phase 2 run reliability (scheduled jobs not firing)   ✅ DONE
 Problem: GitHub Actions scheduled jobs are queued, not guaranteed. Peak-load

@@ -315,7 +315,16 @@ def main() -> None:
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
 
     queue = load_queue(drive, index_id)
-    known_ids = set(queue["doc_id"].astype(str)) if not queue.empty else set()
+    # Dedup key: (doc_id, announcement_date) — not just doc_id.
+    # Same URL reappearing on a different date (e.g. MP3 on day 1, PDF on day 2)
+    # is treated as a new document and processed independently.
+    if not queue.empty:
+        known_keys: set[str] = set(
+            queue["doc_id"].astype(str) + "__"
+            + queue["announcement_date"].astype(str).str[:10]
+        )
+    else:
+        known_keys = set()
     sym2isin = load_symbol_isin_map(drive, index_id)
     log(f"Queue has {len(queue)} existing rows · universe map: {len(sym2isin)} symbols")
 
@@ -345,7 +354,8 @@ def main() -> None:
                 else:
                     counts["skipped_old"] += 1
                     continue
-                if a["doc_id"] in known_ids:
+                dedup_key = f"{a['doc_id']}__{str(a['announcement_date'])[:10]}"
+                if dedup_key in known_keys:
                     counts["dup"] += 1
                     continue
 
@@ -368,7 +378,7 @@ def main() -> None:
                     log(f"  + {a['symbol']:<14} {a['doc_type']:<14} "
                         f"{a['announcement_date']}")
 
-                known_ids.add(a["doc_id"])
+                known_keys.add(dedup_key)
                 new_rows.append({
                     "doc_id": a["doc_id"], "key": key, "isin": isin,
                     "symbol": a["symbol"], "company_name": a["company_name"],
