@@ -6,6 +6,24 @@ through Gemini (File API), extracts structured quarterly facts and guidance into
 parquet tables, appends a markdown brief to the company's company_page.md, and
 marks queue rows done.
 
+Outputs per processed concall
+  1. company_repo/<key>/company_page.md             — per-company brief (cumulative)
+  2. company_repo/_daily/concall_DD_MMMYYYY.md      — daily digest with index
+  3. company_repo/_quarterly/QXFY_mgmt_guidance.md  — quarterly guidance tracker
+  4. company_repo/_index/quarterly_facts.parquet    — actuals (Table_A)
+     company_repo/_index/guidance_tracker.parquet   — Table_A guidance rows
+     company_repo/_index/gf1_guidance_statements.parquet  — raw forward stmts
+     company_repo/_index/gf2_historical_guidance.parquet  — past guidance vs actuals
+     company_repo/_index/gf3_operational_visibility.parquet
+     company_repo/_index/gf4_quality_flags.parquet
+
+CSV snapshots written once per run (overwrite):
+     company_repo/_index/gf1_guidance_statements.csv
+     company_repo/_index/gf2_historical_guidance.csv
+     company_repo/_index/gf3_operational_visibility.csv
+     company_repo/_index/gf4_quality_flags.csv
+     company_repo/_index/guidance_tracker.csv
+
 On Gemini 429 with all keys exhausted: stops cleanly (exit 0) so the next
 scheduled run resumes from remaining pending rows.
 
@@ -39,11 +57,16 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 GEMINI_MODEL = "gemini-2.5-flash"
 
+# Minimum seconds to sleep between consecutive Gemini calls.
+# Keeps us at ≤10 calls/min per key, eliminating most RPM 429 cascades.
+INTER_CALL_SLEEP = 6
+
 # ---- Output toggles ----
-OUTPUT_COMPANY_MD   = True   # append to company_repo/<ISIN>/company_page.md
-OUTPUT_DAY_MD       = True   # append to company_repo/_daily/concall_DD_MMMYYYY.md
-OUTPUT_COMPANY_DOCX = False  # .docx alongside company_page.md  [Stage C]
-OUTPUT_DAY_DOCX     = False  # .docx alongside day page          [Stage C]
+OUTPUT_COMPANY_MD          = True   # append to company_repo/<ISIN>/company_page.md
+OUTPUT_DAY_MD              = True   # append to company_repo/_daily/concall_DD_MMMYYYY.md
+OUTPUT_QUARTERLY_MD        = True   # append to company_repo/_quarterly/QXFY_mgmt_guidance.md
+OUTPUT_GF_PARQUETS         = True   # write GF1-4 parquets to _index/
+OUTPUT_GF_CSV              = True   # write CSV snapshots at end of run
 
 
 def log(msg: str) -> None:
@@ -51,7 +74,7 @@ def log(msg: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-#  Drive helpers  (same pattern as ingest_company_docs.py)            #
+#  Drive helpers                                                       #
 # ------------------------------------------------------------------ #
 
 def get_drive():
@@ -60,7 +83,6 @@ def get_drive():
     cs_path = Path(os.environ["GDRIVE_OAUTH_CLIENT_SECRET_PATH"])
     cred_data = json.loads(cs_path.read_text())
 
-    # Service account key — no browser flow needed
     if cred_data.get("type") == "service_account":
         from google.oauth2 import service_account
         creds = service_account.Credentials.from_service_account_file(
@@ -68,16 +90,13 @@ def get_drive():
         )
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # Saved OAuth token (Credentials.to_json() format) — has refresh_token directly
     if "refresh_token" in cred_data:
         creds = Credentials.from_authorized_user_file(str(cs_path), SCOPES)
         if not creds.valid:
             creds.refresh(Request())
-            # Persist refreshed token back to the same file
             cs_path.write_text(creds.to_json())
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # Standard OAuth installed-app flow (proper client_secrets.json)
     token_path = Path(os.environ["GDRIVE_OAUTH_TOKEN_PATH"])
     creds = None
     if token_path.exists():
@@ -171,7 +190,7 @@ def save_queue(drive, index_id, df: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------ #
-#  Parquet schemas and upsert helpers                                  #
+#  Parquet schemas                                                     #
 # ------------------------------------------------------------------ #
 
 QFACTS_COLS = [
@@ -186,6 +205,42 @@ GUIDANCE_COLS = [
     "processed_at", "source_doc_id",
 ]
 
+# GF1 — Raw forward-looking statements (exact text from transcript)
+GF1_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "statement_id", "exact_statement", "metric_type", "timeframe",
+    "explicitness_type", "quantifiable", "numeric_value", "range_val",
+    "operational_anchor", "supporting_evidence",
+    "processed_at", "source_doc_id",
+]
+
+# GF2 — Historical guidance vs actuals
+GF2_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "financial_qtr", "historical_reference", "original_guidance",
+    "actual_mentioned_outcome", "context_source", "management_self_assessment",
+    "processed_at", "source_doc_id",
+]
+
+# GF3 — Operational visibility drivers
+GF3_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "visibility_driver", "evidence_type", "timeframe",
+    "quantified", "commentary",
+    "processed_at", "source_doc_id",
+]
+
+# GF4 — Guidance quality flags
+GF4_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "flag_type", "evidence",
+    "processed_at", "source_doc_id",
+]
+
+
+# ------------------------------------------------------------------ #
+#  Parquet helpers                                                     #
+# ------------------------------------------------------------------ #
 
 def _load_parquet(drive, index_id, filename, cols) -> pd.DataFrame:
     fid = find_file(drive, index_id, filename)
@@ -239,8 +294,59 @@ def upsert_guidance(drive, index_id, guidance_rows: list[dict]) -> None:
     _save_parquet(drive, index_id, "guidance_tracker.parquet", df)
 
 
+def _upsert_gf(drive, index_id, filename: str, cols: list, rows: list[dict]) -> None:
+    """Generic GF table upsert: delete existing rows for this source_doc_id, append new."""
+    if not rows:
+        return
+    df = _load_parquet(drive, index_id, filename, cols)
+    source_doc_id = str(rows[0].get("source_doc_id", ""))
+    if source_doc_id:
+        df = df[df["source_doc_id"].astype(str) != source_doc_id]
+    new_df = pd.DataFrame([{c: r.get(c) for c in cols} for r in rows])
+    df = pd.concat([df, new_df], ignore_index=True)
+    _save_parquet(drive, index_id, filename, df)
+
+
+def upsert_gf1(drive, index_id, rows: list[dict]) -> None:
+    _upsert_gf(drive, index_id, "gf1_guidance_statements.parquet", GF1_COLS, rows)
+
+
+def upsert_gf2(drive, index_id, rows: list[dict]) -> None:
+    _upsert_gf(drive, index_id, "gf2_historical_guidance.parquet", GF2_COLS, rows)
+
+
+def upsert_gf3(drive, index_id, rows: list[dict]) -> None:
+    _upsert_gf(drive, index_id, "gf3_operational_visibility.parquet", GF3_COLS, rows)
+
+
+def upsert_gf4(drive, index_id, rows: list[dict]) -> None:
+    _upsert_gf(drive, index_id, "gf4_quality_flags.parquet", GF4_COLS, rows)
+
+
+def write_csv_exports(drive, index_id) -> None:
+    """Write CSV snapshots of all guidance parquets to Drive. Called once per run."""
+    exports = [
+        ("guidance_tracker.parquet",         "guidance_tracker.csv",         GUIDANCE_COLS),
+        ("gf1_guidance_statements.parquet",  "gf1_guidance_statements.csv",  GF1_COLS),
+        ("gf2_historical_guidance.parquet",  "gf2_historical_guidance.csv",  GF2_COLS),
+        ("gf3_operational_visibility.parquet","gf3_operational_visibility.csv",GF3_COLS),
+        ("gf4_quality_flags.parquet",        "gf4_quality_flags.csv",        GF4_COLS),
+    ]
+    for pq_name, csv_name, cols in exports:
+        try:
+            df = _load_parquet(drive, index_id, pq_name, cols)
+            if df.empty:
+                continue
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            fid = find_file(drive, index_id, csv_name)
+            upload_bytes(drive, index_id, csv_name, csv_bytes, "text/csv", existing_id=fid)
+            log(f"  CSV export: {csv_name} ({len(df)} rows)")
+        except Exception as e:
+            log(f"  WARNING: CSV export failed for {csv_name}: {str(e)[:80]}")
+
+
 # ------------------------------------------------------------------ #
-#  company_page.md helper                                              #
+#  Markdown output helpers                                             #
 # ------------------------------------------------------------------ #
 
 def _day_filename(announcement_date: str) -> str:
@@ -250,6 +356,15 @@ def _day_filename(announcement_date: str) -> str:
         return f"concall_{dt.day:02d}_{dt.strftime('%b').lower()}{dt.year}.md"
     except Exception:
         return f"concall_{str(announcement_date)[:10].replace('-', '_')}.md"
+
+
+def _quarter_filename(quarter: str) -> str:
+    """Return e.g. 'Q4_FY26_mgmt_guidance.md' from 'Q4 FY26'."""
+    if not quarter:
+        return "QX_FYxx_mgmt_guidance.md"
+    safe = re.sub(r"\s+", "_", quarter.strip())
+    safe = re.sub(r"[^A-Za-z0-9_]", "", safe)
+    return f"{safe}_mgmt_guidance.md"
 
 
 def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
@@ -270,10 +385,6 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
         ## concall_1 — TCS · Tata Consultancy Services | Q4 FY26
         ...content...
 
-        ---
-        ## concall_3 — INFY · Infosys | Q4 FY26
-        ...content...
-
     Ctrl+F / search "concall_3" jumps directly to the third entry.
     The Index list and Total count are fully rewritten on every append.
     """
@@ -286,13 +397,11 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
     if fid:
         existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
 
-        # Parse all existing numbered headings: [('1', 'TCS · Company | Q4 FY26'), ...]
         existing_entries = re.findall(
             r'^## concall_(\d+) — (.+)$', existing, re.MULTILINE
         )
         new_num = len(existing_entries) + 1
 
-        # Build index list (all previous + the new one being added)
         index_lines = [f"- concall_{n}: {desc}" for n, desc in existing_entries]
         index_lines.append(
             f"- concall_{new_num}: {symbol} · {company_name} | {quarter}"
@@ -307,13 +416,10 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
             + "\n"
         )
 
-        # Split at the first numbered entry separator to keep entry content intact
         split_match = re.search(r'\n---\n## concall_', existing)
         if split_match:
-            # New-format file — replace header, keep all entry content
             entries_part = existing[split_match.start():]
         else:
-            # Old-format file (no numbered entries yet) — keep as-is, append only
             entries_part = "\n\n" + existing.lstrip("# \n")
 
         new_entry = (
@@ -325,7 +431,6 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
                      (new_header + entries_part + new_entry).encode("utf-8"),
                      "text/markdown", existing_id=fid)
     else:
-        # Brand new file
         header = (
             f"# Daily Concall Digest — {date_str}\n"
             f"*Total: 1 concall — last updated {now_str} IST*\n\n"
@@ -363,6 +468,70 @@ def append_company_page(drive, repo_id, key: str, content: str,
                      initial.encode("utf-8"), "text/markdown")
 
 
+def append_quarterly_guidance_page(drive, repo_id, symbol: str, company_name: str,
+                                   quarter: str, guidance_content: str) -> None:
+    """Append compact guidance summary to the quarterly guidance tracker.
+
+    File: company_repo/_quarterly/Q4_FY26_mgmt_guidance.md
+    Format: indexed like daily digest, one entry per company.
+    Contains: Table_A + GF1 + GF4 + A-3 summary extracted from full response.
+    """
+    if not quarter:
+        return
+    quarterly_id = get_or_create_subfolder(drive, repo_id, "_quarterly")
+    fname = _quarter_filename(quarter)
+    now_str = datetime.now().strftime("%d %b %Y %H:%M")
+
+    fid = find_file(drive, quarterly_id, fname)
+    if fid:
+        existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+
+        existing_entries = re.findall(
+            r'^## co_(\d+) — (.+)$', existing, re.MULTILINE
+        )
+        new_num = len(existing_entries) + 1
+
+        index_lines = [f"- co_{n}: {desc}" for n, desc in existing_entries]
+        index_lines.append(f"- co_{new_num}: {symbol} · {company_name}")
+        total = (f"*Total: {new_num} compan{'ies' if new_num != 1 else 'y'}"
+                 f" — last updated {now_str} IST*")
+        new_header = (
+            f"# {quarter} Management Guidance Tracker\n"
+            f"{total}\n\n"
+            f"**Index:**\n"
+            + "\n".join(index_lines)
+            + "\n"
+        )
+
+        split_match = re.search(r'\n---\n## co_', existing)
+        entries_part = existing[split_match.start():] if split_match else (
+            "\n\n" + existing.lstrip("# \n")
+        )
+
+        new_entry = (
+            f"\n---\n"
+            f"## co_{new_num} — {symbol} · {company_name}\n\n"
+            + guidance_content
+        )
+        upload_bytes(drive, quarterly_id, fname,
+                     (new_header + entries_part + new_entry).encode("utf-8"),
+                     "text/markdown", existing_id=fid)
+    else:
+        header = (
+            f"# {quarter} Management Guidance Tracker\n"
+            f"*Total: 1 company — last updated {now_str} IST*\n\n"
+            f"**Index:**\n"
+            f"- co_1: {symbol} · {company_name}\n"
+        )
+        entry = (
+            f"\n---\n"
+            f"## co_1 — {symbol} · {company_name}\n\n"
+            + guidance_content
+        )
+        upload_bytes(drive, quarterly_id, fname,
+                     (header + entry).encode("utf-8"), "text/markdown")
+
+
 # ------------------------------------------------------------------ #
 #  Gemini key pool with round-robin rotation on 429                   #
 # ------------------------------------------------------------------ #
@@ -381,10 +550,19 @@ class GeminiKeyPool:
     def __init__(self, api_keys: list[str]):
         self.keys = api_keys
         self.idx = 0
+        self._last_call_ts: float = 0.0
 
     def call(self, pdf_bytes: bytes, prompt: str, display_name: str) -> str:
-        """Generate content using inline PDF bytes. Rotates keys on 429."""
+        """Generate content using inline PDF bytes. Rotates keys on 429.
+
+        Enforces INTER_CALL_SLEEP between consecutive calls to stay within RPM.
+        """
         import base64
+        # Enforce minimum gap between calls (RPM protection)
+        elapsed = time.time() - self._last_call_ts
+        if elapsed < INTER_CALL_SLEEP and self._last_call_ts > 0:
+            time.sleep(INTER_CALL_SLEEP - elapsed)
+
         b64 = base64.standard_b64encode(pdf_bytes).decode()
         backoff = 30
         total_attempts = len(self.keys)
@@ -407,6 +585,7 @@ class GeminiKeyPool:
                     ],
                     config=genai_types.GenerateContentConfig(temperature=0.1),
                 )
+                self._last_call_ts = time.time()
                 self.idx = (self.idx + 1) % len(self.keys)
                 return response.text
             except Exception as exc:
@@ -431,15 +610,10 @@ class GeminiKeyPool:
 # ------------------------------------------------------------------ #
 
 def _extract_md_tables(text: str) -> list[dict]:
-    """Return list of {headers: [...], rows: [[...], ...]} from all tables in text.
-
-    Handles both fenced tables (leading |) and unfenced (cells separated by |
-    without a leading pipe), which is what Gemini typically outputs.
-    """
+    """Return list of {headers: [...], rows: [[...], ...]} from all tables in text."""
     text = text.replace("||", "|")
 
     def _is_sep(line: str) -> bool:
-        """True for markdown separator rows like '--- | --- | ---'."""
         parts = [p.strip() for p in line.strip("|").split("|")]
         return bool(parts) and all(re.match(r"^[\-:\s]+$", p) for p in parts if p)
 
@@ -479,6 +653,28 @@ def _extract_md_tables(text: str) -> list[dict]:
     return tables
 
 
+def _find_section_table(text: str, *patterns: str) -> dict | None:
+    """Find the first markdown table appearing after any of the given regex patterns."""
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if not m:
+            continue
+        after = text[m.start():]
+        tables = _extract_md_tables(after)
+        if tables:
+            return tables[0]
+    return None
+
+
+def _find_section_text(text: str, *patterns: str, max_chars: int = 4000) -> str:
+    """Return up to max_chars of text starting from the first matching pattern."""
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return text[m.start(): m.start() + max_chars]
+    return ""
+
+
 def _clean_val(s: str) -> str:
     v = (s or "").strip()
     return v if v and v not in ("-", "–", "") else "NA"
@@ -516,10 +712,192 @@ def _identify_metric(label: str) -> str | None:
     return None
 
 
+# ------------------------------------------------------------------ #
+#  GF section parsers                                                  #
+# ------------------------------------------------------------------ #
+
+def _norm_header(h: str) -> str:
+    """Normalise a table header to a Python identifier for mapping."""
+    return re.sub(r"\W+", "_", h.strip().lower()).strip("_")
+
+
+def _parse_gf_table(table: dict | None, col_map: dict,
+                    fixed: dict) -> list[dict]:
+    """Convert a parsed markdown table → list of row dicts using col_map.
+
+    col_map: {normalised_header_str → schema_column_name}
+    fixed:   values always injected (isin, symbol, company_name, quarter, ...)
+    """
+    if not table:
+        return []
+    hdrs = [_norm_header(h) for h in table["headers"]]
+    rows = []
+    for cells in table["rows"]:
+        row_dict = dict(fixed)
+        for i, hdr in enumerate(hdrs):
+            if i < len(cells):
+                mapped = col_map.get(hdr)
+                if mapped:
+                    row_dict[mapped] = _clean_val(cells[i])
+        rows.append(row_dict)
+    return rows
+
+
+# GF1 header → schema column mapping
+_GF1_MAP = {
+    "company_name":       "company_name",
+    "current_qtr":        "quarter",
+    "statement_id":       "statement_id",
+    "exact_statement":    "exact_statement",
+    "metric_type":        "metric_type",
+    "timeframe":          "timeframe",
+    "explicitness_type":  "explicitness_type",
+    "quantifiable":       "quantifiable",
+    "numeric_value":      "numeric_value",
+    "range":              "range_val",
+    "operational_anchor": "operational_anchor",
+    "supporting_evidence":"supporting_evidence",
+}
+
+# GF2 header → schema column mapping
+_GF2_MAP = {
+    "company_name":              "company_name",
+    "financial_qtr":             "financial_qtr",
+    "historical_reference":      "historical_reference",
+    "original_guidance":         "original_guidance",
+    "actual_mentioned_outcome":  "actual_mentioned_outcome",
+    "context_source":            "context_source",
+    "management_self_assessment":"management_self_assessment",
+}
+
+# GF3 header → schema column mapping
+_GF3_MAP = {
+    "company_name":      "company_name",
+    "financial_qtr":     "quarter",
+    "visibility_driver": "visibility_driver",
+    "evidence_type":     "evidence_type",
+    "timeframe":         "timeframe",
+    "quantified":        "quantified",
+    "commentary":        "commentary",
+}
+
+# GF4 header → schema column mapping
+_GF4_MAP = {
+    "company_name":  "company_name",
+    "financial_qtr": "quarter",
+    "flag_type":     "flag_type",
+    "evidence":      "evidence",
+}
+
+
+def parse_gf_sections(
+    text: str, row: pd.Series, quarter: str, now_str: str
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Extract GF1–GF4 rows from the full Gemini markdown response.
+
+    Returns (gf1_rows, gf2_rows, gf3_rows, gf4_rows).
+    """
+    isin = str(row.get("isin") or "")
+    symbol = str(row.get("symbol") or "")
+    company_name = str(row.get("company_name") or "")
+    source_doc_id = str(row.get("doc_id") or "")
+
+    fixed = {
+        "isin": isin, "symbol": symbol, "company_name": company_name,
+        "quarter": quarter, "processed_at": now_str, "source_doc_id": source_doc_id,
+    }
+
+    # GF1
+    gf1_tbl = _find_section_table(
+        text,
+        r"Section\s+GF1", r"GF1\s*[—–\-]", r"Raw\s+Guidance\s+Extraction"
+    )
+    gf1_rows = _parse_gf_table(gf1_tbl, _GF1_MAP, fixed)
+
+    # GF2
+    gf2_tbl = _find_section_table(
+        text,
+        r"Section\s+GF2", r"GF2\s*[—–\-]", r"Historical\s+Guidance\s+References"
+    )
+    gf2_rows = _parse_gf_table(gf2_tbl, _GF2_MAP, fixed)
+
+    # GF3
+    gf3_tbl = _find_section_table(
+        text,
+        r"Section\s+GF3", r"GF3\s*[—–\-]", r"Operational\s+Visibility\s+Extraction"
+    )
+    gf3_rows = _parse_gf_table(gf3_tbl, _GF3_MAP, fixed)
+
+    # GF4
+    gf4_tbl = _find_section_table(
+        text,
+        r"Section\s+GF4", r"GF4\s*[—–\-]", r"Guidance\s+Quality\s+Flags"
+    )
+    gf4_rows = _parse_gf_table(gf4_tbl, _GF4_MAP, fixed)
+
+    return gf1_rows, gf2_rows, gf3_rows, gf4_rows
+
+
+def build_quarterly_guidance_content(text: str, symbol: str, company_name: str,
+                                     quarter: str) -> str:
+    """Extract compact guidance summary for the quarterly tracker.
+
+    Pulls: A-3 summary + Table_A + GF1 + GF4 sections.
+    Falls back to first 3,000 chars if no sections found.
+    """
+    parts = []
+
+    # A-3 key guidance summary
+    a3 = _find_section_text(
+        text,
+        r"A-3\)", r"A[\-\s]3\b", r"forward\s+guidance.*summary",
+        r"Key\s+Forward\s+Guidance",
+        max_chars=600
+    )
+    if a3:
+        parts.append("#### Key Forward Guidance (A-3)\n" + a3.strip())
+
+    # Table_A financial grid
+    ta = _find_section_text(
+        text,
+        r"Table_A", r"Table\s+A\b", r"Unified\s+Financial",
+        r"Financial\s+Intelligence",
+        max_chars=2500
+    )
+    if ta:
+        parts.append("#### Financial Grid (Table_A)\n" + ta.strip())
+
+    # GF1 raw guidance
+    gf1 = _find_section_text(
+        text,
+        r"Section\s+GF1", r"GF1\s*[—–\-]", r"Raw\s+Guidance\s+Extraction",
+        max_chars=3000
+    )
+    if gf1:
+        parts.append("#### GF1 — Raw Guidance Statements\n" + gf1.strip())
+
+    # GF4 quality flags
+    gf4 = _find_section_text(
+        text,
+        r"Section\s+GF4", r"GF4\s*[—–\-]", r"Guidance\s+Quality\s+Flags",
+        max_chars=1500
+    )
+    if gf4:
+        parts.append("#### GF4 — Guidance Quality Flags\n" + gf4.strip())
+
+    if parts:
+        return "\n\n".join(parts)
+    return text[:3000] + "\n\n*(truncated — full analysis in company_page.md)*"
+
+
+# ------------------------------------------------------------------ #
+#  Main Gemini response parser (Table_A + guidance rows)              #
+# ------------------------------------------------------------------ #
+
 def parse_gemini_response(
     text: str, row: pd.Series
 ) -> tuple[dict, list[dict]]:
-    """Parse Gemini markdown response into (quarterly_facts dict, guidance_rows list)."""
+    """Parse Gemini markdown → (quarterly_facts dict, guidance_rows list) from Table_A."""
     now_str = datetime.now().isoformat(timespec="seconds")
     isin = str(row.get("isin") or "")
     symbol = str(row.get("symbol") or "")
@@ -544,7 +922,6 @@ def parse_gemini_response(
     t1 = tables[0]
     hdrs = t1["headers"]
 
-    # Locate quarter column: first header matching Q\d FY\d+
     q_col = next((i for i, h in enumerate(hdrs)
                   if re.search(r"Q\d\s+FY\d{2,4}", h, re.IGNORECASE)), None)
     quarter_name = ""
@@ -557,11 +934,9 @@ def parse_gemini_response(
             if fy_m:
                 facts["fy_year"] = f"FY{fy_m.group(1)}"
 
-    # 12M column
     m12_col = next((i for i, h in enumerate(hdrs)
                     if re.search(r"12\s*[Mm]", h)), None)
 
-    # Explicit guidance columns → FY label
     fy_explicit: dict[str, int] = {}
     for i, h in enumerate(hdrs):
         if "explicit" in h.lower() or "guidance" in h.lower():
@@ -569,7 +944,6 @@ def parse_gemini_response(
             if m:
                 fy_explicit[f"FY{m.group(1)}"] = i
 
-    # Q-fact field map: metric → schema column
     Q_FIELD = {"revenue": "revenue_q", "ebitda": "ebitda_q", "pat": "pat_q",
                "margin": "margin_pct", "volume": "volume_q", "capacity": "capacity_q"}
     M12_FIELD = {"revenue": "revenue_12m", "pat": "pat_12m"}
@@ -648,10 +1022,9 @@ def main() -> None:
     print("Phase 2 / Stage B — Concall extraction via Gemini")
     print("-" * 56)
 
-    # .env is loaded inside get_drive(); call it first so all env vars are set
     drive = get_drive()
 
-    # Load Gemini API keys — accepts GEMINI_API_KEY_1..N or plain GEMINI_API_KEY
+    # Load Gemini API keys
     api_keys = [
         v for _, v in sorted(
             ((k, v) for k, v in os.environ.items()
@@ -691,7 +1064,7 @@ def main() -> None:
     if args.limit:
         pending_idx = pending_idx[: args.limit]
 
-    counts = {"processed": 0, "error": 0, "skipped": 0}
+    counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0, "gf3": 0, "gf4": 0}
 
     for queue_idx in pending_idx:
         row = queue.loc[queue_idx]
@@ -711,7 +1084,7 @@ def main() -> None:
 
             display_name = f"{row.get('symbol', 'DOC')}_{str(row.get('doc_id', ''))[:12]}.pdf"
 
-            # 2-3. Upload to Gemini + generate
+            # 2-3. Upload to Gemini + generate (includes inter-call sleep)
             markdown_text = gemini.call(pdf_bytes, prompt, display_name)
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
@@ -721,10 +1094,24 @@ def main() -> None:
                 counts["processed"] += 1
                 continue
 
-            # 4. Parse markdown → structured data
+            now_str = datetime.now().isoformat(timespec="seconds")
+
+            # 4. Parse Table_A → quarterly facts + guidance rows
             facts, guidance_rows = parse_gemini_response(markdown_text, row)
-            log(f"  Parsed: quarter={facts['quarter'] or 'unknown'}, "
+            quarter = facts["quarter"]
+            log(f"  Parsed: quarter={quarter or 'unknown'}, "
                 f"guidance_rows={len(guidance_rows)}")
+
+            # 4b. Parse GF1-4 sections
+            gf1_rows, gf2_rows, gf3_rows, gf4_rows = parse_gf_sections(
+                markdown_text, row, quarter, now_str
+            )
+            counts["gf1"] += len(gf1_rows)
+            counts["gf2"] += len(gf2_rows)
+            counts["gf3"] += len(gf3_rows)
+            counts["gf4"] += len(gf4_rows)
+            log(f"  GF parsed: GF1={len(gf1_rows)} GF2={len(gf2_rows)} "
+                f"GF3={len(gf3_rows)} GF4={len(gf4_rows)}")
 
             # 5a. Company page (persisted forever)
             if OUTPUT_COMPANY_MD:
@@ -733,27 +1120,50 @@ def main() -> None:
                     key=str(row.get("key") or row.get("isin") or row.get("symbol") or ""),
                     content=markdown_text,
                     doc_title=str(row.get("title", "")),
-                    quarter=facts["quarter"],
+                    quarter=quarter,
                 )
 
-            # 5b. Day page (auto-deleted after 30 days)
+            # 5b. Daily digest
             if OUTPUT_DAY_MD:
                 append_day_page(
                     drive, repo_id,
                     announcement_date=str(row.get("announcement_date", "")),
                     symbol=str(row.get("symbol", "")),
                     company_name=str(row.get("company_name", "")),
-                    quarter=facts["quarter"],
+                    quarter=quarter,
                     content=markdown_text,
                 )
 
-            # 6-7. Upsert parquets
+            # 5c. Quarterly guidance tracker
+            if OUTPUT_QUARTERLY_MD and quarter:
+                guidance_content = build_quarterly_guidance_content(
+                    markdown_text,
+                    symbol=str(row.get("symbol", "")),
+                    company_name=str(row.get("company_name", "")),
+                    quarter=quarter,
+                )
+                append_quarterly_guidance_page(
+                    drive, repo_id,
+                    symbol=str(row.get("symbol", "")),
+                    company_name=str(row.get("company_name", "")),
+                    quarter=quarter,
+                    guidance_content=guidance_content,
+                )
+
+            # 6. Upsert parquets (Table_A)
             upsert_facts(drive, index_id, facts)
             upsert_guidance(drive, index_id, guidance_rows)
 
-            # 8. Mark done
+            # 6b. Upsert GF1-4 parquets
+            if OUTPUT_GF_PARQUETS:
+                upsert_gf1(drive, index_id, gf1_rows)
+                upsert_gf2(drive, index_id, gf2_rows)
+                upsert_gf3(drive, index_id, gf3_rows)
+                upsert_gf4(drive, index_id, gf4_rows)
+
+            # 7. Mark done
             queue.loc[queue_idx, "status"] = "done"
-            queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
+            queue.loc[queue_idx, "processed_at"] = now_str
             save_queue(drive, index_id, queue)
 
             counts["processed"] += 1
@@ -762,7 +1172,6 @@ def main() -> None:
         except RateLimitExhausted:
             log("All Gemini keys rate-limited — stopping cleanly. "
                 "Remaining pending rows will be picked up on the next run.")
-            # Queue already has progress saved from prior iterations
             break
 
         except Exception as exc:
@@ -772,14 +1181,27 @@ def main() -> None:
             save_queue(drive, index_id, queue)
             counts["error"] += 1
 
+    # CSV snapshots (once per run, after all processing)
+    if OUTPUT_GF_CSV and counts["processed"] > 0 and not args.dry_run:
+        log("Writing CSV snapshots...")
+        write_csv_exports(drive, index_id)
+
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
     print(f"Errors    : {counts['error']}")
     print(f"Skipped   : {counts['skipped']}")
-    if not args.dry_run:
+    print(f"GF rows   : GF1={counts['gf1']} GF2={counts['gf2']} "
+          f"GF3={counts['gf3']} GF4={counts['gf4']}")
+    if not args.dry_run and counts["processed"] > 0:
         print("Output: company_repo/_index/quarterly_facts.parquet")
         print("Output: company_repo/_index/guidance_tracker.parquet")
+        print("Output: company_repo/_index/gf1_guidance_statements.parquet (.csv)")
+        print("Output: company_repo/_index/gf2_historical_guidance.parquet (.csv)")
+        print("Output: company_repo/_index/gf3_operational_visibility.parquet (.csv)")
+        print("Output: company_repo/_index/gf4_quality_flags.parquet (.csv)")
         print("Output: company_repo/<key>/company_page.md")
+        print("Output: company_repo/_daily/concall_DD_MMMYYYY.md")
+        print("Output: company_repo/_quarterly/QXFY_mgmt_guidance.md")
 
 
 if __name__ == "__main__":

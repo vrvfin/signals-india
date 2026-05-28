@@ -5,7 +5,7 @@ records what was *designed*; this file records what is *built and pending*.
 To resume work in any future chat session, paste this file as context — it is
 enough to pick up where we left off.
 
-**Last updated:** 2026-05-27
+**Last updated:** 2026-05-28
 **Repo:** github.com/vrvfin/signals-india (**public** — unlimited GitHub Actions minutes)
 **Local:** `D:\EMA_Screener\claude\signals-india` · conda env `signals-india` (Python 3.11)
 **Storage:** Google Drive folder `signals-india/` (OAuth, app in Production mode)
@@ -136,9 +136,16 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - Company universe (5,525 ISINs)
 - PDF ingestion pipeline + processing queue
 - All 5 extractors running (concall universal; results/rating/presentation/AR portfolio-filtered)
-- Parquet outputs: quarterly_facts, guidance_tracker
-- Dual output: company_page.md per company + daily digest per doc-type per date
-- Daily digest features: numbered entries (`concall_N`), live index list, running total with timestamp
+- **5 output files per concall** (as of 2026-05-28):
+  1. `company_repo/<key>/company_page.md` — per-company cumulative brief
+  2. `company_repo/_daily/concall_DD_MMMYYYY.md` — daily digest (indexed, kept forever)
+  3. `company_repo/_quarterly/QXFY_mgmt_guidance.md` — quarterly guidance tracker (new)
+  4. Parquet outputs: `quarterly_facts`, `guidance_tracker` (Table_A), `gf1_guidance_statements`, `gf2_historical_guidance`, `gf3_operational_visibility`, `gf4_quality_flags`
+  5. CSV snapshots of all parquets written to Drive at end of each run (for Excel filtering)
+- GF1–GF4 fully parsed from Gemini output into structured parquets (section-aware extraction)
+- Daily digest: numbered entries (`concall_N`), live index list, running total with timestamp
+- Quarterly guidance tracker: indexed by company, contains Table_A + GF1 + GF4 + A-3 summary
+- Inter-call sleep (6 sec) to reduce Gemini RPM 429 cascades
 - Daily digests kept forever; raw PDFs deleted after 10 days
 - Phase 2 health report written to Drive after every run; visible in dashboard
 
@@ -189,6 +196,7 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - Other strategies — constants near top of each file
 - `pipeline_healthcheck.py` — `MIN_FEATURE_ROWS=1500`, `OHLCV_MAX_STALE_DAYS=6`, `FRESH_WINDOW_HOURS=24`
 - `pipeline_skip_check.py` — `PHASE2_SKIP_MINUTES=45`
+- `extract_concall.py` — `INTER_CALL_SLEEP=6` (seconds between Gemini calls, RPM protection)
 - `daily.yml` — schedule crons; Monday cron triggers weekly steps
 - `phase2.yml` — 29-run/week schedule; `timeout-minutes: 180`
 
