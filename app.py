@@ -599,6 +599,28 @@ def find_company_page(key: str) -> str | None:
         return f"*Error: {e}*"
 
 
+# ---------- Guidance / Results data loaders ----------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_guidance_tracker() -> pd.DataFrame:
+    return load_parquet(["company_repo", "_index", "guidance_tracker.parquet"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_gf1_statements() -> pd.DataFrame:
+    return load_parquet(["company_repo", "_index", "gf1_guidance_statements.parquet"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_gf4_flags() -> pd.DataFrame:
+    return load_parquet(["company_repo", "_index", "gf4_quality_flags.parquet"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_results_summary() -> pd.DataFrame:
+    return load_parquet(["company_repo", "_index", "results.parquet"])
+
+
 def page_company_intel():
     st.title("Company Intelligence")
     st.caption(
@@ -698,6 +720,243 @@ def page_company_intel():
                 )
             else:
                 st.markdown(content)
+
+
+# ---------- Guidance helpers ----------
+
+_GF4_POSITIVE = frozenset({
+    "strong order book", "capacity backed", "high visibility",
+    "order book backed", "confirmed orders", "take or pay",
+    "long term contract", "pipeline visibility",
+})
+_GF4_NEGATIVE = frozenset({
+    "weak visibility", "guidance ambiguous", "execution risk",
+    "volume dependent", "macro dependent", "aspirational",
+    "sector headwind", "demand uncertainty",
+})
+
+
+def _gf4_quality_score(gf4_df: pd.DataFrame, symbol: str) -> int:
+    """Return integer quality score from GF4 flags for a symbol."""
+    rows = gf4_df[gf4_df["symbol"].astype(str) == symbol]
+    if rows.empty:
+        return 0
+    score = 0
+    for flag in rows["flag_type"].astype(str).str.lower():
+        if any(p in flag for p in _GF4_POSITIVE):
+            score += 1
+        elif any(ng in flag for ng in _GF4_NEGATIVE):
+            score -= 1
+    return score
+
+
+def _guidance_is_active(horizon_fy) -> bool:
+    """Return True if the horizon FY is the current FY or a future FY."""
+    today = datetime.now()
+    fy_end_yr = (today.year + 1) if today.month >= 4 else today.year
+    m = re.search(r'FY(\d{2,4})', str(horizon_fy), re.IGNORECASE)
+    if not m:
+        return True
+    yr = int(m.group(1))
+    if yr < 100:
+        yr += 2000
+    return yr >= fy_end_yr
+
+
+def page_guidance():
+    st.title("Management Guidance")
+    st.caption(
+        "Structured guidance extracted from concall transcripts. "
+        "Updated as new concalls are processed by the Phase 2 pipeline."
+    )
+
+    tab_tracker, tab_watchlist, tab_momentum = st.tabs([
+        "📋 Guidance Tracker",
+        "👁 Active Watchlist",
+        "🚀 Guidance × Momentum",
+    ])
+
+    # ── Tab 1: Guidance Tracker ───────────────────────────────────────
+    with tab_tracker:
+        with st.spinner("Loading guidance data…"):
+            gt  = load_guidance_tracker()
+            gf1 = load_gf1_statements()
+
+        if gt.empty and gf1.empty:
+            st.info(
+                "No guidance data yet. It appears after concalls are processed "
+                "by the Phase 2 pipeline."
+            )
+        else:
+            # Filters
+            c1, c2, c3, c4 = st.columns(4)
+            companies = sorted(gt["symbol"].dropna().unique().tolist()) if not gt.empty else []
+            sel_company = c1.selectbox("Company", ["All"] + companies, key="gt_company")
+
+            metrics = sorted(gt["metric"].dropna().unique().tolist()) if not gt.empty else []
+            sel_metric = c2.selectbox("Metric", ["All"] + metrics, key="gt_metric")
+
+            horizons = sorted(gt["horizon_fy"].dropna().unique().tolist()) if not gt.empty else []
+            sel_horizon = c3.selectbox("Horizon FY", ["All"] + [str(h) for h in horizons],
+                                       key="gt_horizon")
+
+            g_types = sorted(gt["guidance_type"].dropna().unique().tolist()) if not gt.empty else []
+            sel_type = c4.selectbox("Type", ["All"] + g_types, key="gt_type")
+
+            gf = gt.copy() if not gt.empty else pd.DataFrame()
+            if not gf.empty:
+                if sel_company != "All":
+                    gf = gf[gf["symbol"] == sel_company]
+                if sel_metric != "All":
+                    gf = gf[gf["metric"] == sel_metric]
+                if sel_horizon != "All":
+                    gf = gf[gf["horizon_fy"].astype(str) == sel_horizon]
+                if sel_type != "All":
+                    gf = gf[gf["guidance_type"] == sel_type]
+
+                st.caption(f"{len(gf)} guidance rows")
+                show_cols = [c for c in [
+                    "symbol", "company_name", "quarter", "metric",
+                    "guidance_type", "horizon_fy", "value", "unit",
+                    "cagr_pct", "notes",
+                ] if c in gf.columns]
+                st.dataframe(gf[show_cols], use_container_width=True,
+                             hide_index=True, height=400)
+
+            if not gf1.empty:
+                with st.expander("📝 Raw forward-looking statements (GF1)"):
+                    gf1_flt = gf1.copy()
+                    if sel_company != "All" and "symbol" in gf1.columns:
+                        gf1_flt = gf1_flt[gf1_flt["symbol"] == sel_company]
+                    show_gf1 = [c for c in [
+                        "symbol", "company_name", "quarter",
+                        "exact_statement", "metric_type", "timeframe",
+                        "explicitness_type", "quantifiable", "numeric_value",
+                    ] if c in gf1_flt.columns]
+                    st.dataframe(gf1_flt[show_gf1], use_container_width=True,
+                                 hide_index=True, height=300)
+
+    # ── Tab 2: Active Watchlist ───────────────────────────────────────
+    with tab_watchlist:
+        with st.spinner("Loading guidance and quality data…"):
+            gt  = load_guidance_tracker()
+            gf4 = load_gf4_flags()
+
+        if gt.empty:
+            st.info("No guidance data yet.")
+        else:
+            active_mask = gt["horizon_fy"].apply(_guidance_is_active)
+            active = gt[active_mask].copy()
+
+            if "guidance_type" in active.columns:
+                explicit = active[
+                    active["guidance_type"].astype(str).str.lower()
+                    .isin(["explicit", "quantified", "numeric"])
+                ]
+                if explicit.empty:
+                    explicit = active
+            else:
+                explicit = active
+
+            explicit = explicit.copy()
+            explicit["quality_score"] = explicit["symbol"].apply(
+                lambda s: _gf4_quality_score(gf4, s) if not gf4.empty else 0
+            )
+
+            guidance_counts = (
+                explicit.groupby("symbol")
+                .agg(
+                    n_guidance=("metric", "count"),
+                    quality_score=("quality_score", "first"),
+                    metrics=("metric", lambda x: ", ".join(sorted(set(x.dropna())))),
+                )
+                .reset_index()
+                .sort_values(["quality_score", "n_guidance"], ascending=[False, False])
+                .reset_index(drop=True)
+            )
+
+            st.subheader("Companies with active guidance")
+            st.caption(
+                f"{len(guidance_counts)} companies with explicit guidance for current/future FY.  "
+                "Quality score: +1 per positive flag (strong order book, capacity backed…), "
+                "−1 per negative flag (execution risk, macro dependent…)."
+            )
+            st.dataframe(
+                guidance_counts[["symbol", "n_guidance", "quality_score", "metrics"]],
+                use_container_width=True, hide_index=True, height=400,
+            )
+
+            syms = guidance_counts["symbol"].tolist()
+            if syms:
+                sel_sym = st.selectbox("Drill into company", syms, key="watchlist_drill")
+                detail = explicit[explicit["symbol"] == sel_sym]
+                detail_cols = [c for c in [
+                    "quarter", "metric", "guidance_type",
+                    "horizon_fy", "value", "unit", "cagr_pct", "notes",
+                ] if c in detail.columns]
+                st.dataframe(detail[detail_cols], use_container_width=True, hide_index=True)
+
+    # ── Tab 3: Guidance × Momentum ────────────────────────────────────
+    with tab_momentum:
+        with st.spinner("Loading signals, guidance and quality data…"):
+            signals = load_all_strategy_signals()
+            gt      = load_guidance_tracker()
+            gf4     = load_gf4_flags()
+
+        if signals.empty:
+            st.info("No strategy signals today.")
+        else:
+            buy_add  = signals[signals["zone_type"].isin(["buy", "add"])]
+            momentum = (buy_add.groupby("symbol")["strategy_group"]
+                        .nunique().reset_index(name="n_strategies"))
+
+            if not gt.empty:
+                active_mask = gt["horizon_fy"].apply(_guidance_is_active)
+                guidance_agg = (gt[active_mask].groupby("symbol")["metric"]
+                                .count().reset_index(name="n_guidance"))
+            else:
+                guidance_agg = pd.DataFrame(columns=["symbol", "n_guidance"])
+
+            # Pre-compute quality scores only for symbols appearing in signals
+            sig_syms = buy_add["symbol"].dropna().unique()
+            quality_map = (
+                {s: _gf4_quality_score(gf4, s) for s in sig_syms}
+                if not gf4.empty else {}
+            )
+
+            combined = momentum.merge(guidance_agg, on="symbol", how="left")
+            combined["n_guidance"] = combined["n_guidance"].fillna(0).astype(int)
+            combined["quality"]    = combined["symbol"].map(quality_map).fillna(0).astype(int)
+            combined["guidance_multiplier"] = combined["quality"].apply(
+                lambda q: round(max(0.5, 1 + q * 0.3), 2)
+            )
+            combined["combined_score"] = (
+                combined["n_strategies"] * combined["guidance_multiplier"]
+                + combined["n_guidance"] * 0.2
+            ).round(2)
+            combined = combined.sort_values("combined_score", ascending=False).reset_index(drop=True)
+
+            st.subheader("Guidance-backed momentum leaders")
+            st.caption(
+                "**Score** = n\\_strategies × max(0.5, 1 + quality × 0.3) + n\\_guidance × 0.2  \n"
+                "Positive quality flags amplify the score; negative flags dampen it."
+            )
+
+            c1, c2 = st.columns(2)
+            min_strats   = c1.number_input("Min strategies",     min_value=1, max_value=10,
+                                            value=1, step=1, key="gxm_min_strats")
+            min_guidance = c2.number_input("Min guidance items", min_value=0, max_value=20,
+                                            value=0, step=1, key="gxm_min_guidance")
+
+            view = combined[
+                (combined["n_strategies"] >= int(min_strats)) &
+                (combined["n_guidance"]   >= int(min_guidance))
+            ]
+            st.dataframe(
+                view[["symbol", "n_strategies", "n_guidance",
+                       "quality", "guidance_multiplier", "combined_score"]],
+                use_container_width=True, hide_index=True, height=500,
+            )
 
 
 # ---------- Market Overview helpers ----------
@@ -967,6 +1226,66 @@ def page_signals():
         flt = flt[flt["symbol"].str.contains(search, na=False)]
 
     flt = flt.sort_values("score", ascending=False)
+
+    with st.expander("📈 Filter by results growth (optional)", expanded=False):
+        results  = load_results_summary()
+        universe = load_csv(["universe", "master_list.csv"])
+
+        if results.empty:
+            st.caption("No results.parquet yet — run scrape_results_table.py first.")
+        else:
+            c_r1, c_r2 = st.columns(2)
+            min_rev_yoy = c_r1.number_input(
+                "Min Revenue YoY %", min_value=-100.0, max_value=500.0,
+                value=0.0, step=5.0, key="sig_min_rev_yoy",
+            )
+            min_pat_yoy = c_r2.number_input(
+                "Min PAT/Profit YoY %", min_value=-100.0, max_value=500.0,
+                value=0.0, step=5.0, key="sig_min_pat_yoy",
+            )
+            apply_growth = st.checkbox("Apply growth filter", value=False,
+                                       key="sig_apply_growth")
+            if apply_growth:
+                # Map ISIN → symbol from universe so results join works
+                if (not universe.empty
+                        and "isin" in universe.columns
+                        and "symbol" in universe.columns):
+                    isin_sym    = universe[["isin", "symbol"]].drop_duplicates()
+                    results_sym = results.merge(isin_sym, on="isin", how="left")
+                else:
+                    results_sym = results.copy()
+                    if "symbol" not in results_sym.columns:
+                        results_sym["symbol"] = None
+
+                rev_rows = results_sym[
+                    results_sym["metric"].astype(str).str.lower()
+                    .str.contains("revenue|sales|income from operations", na=False)
+                ]
+                pat_rows = results_sym[
+                    results_sym["metric"].astype(str).str.lower()
+                    .str.contains("net profit|pat|profit after tax", na=False)
+                ]
+                rev_best = (rev_rows.groupby("symbol")["yoy_pct"].max()
+                            .reset_index(name="rev_yoy_pct"))
+                pat_best = (pat_rows.groupby("symbol")["yoy_pct"].max()
+                            .reset_index(name="pat_yoy_pct"))
+
+                growth_pass = pd.DataFrame({"symbol": flt["symbol"].unique()})
+                growth_pass = growth_pass.merge(rev_best, on="symbol", how="left")
+                growth_pass = growth_pass.merge(pat_best, on="symbol", how="left")
+                rev_ok = (growth_pass["rev_yoy_pct"].isna() |
+                          (growth_pass["rev_yoy_pct"] >= min_rev_yoy))
+                pat_ok = (growth_pass["pat_yoy_pct"].isna() |
+                          (growth_pass["pat_yoy_pct"] >= min_pat_yoy))
+                pass_syms = growth_pass[rev_ok & pat_ok]["symbol"].tolist()
+
+                before = len(flt)
+                flt = flt[flt["symbol"].isin(pass_syms)]
+                st.caption(
+                    f"Growth filter applied — {len(flt)} of {before} signals pass "
+                    f"(rev YoY ≥ {min_rev_yoy:.0f}%, PAT YoY ≥ {min_pat_yoy:.0f}%)"
+                )
+
     st.caption(f"Showing {len(flt)} signals")
     show_cols = [c for c in ["symbol", "strategy", "zone_type", "score",
                               "entry", "stop", "reason"] if c in flt.columns]
@@ -1082,6 +1401,54 @@ def page_stock_detail():
                     st.markdown("**Signal values:**")
                     st.json({c: (float(sig[c]) if isinstance(sig[c], (int, float))
                                  else str(sig[c])) for c in cols_to_show})
+
+    # ── Management Guidance section ──────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Management Guidance")
+    with st.spinner("Loading guidance…"):
+        gt_sd  = load_guidance_tracker()
+        gf1_sd = load_gf1_statements()
+        gf4_sd = load_gf4_flags()
+
+    sym_gt  = gt_sd[gt_sd["symbol"]  == symbol] if not gt_sd.empty  else pd.DataFrame()
+    sym_gf1 = gf1_sd[gf1_sd["symbol"] == symbol] if not gf1_sd.empty else pd.DataFrame()
+
+    if sym_gt.empty and sym_gf1.empty:
+        st.info(f"No management guidance found for {symbol} yet.")
+    else:
+        quality = _gf4_quality_score(gf4_sd, symbol) if not gf4_sd.empty else 0
+        q_icon  = "🟢" if quality > 0 else ("🔴" if quality < 0 else "⚪")
+        st.caption(f"GF4 guidance quality score: {q_icon} {quality:+d}")
+
+        if not sym_gt.empty:
+            st.markdown("**Structured guidance (Table A)**")
+            active_gt = sym_gt[sym_gt["horizon_fy"].apply(_guidance_is_active)]
+            if not active_gt.empty:
+                show_cols_gt = [c for c in [
+                    "quarter", "metric", "guidance_type",
+                    "horizon_fy", "value", "unit", "cagr_pct", "notes",
+                ] if c in active_gt.columns]
+                st.dataframe(active_gt[show_cols_gt], use_container_width=True,
+                             hide_index=True)
+            else:
+                st.caption("No active (current/future FY) guidance on record.")
+
+            with st.expander("All quarters (including past guidance)"):
+                past_cols_gt = [c for c in [
+                    "quarter", "metric", "guidance_type",
+                    "horizon_fy", "value", "unit", "cagr_pct", "notes",
+                ] if c in sym_gt.columns]
+                st.dataframe(sym_gt[past_cols_gt], use_container_width=True,
+                             hide_index=True)
+
+        if not sym_gf1.empty:
+            with st.expander(f"📝 Raw forward-looking statements ({len(sym_gf1)})"):
+                show_gf1_sd = [c for c in [
+                    "quarter", "exact_statement", "metric_type",
+                    "timeframe", "explicitness_type", "quantifiable", "numeric_value",
+                ] if c in sym_gf1.columns]
+                st.dataframe(sym_gf1[show_gf1_sd], use_container_width=True,
+                             hide_index=True)
 
 
 def page_strategy_docs():
@@ -1510,7 +1877,8 @@ def main():
     page = st.sidebar.radio("Page", [
         "Market Overview",
         "Today's Signals",
-        "Company Intel",       # ← new
+        "Company Intel",
+        "Mgmt Guidance",
         "My Portfolio",
         "Graphs",
         "Stock Detail",
@@ -1527,6 +1895,8 @@ def main():
         _safe_render(page_signals)
     elif page == "Company Intel":
         _safe_render(page_company_intel)
+    elif page == "Mgmt Guidance":
+        _safe_render(page_guidance)
     elif page == "My Portfolio":
         _safe_render(page_portfolio)
     elif page == "Graphs":
