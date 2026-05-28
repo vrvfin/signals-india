@@ -42,9 +42,11 @@ PHASE 1 (daily.yml) — Mon–Fri UTC 10:30 (IST 16:00)
   → pipeline_healthcheck  (truth gate — exits non-zero on CRITICAL)
   weekly (Mon only): ingest_fundamentals, enrich_market_cap
 
-PHASE 2 (phase2.yml) — 29 runs/week
-  Mon–Fri: 4×/day (IST 10/13/16/19) + 1 overnight (IST 02:00)
-  Sat: 3×/day (IST 10/13/16)   Sun: 1× (IST 13:00)
+PHASE 2 (phase2.yml) — 47 runs/week  [updated 2026-05-28]
+  Mon–Fri: 7×/day (IST 10/12/14/16/18/20/22, every 2h) + 1 overnight (IST 03:00)
+  Sat: 5×/day (IST 10/12/14/16/18)   Sun: 2× (IST 10/14)
+  Reliability: (a) denser cron; (b) daily.yml triggers Phase 2 after Phase 1
+               via ACTIONS_PAT; (c) optional external cron via cron-job.org
   skip_check (skip if queue empty AND last run < 45 min ago)
   ingest_company_docs → scrape_results_table
   → extract_concall → extract_results → extract_rating
@@ -183,6 +185,7 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - **MP3/transcript dedup** — date-based dedup in `ingest_company_docs.py` (same company, different received_date = new doc) (InfraFix 1)
 - **Seasonal Phase 2 frequency** — higher run frequency during Q-end concall season (45 days after Dec/Mar/Jun/Sep quarter close); lower off-season (InfraFix 2)
 - **Run-block separator in daily digest** — group `concall_N` entries by run within the daily digest (low priority)
+- **ACTIONS_PAT secret** — one-time manual step: create GitHub PAT (workflow scope) → store as `ACTIONS_PAT` repo secret → activates Phase 1→Phase 2 backup trigger in daily.yml
 
 ### Blocked
 - **Insider buy/sell** — no reliable free structured data source identified
@@ -215,7 +218,8 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - `pipeline_skip_check.py` — `PHASE2_SKIP_MINUTES=45`
 - `extract_concall.py` — `INTER_CALL_SLEEP=6` (seconds between Gemini calls, RPM protection)
 - `daily.yml` — schedule crons; Monday cron triggers weekly steps
-- `phase2.yml` — 29-run/week schedule; `timeout-minutes: 180`
+- `phase2.yml` — 47-run/week schedule (every 2h, IST 10–22 + overnight 03:00); `timeout-minutes: 180`; `repository_dispatch: trigger-phase2` added
+- `daily.yml` — Phase 2 backup trigger step at end of Phase 1 (uses `ACTIONS_PAT` secret); safe if secret not yet set
 
 ---
 
@@ -238,6 +242,7 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - `scripts/requirements.txt` — Phase 2 pipeline
 - Secrets: GitHub Actions secrets + Streamlit Cloud secrets + local `.env` (gitignored)
 - Keys: `GDRIVE_FOLDER_ID`, `GDRIVE_OAUTH_TOKEN_JSON`, `GDRIVE_OAUTH_CLIENT_SECRET_JSON`, `SCREENER_SESSION_COOKIE`, `GEMINI_API_KEY`
+- `ACTIONS_PAT` — optional but recommended: GitHub PAT with `workflow` scope; enables Phase 1→Phase 2 backup trigger in daily.yml; create at GitHub → Settings → Developer settings → Personal access tokens (classic)
 - Constraint (binding): code never accesses passwords/PII; portfolio cost/P&L never in git or LLM context
 
 ---
@@ -285,6 +290,32 @@ Full specification detail in `scripts/Concall_Extractor.txt`.
   4. `gf1/gf2/gf3/gf4_*.parquet` (NEW — section-aware GF extraction)
   5. CSV snapshots of all 5 parquets written per run (NEW)
 - All committed and pushed; active from next scheduled Phase 2 run
+
+---
+
+### Session 2026-05-28 (addendum) — Phase 2 run reliability
+
+**Asked:**
+- "Last run today at 1:30 although we should have run at 10 PM — problem will persist."
+- Can run 5 times during 10 AM–10 PM and once around 3 AM; if code doesn't
+  really execute that's a problem.
+
+**Root cause identified:**
+- No 10 PM IST slot existed in old schedule (last slot was 19:00 = 7 PM)
+- GitHub Actions scheduled jobs are queued, not guaranteed — delays of 30–90 min
+  are a known GitHub platform limitation, not a code bug
+
+**Delivered (InfraFix 3):**
+- phase2.yml: schedule upgraded from 29→47 runs/week: every 2h 10 AM–10 PM IST
+  + 3 AM overnight on weekdays; Sat 5×; Sun 2×
+- daily.yml: backup trigger step added at end of Phase 1 — dispatches Phase 2
+  via `gh workflow run` using `ACTIONS_PAT` secret (safe if secret not yet set)
+- phase2.yml: `repository_dispatch: types: [trigger-phase2]` added for the backup
+- Three-layer reliability: (1) denser cron, (2) Phase 1 backup trigger, (3) optional external cron (cron-job.org)
+
+**Pending action from user (1 task):**
+- Create GitHub PAT (workflow scope) → store as `ACTIONS_PAT` repo secret
+  to activate the Phase 1→Phase 2 backup trigger
 
 **Still pending from this session:**
 - OT3: Mgmt said vs delivered cross-quarter view (needs 2-3 quarters of GF2 data)

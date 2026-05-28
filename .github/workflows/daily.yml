@@ -163,3 +163,30 @@ jobs:
       - name: Health check (truth gate)
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/pipeline_healthcheck.py
+
+      # ── Phase 2 backup trigger (Layer 2 reliability) ──────────────────────
+      # GitHub Actions scheduled jobs can be delayed 30-90 min or skipped.
+      # This step fires Phase 2 via workflow_dispatch after every Phase 1 run,
+      # guaranteeing at least one Phase 2 execution per business day.
+      #
+      # Requires: ACTIONS_PAT secret (GitHub PAT with 'workflow' scope).
+      # One-time setup:
+      #   1. GitHub → Settings → Developer settings → Personal access tokens (classic)
+      #   2. Generate token with 'workflow' scope. Copy it.
+      #   3. Repo → Settings → Secrets → Actions → New secret
+      #      Name: ACTIONS_PAT   Value: <your token>
+      #
+      # Safe if secret not yet set: the step logs a message and exits 0.
+      - name: Trigger Phase 2 (backup)
+        if: always()
+        run: |
+          if [ -n "$GH_TOKEN" ]; then
+            gh workflow run phase2.yml --ref main \
+              && echo "Phase 2 backup trigger dispatched." \
+              || echo "Phase 2 backup trigger failed (will rely on scheduled crons)."
+          else
+            echo "ACTIONS_PAT not set — Phase 2 backup trigger skipped."
+            echo "See daily.yml comment for one-time setup instructions."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT }}

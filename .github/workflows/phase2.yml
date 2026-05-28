@@ -1,30 +1,46 @@
 name: Phase 2 — Company Intelligence
 
-# Weekday schedule (Mon–Fri): 5 runs/day  → 25 runs/week
-#   Daytime every 3h: 10:00 / 13:00 / 16:00 / 19:00 IST
-#   Overnight once:   02:00 IST
-# Saturday: 3 runs — 10:00 / 13:00 / 16:00 IST (no overnight)
-# Sunday:   1 run  — 13:00 IST only
-# Total: 29 runs/week
+# ── Schedule design ────────────────────────────────────────────────────────
+# PROBLEM: GitHub Actions scheduled jobs are queued, not guaranteed.
+# Delays of 30–90 min are common; a slot may fire late or be skipped entirely
+# during high-load periods. This is a GitHub platform limitation.
 #
-# Public repo → unlimited GitHub Actions minutes (no quota concern).
+# THREE-LAYER RELIABILITY STRATEGY:
+#   Layer 1 (this file)  — denser cron schedule (every 2h, 47×/week).
+#                          More opportunities = less chance of a long gap.
+#   Layer 2 (daily.yml)  — Phase 1 triggers Phase 2 via workflow_dispatch
+#                          (ACTIONS_PAT secret) at the end of every daily run.
+#                          Guarantees at minimum one execution per business day.
+#   Layer 3 (optional)   — External cron via cron-job.org every 2h calling
+#                          the GitHub API. Not required but maximises uptime.
+#                          See scripts/Concall_Extractor.txt › InfraFix 3.
 #
-# Concurrency group prevents two runs processing the same queue rows simultaneously.
+# Weekday (Mon–Fri IST): 7 daytime runs every 2h (10/12/14/16/18/20/22)
+#                        + 1 overnight at 03:00 IST  →  8 runs/day
+# Saturday (IST):        5 runs (10/12/14/16/18)
+# Sunday (IST):          2 runs (10/14)
+# Total:                 47 runs/week
 #
-# Stage B extractors run in priority order each time:
-#   concall → results → rating → presentation → annual_report
-# Each extractor is independent; a rate-limit in one does not block the others.
+# skip_check (PHASE2_SKIP_MINUTES=45) prevents redundant back-to-back runs
+# when the queue is empty — extra slots cost only ~10 sec when idle.
+#
+# UTC offsets (IST = UTC+5:30):
+#   10 IST = 04:30 UTC | 12 IST = 06:30 | 14 IST = 08:30 | 16 IST = 10:30
+#   18 IST = 12:30 UTC | 20 IST = 14:30 | 22 IST = 16:30 | 03 IST = 21:30 UTC (prev day)
 
 on:
   schedule:
-    # Mon–Fri: every 3h 10AM-7PM IST + once 2AM overnight
-    - cron: '30 4,7,10,13 * * 1-5'   # IST 10:00 / 13:00 / 16:00 / 19:00
-    - cron: '30 20 * * 1-5'           # IST 02:00 overnight
-    # Saturday: 10AM / 1PM / 4PM IST (no overnight)
-    - cron: '30 4,7,10 * * 6'
-    # Sunday: 1PM IST only
-    - cron: '30 7 * * 0'
-  workflow_dispatch:            # manual trigger any time
+    # Mon–Fri daytime: every 2h from 10:00 to 22:00 IST
+    - cron: '30 4,6,8,10,12,14,16 * * 1-5'   # IST 10/12/14/16/18/20/22
+    # Mon–Fri overnight: 03:00 IST (= 21:30 UTC on Sun–Thu)
+    - cron: '30 21 * * 0-4'
+    # Saturday: 10/12/14/16/18 IST
+    - cron: '30 4,6,8,10,12 * * 6'
+    # Sunday: 10/14 IST
+    - cron: '30 4,8 * * 0'
+  workflow_dispatch:            # manual trigger any time (bypasses skip check)
+  repository_dispatch:
+    types: [trigger-phase2]     # triggered by daily.yml via ACTIONS_PAT
 
 concurrency:
   group: phase2-pipeline
@@ -52,8 +68,8 @@ jobs:
 
       # ── Skip check ── reads Drive phase2_latest.json; sets skip=true if queue
       # is empty AND last run was < 45 min ago. Prevents redundant back-to-back
-      # runs when multiple cron slots fire in quick succession. Bypassed on
-      # manual trigger (workflow_dispatch) so you can always force a full rerun.
+      # runs when multiple cron slots fire in quick succession or Phase 1 backup
+      # trigger fires while a run just finished. Bypassed on manual trigger.
       # Fail-safe: Drive unreachable → skip=false (always proceed).
       - name: Skip check
         id: fresh

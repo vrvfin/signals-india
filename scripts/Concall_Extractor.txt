@@ -188,3 +188,39 @@ File: scripts/extract_concall.py → append_day_page()
 ### InfraFix 2 — Phase 2 seasonal frequency scheduling   ⏳ PENDING
 (Same as Fix 2 above — Q-end seasons need higher run frequency.)
 Estimated effort: medium. Requires cron table changes + date-range logic.
+
+### InfraFix 3 — Phase 2 run reliability (scheduled jobs not firing)   ✅ DONE
+Problem: GitHub Actions scheduled jobs are queued, not guaranteed. Peak-load
+delays of 30-90 min are common; a slot can be skipped entirely. User observed:
+"last run today at 1:30, although we should have run at 10 PM." Root cause:
+(1) no 10 PM IST slot existed in old schedule; (2) GitHub platform queuing.
+Ask: Ensure Phase 2 executes reliably and covers 10 AM to 10 PM IST window.
+
+Delivered (2026-05-28):
+THREE-LAYER RELIABILITY:
+  Layer 1 — phase2.yml schedule updated from 29 to 47 runs/week:
+    Weekdays: 10/12/14/16/18/20/22 IST (every 2h) + 03:00 IST overnight = 8/day
+    Saturday: 10/12/14/16/18 IST = 5/day
+    Sunday: 10/14 IST = 2/day
+    More opportunities = shorter gaps even if individual slots are delayed.
+  Layer 2 — daily.yml backup trigger:
+    At end of every Phase 1 run (IST ~17:00), a new step dispatches phase2.yml
+    using workflow_dispatch via ACTIONS_PAT secret. This guarantees at least one
+    Phase 2 execution per business day tied to Phase 1's reliable run.
+    One-time setup required: create GitHub PAT (workflow scope), store as
+    ACTIONS_PAT secret in repo. Step is safe to deploy before secret is set
+    (logs a message and skips cleanly if secret absent).
+  Layer 3 — optional external cron (cron-job.org):
+    For maximum reliability, set up cron-job.org (free) to call:
+      POST https://api.github.com/repos/vrvfin/signals-india/actions/workflows/phase2.yml/dispatches
+      Headers: Authorization: Bearer <GITHUB_PAT_with_workflow_scope>
+               Accept: application/vnd.github+json
+      Body: {"ref": "main"}
+    Run every 2 hours. Cron-job.org runs on different infrastructure — not
+    subject to GitHub queue delays. Requires same PAT as ACTIONS_PAT above.
+    Not required if Layer 1+2 are sufficient.
+
+Pending action from user: Create ACTIONS_PAT secret (one-time, 2-minute task).
+  GitHub → Settings → Developer settings → Personal access tokens (classic)
+  → Generate token → check 'workflow' scope → Copy → Repo Settings →
+  Secrets → Actions → New secret → Name: ACTIONS_PAT → Paste value.
