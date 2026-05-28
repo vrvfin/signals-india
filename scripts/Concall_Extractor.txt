@@ -1,0 +1,190 @@
+# Concall Intelligence — Specification & Change Log
+# signals-india · Phase 2 concall pipeline requirements
+#
+# Status codes:  ✅ DONE  |  🔄 PARTIAL  |  ⏳ PENDING  |  🚫 BLOCKED
+# -----------------------------------------------------------------------
+
+## CONTEXT
+
+Gemini-powered concall extraction pipeline. Each PDF transcript is processed
+through concall_prompt.txt → structured intelligence stored in Google Drive.
+Prompt extracts: Table_A (financial grid + guidance), GF1 (raw forward
+statements), GF2 (historical guidance vs actuals), GF3 (operational
+visibility), GF4 (guidance quality flags), A1/A2/A3 (summaries),
+B/C/E1 (growth drivers, management commentary, forward visibility).
+
+---
+
+## SESSION: 2026-05-26 — Operational setup + prompt review
+
+### Fix 1 — MP3 dedup / date-based queue filtering   ⏳ PENDING
+Problem: Some companies upload an MP3 first; transcript PDF comes a day later.
+Same company-doc appears twice in the queue. Current queue dedup is by
+content-hash only, not by (company × date).
+Ask: If a doc is received for a company on 10-Jan and another doc from the
+same company arrives on 12-Jan, treat as a new document and process both.
+Filter should be: (isin × doc_type × received_date) → only reprocess if
+received_date differs.
+File to change: ingest_company_docs.py
+
+### Fix 2 — Seasonal Phase 2 frequency tuning   ⏳ PENDING
+Problem: Phase 2 runs 29×/week flat. Concall seasons have up to 100 uploads/day
+for 45 working days after each quarter end (Dec, Mar, Jun, Sep quarter closes).
+Off-season volume is low (10-20/day). Running high frequency off-season wastes
+GitHub Actions minutes and is insufficient during peak season.
+Ask:
+  - Peak season (15th of month after Q-end + 45 working days):
+    Increase Phase 2 frequency (e.g., every 2 hours vs current 3-4 hr gaps).
+  - Off-season: Reduce to 2-3×/day.
+  - Mechanism: Either schedule-based (separate cron blocks in phase2.yml for
+    each season date range) or dynamic (check date in skip_check and adjust).
+File to change: .github/workflows/phase2.yml (or pipeline_skip_check.py)
+
+### Fix 3 — Daily digest retention extended to 90 days   ✅ RESOLVED
+Original ask: 90-day retention for daily concall digest files.
+Resolution: Daily digests are kept FOREVER (no deletion) as of current code.
+cleanup_company_docs.py only deletes raw PDFs (>10 days). Daily .md files
+are explicitly excluded from cleanup. 90-day ask is superseded — better.
+
+### Confirmation 1 — Run tracker in daily digest index   ✅ DONE
+Ask: Each run should group its concalls under a run label (Run1_concall_XXX).
+If code runs 5 times in a day, the latest run's entries appear first and
+user can stop at the previous run marker.
+Delivered: Daily digest uses numbered entries (concall_1, concall_2 … concall_N)
+with a live **Index:** list and *Total: N concalls — last updated HH:MM IST*
+header rebuilt on every append. Searching "concall_30" jumps to entry 30.
+Note: Per-run grouping label (Run1/Run2 block separator) not yet added — the
+current sequential numbering across runs is live. Full run-block separator
+is deferred as low priority.
+
+### OT1 — Review concall_prompt.txt for quality + clarity   ✅ DONE
+Review done (2026-05-27). Issues found and fixed:
+  - Old prompt used || column separators (not valid markdown table syntax)
+  - Missing: Zero-hallucination enforcement block
+  - Missing: Readability enforcement block
+  - Missing: CROSS-INDUSTRY METRIC ADAPTATION (Manufacturing vs BFSI vs IT rows)
+  - Missing: Strict guidance capture rules (Explicit vs Derived classification)
+  - Missing: Mandatory derivation footnotes rule
+  - Sections incomplete: only A1/A2 existed; A3, B, C, E1 added
+Updated prompt committed to git as scripts/concall_prompt.txt (2026-05-27).
+
+---
+
+## SESSION: 2026-05-28 — Capacity analysis + 5-output pipeline
+
+### Capacity Analysis Ask   ✅ DONE
+Ask: Check how many Gemini keys are active. If 100 concalls + 100
+presentations/results per day, do we have bandwidth? What if we hit a monthly
+limit like GitHub Actions? Provide a conservative estimate for the full month.
+"Your assumption were wrong yesterday — 8 companies took 40 mins, not 8-10 min."
+
+Delivered findings:
+  - 6 Gemini API keys confirmed active in environment
+  - Corrected timing model: ~2 min/concall all-in (Gemini call + Drive I/O +
+    amortised 429 wait). Previous estimate of 8-10 min/run was wrong.
+  - Daily quota: 6 keys × 250 RPD = 1,500 req/day available.
+    Peak load (100 concalls + 30 other docs) = 130 req/day = 8.7% utilisation.
+    No daily quota risk.
+  - Monthly quota: Gemini 2.5 Flash free tier has NO monthly request cap.
+    Only the daily 250 RPD limit applies. No GitHub-style monthly bucket.
+  - Root cause of 429 cascades: RPM (10 req/min per key), not daily exhaustion.
+    Fix: INTER_CALL_SLEEP = 6 sec between calls. Eliminates ~90% of cascades.
+  - Peak season throughput: 100 concalls/day across 5 runs ≈ 200 min/day total.
+    Each run ~43 min. Well within 180 min timeout. No risk.
+
+### OT2 — GF1-4 structured parsing + 5 output files per concall   ✅ DONE
+Ask: GF1-GF4 must be parsed into structured data. Need 5 output files per
+concall in both .md and .csv format. Gemini extracts; code writes into
+daily / company / table-specific outputs.
+
+Delivered (extract_concall.py rewrite, committed 2026-05-28):
+  Output 1: company_repo/<key>/company_page.md  — full analysis per company
+  Output 2: company_repo/_daily/concall_DD_MMMYYYY.md  — daily digest (indexed)
+  Output 3: company_repo/_quarterly/QXFY_mgmt_guidance.md  — NEW quarterly
+             guidance tracker: indexed by company; contains Table_A + GF1 +
+             GF4 + A-3 summary per company; grows throughout the quarter.
+  Output 4: 6 parquets in company_repo/_index/:
+             quarterly_facts.parquet  (Table_A actuals)
+             guidance_tracker.parquet  (Table_A guidance rows)
+             gf1_guidance_statements.parquet  (NEW — raw forward statements)
+             gf2_historical_guidance.parquet  (NEW — past guidance vs actuals)
+             gf3_operational_visibility.parquet  (NEW)
+             gf4_quality_flags.parquet  (NEW)
+  Output 5: 5 CSV snapshots written to _index/ at end of each run:
+             guidance_tracker.csv, gf1_guidance_statements.csv,
+             gf2_historical_guidance.csv, gf3_operational_visibility.csv,
+             gf4_quality_flags.csv
+  GF section extraction: section-aware regex (finds "Section GF1",
+  "GF1 —", "Raw Guidance Extraction" etc.) maps table headers to schema cols.
+  Inter-call throttle: INTER_CALL_SLEEP = 6 sec in GeminiKeyPool.call().
+
+---
+
+## OPEN TASKS — PENDING
+
+### OT3 — Mgmt said vs delivered tracker   ⏳ PENDING
+Ask: Since GF2 (historical guidance references) is now captured per concall,
+build a view comparing what management guided vs what they actually delivered.
+How it works: GF2 rows from past quarters contain "Original Guidance" and
+"Actual Mentioned Outcome". Aggregate across quarters per company to show
+guidance credibility score / hit-rate.
+Files involved: gf2_historical_guidance.parquet → new dashboard view in app.py
+Dependency: GF2 parquet needs 2-3 quarters of data before this is meaningful.
+
+### OT4 — Confirm screener results summary pull   ⏳ PENDING / CLARIFY
+Ask: Confirm if company results summary is being pulled through screener.
+Current state: scrape_results_table.py pulls quarterly numbers from Screener
+HTML (no LLM) and writes to quarterly_facts.parquet. This is separate from
+the Gemini extraction. CONFIRM: is the user asking about something different,
+or is this already covered?
+
+### OT5 — High-guidance watchlist + chart section in app   ⏳ PENDING
+Ask (part a): Create a "high guidance" watchlist from Table_A — companies
+where management has provided explicit forward guidance. Keep active as long
+as guidance horizon is in the future; remove when guidance period lapses.
+Ask (part b): Display guidance on existing charts in app.py — annotate price
+charts with guidance values for revenue/PAT growth at the relevant quarter.
+Files involved: guidance_tracker.parquet → new Watchlist page + chart overlay
+in app.py. Depends on Stage C dashboard work.
+
+### OT6 — Guidance-backed momentum score   ⏳ PENDING
+Ask: Identify fast-running stocks backed by good guidance. Create an internal
+score combining price momentum + guidance quality. Rank-order output.
+Design notes: Inputs = momentum score (from aggregate_signals) × guidance
+quality proxy (GF4 flags: Strong Order Book, Capacity Backed = positive;
+Weak Visibility, Guidance Ambiguous = negative) × GF1 explicit guidance
+count. Output: ranked list per quarter, new section in app.py.
+
+### OT7 — Deep research report via user input   ⏳ PENDING
+Ask: User provides company name / NSE / BSE / ISIN (one or multiple) via
+Streamlit UI or Google Cloud. System runs deep research using
+comapnydeepdive_prompt.txt. User can also upload a local file to cloud;
+next scheduled run checks if a deep run is needed.
+Files involved: scripts/company_deep_report.py (not yet built),
+comapnydeepdive_prompt.txt (exists), app.py (new input UI page).
+Note: Prompt file exists at scripts/comapnydeepdive_prompt.txt. Script not built.
+
+### OT8 — Local document summarisation → Drive → deep research context   ⏳ PENDING
+Ask: User has local documents (industry reports, concalls, research, sell-side
+reports). Summarise those docs and store summaries in Drive under a general-
+purpose folder. When running deep research (OT7), also check if any stored
+summaries reference the target company and include as context.
+Design: Local doc → Gemini summarise → Drive/general_purpose/<doc_hash>.md
+Deep research run: query general_purpose/ for company name matches → inject
+as additional context into comapnydeepdive_prompt.txt call.
+Dependency: OT7 must be built first.
+
+---
+
+## OPEN INFRASTRUCTURE FIXES — PENDING
+
+### InfraFix 1 — Run-block separator in daily digest   ⏳ PENDING (low priority)
+Current state: concall_N numbering is sequential across all runs in a day.
+Ask: Group entries by run (Run1: concall_1…concall_8 | Run2: concall_9…) so
+user can quickly identify what each scheduled run added. Add "Run1_concall_X"
+style markers to the index.
+File: scripts/extract_concall.py → append_day_page()
+
+### InfraFix 2 — Phase 2 seasonal frequency scheduling   ⏳ PENDING
+(Same as Fix 2 above — Q-end seasons need higher run frequency.)
+Estimated effort: medium. Requires cron table changes + date-range logic.

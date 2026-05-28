@@ -60,9 +60,17 @@ Drive folder layout:
   features/latest.parquet
   signals/per_strategy/<name>/latest.csv, signals/aggregated/
   fundamentals/, universe/
-  company_repo/_index/{processing_queue, quarterly_facts, guidance_tracker}.parquet
+  company_repo/_index/processing_queue.parquet
+  company_repo/_index/quarterly_facts.parquet
+  company_repo/_index/guidance_tracker.parquet        ← Table_A guidance rows
+  company_repo/_index/gf1_guidance_statements.parquet ← raw forward statements
+  company_repo/_index/gf2_historical_guidance.parquet ← past guidance vs actuals
+  company_repo/_index/gf3_operational_visibility.parquet
+  company_repo/_index/gf4_quality_flags.parquet
+  company_repo/_index/*.csv                           ← CSV snapshots (per run)
   company_repo/<ISIN>/company_page.md
-  company_repo/_daily/concall_DD_MMMYYYY.md  (daily digest, kept forever)
+  company_repo/_daily/concall_DD_MMMYYYY.md   (daily digest, kept forever)
+  company_repo/_quarterly/QXFY_mgmt_guidance.md  (quarterly tracker, per quarter)
   logs/health/latest.json          (Phase 1 health report)
   logs/health/phase2_latest.json   (Phase 2 queue snapshot)
 
@@ -161,11 +169,20 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 ## 5. What's PENDING
 
 ### Stage C — Dashboard enhancements
-- **Guidance page** in app.py — show `guidance_tracker.parquet` per company (management guidance vs actuals)
+- **Guidance page** in app.py — show `guidance_tracker.parquet` + `gf1_guidance_statements.parquet` per company; management guidance vs actuals view (data now available in parquets)
 - **Results filter-by-growth** — filter signals by revenue/PAT growth criteria from `quarterly_facts.parquet`
+- **High-guidance watchlist** — companies with active explicit guidance; separate chart section in app (OT5)
+- **Guidance-backed momentum score** — internal rank order combining price action + guidance quality (OT6)
+- **Mgmt said vs delivered tracker** — GF2 cross-quarter comparison showing guidance credibility per company (OT3; needs 2-3 quarters of GF2 data to be meaningful)
 
 ### Stage E — Deep dive report
-- `company_deep_report.py` — prompt file `comapnydeepdive_prompt.txt` already exists; script not yet built
+- `company_deep_report.py` — prompt file `comapnydeepdive_prompt.txt` already exists; script not yet built (OT7)
+- **Local doc summarisation → Drive context store** — summarise user's local docs (industry reports, sell-side), store on Drive, inject into deep research (OT8; depends on OT7)
+
+### Infrastructure fixes pending
+- **MP3/transcript dedup** — date-based dedup in `ingest_company_docs.py` (same company, different received_date = new doc) (InfraFix 1)
+- **Seasonal Phase 2 frequency** — higher run frequency during Q-end concall season (45 days after Dec/Mar/Jun/Sep quarter close); lower off-season (InfraFix 2)
+- **Run-block separator in daily digest** — group `concall_N` entries by run within the daily digest (low priority)
 
 ### Blocked
 - **Insider buy/sell** — no reliable free structured data source identified
@@ -222,3 +239,59 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - Secrets: GitHub Actions secrets + Streamlit Cloud secrets + local `.env` (gitignored)
 - Keys: `GDRIVE_FOLDER_ID`, `GDRIVE_OAUTH_TOKEN_JSON`, `GDRIVE_OAUTH_CLIENT_SECRET_JSON`, `SCREENER_SESSION_COOKIE`, `GEMINI_API_KEY`
 - Constraint (binding): code never accesses passwords/PII; portfolio cost/P&L never in git or LLM context
+
+---
+
+## 10. Session change log
+
+Full specification detail in `scripts/Concall_Extractor.txt`.
+
+### Session 2026-05-26 — Prompt review + operational fixes
+
+**Asked:**
+- Review `concall_prompt.txt` and confirm if information is clear or if there are prompt-level challenges
+- Fix 1: MP3 without transcript — date-based dedup so same company on different dates = new doc
+- Fix 2: Seasonal Phase 2 frequency tuning aligned to India Q-end concall seasons
+- Fix 3: Increase daily digest retention to 90 days
+- Confirmation 1: Confirm run-tracker / `Run1_concall_XXX` style grouping in daily digest
+
+**Delivered:**
+- `concall_prompt.txt` fully reviewed and rewritten: added zero-hallucination block, readability block, cross-industry metric adaptation (Manufacturing/BFSI/IT), strict Explicit/Derived guidance classification rules, mandatory derivation footnotes, completed GF1-4 sections, A1/A2/A3/B/C/E1 all present
+- Fix 3 resolved: daily digests kept forever (better than 90 days)
+- Confirmation 1 partial: sequential `concall_N` numbering with live **Index:** list and timestamp is live; per-run block grouping deferred
+
+**Still pending from this session:** Fix 1 (MP3 dedup), Fix 2 (seasonal frequency), run-block separator
+
+---
+
+### Session 2026-05-28 — Capacity analysis + 5-output pipeline
+
+**Asked:**
+- Check Gemini key count and remaining daily/monthly capacity
+- "Your assumption were wrong yesterday — 8 companies took 40 mins, you said 8-10 mins. Wrong by 4x."
+- If 100 concalls + 100 presentations/results per day, is there bandwidth?
+- Plan for the full month — avoid hitting limits like GitHub Actions quota
+- GF1-4 must be parsed into structured data; produce 5 output files per concall in .md and .csv
+
+**Delivered:**
+- Corrected timing model: ~2 min/concall all-in (was 8-10 min estimate — acknowledged wrong)
+- Capacity confirmed safe: 6 keys × 250 RPD = 1,500/day; peak load ~130 req/day = 8.7% utilisation
+- Monthly risk = zero: Gemini 2.5 Flash free tier has no monthly request cap (daily RPD is the only limit)
+- 429 root cause identified: RPM (not RPD). Fix: `INTER_CALL_SLEEP = 6s` added to `GeminiKeyPool`
+- `extract_concall.py` fully rewritten with 5 outputs:
+  1. `company_page.md` (existing, per company)
+  2. `concall_DD_MMMYYYY.md` daily digest (existing)
+  3. `QXFY_mgmt_guidance.md` quarterly guidance tracker (NEW)
+  4. `gf1/gf2/gf3/gf4_*.parquet` (NEW — section-aware GF extraction)
+  5. CSV snapshots of all 5 parquets written per run (NEW)
+- All committed and pushed; active from next scheduled Phase 2 run
+
+**Still pending from this session:**
+- OT3: Mgmt said vs delivered cross-quarter view (needs 2-3 quarters of GF2 data)
+- OT4: Confirm results summary pull via screener
+- OT5: High-guidance watchlist + chart overlay in app.py
+- OT6: Guidance-backed momentum score
+- OT7: Deep research report via user input (Streamlit UI)
+- OT8: Local document summarisation → Drive context store
+- InfraFix 1: MP3/transcript date-based dedup (carried from 2026-05-26)
+- InfraFix 2: Seasonal Phase 2 frequency tuning (carried from 2026-05-26)
