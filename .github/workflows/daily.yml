@@ -7,6 +7,8 @@ on:
     # UTC 10:30 is pre-US-business-hours (off-peak GitHub), so runner queue wait
     # is ~15-30 min → data consistently ready by IST 17:00-17:30.
   workflow_dispatch:          # manual trigger from GitHub UI
+  repository_dispatch:
+    types: [trigger-phase1]   # triggered by cron-job.org every weekday at 16:00 IST
 
 jobs:
   pipeline:
