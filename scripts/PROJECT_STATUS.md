@@ -215,13 +215,14 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 ### P3 — OT9: Streamlit performance optimisation
 - Audit cache TTLs, reduce redundant Drive calls, lazy-load heavy pages
 
-### P1 (new) — OT11: Phase 1 local HTML report
-- `fetch_phase1_report.py` + `get_phase1_report.bat`
-- Downloads signals + features + portfolio from Drive
-- Generates a styled HTML file with two sections:
-  1. Conviction signals (≥2 strategies, buy/add zones) — sorted by strategy count
-  2. Portfolio page — holdings overlaid with RS rank, signals, zone types, 3M return
-- Opens in browser; user can print to PDF from browser (Ctrl+P → Save as PDF)
+### OT11 — Phase 1 HTML report ✅ DONE (2026-05-29)
+- `scripts/fetch_phase1_report.py` + `get_phase1_report.bat`
+- Section 1: Conviction signals (≥N strategies, buy/add zones) — table + collapsible Plotly charts
+- Section 2: Portfolio — holdings overlaid with features + signal zones + collapsible charts
+- Charts: candlestick + 20/50 EMA + 200 SMA + volume + signal entry/stop lines
+- Interactive (hover/zoom/pan), CDN Plotly.js, collapsible `<details>` so 300 charts don't freeze browser
+- Bat options: tables-only (~15s) through top 300 charts (~90 min); portfolio charts always included with --with-charts
+- Saves to `D:\EMA_Screener\Reports\signals-india\phase1_reports\`; print to PDF via Ctrl+P → Landscape
 
 ### P4 — Documentation + Fix 2B
 - **End-to-end runbook** — local + Streamlit, all processes, how to fix common issues
