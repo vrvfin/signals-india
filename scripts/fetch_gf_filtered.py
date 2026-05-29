@@ -160,27 +160,56 @@ def open_in_obsidian(path: Path) -> None:
 from _md_utils import fix_markdown_for_obsidian
 
 
-def download_company_page(drive, isin: str, symbol: str) -> Path | None:
-    """Download company_page.md for a given ISIN, fix, save to OUTPUT_DIR."""
+def _clean_key(val) -> str:
+    """Return string value, or '' if NaN / 'nan' / empty."""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none", "") else s
+
+
+def download_company_page(drive, isin: str, symbol: str) -> tuple[Path | None, str]:
+    """Download company_page.md. Returns (path, status_msg)."""
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = find_subfolder(drive, folder_id, "company_repo")
     if not repo_id:
-        return None
+        return None, "company_repo folder not found on Drive"
 
-    # Try ISIN folder first, then symbol
-    for key in [isin, symbol]:
+    isin_c = _clean_key(isin)
+    sym_c  = _clean_key(symbol)
+
+    # Build candidate keys — skip blanks and obvious non-ISIN numerics as primary
+    keys: list[str] = []
+    if isin_c and not isin_c.isdigit():   # real ISIN (starts with letters)
+        keys.append(isin_c)
+    if sym_c and not sym_c.isdigit():     # real NSE symbol (text)
+        keys.append(sym_c)
+    if isin_c and isin_c not in keys:     # numeric ISIN? still worth trying
+        keys.append(isin_c)
+    if sym_c and sym_c not in keys:
+        keys.append(sym_c)
+
+    if not keys:
+        return None, f"No valid ISIN or symbol (isin='{isin}', symbol='{symbol}')"
+
+    for key in keys:
         comp_id = find_subfolder(drive, repo_id, key)
         if comp_id:
             fid = find_file(drive, comp_id, "company_page.md")
             if fid:
-                raw  = download_bytes(drive, fid)
-                text = raw.decode("utf-8", errors="replace")
+                raw   = download_bytes(drive, fid)
+                text  = raw.decode("utf-8", errors="replace")
                 fixed = fix_markdown_for_obsidian(text)
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                out = OUTPUT_DIR / f"{symbol or isin}_company_page.md"
+                label = isin_c or sym_c
+                out   = OUTPUT_DIR / f"{label}_company_page.md"
                 out.write_text(fixed, encoding="utf-8")
-                return out
-    return None
+                return out, f"found via key='{key}'"
+            else:
+                return None, (f"Folder '{key}' exists on Drive but no company_page.md yet "
+                              f"— concall may be queued but not yet processed")
+
+    tried = ", ".join(f"'{k}'" for k in keys)
+    return None, (f"No folder found for keys {tried}. "
+                  f"Use get_company_intel.bat to try a different ISIN.")
 
 
 # ---------- Interactive prompt helpers ----------
@@ -332,16 +361,19 @@ def main() -> None:
     if max_pct is not None:
         threshold_str += f" ≤{max_pct:.0f}%"
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*75}")
     print(f"  {len(best)} companies match:  {metric} | {horizon}{threshold_str}")
-    print(f"{'='*60}")
-    print(f"  {'Symbol':<15} {'Company':<35} {'Guidance %':>10}  Type")
-    print(f"  {'-'*15} {'-'*35} {'-'*10}  {'-'*8}")
+    print(f"{'='*75}")
+    print(f"  {'ISIN':<14} {'Symbol':<12} {'Company':<28} {'Guidance %':>10}  Type")
+    print(f"  {'-'*14} {'-'*12} {'-'*28} {'-'*10}  {'-'*8}")
     for _, row in best.iterrows():
         score_str = f"{row['_score']:.1f}%" if pd.notna(row["_score"]) else str(row["value"])[:10]
         gtype_str = str(row.get("guidance_type", ""))[:8]
-        print(f"  {str(row['symbol']):<15} {str(row['company_name']):<35} {score_str:>10}  {gtype_str}")
-    print()
+        isin_str  = _clean_key(row.get("isin",   "")) or "—"
+        sym_str   = _clean_key(row.get("symbol", "")) or "—"
+        print(f"  {isin_str:<14} {sym_str:<12} {str(row['company_name']):<28} "
+              f"{score_str:>10}  {gtype_str}")
+    print(f"\n  Tip: use ISIN with get_company_intel.bat if download fails below.")
 
     # ── Confirm download ──────────────────────────────────────────────────────
     confirm = input(f"  Download company_page.md for all {len(best)} companies? [Y/n]: ").strip().lower()
@@ -354,16 +386,17 @@ def main() -> None:
     failed: list[str] = []
 
     for _, row in best.iterrows():
-        sym  = str(row.get("symbol", ""))
-        isin = str(row.get("isin",   ""))
-        log(f"Downloading {sym} ({isin})…")
-        path = download_company_page(drive, isin, sym)
+        sym  = _clean_key(row.get("symbol", ""))
+        isin = _clean_key(row.get("isin",   ""))
+        label = sym or isin or "unknown"
+        log(f"Downloading {label}  (ISIN={isin or '—'})…")
+        path, status = download_company_page(drive, isin, sym)
         if path:
             downloaded.append(path)
-            log(f"  ✓ Saved: {path.name}")
+            log(f"  ✓ {status}")
         else:
-            failed.append(sym or isin)
-            log(f"  ✗ Not found on Drive: {sym}")
+            failed.append(f"{label} [{status}]")
+            log(f"  ✗ {status}")
 
     print(f"\n{'='*60}")
     print(f"  Downloaded: {len(downloaded)}   Not found: {len(failed)}")
