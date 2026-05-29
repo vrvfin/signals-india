@@ -215,6 +215,14 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 ### P3 — OT9: Streamlit performance optimisation
 - Audit cache TTLs, reduce redundant Drive calls, lazy-load heavy pages
 
+### P1 (new) — OT11: Phase 1 local HTML report
+- `fetch_phase1_report.py` + `get_phase1_report.bat`
+- Downloads signals + features + portfolio from Drive
+- Generates a styled HTML file with two sections:
+  1. Conviction signals (≥2 strategies, buy/add zones) — sorted by strategy count
+  2. Portfolio page — holdings overlaid with RS rank, signals, zone types, 3M return
+- Opens in browser; user can print to PDF from browser (Ctrl+P → Save as PDF)
+
 ### P4 — Documentation + Fix 2B
 - **End-to-end runbook** — local + Streamlit, all processes, how to fix common issues
 - **Fix 2B** — BSE Direct API secondary ingestion (eliminates Screener 25-item cap)
@@ -223,11 +231,32 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 ### Infrastructure — Node.js 24 ✅ DONE (2026-05-29)
 - `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` added to both `daily.yml` and `phase2.yml`.
 
-### OT10 — Doc Viewer ✅ DONE (2026-05-29)
-- `scripts/md_viewer.py` — local CLI HTML viewer
-- `scripts/fetch_latest_concall.py` — downloads latest/specific daily digest from Drive,
-  saves to OUTPUT_DIR (configure at top of script), opens in Obsidian via `os.startfile()`
-- "Doc Viewer" Streamlit page — 4 tabs: Company Page, GF Tables, Results, Quarterly Guidance
+### OT10 — Doc Viewer + Local Bat Tools ✅ DONE (2026-05-29)
+
+**Streamlit:**
+- "Doc Viewer" page — 4 tabs: Company Page, GF Tables (dataframes), Results, Quarterly Guidance
+- "Mgmt Guidance" page — Tracker / Active Watchlist / Guidance × Momentum tabs
+
+**Local bat files (all in project root, double-click to run):**
+
+| Bat file | Purpose | Saves to |
+|---|---|---|
+| `get_latest_concall.bat` | Latest daily digest → Obsidian | `signals-india\concalls\` |
+| `get_concalls_range.bat` | Date-range digests → Obsidian | `signals-india\concalls\` |
+| `list_concalls.bat` | Browse + pick by date → Obsidian | `signals-india\concalls\` |
+| `get_company_intel.bat` | Company page by ISIN/symbol → Obsidian | `signals-india\company_intel\` |
+| `get_quarterly_guidance.bat` | Quarterly .md (growing season summary) → Obsidian | `signals-india\quarterly_guidance\` |
+| `get_gf_csv.bat` | GF1-GF4 + Table A as CSV → Explorer/Excel | `signals-india\gf_tables_csv\` |
+| `get_gf_filtered.bat` | Filter by guidance criteria → matching company pages → Obsidian | `signals-india\company_intel\` |
+
+**Supporting scripts:**
+- `scripts/_md_utils.py` — shared Obsidian table fixer (joins split rows, strips leading whitespace, unwraps fenced tables)
+- `scripts/md_viewer.py` — CLI: `python scripts/md_viewer.py file.md` → HTML in browser
+- `scripts/fetch_latest_concall.py`, `fetch_concalls_range.py`, `fetch_company_intel.py`
+- `scripts/fetch_quarterly_guidance.py`, `fetch_gf_csv.py`, `fetch_gf_filtered.py`
+- `scripts/RUNBOOK.md` — operations guide, FAQ, troubleshooting
+
+**Known data quality issue:** Some companies in guidance_tracker have BSE scrip code as `symbol` (e.g. `544675`) and NaN ISIN — company_page.md lookup falls back gracefully with clear error message.
 
 ### Blocked
 - **Insider buy/sell** — no reliable free structured data source identified
