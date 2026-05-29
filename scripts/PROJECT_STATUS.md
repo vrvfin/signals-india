@@ -5,7 +5,7 @@ records what was *designed*; this file records what is *built and pending*.
 To resume work in any future chat session, paste this file as context — it is
 enough to pick up where we left off.
 
-**Last updated:** 2026-05-28
+**Last updated:** 2026-05-29
 **Repo:** github.com/vrvfin/signals-india (**public** — unlimited GitHub Actions minutes)
 **Local:** `D:\EMA_Screener\claude\signals-india` · conda env `signals-india` (Python 3.11)
 **Storage:** Google Drive folder `signals-india/` (OAuth, app in Production mode)
@@ -163,33 +163,43 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - Daily digests kept forever; raw PDFs deleted after 10 days
 - Phase 2 health report written to Drive after every run; visible in dashboard
 
+### Dashboard — Stage C Complete ✅ (2026-05-29)
+- **Mgmt Guidance page** — new sidebar nav item with 3 tabs:
+  - Guidance Tracker: `guidance_tracker.parquet` + `gf1_guidance_statements.parquet`, 4 filters (company / metric / horizon / type)
+  - Active Watchlist: current/future FY explicit guidance, GF4 quality scores (+1/−1 per flag), drill-down per company
+  - Guidance × Momentum: combined score = n_strategies × max(0.5, 1 + quality × 0.3) + n_guidance × 0.2; threshold sliders
+- **Results growth filter** in Today's Signals — opt-in expander (checkbox), min Revenue YoY% + PAT YoY% from `results.parquet`, joins via ISIN→symbol from universe
+- **Management Guidance section** in Stock Detail — active guidance table, all-quarters expander, GF4 quality badge, raw GF1 statements expander
+- 4 new cached data loaders (`load_guidance_tracker`, `load_gf1_statements`, `load_gf4_flags`, `load_results_summary`)
+- GF4 helpers: `_gf4_quality_score()`, `_guidance_is_active()`, `_GF4_POSITIVE`/`_GF4_NEGATIVE` frozensets
+
 ### Infrastructure ✅
 - Repo public (unlimited GitHub Actions minutes; no quota risk)
 - Skip check: Phase 1 skips if already ran today (IST); Phase 2 skips if queue empty + <45min ago; manual trigger always bypasses
 - OHLCV stale threshold: 6d (handles holiday weekends + yfinance NSE data lag)
 - Streamlit malloc crash fixed (yfinance removed from root requirements.txt)
 - Security: no credentials in repo; `*.parquet`, `*.csv`, `*.json` all gitignored; results.parquet removed from git history; `.env.example` has placeholders only; portfolio data never in git
+- **MP3/transcript date-based dedup** — composite key `doc_id + announcement_date` in `ingest_company_docs.py` (Fix 1, 2026-05-28)
+- **Run-block separator in daily digest** — `extract_concall.py` groups `concall_N` entries by run time with `*(Run HH:MM IST)*` suffix; backward-compatible (InfraFix 1 / Confirmation 1, 2026-05-28)
+- **Three-layer Phase 2 reliability** — (1) dense seasonal cron 6-7×/weekday peak; (2) daily.yml ACTIONS_PAT backup trigger; (3) cron-job.org external HTTP trigger every 2h. ACTIONS_PAT secret created ✅
+- **Phase 1 external trigger** — cron-job.org sends `repository_dispatch` to daily.yml at 16:00 IST weekdays; daily.yml updated to receive it. cron-job.org Phase 1 job created ✅
 
 ---
 
 ## 5. What's PENDING
 
-### Stage C — Dashboard enhancements
-- **Guidance page** in app.py — show `guidance_tracker.parquet` + `gf1_guidance_statements.parquet` per company; management guidance vs actuals view (data now available in parquets)
-- **Results filter-by-growth** — filter signals by revenue/PAT growth criteria from `quarterly_facts.parquet`
-- **High-guidance watchlist** — companies with active explicit guidance; separate chart section in app (OT5)
-- **Guidance-backed momentum score** — internal rank order combining price action + guidance quality (OT6)
-- **Mgmt said vs delivered tracker** — GF2 cross-quarter comparison showing guidance credibility per company (OT3; needs 2-3 quarters of GF2 data to be meaningful)
+### Stage D — Mgmt said vs delivered (OT3) — DEFERRED
+- **GF2 credibility tracker** — cross-quarter comparison of guidance_tracker vs quarterly_facts; shows how accurately mgmt delivered vs what they guided. Deferred until 2-3 quarters of GF2 data accumulates (earliest useful: Q2 FY27 season, ~Nov 2026).
 
 ### Stage E — Deep dive report
-- `company_deep_report.py` — prompt file `comapnydeepdive_prompt.txt` already exists; script not yet built (OT7)
+- **`company_deep_report.py`** — prompt file `comapnydeepdive_prompt.txt` already exists; Streamlit UI for user to trigger; script not yet built (OT7)
 - **Local doc summarisation → Drive context store** — summarise user's local docs (industry reports, sell-side), store on Drive, inject into deep research (OT8; depends on OT7)
 
-### Infrastructure fixes pending
-- **MP3/transcript dedup** — date-based dedup in `ingest_company_docs.py` (same company, different received_date = new doc) (InfraFix 1)
-- **Seasonal Phase 2 frequency** — higher run frequency during Q-end concall season (45 days after Dec/Mar/Jun/Sep quarter close); lower off-season (InfraFix 2)
-- **Run-block separator in daily digest** — group `concall_N` entries by run within the daily digest (low priority)
-- **ACTIONS_PAT secret** — one-time manual step: create GitHub PAT (workflow scope) → store as `ACTIONS_PAT` repo secret → activates Phase 1→Phase 2 backup trigger in daily.yml
+### Fix 2B — BSE Direct API secondary ingestion (backlog)
+- **Screener 25-item cap** — Screener.in caps concall lists at 25 per load. Fix: `ingest_company_docs.py` gets a secondary path via BSE Direct API (`https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w`) — public JSON, no auth, no cap, returns ISIN, supports date-range. Medium effort; eliminates risk of missing companies beyond position 25.
+
+### Infrastructure — URGENT (deadline Jun 2, 2026)
+- **Node.js 24 migration** — GitHub Actions is forcing all runners to Node.js 24 from June 2, 2026. Current `actions/checkout@v4`, `actions/setup-python@v5`, `actions/cache@v4` run on Node.js 20 and will break. Fix: bump all three actions to their latest v4 patch (or set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` env var on the runner). Affects both `daily.yml` and `phase2.yml`. ⚠️ Must fix before Jun 2.
 
 ### Blocked
 - **Insider buy/sell** — no reliable free structured data source identified
@@ -199,7 +209,6 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 - 12-quarter financials + valuation overlays on charts
 - Telegram alerts
 - Move LLM prompts from repo to private Drive files (currently in git as .txt)
-- Update GitHub Actions to Node.js 24 (current v4 actions deprecated June 2026; still functional until Sep 2026)
 
 ---
 
@@ -331,3 +340,51 @@ Full specification detail in `scripts/Concall_Extractor.txt`.
 - OT8: Local document summarisation → Drive context store
 - InfraFix 1: MP3/transcript date-based dedup (carried from 2026-05-26)
 - InfraFix 2: Seasonal Phase 2 frequency tuning (carried from 2026-05-26)
+
+---
+
+### Session 2026-05-28 (continued) — Reliability + app.py Stage C
+
+**Asked:**
+- Enforce Phase 1 runs at 4PM IST via external trigger (since GitHub cron is unreliable)
+- Confirm OT4 (screener results summary pull)
+- Close all pending app.py items (OT5-a, OT5-b, OT6, Stage C-1, Stage C-2)
+
+**Delivered:**
+- Phase 1 cron-job.org: `repository_dispatch` trigger added to `daily.yml`; cron-job.org job configured for weekdays 16:00 IST
+- ACTIONS_PAT GitHub secret created (Phase 1→Phase 2 backup trigger now active)
+- OT4 confirmed: `scrape_results_table.py` already covers this; `results.parquet` at `company_repo/_index/results.parquet` with YoY% columns
+- OT3 deferred: needs real data from 2-3 quarters before it's meaningful
+
+**Stage C-1 — Mgmt Guidance page (app.py):**
+- New "Mgmt Guidance" nav item + `page_guidance()` with 3 tabs
+- Tab 1 Guidance Tracker: 4-filter table from `guidance_tracker.parquet` + GF1 raw statements expander
+- Tab 2 Active Watchlist: current/future FY guidance ranked by GF4 quality score, drill-down per company
+- Tab 3 Guidance × Momentum: combined score formula, min-strategy/guidance threshold sliders
+
+**Stage C-2 — Results growth filter (app.py):**
+- Collapsed expander in Today's Signals with opt-in checkbox
+- Filters by min Revenue YoY% + PAT YoY%; joins `results.parquet` → universe via ISIN
+
+**OT5-b — Stock Detail guidance section (app.py):**
+- Management Guidance section at bottom of Stock Detail page
+- Shows active (current/future FY) guidance table + all-quarters expander + GF4 quality badge + raw GF1 expander
+
+**Still pending / deferred:**
+- OT3: Deferred to Nov 2026 (needs 2-3 quarters of GF2 data)
+- OT7: Deep research report (Streamlit input → Gemini) — not yet built
+- OT8: Local doc summarisation → Drive context store (depends on OT7)
+- Fix 2B: BSE Direct API secondary ingestion (eliminates Screener 25-item cap)
+
+---
+
+### Session 2026-05-29 — Status review
+
+**Run health check:**
+- Phase 2 running successfully: 6 successful runs in last 24h (cron + repository_dispatch), 2 cancelled via timeout (3h limit hit — queue is large during peak season). Normal for peak concall season.
+- Phase 1 last run: 2026-05-28T14:07 UTC (manual trigger, all steps passed except Health check truth gate — isolated failure, likely data freshness issue on that specific run). No scheduled Phase 1 run yet today (will fire at 10:30 UTC = 16:00 IST).
+- Node.js 20 deprecation warning visible on all runs — actions/checkout, setup-python, cache all on Node.js 20. **Forces to Node.js 24 from June 2, 2026** — must fix within 4 days.
+
+**Documentation updated:**
+- Section 4 (Done) updated with Stage C completion and all infra items
+- Section 5 (Pending) refreshed — removed completed items, added Fix 2B and Node.js 24 as priority items
