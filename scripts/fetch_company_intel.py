@@ -95,14 +95,17 @@ from _md_utils import fix_markdown_for_obsidian   # split-row fixer + whitespace
 
 # ---------- Open ----------
 
+OBSIDIAN_EXE = Path(r"C:\Users\vaido\AppData\Local\Programs\Obsidian\Obsidian.exe")
+
 def open_file(path: Path) -> None:
     log(f"Opening in Obsidian: {path}")
     try:
-        os.startfile(str(path))
-    except AttributeError:
-        subprocess.run(["open", str(path)])
+        if OBSIDIAN_EXE.exists():
+            subprocess.Popen([str(OBSIDIAN_EXE), str(path)])
+        else:
+            os.startfile(str(path))   # fallback
     except Exception as e:
-        log(f"Could not auto-open ({e}) — path: {path}")
+        log(f"Could not open ({e}) — path: {path}")
 
 
 # ---------- Main ----------

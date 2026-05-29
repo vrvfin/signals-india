@@ -111,15 +111,18 @@ from _md_utils import fix_markdown_for_obsidian   # split-row fixer + whitespace
 
 # ---------- Open in Obsidian ----------
 
+OBSIDIAN_EXE = Path(r"C:\Users\vaido\AppData\Local\Programs\Obsidian\Obsidian.exe")
+
 def open_file(path: Path) -> None:
-    """Open a file with the system default handler (Obsidian if .md is registered)."""
-    log(f"Opening: {path}")
+    """Open file directly in Obsidian (bypasses default .md handler which may be VS Code)."""
+    log(f"Opening in Obsidian: {path}")
     try:
-        os.startfile(str(path))          # Windows — opens with default .md app
-    except AttributeError:
-        subprocess.run(["open", str(path)])   # macOS fallback
+        if OBSIDIAN_EXE.exists():
+            subprocess.Popen([str(OBSIDIAN_EXE), str(path)])
+        else:
+            os.startfile(str(path))   # fallback to default handler
     except Exception as e:
-        log(f"Could not auto-open: {e}")
+        log(f"Could not open ({e})")
         log(f"Open manually: {path}")
 
 
