@@ -111,16 +111,16 @@ from _md_utils import fix_markdown_for_obsidian   # split-row fixer + whitespace
 
 # ---------- Open in Obsidian ----------
 
-OBSIDIAN_EXE = Path(r"C:\Users\vaido\AppData\Local\Programs\Obsidian\Obsidian.exe")
-
 def open_file(path: Path) -> None:
-    """Open file directly in Obsidian (bypasses default .md handler which may be VS Code)."""
+    """Open file in Obsidian using the obsidian:// URI scheme.
+    File MUST be inside an Obsidian vault — set OUTPUT_DIR to your vault folder.
+    """
+    import urllib.parse
     log(f"Opening in Obsidian: {path}")
+    # obsidian://open?path=<absolute-path> — Obsidian handles this natively
+    uri = "obsidian://open?path=" + urllib.parse.quote(str(path).replace("\\", "/"), safe=":/")
     try:
-        if OBSIDIAN_EXE.exists():
-            subprocess.Popen([str(OBSIDIAN_EXE), str(path)])
-        else:
-            os.startfile(str(path))   # fallback to default handler
+        subprocess.run(["cmd", "/c", "start", "", uri], shell=False)
     except Exception as e:
         log(f"Could not open ({e})")
         log(f"Open manually: {path}")

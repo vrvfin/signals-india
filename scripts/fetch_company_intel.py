@@ -95,15 +95,15 @@ from _md_utils import fix_markdown_for_obsidian   # split-row fixer + whitespace
 
 # ---------- Open ----------
 
-OBSIDIAN_EXE = Path(r"C:\Users\vaido\AppData\Local\Programs\Obsidian\Obsidian.exe")
-
 def open_file(path: Path) -> None:
+    """Open file in Obsidian using the obsidian:// URI scheme.
+    File MUST be inside an Obsidian vault — set OUTPUT_DIR to your vault folder.
+    """
+    import urllib.parse
     log(f"Opening in Obsidian: {path}")
+    uri = "obsidian://open?path=" + urllib.parse.quote(str(path).replace("\\", "/"), safe=":/")
     try:
-        if OBSIDIAN_EXE.exists():
-            subprocess.Popen([str(OBSIDIAN_EXE), str(path)])
-        else:
-            os.startfile(str(path))   # fallback
+        subprocess.run(["cmd", "/c", "start", "", uri], shell=False)
     except Exception as e:
         log(f"Could not open ({e}) — path: {path}")
 
