@@ -193,39 +193,50 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 
 ## 5. What's PENDING
 
-### Stage D — Mgmt said vs delivered (OT3) — DEFERRED
-- **GF2 credibility tracker** — cross-quarter comparison of guidance_tracker vs quarterly_facts; shows how accurately mgmt delivered vs what they guided. Deferred until 2-3 quarters of GF2 data accumulates (earliest useful: Q2 FY27 season, ~Nov 2026).
+<!-- Priority order as set 2026-05-29: P0→P1→P2→P3→P4 -->
 
-### Stage E — Deep dive report
-- **`company_deep_report.py`** — prompt file `comapnydeepdive_prompt.txt` already exists; Streamlit UI for user to trigger; script not yet built (OT7)
-- **Local doc summarisation → Drive context store** — summarise user's local docs (industry reports, sell-side), store on Drive, inject into deep research (OT8; depends on OT7)
+### P0 — OT8: Local doc summarisation → Drive context store
+- Upload local documents (annual reports, sell-side, industry notes) via Streamlit
+- Gemini summarises each doc → structured context stored on Drive
+- Viewable in app independently; later consumed by OT7 deep research report
+- Note: OT8 is being built standalone first; OT7 connects to its output
 
-### Fix 2B — BSE Direct API secondary ingestion (backlog)
-- **Screener 25-item cap** — Screener.in caps concall lists at 25 per load. Fix: `ingest_company_docs.py` gets a secondary path via BSE Direct API (`https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w`) — public JSON, no auth, no cap, returns ISIN, supports date-range. Medium effort; eliminates risk of missing companies beyond position 25.
+### P1 — OT7: Deep research report (company_deep_report.py)
+- Prompt file `comapnydeepdive_prompt.txt` already exists (forensic equity analysis)
+- Script `company_deep_report.py` not yet built
+- Streamlit UI: user selects company, triggers report, views/downloads output
+- Consumes OT8 context store for local-document-backed research
+
+### P2 — OT3: Mgmt said vs delivered (GF2 credibility tracker)
+- Cross-quarter comparison of guidance_tracker vs quarterly_facts
+- Shows guidance credibility per company per metric
+- Deferred: needs 2-3 quarters of GF2 data (earliest useful: ~Nov 2026)
+
+### P3 — OT9: Streamlit performance optimisation
+- Audit cache TTLs, reduce redundant Drive calls, lazy-load heavy pages
+
+### P4 — Documentation + Fix 2B
+- **End-to-end runbook** — local + Streamlit, all processes, how to fix common issues
+- **Fix 2B** — BSE Direct API secondary ingestion (eliminates Screener 25-item cap)
+  API: `https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w` — public, no auth, no cap
 
 ### Infrastructure — Node.js 24 ✅ DONE (2026-05-29)
-- `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` added to both `daily.yml` and `phase2.yml` job env. Silences deprecation warnings, opts in to Node.js 24 before the forced migration on Jun 2, 2026.
+- `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` added to both `daily.yml` and `phase2.yml`.
 
-### OT10 — Doc Viewer (P1) ✅ DONE (2026-05-29)
-- **`scripts/md_viewer.py`** — local CLI tool; takes any .md file path, converts to HTML with proper table rendering, opens in default browser. `pip install markdown` required (in scripts/requirements.txt).
-- **"Doc Viewer" page in app.py** — new sidebar nav item with 4 tabs:
-  - 🏢 Company Page: renders company_page.md with tables + download button
-  - 📋 GF Tables: shows guidance_tracker, gf1_guidance_statements, gf4_quality_flags as proper dataframes per company
-  - 📊 Results: results.parquet for the symbol
-  - 📅 Quarterly Guidance: browses and renders company_repo/_quarterly/*.md files
-- Matches by both ISIN and symbol across all parquet tables.
-
-### OT9 — Streamlit performance optimisation (P2 — deferred)
-- Audit cache TTLs, reduce redundant Drive calls, lazy-load heavy pages. Do after all P1 items are closed.
+### OT10 — Doc Viewer ✅ DONE (2026-05-29)
+- `scripts/md_viewer.py` — local CLI HTML viewer
+- `scripts/fetch_latest_concall.py` — downloads latest/specific daily digest from Drive,
+  saves to OUTPUT_DIR (configure at top of script), opens in Obsidian via `os.startfile()`
+- "Doc Viewer" Streamlit page — 4 tabs: Company Page, GF Tables, Results, Quarterly Guidance
 
 ### Blocked
 - **Insider buy/sell** — no reliable free structured data source identified
 
-### Low-priority / deferred
-- Dashboard pages from DESIGN §11: Conviction (dedicated page), Watchlist, Backtest, Build Journal
+### Low-priority / long-term
+- Dashboard pages from DESIGN §11: Conviction, Watchlist, Backtest, Build Journal
 - 12-quarter financials + valuation overlays on charts
 - Telegram alerts
-- Move LLM prompts from repo to private Drive files (currently in git as .txt)
+- Move prompts to private Drive files (currently in git as .txt)
 
 ---
 
