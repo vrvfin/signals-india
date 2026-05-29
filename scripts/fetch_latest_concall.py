@@ -37,7 +37,7 @@ from googleapiclient.http import MediaIoBaseDownload
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # Set this to a folder INSIDE your Obsidian vault so the file is indexed.
 # Example: r"C:\Users\vaido\Documents\ObsidianVault\signals-india\concalls"
-OUTPUT_DIR = Path(r"C:\Users\vaido\OneDrive\Documents\concalls")
+OUTPUT_DIR = Path(r"D:\EMA_Screener\Reports\signals-india\concalls")
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
