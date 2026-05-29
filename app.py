@@ -599,6 +599,93 @@ def find_company_page(key: str) -> str | None:
         return f"*Error: {e}*"
 
 
+# ---------- OT8: User document library (Drive helpers) ----------
+
+def _get_or_create_folder(drive, parent_id: str, name: str) -> str:
+    """Return folder ID, creating it if it does not exist."""
+    existing = _find_subfolder(drive, parent_id, name)
+    if existing:
+        return existing
+    meta = {"name": name, "parents": [parent_id],
+            "mimeType": "application/vnd.google-apps.folder"}
+    return drive.files().create(body=meta, fields="id").execute()["id"]
+
+
+def _upload_bytes_to_drive(drive, folder_id: str, filename: str,
+                            content: bytes, mime_type: str = "application/octet-stream") -> str:
+    """Upload raw bytes to a Drive folder. Returns file_id."""
+    from googleapiclient.http import MediaIoBaseUpload
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+    meta  = {"name": filename, "parents": [folder_id]}
+    return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
+
+
+def _read_manifest(drive, folder_id: str) -> list:
+    """Read _manifest.json from a Drive folder. Returns [] if absent."""
+    q = f"name='_manifest.json' and '{folder_id}' in parents and trashed=false"
+    files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if not files:
+        return []
+    try:
+        return json.loads(_download_bytes(drive, files[0]["id"]).decode("utf-8"))
+    except Exception:
+        return []
+
+
+def _write_manifest(drive, folder_id: str, manifest: list) -> None:
+    """Upsert _manifest.json in a Drive folder."""
+    from googleapiclient.http import MediaIoBaseUpload
+    content = json.dumps(manifest, indent=2, default=str).encode("utf-8")
+    media   = MediaIoBaseUpload(io.BytesIO(content), mimetype="application/json",
+                                resumable=False)
+    q = f"name='_manifest.json' and '{folder_id}' in parents and trashed=false"
+    existing = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if existing:
+        drive.files().update(fileId=existing[0]["id"], media_body=media).execute()
+    else:
+        drive.files().create(
+            body={"name": "_manifest.json", "parents": [folder_id]},
+            media_body=media, fields="id",
+        ).execute()
+
+
+def _user_docs_company_folder(drive, company_key: str) -> str:
+    """Return (creating if needed) user_docs/<company_key>/ folder ID."""
+    root_id      = os.environ["GDRIVE_FOLDER_ID"]
+    user_docs_id = _get_or_create_folder(drive, root_id, "user_docs")
+    return _get_or_create_folder(drive, user_docs_id, company_key.upper())
+
+
+_MIME = {
+    ".pdf":  "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc":  "application/msword",
+    ".txt":  "text/plain",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".csv":  "text/csv",
+}
+
+_DOC_TYPES = [
+    "Annual Report",
+    "Analyst / Sell-side Note",
+    "Credit Rating Report",
+    "Industry Report",
+    "Concall Transcript",
+    "Financial Statements",
+    "Other",
+]
+
+_DOC_TYPE_SLUG = {
+    "Annual Report": "annual_report",
+    "Analyst / Sell-side Note": "analyst_note",
+    "Credit Rating Report": "credit_rating",
+    "Industry Report": "industry_report",
+    "Concall Transcript": "transcript",
+    "Financial Statements": "financials",
+    "Other": "doc",
+}
+
+
 # ---------- Guidance / Results data loaders ----------
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2044,6 +2131,190 @@ def page_portfolio():
 
 # ---------- Main ----------
 
+def page_doc_upload():
+    st.title("📂 Document Library")
+    st.caption(
+        "Upload company documents to Drive. These become the input for "
+        "AI Deep-Dive analysis. Supports Annual Reports, analyst notes, "
+        "credit ratings, transcripts and more."
+    )
+
+    tab_upload, tab_browse = st.tabs(["⬆ Upload Documents", "📋 My Library"])
+
+    # ── Tab 1: Upload ─────────────────────────────────────────────────────────
+    with tab_upload:
+        st.subheader("Upload new documents")
+
+        col1, col2 = st.columns(2)
+        company_key = col1.text_input(
+            "Company ISIN or NSE Symbol",
+            placeholder="e.g. RELIANCE or INE002A01018",
+            key="du_company",
+        ).strip().upper()
+        company_name = col2.text_input(
+            "Company name (for display)",
+            placeholder="e.g. Reliance Industries",
+            key="du_cname",
+        ).strip()
+
+        col3, col4 = st.columns(2)
+        doc_type = col3.selectbox("Document type", _DOC_TYPES, key="du_dtype")
+        label    = col4.text_input(
+            "Year / label",
+            placeholder="e.g. FY25  or  Q4FY26  or  May2026",
+            key="du_label",
+        ).strip()
+
+        uploaded_files = st.file_uploader(
+            "Select file(s) — PDF, DOCX, TXT, XLSX accepted",
+            type=["pdf", "docx", "doc", "txt", "xlsx", "csv"],
+            accept_multiple_files=True,
+            key="du_files",
+        )
+
+        if uploaded_files and company_key:
+            st.caption(f"{len(uploaded_files)} file(s) ready to upload for **{company_key}**")
+
+        if st.button("⬆ Upload to Drive", type="primary",
+                     disabled=not (uploaded_files and company_key)):
+            drive = drive_service()
+            comp_folder = _user_docs_company_folder(drive, company_key)
+            manifest    = _read_manifest(drive, comp_folder)
+            existing_names = {e["filename"] for e in manifest}
+
+            progress = st.progress(0)
+            results  = []
+
+            for i, f in enumerate(uploaded_files):
+                ext      = "." + f.name.rsplit(".", 1)[-1].lower()
+                slug     = _DOC_TYPE_SLUG.get(doc_type, "doc")
+                lbl_safe = label.replace(" ", "_").replace("/", "_") if label else "unlabelled"
+                fname    = f"{slug}_{lbl_safe}{ext}"
+
+                # Avoid name collision
+                if fname in existing_names:
+                    base = f"{slug}_{lbl_safe}"
+                    for n in range(2, 100):
+                        candidate = f"{base}_{n}{ext}"
+                        if candidate not in existing_names:
+                            fname = candidate
+                            break
+
+                mime    = _MIME.get(ext, "application/octet-stream")
+                content = f.read()
+
+                try:
+                    fid = _upload_bytes_to_drive(drive, comp_folder, fname, content, mime)
+                    entry = {
+                        "file_id":       fid,
+                        "filename":      fname,
+                        "original_name": f.name,
+                        "doc_type":      doc_type,
+                        "label":         label,
+                        "company_key":   company_key,
+                        "company_name":  company_name,
+                        "uploaded_at":   datetime.now().isoformat(),
+                        "size_kb":       round(len(content) / 1024, 1),
+                        "deep_dive_status": "pending",
+                    }
+                    manifest.append(entry)
+                    existing_names.add(fname)
+                    results.append(("✅", fname, f"{len(content)//1024:.0f} KB"))
+                except Exception as e:
+                    results.append(("❌", f.name, str(e)[:60]))
+
+                progress.progress((i + 1) / len(uploaded_files))
+
+            _write_manifest(drive, comp_folder, manifest)
+            st.cache_data.clear()   # refresh library tab
+
+            for icon, name, info in results:
+                st.write(f"{icon} **{name}** — {info}")
+            if all(r[0] == "✅" for r in results):
+                st.success(f"Uploaded {len(results)} file(s) for **{company_key}**. "
+                           "Ready for Deep-Dive analysis.")
+
+    # ── Tab 2: Browse library ─────────────────────────────────────────────────
+    with tab_browse:
+        st.subheader("Uploaded document library")
+
+        try:
+            drive     = drive_service()
+            folder_id = os.environ["GDRIVE_FOLDER_ID"]
+            udocs_id  = _find_subfolder(drive, folder_id, "user_docs")
+
+            if not udocs_id:
+                st.info("No documents uploaded yet. Use the Upload tab to add your first document.")
+                return
+
+            # List all company folders
+            q = (f"'{udocs_id}' in parents and "
+                 f"mimeType='application/vnd.google-apps.folder' and trashed=false")
+            companies = drive.files().list(q=q, fields="files(id,name)").execute().get("files", [])
+
+            if not companies:
+                st.info("No documents yet.")
+                return
+
+            all_docs: list[dict] = []
+            for comp in sorted(companies, key=lambda x: x["name"]):
+                manifest = _read_manifest(drive, comp["id"])
+                for entry in manifest:
+                    entry["_folder_id"]   = comp["id"]
+                    entry["_company_key"] = comp["name"]
+                    all_docs.append(entry)
+
+            if not all_docs:
+                st.info("Folders exist but no documents uploaded yet.")
+                return
+
+            # Summary metrics
+            n_companies = len({d["_company_key"] for d in all_docs})
+            n_pending   = sum(1 for d in all_docs
+                              if d.get("deep_dive_status") == "pending")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Companies", n_companies)
+            c2.metric("Total documents", len(all_docs))
+            c3.metric("Pending deep-dive", n_pending)
+
+            st.markdown("---")
+
+            # Company filter
+            comp_names = sorted({d["_company_key"] for d in all_docs})
+            sel = st.selectbox("Filter by company", ["All"] + comp_names, key="dl_sel")
+            filtered = all_docs if sel == "All" else [d for d in all_docs
+                                                      if d["_company_key"] == sel]
+
+            # Display table
+            rows = []
+            for d in filtered:
+                rows.append({
+                    "Company":     d.get("_company_key", ""),
+                    "Name":        d.get("company_name", ""),
+                    "File":        d.get("filename", ""),
+                    "Type":        d.get("doc_type", ""),
+                    "Label":       d.get("label", ""),
+                    "Size (KB)":   d.get("size_kb", ""),
+                    "Uploaded":    str(d.get("uploaded_at", ""))[:10],
+                    "Deep-dive":   d.get("deep_dive_status", ""),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True, height=400)
+
+            # Per-company ready indicator
+            if sel != "All":
+                n_docs = len(filtered)
+                n_ar   = sum(1 for d in filtered if "Annual Report" in d.get("doc_type", ""))
+                st.caption(
+                    f"**{sel}**: {n_docs} document(s), {n_ar} Annual Report(s). "
+                    + ("✅ Ready for Deep-Dive." if n_ar >= 1 else
+                       "⚠️ Upload at least 1 Annual Report for best Deep-Dive results.")
+                )
+
+        except Exception as e:
+            st.error(f"Could not load library: {e}")
+
+
 def _safe_render(page_fn):
     """Run a page function; show a recoverable error instead of crashing."""
     try:
@@ -2068,6 +2339,7 @@ def main():
         "Company Intel",
         "Mgmt Guidance",
         "Doc Viewer",
+        "Doc Library",
         "My Portfolio",
         "Graphs",
         "Stock Detail",
@@ -2088,6 +2360,8 @@ def main():
         _safe_render(page_guidance)
     elif page == "Doc Viewer":
         _safe_render(page_doc_viewer)
+    elif page == "Doc Library":
+        _safe_render(page_doc_upload)
     elif page == "My Portfolio":
         _safe_render(page_portfolio)
     elif page == "Graphs":

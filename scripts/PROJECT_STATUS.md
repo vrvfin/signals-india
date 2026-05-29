@@ -195,17 +195,24 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 
 <!-- Priority order as set 2026-05-29: P0→P1→P2→P3→P4 -->
 
-### P0 — OT8: Local doc summarisation → Drive context store
-- Upload local documents (annual reports, sell-side, industry notes) via Streamlit
-- Gemini summarises each doc → structured context stored on Drive
-- Viewable in app independently; later consumed by OT7 deep research report
-- Note: OT8 is being built standalone first; OT7 connects to its output
+### OT8 — Document Library (context store) ✅ DONE (2026-05-29)
+- New "Doc Library" Streamlit page with 2 tabs:
+  - ⬆ Upload: company key, doc type, year/label, multi-file uploader → Drive
+  - 📋 My Library: browse all uploaded docs across companies, metrics, per-company readiness
+- Drive structure: `user_docs/<company_key>/<doc_type>_<label>.pdf` + `_manifest.json` per company
+- Manifest tracks: file_id, original_name, doc_type, label, size_kb, uploaded_at, deep_dive_status
+- `deep_dive_status: "pending"` flags docs not yet processed by OT7
+- Supports PDF, DOCX, TXT, XLSX; graceful name-collision handling
+- Helper functions: `_get_or_create_folder`, `_upload_bytes_to_drive`, `_read_manifest`, `_write_manifest`
 
-### P1 — OT7: Deep research report (company_deep_report.py)
-- Prompt file `comapnydeepdive_prompt.txt` already exists (forensic equity analysis)
+### P0 — OT7: Deep research report (company_deep_report.py)
+- Prompt file `comapnydeepdive_prompt.txt` already exists (forensic equity analysis: 4-phase chain,
+  Phase 1 raw extraction, Phase 2 forensic shenanigans analysis, Phase 3 executive scorecard +
+  weighted risk matrix, Phase 4 PM tear sheet)
 - Script `company_deep_report.py` not yet built
-- Streamlit UI: user selects company, triggers report, views/downloads output
-- Consumes OT8 context store for local-document-backed research
+- Streamlit flow: user opens Doc Library → uploads Annual Reports → goes to Deep-Dive page →
+  selects company → triggers Gemini analysis → report stored on Drive + displayed in app
+- OT8 manifest `deep_dive_status` field tracks which docs have been analysed
 
 ### P2 — OT3: Mgmt said vs delivered (GF2 credibility tracker)
 - Cross-quarter comparison of guidance_tracker vs quarterly_facts
