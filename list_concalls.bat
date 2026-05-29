@@ -2,16 +2,18 @@
 title List Available Concall Digests
 cd /d D:\EMA_Screener\claude\signals-india
 
+set PYTHON=C:\Users\vaido\.conda\envs\signals-india\python.exe
+
 echo.
 echo  Available concall digest files on Drive:
 echo.
 
-conda run -n signals-india python scripts/fetch_latest_concall.py --list
+"%PYTHON%" scripts/fetch_latest_concall.py --list
 
 echo.
 set /p CHOICE="Enter date to fetch (e.g. 29may2026), or press Enter to exit: "
 if "%CHOICE%"=="" goto end
 
-conda run -n signals-india python scripts/fetch_latest_concall.py --date %CHOICE%
+"%PYTHON%" scripts/fetch_latest_concall.py --date %CHOICE%
 
 :end

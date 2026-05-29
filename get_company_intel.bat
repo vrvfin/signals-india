@@ -2,12 +2,13 @@
 title Fetch Company Intel (Table A / GF1-GF4)
 cd /d D:\EMA_Screener\claude\signals-india
 
+set PYTHON=C:\Users\vaido\.conda\envs\signals-india\python.exe
+
 echo.
 echo  Downloads company_page.md (Table A, GF1-GF4, summaries) from Drive,
 echo  fixes table formatting and opens in Obsidian.
 echo.
-echo  Use the ISIN (e.g. INE002A01018) for best results.
-echo  Symbol lookup (e.g. RELIANCE) works if the folder is named by symbol.
+echo  Use ISIN (e.g. INE002A01018) for best results.
 echo.
 set /p SYMBOL="Enter NSE symbol or ISIN: "
 
@@ -17,7 +18,7 @@ if "%SYMBOL%"=="" (
     exit /b
 )
 
-conda run -n signals-india python scripts/fetch_company_intel.py --symbol %SYMBOL%
+"%PYTHON%" scripts/fetch_company_intel.py --symbol %SYMBOL%
 
 if errorlevel 1 (
     echo.

@@ -89,12 +89,13 @@ Edit `OUTPUT_DIR` in both scripts to point inside your Obsidian vault:
 3. GitHub → repo → Settings → Secrets → `SCREENER_SESSION_COOKIE` → Update
 4. Re-run Phase 1 manually from GitHub Actions
 
-### `get_latest_concall.bat` — "Python was not found"
-**Symptom:** Error about Python not found when running bat
-**Cause:** `conda activate` doesn't work in plain .bat files
-**Fix:** Bat files now use `conda run -n signals-india python` (fixed 2026-05-29). If still failing:
-- Open Anaconda Prompt, navigate to `D:\EMA_Screener\claude\signals-india`
-- Run: `python scripts/fetch_latest_concall.py`
+### `get_latest_concall.bat` — "conda is not recognized" or "Python was not found"
+**Symptom:** Error about conda or Python not found when running bat from desktop/Explorer
+**Cause:** conda and Python are not on the system PATH outside Anaconda Prompt
+**Fix (already applied 2026-05-29):** Bat files use hardcoded Python path:
+`C:\Users\vaido\.conda\envs\signals-india\python.exe`
+No conda activation needed — calls Python directly.
+If the env is ever rebuilt at a different path, update the `set PYTHON=` line in each bat file.
 
 ### Obsidian tables not rendering (pipe characters visible)
 **Symptom:** GF1-4 tables show as raw `| col | col |` text instead of grids
