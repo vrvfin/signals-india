@@ -93,7 +93,8 @@ def list_daily_files(drive, daily_folder_id: str, limit: int = 30) -> list[dict]
         orderBy="modifiedTime desc",
         pageSize=limit,
     ).execute().get("files", [])
-    return [f for f in files if f["name"].endswith(".md")]
+    return [f for f in files
+            if f["name"].endswith(".md") and f["name"].startswith("concall_")]
 
 
 def download_file(drive, file_id: str) -> bytes:
