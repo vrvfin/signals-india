@@ -160,13 +160,22 @@ def open_in_obsidian(path: Path) -> None:
 from _md_utils import fix_markdown_for_obsidian
 
 
+def _safe_filename(name: str) -> str:
+    """Turn a company name into a safe filename fragment."""
+    import re
+    s = re.sub(r"[^\w\s-]", "", str(name)).strip()
+    s = re.sub(r"\s+", "_", s)
+    return s[:35]
+
+
 def _clean_key(val) -> str:
     """Return string value, or '' if NaN / 'nan' / empty."""
     s = str(val).strip()
     return "" if s.lower() in ("nan", "none", "") else s
 
 
-def download_company_page(drive, isin: str, symbol: str) -> tuple[Path | None, str]:
+def download_company_page(drive, isin: str, symbol: str,
+                          company_name: str = "") -> tuple[Path | None, str]:
     """Download company_page.md. Returns (path, status_msg)."""
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = find_subfolder(drive, folder_id, "company_repo")
@@ -199,8 +208,10 @@ def download_company_page(drive, isin: str, symbol: str) -> tuple[Path | None, s
                 text  = raw.decode("utf-8", errors="replace")
                 fixed = fix_markdown_for_obsidian(text)
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                cname_safe = _safe_filename(company_name) if company_name else ""
                 label = isin_c or sym_c
-                out   = OUTPUT_DIR / f"{label}_company_page.md"
+                prefix = f"{cname_safe}__{label}" if cname_safe else label
+                out   = OUTPUT_DIR / f"{prefix}_company_page.md"
                 out.write_text(fixed, encoding="utf-8")
                 return out, f"found via key='{key}'"
             else:
@@ -386,11 +397,12 @@ def main() -> None:
     failed: list[str] = []
 
     for _, row in best.iterrows():
-        sym  = _clean_key(row.get("symbol", ""))
-        isin = _clean_key(row.get("isin",   ""))
+        sym   = _clean_key(row.get("symbol",       ""))
+        isin  = _clean_key(row.get("isin",         ""))
+        cname = _clean_key(row.get("company_name", ""))
         label = sym or isin or "unknown"
-        log(f"Downloading {label}  (ISIN={isin or '—'})…")
-        path, status = download_company_page(drive, isin, sym)
+        log(f"Downloading {cname or label}  (ISIN={isin or '—'})…")
+        path, status = download_company_page(drive, isin, sym, cname)
         if path:
             downloaded.append(path)
             log(f"  ✓ {status}")
