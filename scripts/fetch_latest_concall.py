@@ -106,59 +106,7 @@ def download_file(drive, file_id: str) -> bytes:
     return fh.getvalue()
 
 
-# ---------- Obsidian markdown fixer ----------
-
-def _fix_markdown_for_obsidian(text: str) -> str:
-    """Fix common rendering failures in Obsidian for LLM-generated markdown.
-
-    Problems fixed:
-    1. Leading whitespace before | rows → Obsidian treats them as code blocks.
-    2. No blank line before a table that follows normal text → table not rendered.
-    3. Windows \\r\\n or bare \\r line endings → strip to \\n.
-    4. Tables wrapped inside triple-backtick fences → unwrap them.
-    """
-    # Normalise line endings
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    # Unwrap tables that Gemini accidentally put inside code fences.
-    # Pattern: ```\n<table lines>\n```
-    def _unwrap_table_fence(m):
-        inner = m.group(1)
-        if any(l.lstrip().startswith('|') for l in inner.splitlines()):
-            return inner          # remove the fence; keep the table
-        return m.group(0)        # leave other code blocks alone
-    text = re.sub(r'```[^\n]*\n(.*?)```', _unwrap_table_fence, text,
-                  flags=re.DOTALL)
-
-    lines = text.split('\n')
-    out: list[str] = []
-    in_fence = False
-
-    for i, line in enumerate(lines):
-        # Track code fences so we don't mangle real code blocks
-        if re.match(r'^```', line):
-            in_fence = not in_fence
-            out.append(line)
-            continue
-
-        if not in_fence:
-            stripped = line.lstrip()
-            if stripped.startswith('|'):
-                line = stripped   # kill all leading whitespace
-                # Insert blank line before this table row if previous
-                # non-blank line is NOT also a table row
-                if out:
-                    last_nonempty = next(
-                        (l for l in reversed(out) if l.strip()), None
-                    )
-                    if (last_nonempty
-                            and not last_nonempty.lstrip().startswith('|')
-                            and out[-1].strip()):   # no blank already
-                        out.append('')
-
-        out.append(line)
-
-    return '\n'.join(out)
+from _md_utils import fix_markdown_for_obsidian   # split-row fixer + whitespace + fence unwrap
 
 
 # ---------- Open in Obsidian ----------
@@ -245,7 +193,7 @@ def main() -> None:
         raw_text   = raw_bytes.decode("utf-8", errors="replace")
         log(f"Downloaded ({len(raw_bytes)//1024:.0f} KB)")
 
-    fixed = _fix_markdown_for_obsidian(raw_text)
+    fixed = fix_markdown_for_obsidian(raw_text)
     out_path.write_text(fixed, encoding="utf-8")
     log(f"Saved (Obsidian-fixed): {out_path}")
 

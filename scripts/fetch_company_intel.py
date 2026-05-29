@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import io
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -91,47 +90,7 @@ def download_file(drive, file_id: str) -> bytes:
     return fh.getvalue()
 
 
-# ---------- Obsidian markdown fixer (shared with fetch_latest_concall.py) ----------
-
-def fix_markdown_for_obsidian(text: str) -> str:
-    """Fix LLM-generated markdown for Obsidian:
-    1. Strip leading whitespace from | table rows (prevents code-block treatment)
-    2. Ensure blank line before each new table block
-    3. Unwrap tables accidentally fenced in ```
-    4. Normalise line endings
-    """
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    def _unwrap_table_fence(m):
-        inner = m.group(1)
-        if any(l.lstrip().startswith('|') for l in inner.splitlines()):
-            return inner
-        return m.group(0)
-    text = re.sub(r'```[^\n]*\n(.*?)```', _unwrap_table_fence,
-                  text, flags=re.DOTALL)
-
-    lines = text.split('\n')
-    out: list[str] = []
-    in_fence = False
-
-    for line in lines:
-        if re.match(r'^```', line):
-            in_fence = not in_fence
-            out.append(line)
-            continue
-        if not in_fence:
-            stripped = line.lstrip()
-            if stripped.startswith('|'):
-                line = stripped
-                last_nonempty = next(
-                    (l for l in reversed(out) if l.strip()), None)
-                if (last_nonempty
-                        and not last_nonempty.lstrip().startswith('|')
-                        and out and out[-1].strip()):
-                    out.append('')
-        out.append(line)
-
-    return '\n'.join(out)
+from _md_utils import fix_markdown_for_obsidian   # split-row fixer + whitespace + fence unwrap
 
 
 # ---------- Open ----------
