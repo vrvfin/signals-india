@@ -9,10 +9,12 @@ Two sections:
 Opens in your default browser. Print to PDF via Ctrl+P → Save as PDF.
 
 Usage:
-    python scripts/fetch_phase1_report.py                  # default (min 2 strategies)
-    python scripts/fetch_phase1_report.py --min-strats 3   # stricter filter
-    python scripts/fetch_phase1_report.py --no-portfolio   # signals only
-    python scripts/fetch_phase1_report.py --no-open        # save only, don't open
+    python scripts/fetch_phase1_report.py                        # tables only
+    python scripts/fetch_phase1_report.py --with-charts          # + Plotly charts (top 10)
+    python scripts/fetch_phase1_report.py --with-charts --max-charts 20
+    python scripts/fetch_phase1_report.py --min-strats 3         # stricter filter
+    python scripts/fetch_phase1_report.py --no-portfolio         # signals only
+    python scripts/fetch_phase1_report.py --no-open              # save only
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -212,6 +216,97 @@ def load_universe(drive, folder_id: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(_dl(drive, fid)))
 
 
+# ── OHLCV + chart helpers ─────────────────────────────────────────────────────
+
+def load_ohlcv(drive, folder_id: str, symbol: str) -> pd.DataFrame:
+    """Download OHLCV parquet for one symbol. Returns empty DF if missing."""
+    data_id = _find_subfolder(drive, folder_id, "data")
+    if not data_id:
+        return pd.DataFrame()
+    ohlcv_id = _find_subfolder(drive, data_id, "ohlcv")
+    if not ohlcv_id:
+        return pd.DataFrame()
+    files = _list_folder(drive, ohlcv_id)
+    fid   = files.get(f"{symbol}.parquet")
+    if not fid:
+        return pd.DataFrame()
+    return pd.read_parquet(io.BytesIO(_dl(drive, fid)))
+
+
+def build_chart_html(symbol: str, ohlcv: pd.DataFrame,
+                     sym_signals: pd.DataFrame,
+                     first_chart: bool = False,
+                     days: int = 180) -> str:
+    """Return Plotly chart as an HTML div string (no <html> wrapper)."""
+    df = ohlcv.sort_values("date").tail(days).reset_index(drop=True)
+    if df.empty:
+        return f"<p style='color:#aaa'>No OHLCV data for {symbol}</p>"
+
+    df["ema_20"]  = df["close"].ewm(span=20).mean()
+    df["ema_50"]  = df["close"].ewm(span=50).mean()
+    df["sma_200"] = df["close"].rolling(200).mean()
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.75, 0.25], vertical_spacing=0.03,
+    )
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df["date"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"],
+        name="Price", showlegend=False,
+        increasing_line_color="#1a9e3f", decreasing_line_color="#c0392b",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_20"],  name="20 EMA",
+                             line=dict(color="#2980b9", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_50"],  name="50 EMA",
+                             line=dict(color="#8e44ad", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["sma_200"], name="200 SMA",
+                             line=dict(color="#e67e22", width=1.2, dash="dash")),
+                  row=1, col=1)
+
+    # Signal lines
+    if not sym_signals.empty:
+        for _, sig in sym_signals.iterrows():
+            zt    = sig.get("zone_type", "")
+            entry = sig.get("entry")
+            stop  = sig.get("stop")
+            col   = ZONE_COLORS.get(zt, "#666")
+            strat = sig.get("strategy", sig.get("strategy_group", ""))
+            if pd.notna(entry):
+                fig.add_hline(y=entry, line=dict(color=col, width=1),
+                              annotation_text=f"{strat}:{zt}",
+                              annotation_position="right", row=1, col=1)
+            if pd.notna(stop):
+                fig.add_hline(y=stop,
+                              line=dict(color=ZONE_COLORS["stop_loss"], width=1, dash="dot"),
+                              annotation_text="stop",
+                              annotation_position="right", row=1, col=1)
+
+    # Volume
+    colors = ["#1a9e3f" if c >= o else "#c0392b"
+              for c, o in zip(df["close"], df["open"])]
+    fig.add_trace(go.Bar(x=df["date"], y=df["volume"], name="Vol",
+                         marker_color=colors, showlegend=False), row=2, col=1)
+
+    fig.update_layout(
+        height=420, xaxis_rangeslider_visible=False,
+        margin=dict(l=10, r=80, t=10, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    font=dict(size=11)),
+        plot_bgcolor="#fafbfc", paper_bgcolor="#fff",
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1, tickfont=dict(size=10))
+    fig.update_yaxes(title_text="Vol",   row=2, col=1, tickfont=dict(size=10))
+
+    # First chart loads Plotly.js from CDN; subsequent charts reuse it
+    include_js = "cdn" if first_chart else False
+    return fig.to_html(full_html=False, include_plotlyjs=include_js,
+                       config={"displayModeBar": False})
+
+
 # ── HTML generation ───────────────────────────────────────────────────────────
 
 _CSS = """
@@ -298,7 +393,10 @@ def _num(val, fmt=".0f") -> str:
 
 def build_conviction_section(signals: pd.DataFrame,
                               features: pd.DataFrame,
-                              min_strats: int) -> str:
+                              min_strats: int,
+                              drive=None,
+                              folder_id: str = "",
+                              max_charts: int = 0) -> str:
     if signals.empty:
         return "<h2>Conviction Signals</h2><p>No signals data found.</p>"
 
@@ -376,7 +474,30 @@ def build_conviction_section(signals: pd.DataFrame,
         + "".join(rows)
         + "</tbody></table>"
     )
-    return title + table
+
+    # ── Embed charts if requested ────────────────────────────────────────────
+    charts_html = ""
+    if max_charts > 0 and drive and folder_id:
+        log(f"  Building charts for top {min(max_charts, len(conv))} stocks…")
+        chart_syms = conv["symbol"].tolist()[:max_charts]
+        first = True
+        for i, sym in enumerate(chart_syms, 1):
+            log(f"    [{i}/{len(chart_syms)}] {sym}")
+            ohlcv = load_ohlcv(drive, folder_id, sym)
+            sym_sigs = signals[signals["symbol"] == sym] if not signals.empty else pd.DataFrame()
+            chart_div = build_chart_html(sym, ohlcv, sym_sigs, first_chart=first)
+            strat_list = ", ".join(conv[conv["symbol"] == sym]["strategies"].iloc[0])
+            charts_html += (
+                f"<div style='margin:16px 0 32px;'>"
+                f"<h3 style='font-size:14px;color:#2c3e50;margin-bottom:6px;'>"
+                f"{sym} &nbsp;<small style='font-weight:normal;color:#666;'>{strat_list}</small>"
+                f"</h3>"
+                f"{chart_div}"
+                f"</div>"
+            )
+            first = False
+
+    return title + table + charts_html
 
 
 def build_portfolio_section(portfolio: pd.DataFrame,
@@ -476,6 +597,10 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--min-strats",   type=int, default=2,
                         help="Minimum strategies for conviction section (default 2)")
+    parser.add_argument("--with-charts",  action="store_true",
+                        help="Embed interactive Plotly charts (downloads OHLCV per stock)")
+    parser.add_argument("--max-charts",   type=int, default=10,
+                        help="Max charts to generate when --with-charts (default 10)")
     parser.add_argument("--no-portfolio", action="store_true",
                         help="Skip portfolio section")
     parser.add_argument("--no-open",      action="store_true",
@@ -493,7 +618,13 @@ def main() -> None:
     log("Building HTML report…")
     now = datetime.now()
 
-    conviction_html = build_conviction_section(signals, features, args.min_strats)
+    max_charts = args.max_charts if args.with_charts else 0
+    if args.with_charts:
+        log(f"Charts enabled — will download OHLCV for up to {max_charts} stocks")
+    conviction_html = build_conviction_section(
+        signals, features, args.min_strats,
+        drive=drive, folder_id=folder_id, max_charts=max_charts,
+    )
     portfolio_html  = build_portfolio_section(portfolio, signals, features, universe)
 
     html = _HTML.format(
