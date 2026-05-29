@@ -1827,15 +1827,22 @@ def _read_portfolio_table(raw_bytes: bytes, filename: str):
     # Drop rows without ISIN (totals rows, footers)
     df = df.dropna(subset=["ISIN"]).copy()
 
-    # Normalize Screener column names → our convention
+    # Normalize column names → our convention.
+    # Handles both Screener "My Investments" export and broker "Holdings Statement" format.
     rename = {
-        "ISIN": "isin",
-        "Company name": "screener_name",
-        "Rating": "screener_rating",
-        "Last price": "screener_last_price",
-        "Last price date": "screener_last_price_date",
-        "1D Change (INR)": "one_d_change_inr",
-        "1D Change (%)": "one_d_change_pct",
+        "ISIN":             "isin",
+        # company name — Screener vs broker
+        "Company name":     "screener_name",
+        "Stock/ETF Name":   "screener_name",
+        # rating — Screener only
+        "Rating":           "screener_rating",
+        # price — Screener vs broker
+        "Last price":       "screener_last_price",
+        "Market Price":     "screener_last_price",
+        "Last price date":  "screener_last_price_date",
+        # intraday change — Screener only
+        "1D Change (INR)":  "one_d_change_inr",
+        "1D Change (%)":    "one_d_change_pct",
     }
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
     df["isin"] = df["isin"].astype(str).str.strip()
