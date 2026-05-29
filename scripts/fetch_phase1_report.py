@@ -313,8 +313,7 @@ _CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-  font-size: 13px; color: #1a1a2e; background: #f5f6fa;
-  padding: 24px 32px;
+  font-size: 13px; color: #1a1a2e; background: #f5f6fa; padding: 24px 32px;
 }
 h1 { font-size: 22px; margin-bottom: 4px; color: #1a1a2e; }
 h2 { font-size: 16px; margin: 28px 0 10px; color: #2c3e50;
@@ -325,31 +324,50 @@ table {
   background: #fff; border-radius: 6px; overflow: hidden;
   box-shadow: 0 1px 4px rgba(0,0,0,.08);
 }
-th {
-  background: #2c3e50; color: #fff; padding: 8px 10px;
-  text-align: left; font-size: 12px; font-weight: 600;
-  white-space: nowrap;
-}
+th { background: #2c3e50; color: #fff; padding: 8px 10px;
+     text-align: left; font-size: 12px; font-weight: 600; white-space: nowrap; }
 td { padding: 7px 10px; border-bottom: 1px solid #eef0f4; vertical-align: top; }
 tr:last-child td { border-bottom: none; }
 tr:nth-child(even) td { background: #f8f9fc; }
 tr:hover td { background: #eaf4fb; }
 .sym { font-weight: 700; color: #2c3e50; font-size: 13px; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
-.green  { color: #1a9e3f; font-weight: 600; }
-.red    { color: #c0392b; font-weight: 600; }
+.green { color: #1a9e3f; font-weight: 600; }
+.red   { color: #c0392b; font-weight: 600; }
 .badge {
   display: inline-block; padding: 2px 8px; border-radius: 10px;
-  font-size: 11px; font-weight: 600; color: #fff; margin: 1px 2px;
-  white-space: nowrap;
+  font-size: 11px; font-weight: 600; color: #fff; margin: 1px 2px; white-space: nowrap;
 }
-.stars { color: #f39c12; }
 .na { color: #aaa; }
+
+/* ── Collapsible chart blocks ── */
+details.chart-block {
+  background: #fff; border: 1px solid #e0e4ec; border-radius: 6px;
+  margin: 8px 0; overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,.06);
+}
+details.chart-block summary {
+  cursor: pointer; padding: 10px 14px; font-weight: 600;
+  font-size: 13px; color: #2c3e50; user-select: none;
+  display: flex; align-items: center; gap: 10px;
+  background: #f8f9fc; border-bottom: 1px solid transparent;
+  list-style: none;
+}
+details.chart-block summary::-webkit-details-marker { display: none; }
+details.chart-block summary::before {
+  content: "▶"; font-size: 10px; color: #3498db;
+  transition: transform .15s; display: inline-block;
+}
+details.chart-block[open] summary::before { transform: rotate(90deg); }
+details.chart-block[open] summary { border-bottom-color: #e0e4ec; }
+details.chart-block .chart-inner { padding: 8px 4px 4px; }
+.chart-meta { font-size: 11px; color: #666; font-weight: 400; margin-left: 4px; }
+
 @media print {
   body { background: #fff; padding: 12px; }
   table { box-shadow: none; }
-  h2 { break-before: avoid; }
-  tr { break-inside: avoid; }
+  details.chart-block { border: none; box-shadow: none; }
+  details.chart-block summary { background: #f0f0f0; }
 }
 """
 
@@ -363,11 +381,22 @@ _HTML = """<!DOCTYPE html>
 <body>
 <h1>Signals India — Phase 1 Daily Report</h1>
 <p class="meta">Generated {datetime} &nbsp;·&nbsp; {n_signals} total signals &nbsp;·&nbsp;
-Print to PDF: Ctrl+P → Save as PDF (use Landscape for wide tables)</p>
+Print to PDF: Ctrl+P → Save as PDF (Landscape). Click ▶ to expand any chart.</p>
 
 {conviction_section}
 
 {portfolio_section}
+
+<script>
+/* Re-render Plotly chart when a details block is opened.
+   Charts inside hidden elements don't render until visible. */
+document.addEventListener('toggle', function(e) {{
+  if (e.target.tagName === 'DETAILS' && e.target.open) {{
+    var gd = e.target.querySelector('.plotly-graph-div');
+    if (gd && window.Plotly) Plotly.relayout(gd, {{autosize: true}});
+  }}
+}}, true);
+</script>
 </body>
 </html>
 """
@@ -475,25 +504,31 @@ def build_conviction_section(signals: pd.DataFrame,
         + "</tbody></table>"
     )
 
-    # ── Embed charts if requested ────────────────────────────────────────────
+    # ── Embed charts as collapsible <details> blocks ─────────────────────────
     charts_html = ""
     if max_charts > 0 and drive and folder_id:
-        log(f"  Building charts for top {min(max_charts, len(conv))} stocks…")
-        chart_syms = conv["symbol"].tolist()[:max_charts]
+        n = min(max_charts, len(conv))
+        log(f"  Downloading OHLCV + building charts for {n} stocks…")
+        chart_syms = conv["symbol"].tolist()[:n]
         first = True
         for i, sym in enumerate(chart_syms, 1):
-            log(f"    [{i}/{len(chart_syms)}] {sym}")
-            ohlcv = load_ohlcv(drive, folder_id, sym)
-            sym_sigs = signals[signals["symbol"] == sym] if not signals.empty else pd.DataFrame()
-            chart_div = build_chart_html(sym, ohlcv, sym_sigs, first_chart=first)
-            strat_list = ", ".join(conv[conv["symbol"] == sym]["strategies"].iloc[0])
+            log(f"    [{i}/{n}] {sym}")
+            ohlcv    = load_ohlcv(drive, folder_id, sym)
+            sym_sigs = (signals[signals["symbol"] == sym]
+                        if not signals.empty else pd.DataFrame())
+            chart_div  = build_chart_html(sym, ohlcv, sym_sigs, first_chart=first)
+            row        = conv[conv["symbol"] == sym].iloc[0]
+            strats_str = ", ".join(row["strategies"])
+            zones_str  = " / ".join(row["zones"])
+            n_str      = int(row["n_strategies"])
             charts_html += (
-                f"<div style='margin:16px 0 32px;'>"
-                f"<h3 style='font-size:14px;color:#2c3e50;margin-bottom:6px;'>"
-                f"{sym} &nbsp;<small style='font-weight:normal;color:#666;'>{strat_list}</small>"
-                f"</h3>"
-                f"{chart_div}"
-                f"</div>"
+                f"<details class='chart-block'>"
+                f"<summary>{sym}"
+                f"<span class='chart-meta'>"
+                f"· {n_str} strategies · {zones_str} · {strats_str}"
+                f"</span></summary>"
+                f"<div class='chart-inner'>{chart_div}</div>"
+                f"</details>\n"
             )
             first = False
 
@@ -503,7 +538,10 @@ def build_conviction_section(signals: pd.DataFrame,
 def build_portfolio_section(portfolio: pd.DataFrame,
                              signals: pd.DataFrame,
                              features: pd.DataFrame,
-                             universe: pd.DataFrame) -> str:
+                             universe: pd.DataFrame,
+                             drive=None,
+                             folder_id: str = "",
+                             with_charts: bool = False) -> str:
     if portfolio.empty:
         return ""
 
@@ -587,7 +625,38 @@ def build_portfolio_section(portfolio: pd.DataFrame,
         + "".join(rows)
         + "</tbody></table>"
     )
-    return title + table
+
+    # ── Portfolio charts ─────────────────────────────────────────────────────
+    charts_html = ""
+    if with_charts and drive and folder_id:
+        syms = pf["symbol"].dropna().unique().tolist()
+        log(f"  Building portfolio charts for {len(syms)} holdings…")
+        first = True
+        for i, sym in enumerate(syms, 1):
+            log(f"    [{i}/{len(syms)}] {sym}")
+            ohlcv    = load_ohlcv(drive, folder_id, sym)
+            sym_sigs = (signals[signals["symbol"] == sym]
+                        if not signals.empty else pd.DataFrame())
+            chart_div = build_chart_html(sym, ohlcv, sym_sigs, first_chart=first)
+            # Get holding info for summary line
+            h_row     = pf[pf["symbol"] == sym].iloc[0]
+            name_str  = str(h_row.get("name", h_row.get("screener_name", "")))[:35]
+            ret3_str  = (f"{h_row['return_3m_pct']:+.1f}%"
+                         if "return_3m_pct" in h_row.index and pd.notna(h_row.get("return_3m_pct"))
+                         else "")
+            zones_str = str(h_row.get("zones", "")) if h_row.get("zones") else "no signal"
+            charts_html += (
+                f"<details class='chart-block'>"
+                f"<summary>{sym}"
+                f"<span class='chart-meta'>"
+                f"· {name_str} · 3M {ret3_str} · {zones_str}"
+                f"</span></summary>"
+                f"<div class='chart-inner'>{chart_div}</div>"
+                f"</details>\n"
+            )
+            first = False
+
+    return title + table + charts_html
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -625,7 +694,11 @@ def main() -> None:
         signals, features, args.min_strats,
         drive=drive, folder_id=folder_id, max_charts=max_charts,
     )
-    portfolio_html  = build_portfolio_section(portfolio, signals, features, universe)
+    portfolio_html  = build_portfolio_section(
+        portfolio, signals, features, universe,
+        drive=drive, folder_id=folder_id,
+        with_charts=args.with_charts,
+    )
 
     html = _HTML.format(
         date      = now.strftime("%d-%b-%Y"),
