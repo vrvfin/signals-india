@@ -27,7 +27,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-OUTPUT_DIR = Path(r"C:\Users\vaido\Downloads\company_intel")
+OUTPUT_DIR = Path(r"C:\Users\vaido\OneDrive\Documents\company_intel")
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
