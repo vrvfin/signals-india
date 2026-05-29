@@ -5,6 +5,11 @@ records what was *designed*; this file records what is *built and pending*.
 To resume work in any future chat session, paste this file as context — it is
 enough to pick up where we left off.
 
+**IMPORTANT — single file rule.** This is the ONLY status/tracking document.
+Whether new items arrive in chat, from an uploaded document, or verbally — they
+must be added here in the appropriate section (Section 5 pending or Section 10
+session log) before the session ends. No separate tracking spreadsheets or docs.
+
 **Last updated:** 2026-05-29
 **Repo:** github.com/vrvfin/signals-india (**public** — unlimited GitHub Actions minutes)
 **Local:** `D:\EMA_Screener\claude\signals-india` · conda env `signals-india` (Python 3.11)
@@ -198,8 +203,20 @@ Each writes `signals/per_strategy/<name>/latest.csv` + dated CSV.
 ### Fix 2B — BSE Direct API secondary ingestion (backlog)
 - **Screener 25-item cap** — Screener.in caps concall lists at 25 per load. Fix: `ingest_company_docs.py` gets a secondary path via BSE Direct API (`https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w`) — public JSON, no auth, no cap, returns ISIN, supports date-range. Medium effort; eliminates risk of missing companies beyond position 25.
 
-### Infrastructure — URGENT (deadline Jun 2, 2026)
-- **Node.js 24 migration** — GitHub Actions is forcing all runners to Node.js 24 from June 2, 2026. Current `actions/checkout@v4`, `actions/setup-python@v5`, `actions/cache@v4` run on Node.js 20 and will break. Fix: bump all three actions to their latest v4 patch (or set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` env var on the runner). Affects both `daily.yml` and `phase2.yml`. ⚠️ Must fix before Jun 2.
+### Infrastructure — Node.js 24 ✅ DONE (2026-05-29)
+- `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` added to both `daily.yml` and `phase2.yml` job env. Silences deprecation warnings, opts in to Node.js 24 before the forced migration on Jun 2, 2026.
+
+### OT10 — Doc Viewer (P1) ✅ DONE (2026-05-29)
+- **`scripts/md_viewer.py`** — local CLI tool; takes any .md file path, converts to HTML with proper table rendering, opens in default browser. `pip install markdown` required (in scripts/requirements.txt).
+- **"Doc Viewer" page in app.py** — new sidebar nav item with 4 tabs:
+  - 🏢 Company Page: renders company_page.md with tables + download button
+  - 📋 GF Tables: shows guidance_tracker, gf1_guidance_statements, gf4_quality_flags as proper dataframes per company
+  - 📊 Results: results.parquet for the symbol
+  - 📅 Quarterly Guidance: browses and renders company_repo/_quarterly/*.md files
+- Matches by both ISIN and symbol across all parquet tables.
+
+### OT9 — Streamlit performance optimisation (P2 — deferred)
+- Audit cache TTLs, reduce redundant Drive calls, lazy-load heavy pages. Do after all P1 items are closed.
 
 ### Blocked
 - **Insider buy/sell** — no reliable free structured data source identified
@@ -388,3 +405,41 @@ Full specification detail in `scripts/Concall_Extractor.txt`.
 **Documentation updated:**
 - Section 4 (Done) updated with Stage C completion and all infra items
 - Section 5 (Pending) refreshed — removed completed items, added Fix 2B and Node.js 24 as priority items
+
+---
+
+### Session 2026-05-29 — P0 + stale fix + OT10
+
+**Asked:**
+- Fix Node.js 24 migration (P0, deadline Jun 2)
+- Investigate Phase 1 stale warning (yfinance has latest data)
+- Maintain single status file for all tracking
+- OT9: Streamlit optimisation (P2, defer)
+- OT10: Tool to read .md files with proper table rendering (P1)
+
+**Delivered:**
+
+**P0 — Node.js 24 (both workflows):**
+- Added `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` as job-level env var in `daily.yml` and `phase2.yml`
+- Silences all deprecation warnings; opts in now before Jun 2 forced migration
+
+**Stale warning root cause found and fixed:**
+- `pipeline_healthcheck.py` line 205: `stale_days = (datetime.now() - latest_bar).days`
+- `datetime.now()` is timezone-naive; `latest_bar` from yfinance can be timezone-aware (IST tz)
+- This raises `TypeError` → uncaught exception → `sys.exit(1)` → CRITICAL failure → "stale" banner in app
+- Fix: compare `.date()` only using `pd.Timestamp(latest_bar).date()` vs `datetime.now(timezone.utc).date()`
+- This is timezone-safe regardless of how yfinance stores NSE timestamps
+
+**OT10 — Doc Viewer:**
+- `scripts/md_viewer.py`: local CLI tool; `python scripts/md_viewer.py <file.md>` opens HTML in browser with proper table rendering. Falls back to `<pre>` if `markdown` package not installed.
+- New "Doc Viewer" page in `app.py` (sidebar nav): 4 tabs — Company Page (.md rendered), GF Tables (parquets as dataframes), Results, Quarterly Guidance (.md browser)
+- Matches by both ISIN and symbol
+
+**Single file rule:** Added explicit note to top of this file — all tracking lives here.
+
+**Still pending:**
+- OT7: Deep research report (company_deep_report.py)
+- OT8: Local doc summarisation → Drive context store
+- Fix 2B: BSE Direct API (Screener 25-item cap)
+- OT9: Streamlit optimisation (P2, deferred)
+- User to add new items

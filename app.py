@@ -621,6 +621,32 @@ def load_results_summary() -> pd.DataFrame:
     return load_parquet(["company_repo", "_index", "results.parquet"])
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_quarterly_index() -> list[dict]:
+    """List quarterly guidance .md files from company_repo/_quarterly/."""
+    def _do():
+        drive = drive_service()
+        folder_id = os.environ["GDRIVE_FOLDER_ID"]
+        repo_id = _find_subfolder(drive, folder_id, "company_repo")
+        if not repo_id:
+            return []
+        qrt_id = _find_subfolder(drive, repo_id, "_quarterly")
+        if not qrt_id:
+            return []
+        files = drive.files().list(
+            q=f"'{qrt_id}' in parents and trashed=false",
+            fields="files(id, name, modifiedTime)",
+            orderBy="modifiedTime desc",
+            pageSize=200,
+        ).execute().get("files", [])
+        return [{"file_id": f["id"], "filename": f["name"],
+                 "modified": f["modifiedTime"]} for f in files if f["name"].endswith(".md")]
+    try:
+        return _drive_call(_do)
+    except Exception:
+        return []
+
+
 def page_company_intel():
     st.title("Company Intelligence")
     st.caption(
@@ -957,6 +983,161 @@ def page_guidance():
                        "quality", "guidance_multiplier", "combined_score"]],
                 use_container_width=True, hide_index=True, height=500,
             )
+
+
+# ---------- Doc Viewer ----------
+
+def _match_by_key(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """Return rows matching key against 'symbol' or 'isin' column (whichever exists)."""
+    if df.empty:
+        return df
+    sym = df["symbol"].astype(str) == key if "symbol" in df.columns else pd.Series(False, index=df.index)
+    isn = df["isin"].astype(str) == key if "isin" in df.columns else pd.Series(False, index=df.index)
+    return df[sym | isn]
+
+
+def page_doc_viewer():
+    st.title("📄 Doc Viewer")
+    st.caption(
+        "Read pipeline documents with properly formatted tables. "
+        "All pipe-table columns render as real grids here — no raw `|` characters."
+    )
+
+    key_input = st.text_input(
+        "ISIN or NSE Symbol",
+        placeholder="e.g. RELIANCE or INE002A01018",
+        key="dv_key",
+    ).strip().upper()
+
+    tab_page, tab_gf, tab_results, tab_quarterly = st.tabs([
+        "🏢 Company Page",
+        "📋 GF Tables (GF1 / GF4 / Guidance)",
+        "📊 Results",
+        "📅 Quarterly Guidance (.md)",
+    ])
+
+    # ── Tab 1: Company Page ───────────────────────────────────────────
+    with tab_page:
+        if not key_input:
+            st.info("Enter a symbol or ISIN above.")
+        else:
+            with st.spinner(f"Loading company page for {key_input}…"):
+                content = find_company_page(key_input)
+            if content is None:
+                st.warning(
+                    f"No company page found for **{key_input}**.  "
+                    "It appears after at least one concall has been processed for this company."
+                )
+            else:
+                st.download_button(
+                    "⬇ Download .md",
+                    data=content.encode("utf-8"),
+                    file_name=f"{key_input}_company_page.md",
+                    mime="text/markdown",
+                    key="dv_dl_page",
+                )
+                st.markdown(content)
+
+    # ── Tab 2: GF Tables ──────────────────────────────────────────────
+    with tab_gf:
+        if not key_input:
+            st.info("Enter a symbol or ISIN above.")
+        else:
+            with st.spinner("Loading guidance & GF data…"):
+                gt  = load_guidance_tracker()
+                gf1 = load_gf1_statements()
+                gf4 = load_gf4_flags()
+
+            sym_gt  = _match_by_key(gt,  key_input)
+            sym_gf1 = _match_by_key(gf1, key_input)
+            sym_gf4 = _match_by_key(gf4, key_input)
+
+            if sym_gt.empty and sym_gf1.empty and sym_gf4.empty:
+                st.info(
+                    f"No structured GF data found for **{key_input}** yet.  "
+                    "This appears after concalls are processed."
+                )
+            else:
+                if not sym_gt.empty:
+                    st.subheader("Table A — Structured Guidance")
+                    st.caption(f"{len(sym_gt)} rows across "
+                               f"{sym_gt['quarter'].nunique() if 'quarter' in sym_gt.columns else '?'} quarter(s)")
+                    st.dataframe(sym_gt, use_container_width=True, hide_index=True)
+
+                if not sym_gf1.empty:
+                    st.subheader("GF1 — Forward-Looking Statements")
+                    st.caption(f"{len(sym_gf1)} statements")
+                    # Show key columns first; keep the rest in an expander
+                    key_cols_gf1 = [c for c in [
+                        "quarter", "exact_statement", "metric_type",
+                        "timeframe", "explicitness_type", "quantifiable", "numeric_value",
+                    ] if c in sym_gf1.columns]
+                    st.dataframe(sym_gf1[key_cols_gf1], use_container_width=True,
+                                 hide_index=True, height=350)
+                    with st.expander("All GF1 columns"):
+                        st.dataframe(sym_gf1, use_container_width=True, hide_index=True)
+
+                if not sym_gf4.empty:
+                    st.subheader("GF4 — Quality Flags")
+                    st.caption(f"{len(sym_gf4)} flags")
+                    st.dataframe(sym_gf4, use_container_width=True, hide_index=True)
+
+    # ── Tab 3: Results ────────────────────────────────────────────────
+    with tab_results:
+        if not key_input:
+            st.info("Enter a symbol or ISIN above.")
+        else:
+            with st.spinner("Loading results…"):
+                res = load_results_summary()
+            sym_res = _match_by_key(res, key_input)
+            # Also try matching on symbol via universe join if empty
+            if sym_res.empty and not res.empty:
+                universe = load_csv(["universe", "master_list.csv"])
+                if not universe.empty and "symbol" in universe.columns and "isin" in universe.columns:
+                    isin_for_sym = universe[universe["symbol"] == key_input]["isin"].tolist()
+                    if isin_for_sym and "isin" in res.columns:
+                        sym_res = res[res["isin"].isin(isin_for_sym)]
+
+            if sym_res.empty:
+                st.info(f"No results data found for **{key_input}**.")
+            else:
+                st.subheader("Quarterly Results Summary")
+                show_cols = [c for c in [
+                    "metric", "latest_q", "latest_val", "prev_q", "prev_val",
+                    "yearago_q", "yearago_val", "yoy_pct", "qoq_pct",
+                ] if c in sym_res.columns]
+                st.dataframe(sym_res[show_cols], use_container_width=True, hide_index=True)
+
+    # ── Tab 4: Quarterly Guidance .md ─────────────────────────────────
+    with tab_quarterly:
+        with st.spinner("Loading quarterly guidance file list…"):
+            q_files = load_quarterly_index()
+
+        if not q_files:
+            st.info(
+                "No quarterly guidance files yet. They appear after the Phase 2 "
+                "pipeline processes concalls during a results season."
+            )
+        else:
+            filenames = [f["filename"] for f in q_files]
+            sel_file = st.selectbox(
+                "Select quarterly file",
+                filenames,
+                key="dv_q_file",
+            )
+            file_meta = next((f for f in q_files if f["filename"] == sel_file), None)
+            if file_meta:
+                st.caption(f"Last modified: {file_meta['modified'][:10]}")
+                with st.spinner(f"Loading {sel_file}…"):
+                    qcontent = load_md_content(file_meta["file_id"])
+                st.download_button(
+                    "⬇ Download .md",
+                    data=qcontent.encode("utf-8"),
+                    file_name=sel_file,
+                    mime="text/markdown",
+                    key="dv_dl_quarterly",
+                )
+                st.markdown(qcontent)
 
 
 # ---------- Market Overview helpers ----------
@@ -1879,6 +2060,7 @@ def main():
         "Today's Signals",
         "Company Intel",
         "Mgmt Guidance",
+        "Doc Viewer",
         "My Portfolio",
         "Graphs",
         "Stock Detail",
@@ -1897,6 +2079,8 @@ def main():
         _safe_render(page_company_intel)
     elif page == "Mgmt Guidance":
         _safe_render(page_guidance)
+    elif page == "Doc Viewer":
+        _safe_render(page_doc_viewer)
     elif page == "My Portfolio":
         _safe_render(page_portfolio)
     elif page == "Graphs":

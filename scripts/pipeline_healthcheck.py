@@ -202,10 +202,16 @@ def main():
                            "no sample symbols found in features")
                 else:
                     latest_bar = sample["date"].max()
-                    stale_days = (datetime.now() - latest_bar).days
+                    # Normalize to date-only so timezone-aware vs naive never raises TypeError.
+                    # pd.Timestamp.date() strips any tz; datetime.now(utc).date() is UTC date.
+                    try:
+                        latest_date = pd.Timestamp(latest_bar).date()
+                    except Exception:
+                        latest_date = pd.to_datetime(latest_bar).dt.date.max()
+                    stale_days = (datetime.now(timezone.utc).date() - latest_date).days
                     ok = stale_days <= OHLCV_MAX_STALE_DAYS
                     record("OHLCV freshness", "CRITICAL", ok,
-                           f"latest bar {latest_bar.date()} "
+                           f"latest bar {latest_date} "
                            f"({stale_days}d old, max {OHLCV_MAX_STALE_DAYS}d)")
 
     # --- per-strategy signal freshness (WARNING level) ---
