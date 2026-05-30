@@ -32,7 +32,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-RETAIN_DAYS = 10
+RETAIN_DAYS = 2
 
 
 def log(msg: str) -> None:
@@ -161,8 +161,8 @@ def main() -> None:
                 deleted += 1
                 continue
             try:
-                # move to trash (recoverable for ~30 days, frees quota)
-                drive.files().update(fileId=f["id"], body={"trashed": True}).execute()
+                # move to trash (parmanetly, frees quota)
+                drive.files().delete(fileId=f["id"]).execute()
                 deleted += 1
             except Exception as e:
                 errors += 1
