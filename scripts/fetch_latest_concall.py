@@ -188,14 +188,13 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / target["name"]
 
-    if out_path.exists():
-        log(f"Cached locally — re-applying Obsidian table fix: {out_path}")
-        raw_text = out_path.read_text(encoding="utf-8", errors="replace")
-    else:
-        log("Downloading…")
-        raw_bytes = download_file(drive, target["id"])
-        raw_text   = raw_bytes.decode("utf-8", errors="replace")
-        log(f"Downloaded ({len(raw_bytes)//1024:.0f} KB)")
+    # Always download fresh from Drive. The digest file grows through the day as
+    # each pipeline run appends concalls, so a local cache goes stale within
+    # minutes — reusing it (the old behaviour) showed a frozen early snapshot.
+    log("Downloading latest from Drive…")
+    raw_bytes = download_file(drive, target["id"])
+    raw_text  = raw_bytes.decode("utf-8", errors="replace")
+    log(f"Downloaded ({len(raw_bytes)//1024:.0f} KB)")
 
     fixed = fix_markdown_for_obsidian(raw_text)
     out_path.write_text(fixed, encoding="utf-8")
