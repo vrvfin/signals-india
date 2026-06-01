@@ -200,70 +200,56 @@ def save_parquet(drive, index_id: str, filename: str,
 #  Gemini key pool with round-robin rotation on 429                   #
 # ------------------------------------------------------------------ #
 
+# P1 doc-types (results / rating / presentation / annual_report) are PF-only and
+# low-volume. They run on LITE models, kept disjoint from concall's quality chain
+# so P1 can never consume concall's premium (key, model) buckets.
+P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite"]
+
+
 class RateLimitExhausted(Exception):
-    pass
-
-
-def _is_rate_limit(exc: Exception) -> bool:
-    s = str(exc)
-    return any(t in s for t in ("429", "503", "Resource has been exhausted",
-                                "RESOURCE_EXHAUSTED", "UNAVAILABLE", "quota"))
+    """Raised when every (key, model) bucket is exhausted/transient. Callers
+    treat this as 'stop the stage, leave rows pending for the next run'.
+    Kept for backward compatibility with the P1 extractors' except clauses."""
 
 
 class GeminiKeyPool:
-    def __init__(self, api_keys: list[str], model: str):
-        self.keys = api_keys
-        self.model = model
-        self.idx = 0
+    """Back-compat adapter over the bounded BucketPool engine (gemini_pool.py).
 
-    def _run(self, contents: list, label: str) -> str:
-        """Internal: call Gemini with given contents, rotate keys on 429."""
-        backoff = 30
-        total_attempts = len(self.keys)
-        attempted = 0
-        while attempted < total_attempts:
-            client = genai.Client(api_key=self.keys[self.idx])
-            try:
-                log(f"  {label} (key {self.idx + 1}/{len(self.keys)})...")
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=contents,
-                    config=genai_types.GenerateContentConfig(temperature=0.1),
-                )
-                self.idx = (self.idx + 1) % len(self.keys)
-                return response.text
-            except Exception as exc:
-                if _is_rate_limit(exc):
-                    attempted += 1
-                    next_idx = (self.idx + 1) % len(self.keys)
-                    log(f"  429 on key {self.idx + 1}/{len(self.keys)} "
-                        f"(attempt {attempted}/{total_attempts}) — "
-                        f"waiting {backoff}s, next key {next_idx + 1}...")
-                    time.sleep(backoff)
-                    self.idx = next_idx
-                    backoff = min(backoff * 2, 120)
-                    continue
-                raise
-        raise RateLimitExhausted(
-            f"All {len(self.keys)} Gemini keys exhausted after backoff"
-        )
+    Preserves the (api_keys, model) constructor and the string-returning
+    .call()/.call_text() API the P1 extractors already use, so those files need
+    no structural change. `model` may be a single model string or a list (a
+    fallback chain). All the checks-and-balances — error-typed handling,
+    per-(key,model) daily-quota tracking, model fallback, bounded retries, and
+    the stage wall-clock ceiling — come from BucketPool.
+
+    Mapping of the engine's outcomes onto the legacy contract:
+      * AllBucketsExhausted (transient/quota) -> RateLimitExhausted  (defer)
+      * FatalCallError      (bad PDF / 400)   -> propagates as Exception (row error)
+    """
+
+    def __init__(self, api_keys: list[str], model):
+        from gemini_pool import BucketPool
+        models = model if isinstance(model, (list, tuple)) else [model]
+        self._pool = BucketPool(list(api_keys), list(models), logger=log)
+
+    def _guard(self, fn):
+        from gemini_pool import AllBucketsExhausted
+        try:
+            text, _model_used = fn()
+            return text
+        except AllBucketsExhausted as exc:
+            raise RateLimitExhausted(str(exc))
 
     def call(self, pdf_bytes: bytes, prompt: str, display_name: str) -> str:
-        """Generate content from inline PDF bytes + prompt. Rotates keys on 429."""
-        import base64
-        b64 = base64.standard_b64encode(pdf_bytes).decode()
-        contents = [
-            genai_types.Part(
-                inline_data=genai_types.Blob(mime_type="application/pdf", data=b64)
-            ),
-            genai_types.Part.from_text(text=prompt),
-        ]
-        return self._run(contents, f"Generating response [{display_name}]")
+        """Generate from inline PDF bytes + prompt (bounded key/model fallback)."""
+        return self._guard(lambda: self._pool.call_pdf(pdf_bytes, prompt))
 
     def call_text(self, prompt: str, display_name: str) -> str:
-        """Generate content from text prompt only (no PDF). Used for synthesis passes."""
-        contents = [genai_types.Part.from_text(text=prompt)]
-        return self._run(contents, f"Synthesising [{display_name}]")
+        """Generate from a text-only prompt (synthesis passes)."""
+        return self._guard(lambda: self._pool.call_text(prompt))
+
+    def summary(self) -> dict:
+        return self._pool.summary()
 
 
 # ------------------------------------------------------------------ #

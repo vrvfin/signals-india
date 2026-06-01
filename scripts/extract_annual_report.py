@@ -33,7 +33,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _extractor_base import (
-    RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys,
+    RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue,
     load_parquet, save_parquet,
@@ -45,7 +45,7 @@ from _extractor_base import (
 
 # ---- Config ----
 DOC_TYPE        = "annual_report"
-GEMINI_MODEL    = "gemini-2.5-flash"
+GEMINI_MODEL    = P1_MODELS          # lite chain, disjoint from concall (P0)
 PROMPT_FILE     = "annual_report_prompt.txt"
 DOC_TYPE_LABEL  = "Annual Report"
 
@@ -170,9 +170,10 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
     for t in tables:
         hdrs = t["headers"]
         # Look for a table that has at least one FY\d+ column header
-        fy_cols = {i: f"FY{re.search(r'FY(\d{2,4})', h, re.IGNORECASE).group(1)}"
+        _fy_re = re.compile(r"FY(\d{2,4})", re.IGNORECASE)
+        fy_cols = {i: "FY" + _fy_re.search(h).group(1)
                    for i, h in enumerate(hdrs)
-                   if re.search(r"FY\d{2,4}", h, re.IGNORECASE)}
+                   if _fy_re.search(h)}
         if not fy_cols:
             continue
 

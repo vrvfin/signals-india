@@ -331,7 +331,7 @@ def main() -> None:
     session = screener_session()
     new_rows = []
     counts = {"seen": 0, "new": 0, "downloaded": 0, "skipped_old": 0,
-              "dup": 0, "download_fail": 0}
+              "dup": 0, "download_fail": 0, "ingest_error": 0}
 
     for feed_name, cfg in feeds.items():
         src = cfg.get("path") or f"filter {cfg.get('filter_id')}"
@@ -363,20 +363,32 @@ def main() -> None:
                 key = isin if isin else a["symbol"]
                 counts["new"] += 1
 
-                pdf = download_pdf(session, a["pdf_url"])
+                # Per-document isolation: a failed download/upload for ONE doc
+                # must never abort the feed. On hard error we skip the row
+                # WITHOUT marking it known, so it is retried on the next run.
+                # Rule: never stop creating the queue.
                 drive_file_id, status = "", "pending"
-                if pdf is None:
-                    counts["download_fail"] += 1
-                    status = "download_failed"
-                else:
-                    comp_id = get_or_create_subfolder(drive, repo_id, key)
-                    docs_id = get_or_create_subfolder(drive, comp_id, "documents")
-                    fname = f"{a['doc_type']}__{a['announcement_date']}__{a['doc_id']}.pdf"
-                    drive_file_id = upload_bytes(drive, docs_id, fname, pdf,
-                                                 "application/pdf")
-                    counts["downloaded"] += 1
-                    log(f"  + {a['symbol']:<14} {a['doc_type']:<14} "
-                        f"{a['announcement_date']}")
+                try:
+                    pdf = download_pdf(session, a["pdf_url"])
+                    if pdf is None:
+                        counts["download_fail"] += 1
+                        status = "download_failed"
+                    else:
+                        comp_id = get_or_create_subfolder(drive, repo_id, key)
+                        docs_id = get_or_create_subfolder(drive, comp_id, "documents")
+                        fname = f"{a['doc_type']}__{a['announcement_date']}__{a['doc_id']}.pdf"
+                        drive_file_id = upload_bytes(drive, docs_id, fname, pdf,
+                                                     "application/pdf")
+                        counts["downloaded"] += 1
+                        log(f"  + {a['symbol']:<14} {a['doc_type']:<14} "
+                            f"{a['announcement_date']}")
+                except Exception as exc:
+                    counts.setdefault("ingest_error", 0)
+                    counts["ingest_error"] += 1
+                    counts["new"] -= 1   # not actually queued
+                    log(f"  ! {a['symbol']:<14} ingest error "
+                        f"({str(exc)[:80]}) — will retry next run")
+                    continue
 
                 known_keys.add(dedup_key)
                 new_rows.append({
@@ -406,6 +418,7 @@ def main() -> None:
     print(f"New documents queued   : {counts['new']}")
     print(f"  PDFs downloaded      : {counts['downloaded']}")
     print(f"  download failures    : {counts['download_fail']}")
+    print(f"  ingest errors (retry): {counts['ingest_error']}")
     print(f"Queue total rows       : {len(queue)}")
     print("Output: company_repo/_index/processing_queue.parquet")
 

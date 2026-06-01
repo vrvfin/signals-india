@@ -45,8 +45,6 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from google import genai
-from google.genai import types as genai_types
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -54,11 +52,24 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-GEMINI_MODEL = "gemini-2.5-flash"
+from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
+                         load_keys)
 
-# Minimum seconds to sleep between consecutive Gemini calls.
-# Keeps us at ≤10 calls/min per key, eliminating most RPM 429 cascades.
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# Concall is P0 (best quality). Models tried best-first; the pool only
+# downgrades to the next model once the current one is exhausted on ALL keys.
+# Each (key, model) is a separate daily free-tier quota bucket.
+# All confirmed to have a free tier as of 2026-06 (pro-tier models do NOT).
+# Quality-only chain. Disjoint from P1_MODELS (lite) so P1 extraction can never
+# consume concall's premium buckets. 3 models × 6 keys = 18 daily buckets.
+CONCALL_MODELS = [
+    "gemini-3.5-flash",        # best free-tier quality
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",        # 20/day measured
+]
+
+# Minimum seconds to sleep between consecutive successful Gemini calls (RPM hygiene).
 INTER_CALL_SLEEP = 6
 
 # ---- Output toggles ----
@@ -592,76 +603,9 @@ def append_quarterly_guidance_page(drive, repo_id, symbol: str, company_name: st
 
 
 # ------------------------------------------------------------------ #
-#  Gemini key pool with round-robin rotation on 429                   #
+#  Gemini calls are handled by the shared BucketPool engine            #
+#  (see gemini_pool.py) — bounded, error-typed (key, model) fallback.  #
 # ------------------------------------------------------------------ #
-
-class RateLimitExhausted(Exception):
-    pass
-
-
-def _is_rate_limit(exc: Exception) -> bool:
-    s = str(exc)
-    return any(t in s for t in ("429", "503", "Resource has been exhausted",
-                                "RESOURCE_EXHAUSTED", "UNAVAILABLE", "quota"))
-
-
-class GeminiKeyPool:
-    def __init__(self, api_keys: list[str]):
-        self.keys = api_keys
-        self.idx = 0
-        self._last_call_ts: float = 0.0
-
-    def call(self, pdf_bytes: bytes, prompt: str, display_name: str) -> str:
-        """Generate content using inline PDF bytes. Rotates keys on 429.
-
-        Enforces INTER_CALL_SLEEP between consecutive calls to stay within RPM.
-        """
-        import base64
-        # Enforce minimum gap between calls (RPM protection)
-        elapsed = time.time() - self._last_call_ts
-        if elapsed < INTER_CALL_SLEEP and self._last_call_ts > 0:
-            time.sleep(INTER_CALL_SLEEP - elapsed)
-
-        b64 = base64.standard_b64encode(pdf_bytes).decode()
-        backoff = 30
-        total_attempts = len(self.keys)
-        attempted = 0
-
-        while attempted < total_attempts:
-            client = genai.Client(api_key=self.keys[self.idx])
-            try:
-                log(f"  Generating response (key {self.idx + 1}/{len(self.keys)})...")
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        genai_types.Part(
-                            inline_data=genai_types.Blob(
-                                mime_type="application/pdf",
-                                data=b64,
-                            )
-                        ),
-                        genai_types.Part.from_text(text=prompt),
-                    ],
-                    config=genai_types.GenerateContentConfig(temperature=0.1),
-                )
-                self._last_call_ts = time.time()
-                self.idx = (self.idx + 1) % len(self.keys)
-                return response.text
-            except Exception as exc:
-                if _is_rate_limit(exc):
-                    attempted += 1
-                    next_idx = (self.idx + 1) % len(self.keys)
-                    log(f"  429 on key {self.idx + 1}/{len(self.keys)} "
-                        f"(attempt {attempted}/{total_attempts}) — "
-                        f"waiting {backoff}s, next key {next_idx + 1}...")
-                    time.sleep(backoff)
-                    self.idx = next_idx
-                    backoff = min(backoff * 2, 120)
-                    continue
-                raise
-        raise RateLimitExhausted(
-            f"All {len(self.keys)} Gemini keys exhausted after backoff"
-        )
 
 
 # ------------------------------------------------------------------ #
@@ -1083,23 +1027,15 @@ def main() -> None:
 
     drive = get_drive()
 
-    # Load Gemini API keys
-    api_keys = [
-        v for _, v in sorted(
-            ((k, v) for k, v in os.environ.items()
-             if re.match(r"GEMINI_API_KEY_\d+$", k) and v.strip()),
-            key=lambda kv: kv[0],
-        )
-    ]
-    plain = os.environ.get("GEMINI_API_KEY", "").strip()
-    if plain and plain not in api_keys:
-        api_keys.append(plain)
+    # Load Gemini API keys and build the bucket pool (keys × CONCALL_MODELS)
+    api_keys = load_keys(os.environ)
     if not api_keys:
         print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
         sys.exit(1)
-    log(f"Loaded {len(api_keys)} Gemini API key(s)")
-
-    gemini = GeminiKeyPool(api_keys)
+    gemini = BucketPool(api_keys, CONCALL_MODELS,
+                        inter_call_s=INTER_CALL_SLEEP, logger=log)
+    log(f"Loaded {len(api_keys)} key(s) × {len(CONCALL_MODELS)} model(s) "
+        f"= {len(api_keys) * len(CONCALL_MODELS)} buckets")
 
     # Load prompt
     prompt_path = Path(__file__).resolve().parent / "concall_prompt.txt"
@@ -1140,16 +1076,20 @@ def main() -> None:
             counts["skipped"] += 1
             continue
 
+        # Download PDF outside the main try so a transient Drive error doesn't
+        # get misclassified as a permanent row 'error'.
         try:
-            # 1. Download PDF from Drive
             pdf_bytes = download_bytes(drive, drive_fid)
             log(f"  PDF: {len(pdf_bytes):,} bytes")
+        except Exception as exc:
+            log(f"  Drive download failed ({str(exc)[:80]}) — leaving pending")
+            counts["skipped"] += 1
+            continue
 
-            display_name = f"{row.get('symbol', 'DOC')}_{str(row.get('doc_id', ''))[:12]}.pdf"
-
-            # 2-3. Upload to Gemini + generate (includes inter-call sleep)
-            markdown_text = gemini.call(pdf_bytes, prompt, display_name)
-            log(f"  Gemini response: {len(markdown_text):,} chars")
+        try:
+            # Generate via the bucket pool (best model first; bounded fallback).
+            markdown_text, model_used = gemini.call_pdf(pdf_bytes, prompt)
+            log(f"  Gemini response: {len(markdown_text):,} chars [{model_used}]")
 
             if args.dry_run:
                 print(f"\n{'='*60}\nDRY RUN — {row.get('symbol')}\n"
@@ -1233,13 +1173,25 @@ def main() -> None:
             counts["processed"] += 1
             log(f"  Done: {row.get('symbol')}")
 
-        except RateLimitExhausted:
-            log("All Gemini keys rate-limited — stopping cleanly. "
-                "Remaining pending rows will be picked up on the next run.")
+        except AllBucketsExhausted as exc:
+            # Transient/quota: every remaining row faces the same dead buckets,
+            # so stop now. Row stays 'pending' (untouched) and resumes next run.
+            counts["deferred"] = len(pending_idx) - counts["processed"] \
+                - counts["error"] - counts["skipped"]
+            log(f"Stopping: {exc}. {counts['deferred']} concall(s) deferred — "
+                f"resume after next free bucket / reset (~13:30 IST).")
             break
 
+        except FatalCallError as exc:
+            # Deterministic failure for THIS document (bad PDF, blocked, 400).
+            log(f"  FATAL (this doc): {str(exc)[:120]}")
+            queue.loc[queue_idx, "status"] = "error"
+            queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_queue(drive, index_id, queue)
+            counts["error"] += 1
+
         except Exception as exc:
-            log(f"  ERROR: {str(exc)[:120]}")
+            log(f"  ERROR (post-processing): {str(exc)[:120]}")
             queue.loc[queue_idx, "status"] = "error"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
             save_queue(drive, index_id, queue)
@@ -1250,12 +1202,19 @@ def main() -> None:
         log("Writing CSV snapshots...")
         write_csv_exports(drive, index_id)
 
+    pool = gemini.summary()
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
-    print(f"Errors    : {counts['error']}")
-    print(f"Skipped   : {counts['skipped']}")
+    print(f"Deferred  : {counts.get('deferred', 0)}  (still pending — quota/transient)")
+    print(f"Errors    : {counts['error']}  (bad PDF / deterministic)")
+    print(f"Skipped   : {counts['skipped']}  (no drive_file_id / download fail)")
     print(f"GF rows   : GF1={counts['gf1']} GF2={counts['gf2']} "
           f"GF3={counts['gf3']} GF4={counts['gf4']}")
+    print(f"Calls OK by model : {pool['by_model'] or '{}'}")
+    print(f"Buckets   : {pool['buckets_alive']} alive · "
+          f"{pool['buckets_dead_today']} dead-today · "
+          f"{pool['buckets_parked']} parked  (of {pool['buckets_total']}) "
+          f"· {pool['elapsed_s']}s")
     if not args.dry_run and counts["processed"] > 0:
         print("Output: company_repo/_index/quarterly_facts.parquet")
         print("Output: company_repo/_index/guidance_tracker.parquet")

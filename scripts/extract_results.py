@@ -30,7 +30,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _extractor_base import (
-    RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys,
+    RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue,
     load_parquet, save_parquet,
@@ -42,7 +42,7 @@ from _extractor_base import (
 
 # ---- Config ----
 DOC_TYPE        = "results"
-GEMINI_MODEL    = "gemini-2.5-flash"
+GEMINI_MODEL    = P1_MODELS          # lite chain, disjoint from concall (P0)
 PROMPT_FILE     = "results_prompt.txt"
 DOC_TYPE_LABEL  = "Results"
 
