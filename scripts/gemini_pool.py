@@ -28,7 +28,9 @@ order (best model first, across all keys) with these guarantees:
        buckets * (cooling_budget + overload_budget + 1).
     2. Per-call: one pass over live buckets; if none serve, raise — the caller
        defers the document (status stays pending) and moves on.
-    3. Stage wall-clock ceiling: a hard backstop regardless of logic.
+    (An optional stage wall-clock cap exists but is OFF by default: concall is
+     P0 and must never be cut off while still making progress. Bounds 1-2 alone
+     guarantee termination; the GitHub job timeout is the only outer limit.)
 
   No long sleeps
     - PerDay / PerMinute cost ~milliseconds (rotate to a fresh bucket).
@@ -130,11 +132,18 @@ class BucketPool:
         *,
         cooling_budget: int = 2,      # PerMinute cooldowns allowed per bucket
         overload_budget: int = 2,     # 503s allowed per bucket
-        stage_deadline_s: float = 1500.0,   # 25 min hard wall-clock backstop
+        stage_deadline_s: float | None = None,  # optional wall-clock cap; None = no cap
         inter_call_s: float = 6.0,    # min gap between successful calls (RPM hygiene)
         overload_backoff_s: float = 8.0,
         logger=print,
     ):
+        # NOTE: there is deliberately NO wall-clock cap by default. Termination is
+        # already guaranteed by the bucket state machine (DEAD_TODAY is permanent;
+        # COOLING has a finite budget), so a clock cap would only stop productive
+        # work. Concall (P0) must never be cut off while still making progress —
+        # it runs until all rows are done or every free bucket is exhausted, with
+        # the GitHub job timeout as the only outer bound. Pass stage_deadline_s
+        # explicitly only if a specific caller wants a soft cap.
         self.keys = api_keys
         self.models = models
         self.cooling_budget = cooling_budget
@@ -144,7 +153,8 @@ class BucketPool:
         self._log = logger
         self._last_call_ts = 0.0
         self._started = time.time()
-        self._deadline = self._started + stage_deadline_s
+        self._deadline = (self._started + stage_deadline_s
+                          if stage_deadline_s else None)
         self._clients: dict[int, genai.Client] = {}
         # buckets ordered best-model-first, then by key
         self.buckets: list[_Bucket] = [
@@ -205,14 +215,14 @@ class BucketPool:
 
         while True:
             now = time.time()
-            if now >= self._deadline:
+            if self._deadline is not None and now >= self._deadline:
                 raise AllBucketsExhausted("stage wall-clock ceiling reached")
 
             b = self._next_bucket(now)
             if b is None:
-                # nothing live now — can anything wake before the deadline?
+                # nothing live now — can anything wake (before the deadline, if set)?
                 wake = self._earliest_wakeup(now)
-                if wake is None or wake >= self._deadline:
+                if wake is None or (self._deadline is not None and wake >= self._deadline):
                     raise AllBucketsExhausted(self._state_summary())
                 nap = max(0.0, wake - now)
                 self._log(f"  all buckets cooling — waiting {nap:.0f}s for next free bucket")
