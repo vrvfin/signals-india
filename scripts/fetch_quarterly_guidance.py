@@ -160,13 +160,11 @@ def main() -> None:
 
     for f in targets:
         out_path = OUTPUT_DIR / f["name"]
-        if out_path.exists():
-            log(f"Cached — re-fixing: {f['name']}")
-            raw_text = out_path.read_text(encoding="utf-8", errors="replace")
-        else:
-            log(f"Downloading {f['name']}…")
-            raw_bytes = download_bytes(drive, f["id"])
-            raw_text  = raw_bytes.decode("utf-8", errors="replace")
+        # Always download fresh — the guidance tracker grows as the quarter's
+        # concalls are processed, so a local copy goes stale. Overwrites in place.
+        log(f"Downloading {f['name']}…")
+        raw_bytes = download_bytes(drive, f["id"])
+        raw_text  = raw_bytes.decode("utf-8", errors="replace")
 
         fixed = fix_markdown_for_obsidian(raw_text)
         out_path.write_text(fixed, encoding="utf-8")

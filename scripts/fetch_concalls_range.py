@@ -225,13 +225,11 @@ def main() -> None:
 
     for fdate, f in targets:
         out_path = OUTPUT_DIR / f["name"]
-        if out_path.exists():
-            log(f"Cached — re-fixing: {f['name']}")
-            raw_text = out_path.read_text(encoding="utf-8", errors="replace")
-        else:
-            log(f"Downloading: {f['name']} …")
-            raw_bytes = download_file(drive, f["id"])
-            raw_text  = raw_bytes.decode("utf-8", errors="replace")
+        # Always download fresh — digests grow through the day, so a local copy
+        # goes stale. Overwrites the same file in place.
+        log(f"Downloading: {f['name']} …")
+        raw_bytes = download_file(drive, f["id"])
+        raw_text  = raw_bytes.decode("utf-8", errors="replace")
 
         fixed = fix_markdown_for_obsidian(raw_text)
         out_path.write_text(fixed, encoding="utf-8")
