@@ -133,38 +133,105 @@ STRATEGY_DOCS = {
 # ---------- Drive helpers ----------
 
 def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days):
-    """Lightweight line chart for quick scan — no candlestick, no volume.
-    ~5x smaller JSON payload than build_stock_chart; safe to render 300+ at once."""
-    df = ohlcv.sort_values("date").tail(timeframe_days).reset_index(drop=True)
+    """Lightweight line + volume chart for quick scan.
+    Includes: price line, 20/50 EMA, volume bars, start/end date labels,
+    signal zone lines, and 1M/3M/6M/1Y return annotations in the title."""
+    full = ohlcv.sort_values("date").reset_index(drop=True)
+    df   = full.tail(timeframe_days).reset_index(drop=True)
     df["ema_20"] = df["close"].ewm(span=20).mean()
     df["ema_50"] = df["close"].ewm(span=50).mean()
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["date"], y=df["close"],
-                             line=dict(color="#2c3e50", width=1.5), showlegend=False))
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_20"],
-                             line=dict(color="#2980b9", width=1), showlegend=False))
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_50"],
-                             line=dict(color="#8e44ad", width=1), showlegend=False))
+    # ── Return labels ─────────────────────────────────────────────────────────
+    def _ret(days):
+        if len(full) < days + 1:
+            return None
+        p0 = float(full["close"].iloc[-(days + 1)])
+        p1 = float(full["close"].iloc[-1])
+        return (p1 / p0 - 1) * 100 if p0 else None
 
-    if not signals_for_stock.empty:
-        for _, sig in signals_for_stock.iterrows():
-            zt  = sig.get("zone_type")
-            entry = sig.get("entry")
-            if pd.notna(entry):
-                fig.add_hline(y=entry, line=dict(color=ZONE_COLORS.get(zt, "#666"), width=1))
+    rets = {}
+    for label, days in [("1M", 21), ("3M", 63), ("6M", 126), ("1Y", 252)]:
+        v = _ret(days)
+        if v is not None:
+            rets[label] = v
+
+    ret_str = "  ".join(
+        f'<span style="color:{"#27ae60" if v >= 0 else "#e74c3c"}">'
+        f'{label} {v:+.0f}%</span>'
+        for label, v in rets.items()
+    )
 
     last_close = float(df["close"].iloc[-1]) if not df.empty else 0
+    title_html = f"<b>{symbol}</b>  ₹{last_close:,.0f}    {ret_str}"
+
+    # ── Volume colour: green if close ≥ open, else red ────────────────────────
+    vol_colors = [
+        "#27ae60" if c >= o else "#e74c3c"
+        for c, o in zip(df["close"], df["open"])
+    ]
+
+    # ── Date tick positions: first and last bar ───────────────────────────────
+    dates = df["date"].tolist()
+    tick_vals = [dates[0], dates[-1]]
+    tick_text = [
+        str(dates[0])[:10] if hasattr(dates[0], "__str__") else "",
+        str(dates[-1])[:10] if hasattr(dates[-1], "__str__") else "",
+    ]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.72, 0.28], vertical_spacing=0.02,
+    )
+
+    # Price + EMAs
+    fig.add_trace(go.Scatter(x=df["date"], y=df["close"],
+                             line=dict(color="#2c3e50", width=1.5),
+                             showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_20"],
+                             line=dict(color="#2980b9", width=1),
+                             showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_50"],
+                             line=dict(color="#8e44ad", width=1),
+                             showlegend=False), row=1, col=1)
+
+    # Signal zone lines
+    if not signals_for_stock.empty:
+        for _, sig in signals_for_stock.iterrows():
+            zt    = sig.get("zone_type")
+            entry = sig.get("entry")
+            if pd.notna(entry):
+                fig.add_hline(y=entry,
+                              line=dict(color=ZONE_COLORS.get(zt, "#666"), width=1),
+                              row=1, col=1)
+
+    # Volume bars
+    fig.add_trace(go.Bar(x=df["date"], y=df["volume"],
+                         marker_color=vol_colors, showlegend=False), row=2, col=1)
+
     fig.update_layout(
-        height=220,
-        title=dict(text=f"<b>{symbol}</b>  ₹{last_close:,.0f}",
-                   font=dict(size=11), x=0.03, y=0.95),
-        margin=dict(l=4, r=4, t=28, b=4),
-        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-        yaxis=dict(showgrid=False, zeroline=False, tickfont=dict(size=9)),
+        height=300,
+        title=dict(text=title_html, font=dict(size=11), x=0.02, y=0.97),
+        margin=dict(l=4, r=4, t=32, b=4),
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
+        bargap=0.1,
     )
+    fig.update_xaxes(
+        showgrid=False, zeroline=False,
+        tickvals=tick_vals, ticktext=tick_text,
+        tickfont=dict(size=8), tickangle=0,
+        row=1, col=1,
+    )
+    fig.update_xaxes(
+        showgrid=False, zeroline=False,
+        tickvals=tick_vals, ticktext=tick_text,
+        tickfont=dict(size=8), tickangle=0,
+        row=2, col=1,
+    )
+    fig.update_yaxes(showgrid=False, zeroline=False, tickfont=dict(size=8),
+                     row=1, col=1)
+    fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False,
+                     row=2, col=1)
     return fig
 
 
