@@ -132,6 +132,42 @@ STRATEGY_DOCS = {
 
 # ---------- Drive helpers ----------
 
+def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days):
+    """Lightweight line chart for quick scan — no candlestick, no volume.
+    ~5x smaller JSON payload than build_stock_chart; safe to render 300+ at once."""
+    df = ohlcv.sort_values("date").tail(timeframe_days).reset_index(drop=True)
+    df["ema_20"] = df["close"].ewm(span=20).mean()
+    df["ema_50"] = df["close"].ewm(span=50).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["date"], y=df["close"],
+                             line=dict(color="#2c3e50", width=1.5), showlegend=False))
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_20"],
+                             line=dict(color="#2980b9", width=1), showlegend=False))
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_50"],
+                             line=dict(color="#8e44ad", width=1), showlegend=False))
+
+    if not signals_for_stock.empty:
+        for _, sig in signals_for_stock.iterrows():
+            zt  = sig.get("zone_type")
+            entry = sig.get("entry")
+            if pd.notna(entry):
+                fig.add_hline(y=entry, line=dict(color=ZONE_COLORS.get(zt, "#666"), width=1))
+
+    last_close = float(df["close"].iloc[-1]) if not df.empty else 0
+    fig.update_layout(
+        height=220,
+        title=dict(text=f"<b>{symbol}</b>  ₹{last_close:,.0f}",
+                   font=dict(size=11), x=0.03, y=0.95),
+        margin=dict(l=4, r=4, t=28, b=4),
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=False, zeroline=False, tickfont=dict(size=9)),
+        plot_bgcolor="#fafafa",
+        paper_bgcolor="white",
+    )
+    return fig
+
+
 def build_stock_chart(symbol, ohlcv, signals_for_stock, timeframe_days, height=500):
     """Single-stock chart: candlestick + EMAs (with zone overlays) + volume."""
     df = ohlcv.sort_values("date").tail(timeframe_days).reset_index(drop=True)
@@ -469,7 +505,7 @@ def load_csv(path_parts):
     return _drive_call(_do)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_parquet(path_parts):
     def _do():
         drive = drive_service()
@@ -510,6 +546,37 @@ def load_all_strategy_signals():
                 df["strategy_group"] = s["name"]
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return _drive_call(_do)
+
+
+# ---------- Bulk OHLCV loader (traverses Drive path ONCE for N symbols) ----------
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_ohlcv_bulk(symbols: tuple) -> dict:
+    """Download OHLCV for multiple symbols in a single Drive session.
+    Folder lookups happen once; only the needed parquets are downloaded.
+    Returns {symbol: DataFrame}. Missing symbols map to empty DataFrame."""
+    def _do():
+        drive  = drive_service()
+        root   = os.environ["GDRIVE_FOLDER_ID"]
+        data_id = _find_subfolder(drive, root, "data")
+        if not data_id:
+            return {}
+        ohlcv_id = _find_subfolder(drive, data_id, "ohlcv")
+        if not ohlcv_id:
+            return {}
+        all_files = _list_folder(drive, ohlcv_id)   # one API call lists everything
+        result = {}
+        for sym in symbols:
+            fid = all_files.get(f"{sym}.parquet")
+            if not fid:
+                result[sym] = pd.DataFrame()
+                continue
+            try:
+                result[sym] = pd.read_parquet(io.BytesIO(_download_bytes(drive, fid)))
+            except Exception:
+                result[sym] = pd.DataFrame()
+        return result
     return _drive_call(_do)
 
 
@@ -1739,25 +1806,32 @@ def page_graphs():
         return
 
     strat_groups = sorted(signals["strategy_group"].unique())
-    zone_opts = sorted(signals["zone_type"].dropna().unique())
+    zone_opts    = sorted(signals["zone_type"].dropna().unique())
 
+    # ── Filters row ───────────────────────────────────────────────────────────
     c1, c2 = st.columns([3, 2])
     with c1:
-        chosen = st.multiselect("Strategies (add / remove)",
-                                strat_groups, default=strat_groups)
+        chosen = st.multiselect("Strategies", strat_groups, default=strat_groups)
     with c2:
         zones = st.multiselect("Zones", zone_opts, default=["buy", "add"])
 
-    c3, c4, c5 = st.columns(3)
+    c3, c4, c5, c6 = st.columns(4)
     with c3:
-        min_strats = st.number_input("Min strategies a stock must satisfy",
-                                     min_value=1, max_value=10, value=2, step=1)
+        min_strats = st.number_input("Min strategies", min_value=1,
+                                     max_value=10, value=1, step=1)
     with c4:
-        per_page = st.number_input("Charts per page", min_value=4,
-                                   max_value=40, value=12, step=4)
-    with c5:
         tf = st.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()), index=2)
+    with c5:
+        view_mode = st.radio("View mode", ["Quick Scan", "Detailed"],
+                             horizontal=True,
+                             help="Quick Scan: 3-column line charts, scroll all at once. "
+                                  "Detailed: full candlestick with volume, paginated.")
+    with c6:
+        if view_mode == "Detailed":
+            per_page = int(st.number_input("Charts/page", min_value=2,
+                                           max_value=20, value=6, step=2))
 
+    # ── Filter signals ────────────────────────────────────────────────────────
     sel = signals[signals["strategy_group"].isin(chosen)]
     if zones:
         sel = sel[sel["zone_type"].isin(zones)]
@@ -1769,8 +1843,7 @@ def page_graphs():
             .reset_index(name="n_strategies"))
     conv = conv[conv["n_strategies"] >= int(min_strats)]
     if conv.empty:
-        st.info(f"No stock satisfies ≥ {int(min_strats)} of the selected "
-                f"strategies. Lower the threshold to see more.")
+        st.info(f"No stock satisfies ≥ {int(min_strats)} strategies. Lower the threshold.")
         return
 
     best = sel.groupby("symbol")["score"].max().reset_index(name="best_score")
@@ -1778,15 +1851,54 @@ def page_graphs():
     conv = conv.sort_values(["n_strategies", "best_score"],
                             ascending=[False, False]).reset_index(drop=True)
 
-    # --- Pagination ---
     total = len(conv)
-    per_page = int(per_page)
-    n_pages = max(1, (total + per_page - 1) // per_page)
+    sym_list = tuple(conv["symbol"].tolist())
+    st.caption(f"{total} stock(s) matching filters")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # QUICK SCAN MODE — load all OHLCV in one Drive session, render 3-col grid
+    # ─────────────────────────────────────────────────────────────────────────
+    if view_mode == "Quick Scan":
+        st.info(
+            f"Loading {total} charts. First load downloads from Drive (~1-3 min "
+            f"for 300+ stocks). Subsequent visits use the 30-min cache — instant.",
+            icon="ℹ️",
+        )
+        prog = st.progress(0, text="Loading OHLCV from Drive (one batch call)…")
+        ohlcv_map = load_ohlcv_bulk(sym_list)
+        prog.progress(100, text="Done — rendering charts…")
+
+        tf_days = TIMEFRAME_DAYS[tf]
+        cols3   = st.columns(3)
+
+        for i, (_, crow) in enumerate(conv.iterrows()):
+            sym      = crow["symbol"]
+            sym_sigs = sel[sel["symbol"] == sym]
+            ohlcv    = ohlcv_map.get(sym, pd.DataFrame())
+
+            with cols3[i % 3]:
+                zone_colors_html = " ".join(
+                    f'<span style="background:{ZONE_COLORS.get(sg.get("zone_type",""),"#666")};'
+                    f'color:white;padding:1px 5px;border-radius:8px;font-size:10px;">'
+                    f'{sg.get("zone_type","")}</span>'
+                    for _, sg in sym_sigs.drop_duplicates("zone_type").iterrows()
+                )
+                st.markdown(zone_colors_html, unsafe_allow_html=True)
+                if ohlcv.empty:
+                    st.caption(f"{sym} — no data")
+                else:
+                    fig = build_quick_chart(sym, ohlcv, sym_sigs, tf_days)
+                    st.plotly_chart(fig, use_container_width=True,
+                                    key=f"qs_{sym}", config={"displayModeBar": False})
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # DETAILED MODE — paginated candlestick + volume
+    # ─────────────────────────────────────────────────────────────────────────
+    n_pages = max(1, (total + per_page - 1) // per_page)
     if "graphs_page" not in st.session_state:
         st.session_state["graphs_page"] = 0
-    st.session_state["graphs_page"] = min(st.session_state["graphs_page"],
-                                          n_pages - 1)
+    st.session_state["graphs_page"] = min(st.session_state["graphs_page"], n_pages - 1)
     page = st.session_state["graphs_page"]
 
     def _nav(suffix):
@@ -1796,68 +1908,59 @@ def page_graphs():
         with n1:
             if st.button("⏮ First", key=f"first_{suffix}",
                          disabled=at_first, use_container_width=True):
-                st.session_state["graphs_page"] = 0
-                st.rerun()
+                st.session_state["graphs_page"] = 0; st.rerun()
         with n2:
             if st.button("◀ Prev", key=f"prev_{suffix}",
                          disabled=at_first, use_container_width=True):
-                st.session_state["graphs_page"] = page - 1
-                st.rerun()
+                st.session_state["graphs_page"] = page - 1; st.rerun()
         with n3:
             if suffix == "top":
-                # Sync the jump widget to the current page so it stays in step
-                # with Prev/Next button navigation.
-                st.session_state["graphs_jump"] = page + 1
                 jump = st.number_input(
                     f"Page (1–{n_pages})", min_value=1, max_value=n_pages,
-                    step=1, key="graphs_jump", label_visibility="collapsed",
+                    value=page + 1, step=1, label_visibility="collapsed",
+                    key=f"graphs_jump_{n_pages}_{per_page}",
                 )
-                st.caption(f"of {n_pages}  ·  {total} stock(s)  "
-                           f"(≥ {int(min_strats)} strategies)  "
-                           f"— type a page number and press Enter to jump")
+                st.caption(f"of {n_pages}  ·  {total} stock(s)  — type page & press Enter")
                 if jump - 1 != page:
-                    st.session_state["graphs_page"] = jump - 1
-                    st.rerun()
+                    st.session_state["graphs_page"] = jump - 1; st.rerun()
             else:
-                st.markdown(
-                    f"<div style='text-align:center;padding-top:8px;'>"
-                    f"Page {page + 1} of {n_pages}</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"<div style='text-align:center;padding-top:8px;'>"
+                            f"Page {page + 1} of {n_pages}</div>",
+                            unsafe_allow_html=True)
         with n4:
             if st.button("Next ▶", key=f"next_{suffix}",
                          disabled=at_last, use_container_width=True):
-                st.session_state["graphs_page"] = page + 1
-                st.rerun()
+                st.session_state["graphs_page"] = page + 1; st.rerun()
         with n5:
             if st.button("Last ⏭", key=f"last_{suffix}",
                          disabled=at_last, use_container_width=True):
-                st.session_state["graphs_page"] = n_pages - 1
-                st.rerun()
+                st.session_state["graphs_page"] = n_pages - 1; st.rerun()
 
     _nav("top")
     st.markdown("---")
 
-    start = page * per_page
-    for _, crow in conv.iloc[start:start + per_page].iterrows():
-        sym = crow["symbol"]
+    # Load only the symbols on this page in one bulk call
+    page_syms = tuple(conv.iloc[page * per_page:(page + 1) * per_page]["symbol"].tolist())
+    with st.spinner(f"Loading {len(page_syms)} charts from Drive…"):
+        ohlcv_map = load_ohlcv_bulk(page_syms)
+
+    for _, crow in conv.iloc[page * per_page:(page + 1) * per_page].iterrows():
+        sym      = crow["symbol"]
         sym_sigs = sel[sel["symbol"] == sym]
         st.markdown(f"### {sym}  ·  {int(crow['n_strategies'])} strategies")
         chips = []
         for _, sg in sym_sigs.iterrows():
             z = sg.get("zone_type", "")
             s = sg.get("strategy", sg.get("strategy_group", ""))
-            color = ZONE_COLORS.get(z, "#666")
-            chips.append(f'<span style="background:{color};color:white;'
+            chips.append(f'<span style="background:{ZONE_COLORS.get(z,"#666")};color:white;'
                          f'padding:2px 8px;border-radius:10px;font-size:12px;'
                          f'margin-right:4px;">{s} · {z}</span>')
         st.markdown(" ".join(chips), unsafe_allow_html=True)
-        ohlcv = load_parquet(["data", "ohlcv", f"{sym}.parquet"])
+        ohlcv = ohlcv_map.get(sym, pd.DataFrame())
         if ohlcv.empty:
             st.caption("No OHLCV available for this symbol.")
         else:
-            fig = build_stock_chart(sym, ohlcv, sym_sigs,
-                                    TIMEFRAME_DAYS[tf], height=460)
+            fig = build_stock_chart(sym, ohlcv, sym_sigs, TIMEFRAME_DAYS[tf], height=460)
             st.plotly_chart(fig, use_container_width=True, key=f"graphs_{sym}")
         st.markdown("---")
 
@@ -2083,10 +2186,36 @@ def page_portfolio():
 
     # --- Chart cards ---
     st.subheader("Charts (per holding)")
-    tf = st.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()),
-                      index=2, key="pf_tf")
+    pf_c1, pf_c2 = st.columns(2)
+    tf = pf_c1.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()),
+                         index=2, key="pf_tf")
+    pf_per_page = pf_c2.number_input("Charts per page", min_value=2,
+                                     max_value=20, value=5, step=1, key="pf_per_page")
 
-    for _, h in pf.iterrows():
+    pf_total = len(pf)
+    pf_per_page = int(pf_per_page)
+    pf_n_pages = max(1, (pf_total + pf_per_page - 1) // pf_per_page)
+    if "pf_page" not in st.session_state:
+        st.session_state["pf_page"] = 0
+    st.session_state["pf_page"] = min(st.session_state["pf_page"], pf_n_pages - 1)
+    pf_page = st.session_state["pf_page"]
+
+    pf_a, pf_b, pf_c, pf_d = st.columns([1, 1, 1, 1])
+    if pf_a.button("◀ Prev", key="pf_prev", disabled=(pf_page <= 0)):
+        st.session_state["pf_page"] = pf_page - 1
+        st.rerun()
+    pf_b.caption(f"Page {pf_page + 1} of {pf_n_pages}  ·  {pf_total} holdings")
+    if pf_c.button("Next ▶", key="pf_next", disabled=(pf_page >= pf_n_pages - 1)):
+        st.session_state["pf_page"] = pf_page + 1
+        st.rerun()
+    if pf_d.button("Reset", key="pf_reset"):
+        st.session_state["pf_page"] = 0
+        st.rerun()
+
+    pf_start = pf_page * pf_per_page
+    pf_slice = pf.iloc[pf_start:pf_start + pf_per_page]
+
+    for _, h in pf_slice.iterrows():
         sym = h["symbol"]
         with st.container():
             c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
@@ -2341,6 +2470,7 @@ def main():
         "Doc Viewer",
         "Doc Library",
         "My Portfolio",
+        "PF Tracking",
         "Graphs",
         "Stock Detail",
         "Strategy Docs",
@@ -2370,6 +2500,8 @@ def main():
         _safe_render(page_stock_detail)
     elif page == "Strategy Docs":
         _safe_render(page_strategy_docs)
+    elif page == "PF Tracking":
+        _safe_render(page_pf_tracking)
 
 
 
