@@ -132,16 +132,20 @@ STRATEGY_DOCS = {
 
 # ---------- Drive helpers ----------
 
-def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days):
+def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days,
+                      normalize: bool = True):
     """Lightweight line + volume chart for quick scan.
-    Includes: price line, 20/50 EMA, volume bars, start/end date labels,
-    signal zone lines, and 1M/3M/6M/1Y return annotations in the title."""
+
+    normalize=True  → all prices indexed to 0% at window start so every chart
+                      uses the same scale and run-ups are directly comparable.
+    normalize=False → absolute ₹ prices (default axis scale per stock).
+    """
     full = ohlcv.sort_values("date").reset_index(drop=True)
     df   = full.tail(timeframe_days).reset_index(drop=True)
     df["ema_20"] = df["close"].ewm(span=20).mean()
     df["ema_50"] = df["close"].ewm(span=50).mean()
 
-    # ── Return labels ─────────────────────────────────────────────────────────
+    # ── Return labels (always from full history, not window) ──────────────────
     def _ret(days):
         if len(full) < days + 1:
             return None
@@ -164,19 +168,31 @@ def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days):
     last_close = float(df["close"].iloc[-1]) if not df.empty else 0
     title_html = f"<b>{symbol}</b>  ₹{last_close:,.0f}    {ret_str}"
 
-    # ── Volume colour: green if close ≥ open, else red ────────────────────────
+    # ── Normalise to % from first close in window ─────────────────────────────
+    base = float(df["close"].iloc[0]) if not df.empty and df["close"].iloc[0] != 0 else 1.0
+    if normalize:
+        y_close  = (df["close"]  / base - 1) * 100
+        y_ema20  = (df["ema_20"] / base - 1) * 100
+        y_ema50  = (df["ema_50"] / base - 1) * 100
+        y_suffix = "%"
+        ytick_fmt = ".0f"
+    else:
+        y_close  = df["close"]
+        y_ema20  = df["ema_20"]
+        y_ema50  = df["ema_50"]
+        y_suffix = ""
+        ytick_fmt = ",.0f"
+
+    # ── Volume colour: green if close ≥ open, else red ───────────────────────
     vol_colors = [
         "#27ae60" if c >= o else "#e74c3c"
         for c, o in zip(df["close"], df["open"])
     ]
 
-    # ── Date tick positions: first and last bar ───────────────────────────────
-    dates = df["date"].tolist()
+    # ── Date tick: start and end only ────────────────────────────────────────
+    dates     = df["date"].tolist()
     tick_vals = [dates[0], dates[-1]]
-    tick_text = [
-        str(dates[0])[:10] if hasattr(dates[0], "__str__") else "",
-        str(dates[-1])[:10] if hasattr(dates[-1], "__str__") else "",
-    ]
+    tick_text = [str(dates[0])[:10], str(dates[-1])[:10]]
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
@@ -184,23 +200,29 @@ def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days):
     )
 
     # Price + EMAs
-    fig.add_trace(go.Scatter(x=df["date"], y=df["close"],
+    fig.add_trace(go.Scatter(x=df["date"], y=y_close,
                              line=dict(color="#2c3e50", width=1.5),
                              showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_20"],
+    fig.add_trace(go.Scatter(x=df["date"], y=y_ema20,
                              line=dict(color="#2980b9", width=1),
                              showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ema_50"],
+    fig.add_trace(go.Scatter(x=df["date"], y=y_ema50,
                              line=dict(color="#8e44ad", width=1),
                              showlegend=False), row=1, col=1)
 
-    # Signal zone lines
+    # Zero / baseline reference line when normalised
+    if normalize:
+        fig.add_hline(y=0, line=dict(color="#bdc3c7", width=0.8, dash="dot"),
+                      row=1, col=1)
+
+    # Signal zone lines (normalised when needed)
     if not signals_for_stock.empty:
         for _, sig in signals_for_stock.iterrows():
             zt    = sig.get("zone_type")
             entry = sig.get("entry")
             if pd.notna(entry):
-                fig.add_hline(y=entry,
+                y_val = (float(entry) / base - 1) * 100 if normalize else float(entry)
+                fig.add_hline(y=y_val,
                               line=dict(color=ZONE_COLORS.get(zt, "#666"), width=1),
                               row=1, col=1)
 
@@ -216,20 +238,13 @@ def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days):
         paper_bgcolor="white",
         bargap=0.1,
     )
-    fig.update_xaxes(
-        showgrid=False, zeroline=False,
-        tickvals=tick_vals, ticktext=tick_text,
-        tickfont=dict(size=8), tickangle=0,
-        row=1, col=1,
-    )
-    fig.update_xaxes(
-        showgrid=False, zeroline=False,
-        tickvals=tick_vals, ticktext=tick_text,
-        tickfont=dict(size=8), tickangle=0,
-        row=2, col=1,
-    )
+    xaxis_cfg = dict(showgrid=False, zeroline=False,
+                     tickvals=tick_vals, ticktext=tick_text,
+                     tickfont=dict(size=8), tickangle=0)
+    fig.update_xaxes(**xaxis_cfg, row=1, col=1)
+    fig.update_xaxes(**xaxis_cfg, row=2, col=1)
     fig.update_yaxes(showgrid=False, zeroline=False, tickfont=dict(size=8),
-                     row=1, col=1)
+                     ticksuffix=y_suffix, tickformat=ytick_fmt, row=1, col=1)
     fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False,
                      row=2, col=1)
     return fig
@@ -1894,7 +1909,13 @@ def page_graphs():
                              help="Quick Scan: 3-column line charts, scroll all at once. "
                                   "Detailed: full candlestick with volume, paginated.")
     with c6:
-        if view_mode == "Detailed":
+        if view_mode == "Quick Scan":
+            normalize = st.toggle("Normalise (% from start)",
+                                  value=True,
+                                  help="Index all charts to 0% at window start so run-ups "
+                                       "are directly comparable across stocks.")
+        else:
+            normalize = False
             per_page = int(st.number_input("Charts/page", min_value=2,
                                            max_value=20, value=6, step=2))
 
@@ -1954,7 +1975,8 @@ def page_graphs():
                 if ohlcv.empty:
                     st.caption(f"{sym} — no data")
                 else:
-                    fig = build_quick_chart(sym, ohlcv, sym_sigs, tf_days)
+                    fig = build_quick_chart(sym, ohlcv, sym_sigs, tf_days,
+                                            normalize=normalize)
                     st.plotly_chart(fig, use_container_width=True,
                                     key=f"qs_{sym}", config={"displayModeBar": False})
         return
