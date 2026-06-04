@@ -159,14 +159,16 @@ def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days,
         if v is not None:
             rets[label] = v
 
-    ret_str = "  ".join(
+    ret_parts = "  ".join(
         f'<span style="color:{"#27ae60" if v >= 0 else "#e74c3c"}">'
         f'{label} {v:+.0f}%</span>'
         for label, v in rets.items()
     )
 
     last_close = float(df["close"].iloc[-1]) if not df.empty else 0
-    title_html = f"<b>{symbol}</b>  ₹{last_close:,.0f}    {ret_str}"
+    # Returns on second line so long names never crowd them out
+    title_html = (f"<b>{symbol}</b>  ₹{last_close:,.0f}"
+                  f"<br><span style='font-size:10px'>{ret_parts}</span>")
 
     # ── Normalise to % from first close in window ─────────────────────────────
     base = float(df["close"].iloc[0]) if not df.empty and df["close"].iloc[0] != 0 else 1.0
@@ -215,25 +217,35 @@ def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days,
         fig.add_hline(y=0, line=dict(color="#bdc3c7", width=0.8, dash="dot"),
                       row=1, col=1)
 
-    # Signal zone lines (normalised when needed)
+    # Signal zone lines — labelled so the colour is self-explanatory
     if not signals_for_stock.empty:
+        seen_zones: set = set()
         for _, sig in signals_for_stock.iterrows():
-            zt    = sig.get("zone_type")
+            zt    = sig.get("zone_type", "")
             entry = sig.get("entry")
-            if pd.notna(entry):
-                y_val = (float(entry) / base - 1) * 100 if normalize else float(entry)
-                fig.add_hline(y=y_val,
-                              line=dict(color=ZONE_COLORS.get(zt, "#666"), width=1),
-                              row=1, col=1)
+            if not pd.notna(entry):
+                continue
+            y_val = (float(entry) / base - 1) * 100 if normalize else float(entry)
+            color = ZONE_COLORS.get(zt, "#666")
+            ann   = zt if zt not in seen_zones else ""   # label each zone type once
+            seen_zones.add(zt)
+            fig.add_hline(
+                y=y_val,
+                line=dict(color=color, width=1, dash="dash"),
+                annotation_text=ann,
+                annotation_position="right",
+                annotation_font=dict(size=8, color=color),
+                row=1, col=1,
+            )
 
     # Volume bars
     fig.add_trace(go.Bar(x=df["date"], y=df["volume"],
                          marker_color=vol_colors, showlegend=False), row=2, col=1)
 
     fig.update_layout(
-        height=300,
-        title=dict(text=title_html, font=dict(size=11), x=0.02, y=0.97),
-        margin=dict(l=4, r=4, t=32, b=4),
+        height=380,
+        title=dict(text=title_html, font=dict(size=12), x=0.02, y=0.97),
+        margin=dict(l=4, r=55, t=52, b=4),   # r=55 leaves room for hline labels
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
         bargap=0.1,
@@ -1936,15 +1948,64 @@ def page_graphs():
 
     best = sel.groupby("symbol")["score"].max().reset_index(name="best_score")
     conv = conv.merge(best, on="symbol", how="left")
-    conv = conv.sort_values(["n_strategies", "best_score"],
-                            ascending=[False, False]).reset_index(drop=True)
 
-    total = len(conv)
+    # ── Sort ──────────────────────────────────────────────────────────────────
+    SORT_OPTIONS = {
+        "Strategies ↓  →  1M ret ↓  →  3M ret ↓  (default)": "default",
+        "1M Return ↓": "ret_1m",
+        "3M Return ↓": "ret_3m",
+        "6M Return ↓": "ret_6m",
+        "Score ↓": "score",
+        "Symbol A→Z": "alpha",
+    }
+    sort_choice = st.selectbox("Sort by", list(SORT_OPTIONS.keys()),
+                               index=0, key="qs_sort")
+    sort_key = SORT_OPTIONS[sort_choice]
+
+    # We need return data for sorting — load OHLCV once so we can compute it.
+    # This is the same bulk call used for rendering, so it hits cache if already loaded.
+    sym_list_unsorted = tuple(conv["symbol"].tolist())
+
+    if sort_key in ("default", "ret_1m", "ret_3m", "ret_6m"):
+        # Pre-load returns for sorting (uses the same cache as rendering)
+        with st.spinner("Computing returns for sort…"):
+            ohlcv_map_sort = load_ohlcv_bulk(sym_list_unsorted)
+
+        def _period_ret(sym, days):
+            df_s = ohlcv_map_sort.get(sym, pd.DataFrame())
+            if df_s.empty or len(df_s) < days + 1:
+                return -999.0
+            df_s = df_s.sort_values("date")
+            p0 = float(df_s["close"].iloc[-(days + 1)])
+            p1 = float(df_s["close"].iloc[-1])
+            return (p1 / p0 - 1) * 100 if p0 else -999.0
+
+        conv["ret_1m"] = conv["symbol"].apply(lambda s: _period_ret(s, 21))
+        conv["ret_3m"] = conv["symbol"].apply(lambda s: _period_ret(s, 63))
+        conv["ret_6m"] = conv["symbol"].apply(lambda s: _period_ret(s, 126))
+
+        if sort_key == "default":
+            conv = conv.sort_values(
+                ["n_strategies", "ret_1m", "ret_3m"],
+                ascending=[False, False, False],
+            ).reset_index(drop=True)
+        elif sort_key == "ret_1m":
+            conv = conv.sort_values("ret_1m", ascending=False).reset_index(drop=True)
+        elif sort_key == "ret_3m":
+            conv = conv.sort_values("ret_3m", ascending=False).reset_index(drop=True)
+        elif sort_key == "ret_6m":
+            conv = conv.sort_values("ret_6m", ascending=False).reset_index(drop=True)
+    elif sort_key == "score":
+        conv = conv.sort_values("best_score", ascending=False).reset_index(drop=True)
+    else:  # alpha
+        conv = conv.sort_values("symbol").reset_index(drop=True)
+
+    total    = len(conv)
     sym_list = tuple(conv["symbol"].tolist())
     st.caption(f"{total} stock(s) matching filters")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # QUICK SCAN MODE — load all OHLCV in one Drive session, render 3-col grid
+    # QUICK SCAN MODE — bulk load, 2-column grid
     # ─────────────────────────────────────────────────────────────────────────
     if view_mode == "Quick Scan":
         st.info(
@@ -1952,26 +2013,23 @@ def page_graphs():
             f"for 300+ stocks). Subsequent visits use the 30-min cache — instant.",
             icon="ℹ️",
         )
-        prog = st.progress(0, text="Loading OHLCV from Drive (one batch call)…")
-        ohlcv_map = load_ohlcv_bulk(sym_list)
-        prog.progress(100, text="Done — rendering charts…")
+        # ohlcv_map_sort already populated above for return-based sorts; otherwise load now
+        if "ohlcv_map_sort" not in dir():
+            prog = st.progress(0, text="Loading OHLCV from Drive (one batch call)…")
+            ohlcv_map_sort = load_ohlcv_bulk(sym_list)
+            prog.progress(100, text="Done — rendering charts…")
+        else:
+            st.caption("OHLCV already loaded for sort — rendering now.")
 
         tf_days = TIMEFRAME_DAYS[tf]
-        cols3   = st.columns(3)
+        cols2   = st.columns(2)
 
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
             sym_sigs = sel[sel["symbol"] == sym]
-            ohlcv    = ohlcv_map.get(sym, pd.DataFrame())
+            ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
-            with cols3[i % 3]:
-                zone_colors_html = " ".join(
-                    f'<span style="background:{ZONE_COLORS.get(sg.get("zone_type",""),"#666")};'
-                    f'color:white;padding:1px 5px;border-radius:8px;font-size:10px;">'
-                    f'{sg.get("zone_type","")}</span>'
-                    for _, sg in sym_sigs.drop_duplicates("zone_type").iterrows()
-                )
-                st.markdown(zone_colors_html, unsafe_allow_html=True)
+            with cols2[i % 2]:
                 if ohlcv.empty:
                     st.caption(f"{sym} — no data")
                 else:
