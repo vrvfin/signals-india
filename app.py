@@ -2591,6 +2591,165 @@ def page_doc_upload():
             st.error(f"Could not load library: {e}")
 
 
+@st.cache_data(ttl=300)
+def load_deep_dive_index():
+    svc = drive_service(); root = os.environ.get("GDRIVE_FOLDER_ID", "")
+    b = drive_download(svc, "company_repo/_index/deep_dive_index.parquet", root)
+    return pd.read_parquet(io.BytesIO(b)) if b else pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_deep_dive_queue():
+    svc = drive_service(); root = os.environ.get("GDRIVE_FOLDER_ID", "")
+    b = drive_download(svc, "company_repo/_index/deep_dive_queue.parquet", root)
+    return pd.read_parquet(io.BytesIO(b)) if b else pd.DataFrame()
+
+
+def page_deep_dive():
+    st.title("🔬 Deep Dive")
+    st.caption(
+        "Forensic equity analysis: 4-phase deep dive covering financials, "
+        "governance, risk scorecard, and PM one-pager verdict."
+    )
+
+    tab_queue, tab_reports = st.tabs(["📋 Queue", "📄 Reports"])
+
+    # ── Tab 1: Queue ─────────────────────────────────────────────────────────
+    with tab_queue:
+        st.subheader("Request a Deep Dive")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            company_input = st.text_input(
+                "Company name, NSE/BSE symbol, or ISIN",
+                placeholder="e.g. TCS  or  VENUSREM  or  INE467B01029")
+        with col2:
+            st.write("")
+            st.write("")
+            add_btn = st.button("Add to Queue", type="primary")
+
+        if add_btn and company_input.strip():
+            try:
+                svc  = drive_service()
+                root = os.environ.get("GDRIVE_FOLDER_ID", "")
+                # resolve company first
+                univ_b = drive_download(svc, "universe/master_list.csv", root)
+                univ   = pd.read_csv(io.BytesIO(univ_b)) if univ_b else pd.DataFrame()
+                from scripts.company_deep_report import resolve_isin
+                isin, symbol, name, _ = resolve_isin(company_input.strip(), univ)
+                if isin == company_input.strip() and symbol == company_input.strip():
+                    st.error(f"Could not resolve '{company_input}' in universe. "
+                             "Try a different name, symbol, or ISIN.")
+                else:
+                    q_b = drive_download(svc, "company_repo/_index/deep_dive_queue.parquet", root)
+                    q   = pd.read_parquet(io.BytesIO(q_b)) if q_b else pd.DataFrame()
+                    new_row = pd.DataFrame([dict(
+                        token=isin, status="pending",
+                        added_at=datetime.now().isoformat())])
+                    q = pd.concat([q, new_row], ignore_index=True)
+                    buf = io.BytesIO(); q.to_parquet(buf, index=False)
+                    _drive_upload(svc, "company_repo/_index/deep_dive_queue.parquet",
+                                  root, buf.getvalue(), "application/octet-stream")
+                    st.success(
+                        f"Queued: **{name}** ({symbol} / {isin}). "
+                        "CI runs at 08:00 IST — you'll receive an email when done.")
+                    st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Failed to queue: {e}")
+
+        st.markdown("---")
+        st.subheader("Current Queue")
+        queue_df = load_deep_dive_queue()
+        if queue_df.empty:
+            st.caption("Queue is empty.")
+        else:
+            show_cols = [c for c in ["token", "status", "added_at", "done_at", "error"]
+                         if c in queue_df.columns]
+            st.dataframe(queue_df[show_cols].sort_values(
+                "added_at", ascending=False).head(50),
+                use_container_width=True)
+
+    # ── Tab 2: Reports ────────────────────────────────────────────────────────
+    with tab_reports:
+        idx = load_deep_dive_index()
+        if idx.empty:
+            st.info("No deep-dive reports yet. Use the Queue tab to request one.")
+            return
+
+        # build display label
+        def _label(row):
+            name = str(row.get("name", row.get("isin", "?")))
+            sym  = str(row.get("symbol", ""))
+            upd  = str(row.get("last_update", ""))[:10]
+            return f"{name} ({sym}) · {upd}"
+
+        idx = idx.sort_values("last_update", ascending=False)
+        labels = [_label(r) for _, r in idx.iterrows()]
+        choice = st.selectbox("Select company report", labels)
+
+        if choice:
+            row = idx.iloc[labels.index(choice)]
+            isin        = str(row.get("isin", ""))
+            symbol      = str(row.get("symbol", ""))
+            name        = str(row.get("name", isin))
+            report_path = str(row.get("report_path", ""))
+            last_update = str(row.get("last_update", ""))[:16]
+
+            # coverage badge
+            try:
+                import json as _json
+                cov = _json.loads(row.get("coverage", "{}"))
+                ar  = cov.get("ar_years", [])
+                nc  = cov.get("n_concall", 0)
+                nr  = cov.get("n_research", 0)
+                st.caption(
+                    f"📅 Generated {last_update} · "
+                    f"AR years: {ar or 'none'} · "
+                    f"Concalls: ~{nc} · Research docs: ~{nr}")
+            except Exception:
+                st.caption(f"Generated {last_update}")
+
+            if report_path:
+                try:
+                    svc  = drive_service()
+                    root = os.environ.get("GDRIVE_FOLDER_ID", "")
+                    raw  = drive_download(svc, report_path, root)
+                    if raw:
+                        md_text = raw.decode("utf-8")
+                        st.markdown(md_text)
+
+                        # download buttons
+                        st.markdown("---")
+                        dl1, dl2 = st.columns(2)
+                        with dl1:
+                            st.download_button(
+                                "⬇ Download .md",
+                                data=raw,
+                                file_name=f"deepdive_{symbol}_{last_update[:10]}.md",
+                                mime="text/markdown")
+                        with dl2:
+                            # docx on demand
+                            try:
+                                import sys, os as _os
+                                _sdir = _os.path.join(_os.path.dirname(__file__), "scripts")
+                                if _sdir not in sys.path: sys.path.insert(0, _sdir)
+                                from format_deepdive_docx import md_to_docx
+                                docx_bytes = md_to_docx(md_text, name, symbol, isin)
+                                st.download_button(
+                                    "⬇ Download .docx",
+                                    data=docx_bytes,
+                                    file_name=f"deepdive_{symbol}_{last_update[:10]}.docx",
+                                    mime="application/vnd.openxmlformats-officedocument"
+                                         ".wordprocessingml.document")
+                            except Exception:
+                                pass
+                    else:
+                        st.warning("Report file not found on Drive.")
+                except Exception as e:
+                    st.error(f"Could not load report: {e}")
+            else:
+                st.warning("No report path recorded in index.")
+
+
 def _safe_render(page_fn):
     """Run a page function; show a recoverable error instead of crashing."""
     try:
@@ -2616,6 +2775,7 @@ def main():
         "Mgmt Guidance",
         "Doc Viewer",
         "Doc Library",
+        "Deep Dive",
         "My Portfolio",
         "PF Tracking",
         "Graphs",
@@ -2639,6 +2799,8 @@ def main():
         _safe_render(page_doc_viewer)
     elif page == "Doc Library":
         _safe_render(page_doc_upload)
+    elif page == "Deep Dive":
+        _safe_render(page_deep_dive)
     elif page == "My Portfolio":
         _safe_render(page_portfolio)
     elif page == "Graphs":
