@@ -247,7 +247,7 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token, interacti
                           page,
                           research_block(ridx, isin, symbol, name),
                           bse_announcements(bse_code))
-    report = pool.call_text(prompt)
+    report, model_used = pool.call_text(prompt)
 
     stamp = dt.datetime.now().strftime("%d%b%y")
     out_path = f"{DRIVE['company_page']}/{isin}/company_deepdive_{stamp}.md"
