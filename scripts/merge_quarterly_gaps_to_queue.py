@@ -153,14 +153,21 @@ def generate_doc_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:20]
 
 
-def merge_gaps_to_queue(gaps_df: pd.DataFrame, queue_df: pd.DataFrame, dry_run: bool = False) -> tuple[int, int]:
+def merge_gaps_to_queue(gaps_df: pd.DataFrame, queue_df: pd.DataFrame, dry_run: bool = False,
+                       gemini_daily_usage: dict = None) -> tuple[int, int, dict]:
     """
-    Merge new gaps into queue.
-    Returns: (num_pushed, num_remaining)
+    Merge new gaps into queue with intelligent quota-aware batch sizing.
+
+    Strategy:
+    - Maintain queue at optimal depth (50–75 pending)
+    - Only push if: (a) pending < 75, AND (b) Gemini quota permits
+    - Batch size adapts based on available quota
+
+    Returns: (num_pushed, num_remaining, updated_gemini_usage_dict)
     """
     if gaps_df.empty:
         print("  [INFO] No gaps to merge")
-        return 0, 0
+        return 0, 0, gemini_daily_usage or {}
 
     # Build dedup key set from queue: (isin, announcement_date)
     # CRITICAL: Load ALL queue rows (all statuses) to prevent re-adding done/error items
@@ -185,31 +192,44 @@ def merge_gaps_to_queue(gaps_df: pd.DataFrame, queue_df: pd.DataFrame, dry_run: 
 
     if new_gaps.empty:
         print("  [INFO] All gaps already in queue")
-        return 0, 0
+        return 0, 0, gemini_daily_usage or {}
 
     # Check Gemini quota headroom
     pending_concalls = len(queue_df[queue_df.get('status') == 'pending']) if not queue_df.empty else 0
     print(f"  [DEBUG] Current pending: {pending_concalls}")
 
+    # Report Gemini quota status
+    if gemini_daily_usage:
+        used = gemini_daily_usage.get('used', 0)
+        total = gemini_daily_usage.get('total', 1500)
+        remaining = total - used
+        pct = (used / total * 100) if total > 0 else 0
+        print(f"  [QUOTA] Gemini: {used}/{total} RPD used ({pct:.1f}%), {remaining} remaining")
+    else:
+        print(f"  [QUOTA] Gemini quota tracking unavailable")
+
     # Smart quota safeguard
     if pending_concalls >= 150:
         print(f"  [WARN] Queue backlogged ({pending_concalls} >= 150 pending)")
-        print(f"        Gaps dormant; will retry next weekend")
-        return 0, len(new_gaps)
+        print(f"        Gaps dormant; retry later when queue drains")
+        return 0, len(new_gaps), gemini_daily_usage or {}
 
-    # Decide batch size
+    # Decide batch size based on queue depth + quota
     if pending_concalls < 20:
-        available = 75 - pending_concalls
-        to_push = min(available, len(new_gaps))
+        available_slots = 75 - pending_concalls
+        to_push = min(available_slots, len(new_gaps))
+    elif pending_concalls < 50:
+        # Conservative: push only what brings us to 50–75 range
+        to_push = min(max(0, 50 - pending_concalls), len(new_gaps))
     else:
         print(f"  [INFO] Queue at {pending_concalls}; skipping push this cycle")
-        return 0, len(new_gaps)
-
-    print(f"  [DEBUG] Available slots: {available}, will push: {to_push}")
+        return 0, len(new_gaps), gemini_daily_usage or {}
 
     if to_push <= 0:
-        print(f"  [INFO] No available slots")
-        return 0, len(new_gaps)
+        print(f"  [INFO] Queue already at optimal depth ({pending_concalls})")
+        return 0, len(new_gaps), gemini_daily_usage or {}
+
+    print(f"  [DEBUG] Will push {to_push} items, queue will have {pending_concalls + to_push} pending")
 
     # Build queue rows
     push_gaps = new_gaps.iloc[:to_push]
@@ -248,7 +268,7 @@ def merge_gaps_to_queue(gaps_df: pd.DataFrame, queue_df: pd.DataFrame, dry_run: 
         return to_push, len(new_gaps) - to_push, updated_queue
     else:
         print(f"  [DEBUG] DRY-RUN: would add {to_push} rows")
-        return to_push, len(new_gaps) - to_push, None
+        return to_push, len(new_gaps) - to_push, updated_queue
 
 
 def main():

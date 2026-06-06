@@ -151,12 +151,13 @@ jobs:
         run: python scripts/write_phase2_status.py
         continue-on-error: true
 
-  # ── Quarterly Concall Gap Filler (weekends only) ────────────────────────
+  # ── Quarterly Concall Gap Filler (runs every phase2 run) ────────────────
   quarterly_gap_filler:
     runs-on: ubuntu-latest
-    name: "Quarterly concall gap filler"
-    # Only run on Saturday (6) or Sunday (0)
-    if: github.event_name == 'workflow_dispatch' || contains('0,6', github.event.schedule.day_of_week)
+    name: "Quarterly concall gap filler (smart daily merge)"
+    # Runs on every phase2 execution (daily, multiple times/day)
+    # find_quarterly_gaps.py discovers gaps (smart caching)
+    # merge_quarterly_gaps_to_queue.py intelligently pushes based on quota + queue depth
     timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

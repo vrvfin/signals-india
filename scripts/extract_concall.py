@@ -41,7 +41,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -428,10 +428,13 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
                     run_time: str = "") -> None:
     """Append this company's analysis to the daily digest file in _daily/.
 
+    UPDATED: Uses EXTRACTION_DATE (today) for filename, not announcement_date.
+    This shows "what was processed today" vs "what was announced in the past".
+
     File format (header rebuilt on every append):
 
-        # Daily Concall Digest — 2026-05-26
-        *Total: 3 concalls — last updated 26 May 2026 14:30 IST*
+        # Daily Concall Digest — 2026-06-06 (extraction date, not announcement date)
+        *Total: 3 concalls — last updated 06 Jun 2026 14:30 IST*
 
         **Index:**
         *Run 1 — 08:12 IST*
@@ -451,13 +454,16 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
     The Index list and Total count are fully rewritten on every append.
     """
     daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
-    fname = _day_filename(announcement_date)
+    # USE EXTRACTION DATE (today) for the daily digest filename
+    # This groups concalls by "when processed" not "when announced"
+    extraction_date = datetime.now().strftime("%Y-%m-%d")  # e.g., "2026-06-06"
+    fname = _day_filename(extraction_date)
     now_str = datetime.now().strftime("%d %b %Y %H:%M")
-    date_str = str(announcement_date)[:10]
+    date_str = extraction_date[:10]  # "2026-06-06"
 
     # Description stored in ## heading includes run suffix (for index reconstruction).
     # Index lines show the clean version; run group headers show the time.
-    entry_clean  = f"{symbol} · {company_name} | {quarter}"
+    entry_clean  = f"{symbol} · {company_name} | {quarter} (announced {announcement_date})"
     entry_stored = f"{entry_clean} *(Run {run_time})*" if run_time else entry_clean
 
     fid = find_file(drive, daily_id, fname)
@@ -888,6 +894,15 @@ def build_quarterly_guidance_content(text: str, symbol: str, company_name: str,
     if gf4:
         parts.append("#### GF4 — Guidance Quality Flags\n" + gf4.strip())
 
+    # GF_TRACK credibility section (present only when historical context was injected)
+    gf_track = _find_section_text(
+        text,
+        r"Section\s+GF_TRACK", r"GF_TRACK\s*[—–\-]", r"Mgmt\s+Said\s+vs\s+Delivered",
+        max_chars=2500
+    )
+    if gf_track:
+        parts.append("#### Mgmt Said vs Delivered (GF_TRACK)\n" + gf_track.strip())
+
     if parts:
         return "\n\n".join(parts)
     return text[:3000] + "\n\n*(truncated — full analysis in company_page.md)*"
@@ -1009,6 +1024,134 @@ def parse_gemini_response(
 
 
 # ------------------------------------------------------------------ #
+#  Historical context helpers (GF_TRACK credibility section)         #
+# ------------------------------------------------------------------ #
+
+def _current_india_quarter() -> str:
+    """Return current India FY quarter tag, e.g. 'Q1FY27'.
+    India FY: Apr-Jun = Q1, Jul-Sep = Q2, Oct-Dec = Q3, Jan-Mar = Q4."""
+    m, y = datetime.now().month, datetime.now().year
+    if m in (4, 5, 6):    return f"Q1FY{str(y + 1)[2:]}"
+    if m in (7, 8, 9):    return f"Q2FY{str(y + 1)[2:]}"
+    if m in (10, 11, 12): return f"Q3FY{str(y + 1)[2:]}"
+    return f"Q4FY{str(y)[2:]}"  # Jan–Mar
+
+
+def _build_historical_context(
+    gf1_df: pd.DataFrame,
+    qfacts_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    row: pd.Series,
+) -> str | None:
+    """Build a [HISTORICAL_CONTEXT] block for the Gemini prompt.
+
+    Returns None if there is no GF1 history for this company (first-ever
+    processed concall) — the prompt is then sent unchanged and Gemini will
+    NOT produce a GF_TRACK section (the conditional rule in the prompt handles this).
+
+    When history exists, the block contains:
+      - Past GF1 guidance statements (up to 30 rows, last 8 quarters)
+      - Actual delivered results from quarterly_facts and results parquets
+    """
+    isin = str(row.get("isin") or "").strip()
+    company_name = str(row.get("company_name") or "").strip()
+    symbol = str(row.get("symbol") or "").strip()
+
+    if gf1_df.empty:
+        return None
+
+    # --- Filter GF1 to this company (ISIN preferred, fall back to name) ---
+    if isin:
+        co_gf1 = gf1_df[gf1_df["isin"].astype(str).str.strip() == isin].copy()
+    else:
+        co_gf1 = gf1_df[
+            gf1_df["company_name"].astype(str).str.lower().str.strip()
+            == company_name.lower().strip()
+        ].copy()
+
+    if co_gf1.empty:
+        return None  # No history yet — skip GF_TRACK for this concall
+
+    # Sort chronologically, cap to last 30 rows
+    if "quarter" in co_gf1.columns:
+        co_gf1 = co_gf1.sort_values("quarter", na_position="first")
+    co_gf1 = co_gf1.tail(30)
+
+    # Drop rows with no real statement
+    co_gf1 = co_gf1[
+        co_gf1["exact_statement"].astype(str).str.strip().str.upper() != "NA"
+    ]
+    if co_gf1.empty:
+        return None
+
+    # --- Build GF1 compact table ---
+    gf1_lines = [
+        "| Quarter | Metric | Exact Statement | Timeframe | Value |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for _, r in co_gf1.iterrows():
+        stmt = str(r.get("exact_statement", "NA"))[:180].replace("|", "/")
+        gf1_lines.append(
+            f"| {r.get('quarter', 'NA')} | {r.get('metric_type', 'NA')} | "
+            f"{stmt} | {r.get('timeframe', 'NA')} | {r.get('numeric_value', 'NA')} |"
+        )
+
+    parts = [
+        "[HISTORICAL_CONTEXT]",
+        f"Company: {company_name or symbol}  |  ISIN: {isin or 'unknown'}",
+        "",
+        "=== Past GF1 Guidance Statements (last 8 quarters) ===",
+        "\n".join(gf1_lines),
+    ]
+
+    # --- Actuals from quarterly_facts parquet ---
+    actuals_lines: list[str] = []
+    if not qfacts_df.empty and isin:
+        co_facts = qfacts_df[qfacts_df["isin"].astype(str).str.strip() == isin].copy()
+        if not co_facts.empty:
+            if "quarter" in co_facts.columns:
+                co_facts = co_facts.sort_values("quarter", na_position="first")
+            for _, r in co_facts.tail(8).iterrows():
+                actuals_lines.append(
+                    f"| {r.get('quarter', 'NA')} | "
+                    f"Rev={r.get('revenue_q', 'NA')} | "
+                    f"EBITDA={r.get('ebitda_q', 'NA')} | "
+                    f"PAT={r.get('pat_q', 'NA')} | "
+                    f"Margin={r.get('margin_pct', 'NA')} |"
+                )
+
+    # --- Actuals from results.parquet (Screener YoY numbers) ---
+    if not results_df.empty:
+        if isin and "isin" in results_df.columns:
+            co_res = results_df[results_df["isin"].astype(str).str.strip() == isin]
+        elif symbol and "slug" in results_df.columns:
+            co_res = results_df[
+                results_df["slug"].astype(str).str.strip().str.lower()
+                == symbol.lower()
+            ]
+        else:
+            co_res = pd.DataFrame()
+
+        for _, r in co_res.iterrows():
+            actuals_lines.append(
+                f"| {r.get('metric', 'NA')} | "
+                f"Latest: {r.get('latest_q', 'NA')}={r.get('latest_val', 'NA')} | "
+                f"YoY: {r.get('yoy_pct', 'NA')}% |"
+            )
+
+    if actuals_lines:
+        parts += [
+            "",
+            "=== Actual Delivered Results (recent quarters) ===",
+            "| Metric / Quarter | Values | YoY |",
+            "| :--- | :--- | :--- |",
+        ] + actuals_lines
+
+    parts.append("[/HISTORICAL_CONTEXT]")
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ #
 #  Main                                                                #
 # ------------------------------------------------------------------ #
 
@@ -1059,7 +1202,21 @@ def main() -> None:
     if args.limit:
         pending_idx = pending_idx[: args.limit]
 
-    counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0, "gf3": 0, "gf4": 0}
+    # ---- Load context caches once per run (GF_TRACK historical credibility) ----
+    # Loaded here so we read Drive once, not once per document.
+    _gf1_cache = _load_parquet(drive, index_id, "gf1_guidance_statements.parquet", GF1_COLS)
+    _qfacts_cache = _load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
+    _results_cache: pd.DataFrame = pd.DataFrame()
+    try:
+        _res_fid = find_file(drive, index_id, "results.parquet")
+        if _res_fid:
+            _results_cache = pd.read_parquet(io.BytesIO(download_bytes(drive, _res_fid)))
+    except Exception as _e:
+        log(f"  NOTE: results.parquet not loaded for context ({str(_e)[:60]})")
+    log(f"Context caches: GF1={len(_gf1_cache)} rows · "
+        f"facts={len(_qfacts_cache)} rows · results={len(_results_cache)} rows")
+
+    counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0, "gf3": 0, "gf4": 0, "gf_track": 0}
 
     # Fixed run-time label for this execution — used to group today's digest entries
     # by run (Run 1 / Run 2 / …) so the user can see what each scheduled slot added.
@@ -1087,8 +1244,14 @@ def main() -> None:
             continue
 
         try:
+            # Build historical context for GF_TRACK (returns None if no prior history)
+            _hist = _build_historical_context(_gf1_cache, _qfacts_cache, _results_cache, row)
+            effective_prompt = prompt + "\n\n" + _hist if _hist else prompt
+            if _hist:
+                log(f"  GF_TRACK: injecting {len(_hist):,}-char historical context")
+
             # Generate via the bucket pool (best model first; bounded fallback).
-            markdown_text, model_used = gemini.call_pdf(pdf_bytes, prompt)
+            markdown_text, model_used = gemini.call_pdf(pdf_bytes, effective_prompt)
             log(f"  Gemini response: {len(markdown_text):,} chars [{model_used}]")
 
             if args.dry_run:
@@ -1115,6 +1278,15 @@ def main() -> None:
             counts["gf4"] += len(gf4_rows)
             log(f"  GF parsed: GF1={len(gf1_rows)} GF2={len(gf2_rows)} "
                 f"GF3={len(gf3_rows)} GF4={len(gf4_rows)}")
+
+            # 4c. Count GF_TRACK presence (credibility section, only when history was injected)
+            if _hist and _find_section_text(
+                markdown_text,
+                r"Section\s+GF_TRACK", r"GF_TRACK\s*[—–\-]", r"Mgmt\s+Said\s+vs\s+Delivered",
+                max_chars=50,
+            ):
+                counts["gf_track"] += 1
+                log("  GF_TRACK section: present")
 
             # 5a. Company page (persisted forever)
             if OUTPUT_COMPANY_MD:
@@ -1210,6 +1382,8 @@ def main() -> None:
     print(f"Skipped   : {counts['skipped']}  (no drive_file_id / download fail)")
     print(f"GF rows   : GF1={counts['gf1']} GF2={counts['gf2']} "
           f"GF3={counts['gf3']} GF4={counts['gf4']}")
+    print(f"GF_TRACK  : {counts['gf_track']} credibility sections written "
+          f"(0 = no prior history yet; expected once backfill is processed)")
     print(f"Calls OK by model : {pool['by_model'] or '{}'}")
     print(f"Buckets   : {pool['buckets_alive']} alive · "
           f"{pool['buckets_dead_today']} dead-today · "
