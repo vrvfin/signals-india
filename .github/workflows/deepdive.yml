@@ -22,7 +22,6 @@ jobs:
     timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
       GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -35,6 +34,27 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: Write credentials
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+          } > .env
 
       - name: Install system deps for PDF rendering
         run: |

@@ -305,23 +305,12 @@ class BucketPool:
 
 
 def load_keys(env: dict) -> list[str]:
-    """Collect GEMINI_API_KEY_<n> (sorted) + plain GEMINI_API_KEY, de-duped.
-
-    GEMINI_API_KEY may be a single key, comma-separated keys, or a newline-
-    separated block (e.g. if an entire .env file was pasted into the secret).
-    We extract only tokens that look like Google API keys (start with 'AIza').
-    """
+    """Collect GEMINI_API_KEY_<n> (sorted) + plain GEMINI_API_KEY, de-duped."""
     keys = [v for _, v in sorted(
         ((k, v) for k, v in env.items()
          if re.match(r"GEMINI_API_KEY_\d+$", k) and v.strip()),
         key=lambda kv: kv[0])]
-    raw = env.get("GEMINI_API_KEY", "").strip()
-    # split on commas and newlines, keep only tokens that look like API keys
-    for token in re.split(r"[\n,]+", raw):
-        token = token.strip()
-        # strip any "KEY = value" or "KEY=value" assignment syntax
-        if "=" in token:
-            token = token.split("=", 1)[1].strip()
-        if token.startswith("AIza") and token not in keys:
-            keys.append(token)
+    plain = env.get("GEMINI_API_KEY", "").strip()
+    if plain and plain not in keys:
+        keys.append(plain)
     return keys
