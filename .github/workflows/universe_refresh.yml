@@ -1,0 +1,49 @@
+name: Universe Refresh
+
+# Rebuilds universe/master_list.csv and company_repo/_index/company_universe.csv
+# from NSE + BSE scrip APIs. Runs weekly (Sunday 03:00 IST) and on manual dispatch.
+# This keeps the company resolution table (ISIN, NSE symbol, BSE code, name) fresh
+# so deep-dive resolve and all downstream scripts always have current data.
+
+on:
+  schedule:
+    - cron: "30 21 * * 0"    # 21:30 UTC Sunday = 03:00 IST Monday
+  workflow_dispatch:          # manual trigger anytime
+
+concurrency:
+  group: universe-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r scripts/requirements.txt
+
+      - name: Write credentials
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_TOKEN_JSON=$GDRIVE_OAUTH_TOKEN_JSON"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+          } > .env
+
+      - name: Build universe
+        run: python scripts/build_company_universe.py

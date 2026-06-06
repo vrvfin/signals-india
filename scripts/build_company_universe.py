@@ -65,19 +65,30 @@ def log(msg: str) -> None:
 
 def get_drive():
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-    cs_path = Path(os.environ["GDRIVE_OAUTH_CLIENT_SECRET_PATH"])
-    token_path = Path(os.environ["GDRIVE_OAUTH_TOKEN_PATH"])
+    # CI path: GDRIVE_OAUTH_TOKEN_JSON holds the token JSON inline
+    # Local path: GDRIVE_OAUTH_TOKEN_PATH points to a token file on disk
+    token_json = os.environ.get("GDRIVE_OAUTH_TOKEN_JSON", "").strip()
+    token_path_str = os.environ.get("GDRIVE_OAUTH_TOKEN_PATH", "")
     creds = None
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if token_json:
+        creds = Credentials.from_authorized_user_info(
+            __import__("json").loads(token_json), SCOPES)
+    elif token_path_str and Path(token_path_str).exists():
+        creds = Credentials.from_authorized_user_file(token_path_str, SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(cs_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json())
+        # Interactive OAuth — only works locally, not in CI
+        cs_path = os.environ.get("GDRIVE_OAUTH_CLIENT_SECRET_PATH", "")
+        if not cs_path:
+            raise RuntimeError(
+                "Set GDRIVE_OAUTH_TOKEN_JSON (CI) or "
+                "GDRIVE_OAUTH_TOKEN_PATH + GDRIVE_OAUTH_CLIENT_SECRET_PATH (local)")
+        flow = InstalledAppFlow.from_client_secrets_file(cs_path, SCOPES)
+        creds = flow.run_local_server(port=0)
+        if token_path_str:
+            Path(token_path_str).parent.mkdir(parents=True, exist_ok=True)
+            Path(token_path_str).write_text(creds.to_json())
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -254,16 +265,24 @@ def main() -> None:
 
     drive = get_drive()
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
-    repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
-    index_id = get_or_create_subfolder(drive, repo_id, "_index")
+
+    # 1. company_repo/_index/company_universe.csv  (Phase 2 pipeline key)
+    repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
+    index_id  = get_or_create_subfolder(drive, repo_id, "_index")
     upload_csv(drive, index_id, "company_universe.csv", merged,
                find_file(drive, index_id, "company_universe.csv"))
+    log("Wrote company_repo/_index/company_universe.csv")
+
+    # 2. universe/master_list.csv  (canonical read path for all scripts)
+    uni_id = get_or_create_subfolder(drive, folder_id, "universe")
+    upload_csv(drive, uni_id, "master_list.csv", merged,
+               find_file(drive, uni_id, "master_list.csv"))
+    log("Wrote universe/master_list.csv")
 
     print("-" * 60)
     print(f"Total companies : {len(merged)}")
     print("By board:")
     print(merged["board"].value_counts().to_string())
-    print("Wrote company_repo/_index/company_universe.csv")
     if merged["board"].eq("NSE Emerge (SME)").sum() == 0:
         print("\nNOTE: no NSE Emerge (SME) rows — that endpoint may have failed.")
         print("      Not fatal: the document pipeline still covers SME companies")
