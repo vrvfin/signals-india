@@ -150,3 +150,70 @@ jobs:
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/write_phase2_status.py
         continue-on-error: true
+
+  # ── Quarterly Concall Gap Filler (weekends only) ────────────────────────
+  quarterly_gap_filler:
+    runs-on: ubuntu-latest
+    name: "Quarterly concall gap filler"
+    # Only run on Saturday (6) or Sunday (0)
+    if: github.event_name == 'workflow_dispatch' || contains('0,6', github.event.schedule.day_of_week)
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Write credentials
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+          } > .env
+
+      - name: "[DEBUG] Check current quarter"
+        run: python -c "from datetime import date; q_map = {(4,5,6): 'Q4FY', (7,8,9): 'Q1FY', (10,11,12): 'Q2FY', (1,2,3): 'Q3FY'}; m = date.today().month; q = next((l for months, l in q_map.items() if m in months), 'NONE'); print(f'Current quarter: {q}')"
+        env:
+          TZ: 'Asia/Kolkata'
+
+      - name: Find quarterly gaps (Screener discovery)
+        id: find_gaps
+        run: python scripts/find_quarterly_gaps.py
+        env:
+          TZ: 'Asia/Kolkata'
+        continue-on-error: true
+
+      - name: "[DEBUG] Gaps discovery result"
+        if: always()
+        run: echo "Gaps discovery step completed (check logs above for details)"
+
+      - name: Merge gaps into queue (smart merge)
+        id: merge_gaps
+        run: python scripts/merge_quarterly_gaps_to_queue.py
+        env:
+          TZ: 'Asia/Kolkata'
+        continue-on-error: true
+
+      - name: "[DEBUG] Queue merge result"
+        if: always()
+        run: echo "Queue merge step completed (check logs above for queue depth and items pushed)"
