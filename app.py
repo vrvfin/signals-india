@@ -2591,17 +2591,55 @@ def page_doc_upload():
             st.error(f"Could not load library: {e}")
 
 
+def _app_drive_download(drive, path_parts: list[str]) -> bytes | None:
+    """Download a file from Drive by path_parts list using app's own Drive helpers."""
+    try:
+        parent = os.environ["GDRIVE_FOLDER_ID"]
+        for part in path_parts[:-1]:
+            parent = _find_subfolder(drive, parent, part)
+            if not parent:
+                return None
+        files = _list_folder(drive, parent)
+        fid = files.get(path_parts[-1])
+        if not fid:
+            return None
+        return _download_bytes(drive, fid)
+    except Exception:
+        return None
+
+
+def _app_drive_upload(drive, path_parts: list[str], content: bytes, mime: str) -> None:
+    """Upload/overwrite a file on Drive by path_parts list."""
+    from googleapiclient.http import MediaIoBaseUpload
+    parent = os.environ["GDRIVE_FOLDER_ID"]
+    for part in path_parts[:-1]:
+        sub = _find_subfolder(drive, parent, part)
+        if not sub:
+            sub = drive.files().create(body={
+                "name": part, "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent]}, fields="id").execute()["id"]
+        parent = sub
+    files = _list_folder(drive, parent)
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime, resumable=False)
+    if path_parts[-1] in files:
+        drive.files().update(fileId=files[path_parts[-1]], media_body=media).execute()
+    else:
+        drive.files().create(
+            body={"name": path_parts[-1], "parents": [parent]},
+            media_body=media, fields="id").execute()
+
+
 @st.cache_data(ttl=300)
 def load_deep_dive_index():
-    svc = drive_service(); root = os.environ.get("GDRIVE_FOLDER_ID", "")
-    b = drive_download(svc, "company_repo/_index/deep_dive_index.parquet", root)
+    drive = drive_service()
+    b = _app_drive_download(drive, ["company_repo", "_index", "deep_dive_index.parquet"])
     return pd.read_parquet(io.BytesIO(b)) if b else pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
 def load_deep_dive_queue():
-    svc = drive_service(); root = os.environ.get("GDRIVE_FOLDER_ID", "")
-    b = drive_download(svc, "company_repo/_index/deep_dive_queue.parquet", root)
+    drive = drive_service()
+    b = _app_drive_download(drive, ["company_repo", "_index", "deep_dive_queue.parquet"])
     return pd.read_parquet(io.BytesIO(b)) if b else pd.DataFrame()
 
 
@@ -2629,10 +2667,9 @@ def page_deep_dive():
 
         if add_btn and company_input.strip():
             try:
-                svc  = drive_service()
-                root = os.environ.get("GDRIVE_FOLDER_ID", "")
+                drive = drive_service()
                 # resolve company first
-                univ_b = drive_download(svc, "universe/master_list.csv", root)
+                univ_b = _app_drive_download(drive, ["universe", "master_list.csv"])
                 univ   = pd.read_csv(io.BytesIO(univ_b)) if univ_b else pd.DataFrame()
                 from scripts.company_deep_report import resolve_isin
                 isin, symbol, name, _ = resolve_isin(company_input.strip(), univ)
@@ -2640,15 +2677,15 @@ def page_deep_dive():
                     st.error(f"Could not resolve '{company_input}' in universe. "
                              "Try a different name, symbol, or ISIN.")
                 else:
-                    q_b = drive_download(svc, "company_repo/_index/deep_dive_queue.parquet", root)
+                    q_b = _app_drive_download(drive, ["company_repo", "_index", "deep_dive_queue.parquet"])
                     q   = pd.read_parquet(io.BytesIO(q_b)) if q_b else pd.DataFrame()
                     new_row = pd.DataFrame([dict(
                         token=isin, status="pending",
                         added_at=datetime.now().isoformat())])
                     q = pd.concat([q, new_row], ignore_index=True)
                     buf = io.BytesIO(); q.to_parquet(buf, index=False)
-                    _drive_upload(svc, "company_repo/_index/deep_dive_queue.parquet",
-                                  root, buf.getvalue(), "application/octet-stream")
+                    _app_drive_upload(drive, ["company_repo", "_index", "deep_dive_queue.parquet"],
+                                      buf.getvalue(), "application/octet-stream")
                     st.success(
                         f"Queued: **{name}** ({symbol} / {isin}). "
                         "CI runs at 08:00 IST — you'll receive an email when done.")
@@ -2710,9 +2747,8 @@ def page_deep_dive():
 
             if report_path:
                 try:
-                    svc  = drive_service()
-                    root = os.environ.get("GDRIVE_FOLDER_ID", "")
-                    raw  = drive_download(svc, report_path, root)
+                    drive = drive_service()
+                    raw   = _app_drive_download(drive, report_path.strip("/").split("/"))
                     if raw:
                         md_text = raw.decode("utf-8")
                         st.markdown(md_text)
