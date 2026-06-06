@@ -2758,8 +2758,8 @@ def page_deep_dive():
         col1, col2 = st.columns([3, 1])
         with col1:
             company_input = st.text_input(
-                "Company name, NSE/BSE symbol, or ISIN",
-                placeholder="e.g. TCS  or  VENUSREM  or  INE467B01029")
+                "Company name, NSE/BSE symbol, or ISIN — comma-separate for multiple",
+                placeholder="e.g. TCS, VENUSREM, INE467B01029  or just  VENUSREM")
         with col2:
             st.write("")
             st.write("")
@@ -2768,28 +2768,39 @@ def page_deep_dive():
         if add_btn and company_input.strip():
             try:
                 drive = drive_service()
-                # resolve company first
                 univ_b = _app_drive_download(drive, ["universe", "master_list.csv"])
                 univ   = pd.read_csv(io.BytesIO(univ_b)) if univ_b else pd.DataFrame()
-                from scripts.company_deep_report import resolve_isin
-                isin, symbol, name, _ = resolve_isin(company_input.strip(), univ)
-                if isin == company_input.strip() and symbol == company_input.strip():
-                    st.error(f"Could not resolve '{company_input}' in universe. "
-                             "Try a different name, symbol, or ISIN.")
-                else:
+                import sys as _sys, os as _os
+                _sdir = _os.path.join(_os.path.dirname(__file__), "scripts")
+                if _sdir not in _sys.path: _sys.path.insert(0, _sdir)
+                from company_deep_report import resolve_isin
+
+                tokens  = [t.strip() for t in company_input.split(",") if t.strip()]
+                queued, failed = [], []
+                for token in tokens:
+                    isin, symbol, name, _ = resolve_isin(token, univ)
+                    if isin == token and symbol == token:
+                        failed.append(token)
+                    else:
+                        queued.append(dict(token=isin, status="pending",
+                                           added_at=datetime.now().isoformat(),
+                                           _label=f"{name} ({symbol})"))
+
+                if queued:
                     q_b = _app_drive_download(drive, ["company_repo", "_index", "deep_dive_queue.parquet"])
                     q   = pd.read_parquet(io.BytesIO(q_b)) if q_b else pd.DataFrame()
-                    new_row = pd.DataFrame([dict(
-                        token=isin, status="pending",
-                        added_at=datetime.now().isoformat())])
-                    q = pd.concat([q, new_row], ignore_index=True)
+                    new_rows = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")}
+                                             for r in queued])
+                    q = pd.concat([q, new_rows], ignore_index=True)
                     buf = io.BytesIO(); q.to_parquet(buf, index=False)
                     _app_drive_upload(drive, ["company_repo", "_index", "deep_dive_queue.parquet"],
                                       buf.getvalue(), "application/octet-stream")
-                    st.success(
-                        f"Queued: **{name}** ({symbol} / {isin}). "
-                        "CI runs at 08:00 IST — you'll receive an email when done.")
+                    labels = ", ".join(r["_label"] for r in queued)
+                    st.success(f"Queued {len(queued)} company/companies: **{labels}**. "
+                               "CI runs at 08:00 IST — you'll receive an email when done.")
                     st.cache_data.clear()
+                if failed:
+                    st.warning(f"Could not resolve: {', '.join(failed)} — check spelling or use ISIN.")
             except Exception as e:
                 st.error(f"Failed to queue: {e}")
 
