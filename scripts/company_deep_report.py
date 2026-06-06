@@ -56,6 +56,7 @@ DRIVE = dict(
     queue        = "company_repo/_index/deep_dive_queue.parquet",
     index        = "company_repo/_index/deep_dive_index.parquet",
     research_idx = "company_repo/_index/research_index.parquet",
+    proc_queue   = "company_repo/_index/processing_queue.parquet",
     fundamentals = "fundamentals/summary.parquet",
     results      = "company_repo/_index/results.parquet",
     universe     = "universe/master_list.csv",
@@ -65,6 +66,20 @@ DRIVE = dict(
 # context-size caps so the single call stays well inside the free-tier budget
 MAX_PAGE_CHARS   = 30_000
 MAX_RESEARCH_ROWS = 25
+
+# ---- document-grounded assembly (Phase 2) ---------------------------------
+# doc_type (from processing_queue) -> its dedicated extraction prompt
+DOC_PROMPTS = {
+    "concall":       "concall_prompt.txt",
+    "annual_report": "annual_report_prompt.txt",
+    "rating":        "rating_prompt.txt",
+    "results":       "results_prompt.txt",
+    "presentation":  "presentation_prompt.txt",
+}
+MAX_INLINE_PDF      = 18 * 1024 * 1024   # Gemini inline-data ceiling (~20MB)
+MAX_DOC_TEXT_CHARS  = 80_000             # cap text extracted from big PDFs / html
+MAX_DOC_SUMMARY_CHARS = 6_000            # cap each per-doc summary fed to deep dive
+DO_BACKFILL         = True               # pull full Screener doc history before a dive
 
 # --------------------------------------------------------------------------
 def _read_parquet(svc, path, root):
@@ -213,12 +228,118 @@ def bse_announcements(bse_code):
     except Exception as e:
         return f"DATA_MISSING (BSE fetch failed: {type(e).__name__})"
 
+# ---- PHASE 2: document-grounded summarisation -----------------------------
+def _download_file_id(svc, file_id: str) -> bytes | None:
+    from googleapiclient.http import MediaIoBaseDownload
+    try:
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue()
+    except Exception as e:
+        print(f"      file fetch failed ({type(e).__name__})")
+        return None
+
+def _load_doc_prompt(doc_type: str) -> str:
+    fname = DOC_PROMPTS.get(doc_type, "research_doc_prompt.txt")
+    path = os.path.join(SCRIPTS_DIR, fname)
+    if not os.path.exists(path):       # fallback if a prompt file is missing
+        path = os.path.join(SCRIPTS_DIR, "research_doc_prompt.txt")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+def _sidecar_path(isin: str, row) -> str:
+    d = str(row["announcement_date"])[:10]
+    return (f"{DRIVE['company_page']}/{isin}/doc_summaries/"
+            f"{row['doc_type']}__{d}__{row['doc_id']}.md")
+
+def summarise_doc(svc, root, pool, isin, row) -> str | None:
+    """Return a per-doc summary. Reuse cached sidecar if present, else fetch the
+    raw file (PDF or extracted-HTML text) and run its doc-type prompt. Caches the
+    result as a sidecar so future dives reuse it for free. AllBucketsExhausted
+    propagates (caller stops); FatalCallError on one doc -> skip that doc."""
+    sidecar = _sidecar_path(isin, row)
+    cached = drive_download(svc, sidecar, root)
+    if cached:
+        return cached.decode("utf-8", "ignore")
+
+    fid = str(row.get("drive_file_id") or "").strip()
+    if not fid:
+        return None
+    data = _download_file_id(svc, fid)
+    if not data:
+        return None
+
+    doc_type = str(row["doc_type"])
+    prompt = _load_doc_prompt(doc_type)
+    label = f"{doc_type} {str(row['announcement_date'])[:10]}"
+    try:
+        is_pdf = data[:5].startswith(b"%PDF")
+        if is_pdf and len(data) <= MAX_INLINE_PDF:
+            summ, _ = pool.call_pdf(data, prompt)
+        else:
+            if is_pdf:
+                import fitz
+                doc = fitz.open(stream=data, filetype="pdf")
+                text = "\n".join(p.get_text() for p in doc)[:MAX_DOC_TEXT_CHARS]
+                doc.close()
+            else:
+                text = data.decode("utf-8", "ignore")[:MAX_DOC_TEXT_CHARS]
+            if len(text.strip()) < 100:
+                print(f"      {label}: no extractable text — skip (needs OCR?)")
+                return None
+            summ, _ = pool.call_text(
+                prompt + f"\n\n=== DOCUMENT CONTENT ({label}) ===\n{text}")
+    except FatalCallError as e:
+        print(f"      {label}: FATAL ({str(e)[:80]}) — skip")
+        return None
+
+    try:
+        drive_upload(svc, sidecar, root, summ.encode("utf-8"), "text/markdown")
+    except Exception:
+        pass
+    return summ
+
+def assemble_doc_summaries(svc, root, pool, isin) -> tuple[str, list[dict]]:
+    """Summarise every actual document for this ISIN (reuse-or-generate) and
+    return (combined_block, used_docs). Docs already folded into company_page.md
+    (status=done) are skipped — the COMPANY_PAGE_BRIEF already carries them."""
+    q = _read_parquet(svc, DRIVE["proc_queue"], root)
+    if q.empty or "isin" not in q.columns:
+        return "DATA_MISSING (no document index).", []
+    rows = q[(q["isin"].astype(str) == isin) &
+             (q["status"].astype(str) != "download_failed")]
+    if rows.empty:
+        return "DATA_MISSING (no documents ingested for this company).", []
+
+    blocks, used = [], []
+    for _, r in rows.sort_values("announcement_date").iterrows():
+        if str(r.get("status")) == "done":
+            continue                       # already in COMPANY_PAGE_BRIEF
+        summ = summarise_doc(svc, root, pool, isin, r)
+        if not summ:
+            continue
+        d = str(r["announcement_date"])[:10]
+        title = str(r.get("title", ""))[:90]
+        blocks.append(f"### [{r['doc_type']} | {d} | {title}]\n"
+                      f"{summ.strip()[:MAX_DOC_SUMMARY_CHARS]}")
+        used.append({"doc_type": str(r["doc_type"]), "date": d,
+                     "title": title, "doc_id": str(r["doc_id"])})
+    if not blocks:
+        return "DATA_MISSING (documents present but none summarisable).", []
+    return "\n\n".join(blocks), used
+
 # ---- prompt assembly ------------------------------------------------------
 def fill_section(tpl, tag, content):
-    return re.sub(rf"\[{tag}\].*?\[/{tag}\]", f"[{tag}]\n{content}\n[/{tag}]",
+    # function replacement -> content is inserted literally (no \g/\1 backref
+    # interpretation, which would crash on summaries containing backslashes).
+    return re.sub(rf"\[{tag}\].*?\[/{tag}\]",
+                  lambda m: f"[{tag}]\n{content}\n[/{tag}]",
                   tpl, flags=re.DOTALL)
 
-def build_prompt(name, symbol, isin, screener, page, research, bse):
+def build_prompt(name, symbol, isin, screener, page, research, bse, docs="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
@@ -227,34 +348,56 @@ def build_prompt(name, symbol, isin, screener, page, research, bse):
     tpl = fill_section(tpl, "SCREENER_FINANCIAL_DATA", screener)
     tpl = fill_section(tpl, "COMPANY_PAGE_BRIEF", page[:MAX_PAGE_CHARS] or "DATA_MISSING")
     tpl = fill_section(tpl, "RESEARCH_INDEX_CONTEXT", research)
+    tpl = fill_section(tpl, "DOCUMENT_SUMMARIES", docs)
     tpl = fill_section(tpl, "BSE_ANNOUNCEMENTS", bse)
     tpl = fill_section(tpl, "RAW_ANNUAL_REPORTS_FOR_GAPS",
-                       "None supplied. Rely on Screener + Company Page.")
+                       "None supplied. Rely on Screener + Document Summaries + Company Page.")
     return tpl
 
 # --------------------------------------------------------------------------
-def process_one(svc, root, pool, universe, fund, results, ridx, token, interactive=False):
+def process_one(svc, root, pool, universe, fund, results, ridx, token,
+                interactive=False, do_backfill=DO_BACKFILL):
     isin, symbol, name, bse_code = resolve_isin(token, universe, interactive=interactive)
     print(f"  deep dive: {token} -> {name} ({symbol} / {isin})")
+
+    # Phase 1 — pull full Screener document history (annual reports, ratings,
+    # concalls) into processing_queue before we assemble. Best-effort; never fatal.
+    if do_backfill and isin.startswith("INE"):
+        try:
+            from backfill_company_docs import backfill as _backfill
+            c = _backfill(symbol, isin)
+            print(f"    backfill: {c.get('downloaded',0)} new doc(s), "
+                  f"{c.get('found',0)} on Screener")
+        except Exception as e:
+            print(f"    backfill skipped ({type(e).__name__}: {str(e)[:80]})")
+
     page_b = drive_download(svc, f"{DRIVE['company_page']}/{isin}/company_page.md", root)
     page = page_b.decode("utf-8") if page_b else ""
     cov = coverage_check(page)
     print(f"    coverage: page={cov['has_page']} ar={cov['ar_years']} "
           f"concall={cov['n_concall']} research={cov['n_research']}")
 
+    # Phase 2 — summarise every actual document (reuse cached sidecar, else
+    # run the doc-type prompt) into a provenance-tagged block.
+    doc_block, used_docs = assemble_doc_summaries(svc, root, pool, isin)
+    print(f"    documents: {len(used_docs)} summarised/reused")
+
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
                           page,
                           research_block(ridx, isin, symbol, name),
-                          bse_announcements(bse_code))
+                          bse_announcements(bse_code),
+                          docs=doc_block)
     report, model_used = pool.call_text(prompt)
 
     stamp = dt.datetime.now().strftime("%d%b%y")
     out_path = f"{DRIVE['company_page']}/{isin}/company_deepdive_{stamp}.md"
+    prov = ", ".join(f"{u['doc_type']}:{u['date']}" for u in used_docs) or "none"
     header = (f"# Deep Dive — {name} ({symbol} / {isin})\n"
               f"*Generated {dt.datetime.now():%Y-%m-%d %H:%M} · "
               f"coverage: AR{cov['ar_years']} concalls~{cov['n_concall']} "
-              f"research~{cov['n_research']}*\n\n---\n\n")
+              f"research~{cov['n_research']} · docs used: {len(used_docs)}*\n\n"
+              f"*Documents fed: {prov}*\n\n---\n\n")
     full_md = header + report
     drive_upload(svc, out_path, root, full_md.encode("utf-8"), "text/markdown")
     print(f"    wrote {out_path}")
@@ -379,6 +522,8 @@ def main():
                     help="prompt to pick when fuzzy name match returns multiple results")
     ap.add_argument("--resolve-only", action="store_true",
                     help="resolve and print company name then exit (used by bat for confirmation)")
+    ap.add_argument("--no-backfill", action="store_true",
+                    help="skip pulling full Screener document history before the dive")
     args = ap.parse_args()
 
     from dotenv import load_dotenv
@@ -423,7 +568,8 @@ def main():
         for t in tokens:
             try:
                 recs.append(process_one(svc, root, pool, universe, fund, results, ridx, t,
-                                        interactive=args.interactive))
+                                        interactive=args.interactive,
+                                        do_backfill=not args.no_backfill))
             except AllBucketsExhausted as exc:
                 print(f"  All Gemini buckets exhausted — stopping. ({exc})")
                 break
@@ -448,7 +594,8 @@ def main():
     for i in pending.index:
         try:
             rec = process_one(svc, root, pool, universe, fund, results, ridx,
-                              queue.at[i, "token"], interactive=args.interactive)
+                              queue.at[i, "token"], interactive=args.interactive,
+                              do_backfill=not args.no_backfill)
             recs.append(rec)
             queue.at[i, "status"] = "done"
             queue.at[i, "done_at"] = dt.datetime.now().isoformat()
