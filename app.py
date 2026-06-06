@@ -2022,7 +2022,82 @@ def page_graphs():
             st.caption("OHLCV already loaded for sort — rendering now.")
 
         tf_days = TIMEFRAME_DAYS[tf]
-        cols2   = st.columns(2)
+
+        # ── Pre-load fundamentals (two already-cached parquets, no Drive calls) ──
+        results_df  = load_results_summary()    # has yoy_pct, qoq_pct per metric row
+        guidance_df = load_guidance_tracker()   # structured guidance rows
+
+        def _fund_line(sym: str) -> str:
+            """Return one compact HTML line: quarter + Sales/PAT YoY/QoQ + guidance."""
+            parts = []
+
+            # ── Results: latest Sales + Net Profit row for this symbol ────────
+            if not results_df.empty and "symbol" in results_df.columns:
+                sym_res = results_df[results_df["symbol"] == sym]
+                for metric_kw, label in [
+                    ("sales|revenue|income from operations", "Sales"),
+                    ("net profit|pat|profit after tax",      "PAT"),
+                ]:
+                    rows = sym_res[
+                        sym_res["metric"].astype(str).str.lower()
+                        .str.contains(metric_kw, na=False, regex=True)
+                    ]
+                    if rows.empty:
+                        continue
+                    r = rows.iloc[0]
+                    qtr   = str(r.get("latest_q", "")).strip()
+                    yoy   = r.get("yoy_pct")
+                    qoq   = r.get("qoq_pct")
+                    yoy_s = (f'<span style="color:{"#27ae60" if float(yoy)>=0 else "#e74c3c"}">'
+                             f'{float(yoy):+.0f}% YoY</span>' if pd.notna(yoy) else "")
+                    qoq_s = (f'<span style="color:{"#27ae60" if float(qoq)>=0 else "#e74c3c"}">'
+                             f'{float(qoq):+.0f}% QoQ</span>' if pd.notna(qoq) else "")
+                    sub = " / ".join(x for x in [yoy_s, qoq_s] if x)
+                    if sub:
+                        qtr_tag = f"<b>{qtr}</b> " if qtr else ""
+                        parts.append(f"{qtr_tag}{label}: {sub}")
+
+            # ── Guidance: active revenue/PAT/EPS rows ─────────────────────────
+            if not guidance_df.empty and "symbol" in guidance_df.columns:
+                sym_g = guidance_df[guidance_df["symbol"] == sym]
+                sym_g = sym_g[sym_g["horizon_fy"].apply(_guidance_is_active)]
+                sym_g = sym_g[
+                    sym_g["metric"].astype(str).str.lower()
+                    .str.contains("revenue|sales|pat|profit|eps|margin", na=False, regex=True)
+                ]
+                g_bits = []
+                for _, gr in sym_g.head(2).iterrows():
+                    metric = str(gr.get("metric", "")).title()
+                    val    = gr.get("value", "")
+                    unit   = gr.get("unit", "")
+                    fy     = gr.get("horizon_fy", "")
+                    if val:
+                        g_bits.append(f"{metric} {val}{' '+unit if unit else ''} {fy}".strip())
+                if g_bits:
+                    parts.append("📋 " + " | ".join(g_bits))
+
+            return "  ·  ".join(parts) if parts else ""
+
+        # ── Strategy chip builder ─────────────────────────────────────────────
+        def _strat_chips(sym_sigs_df) -> str:
+            seen = set()
+            chips = []
+            for _, sg in sym_sigs_df.iterrows():
+                strat = sg.get("strategy", sg.get("strategy_group", ""))
+                zt    = sg.get("zone_type", "")
+                key   = (strat, zt)
+                if key in seen:
+                    continue
+                seen.add(key)
+                color = ZONE_COLORS.get(zt, "#555")
+                chips.append(
+                    f'<span style="background:{color};color:white;'
+                    f'padding:1px 7px;border-radius:8px;font-size:11px;'
+                    f'margin-right:3px;">{strat} · {zt}</span>'
+                )
+            return " ".join(chips)
+
+        cols2 = st.columns(2)
 
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
@@ -2030,8 +2105,23 @@ def page_graphs():
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
             with cols2[i % 2]:
+                # Line 1 — strategy chips
+                chips_html = _strat_chips(sym_sigs)
+                if chips_html:
+                    st.markdown(chips_html, unsafe_allow_html=True)
+
+                # Line 2 — fundamentals (results YoY/QoQ + guidance)
+                fund = _fund_line(sym)
+                if fund:
+                    st.markdown(
+                        f'<div style="font-size:11px;color:#555;'
+                        f'margin:1px 0 3px 0;line-height:1.4">{fund}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Chart
                 if ohlcv.empty:
-                    st.caption(f"{sym} — no data")
+                    st.caption(f"{sym} — no OHLCV data")
                 else:
                     fig = build_quick_chart(sym, ohlcv, sym_sigs, tf_days,
                                             normalize=normalize)
