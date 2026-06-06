@@ -2107,14 +2107,12 @@ def page_graphs():
                 )
             return " ".join(chips)
 
-        cols2 = st.columns(2)
-
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
             sym_sigs = sel[sel["symbol"] == sym]
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
-            with cols2[i % 2]:
+            with st.container():
                 # Line 1 — strategy chips
                 chips_html = _strat_chips(sym_sigs)
                 if chips_html:
