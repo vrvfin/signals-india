@@ -83,10 +83,16 @@ def resolve_isin(token, universe, interactive=False):
     bse_c  = cols.get("bse_code") or cols.get("scrip_code") or cols.get("bsecode")
     t = str(token).strip()
     def row_out(r):
+        raw_bse = r[bse_c] if bse_c else None
+        if bse_c and pd.notna(raw_bse):
+            s = str(raw_bse)
+            bse_out = str(int(float(s))) if s.replace(".", "").isdigit() else s
+        else:
+            bse_out = None
         return (str(r[isin_c]) if isin_c else t,
                 str(r[sym_c]) if sym_c else t,
                 str(r[name_c]) if name_c else t,
-                str(r[bse_c]) if bse_c and pd.notna(r[bse_c]) else None)
+                bse_out)
     # exact matches first
     if isin_c and t.upper().startswith("INE"):
         hit = universe[universe[isin_c].astype(str) == t.upper()]
@@ -95,7 +101,11 @@ def resolve_isin(token, universe, interactive=False):
         hit = universe[universe[sym_c].astype(str).str.upper() == t.upper()]
         if not hit.empty: return row_out(hit.iloc[0])
     if bse_c and t.isdigit():
-        hit = universe[universe[bse_c].astype(str) == t]
+        # bse_code is numeric in CSV so pandas reads it as float -> "522101.0"
+        # normalise by converting to Int64 string before comparing
+        bse_norm = universe[bse_c].apply(
+            lambda x: str(int(float(x))) if pd.notna(x) and str(x).replace(".", "").isdigit() else str(x))
+        hit = universe[bse_norm == t]
         if not hit.empty: return row_out(hit.iloc[0])
     if name_c:
         hit = universe[universe[name_c].astype(str).str.lower() == t.lower()]
