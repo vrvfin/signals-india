@@ -193,7 +193,8 @@ jobs:
           } > .env
 
       - name: "[DEBUG] Check current quarter"
-        run: python -c "from datetime import date; q_map = {(4,5,6): 'Q4FY', (7,8,9): 'Q1FY', (10,11,12): 'Q2FY', (1,2,3): 'Q3FY'}; m = date.today().month; q = next((l for months, l in q_map.items() if m in months), 'NONE'); print(f'Current quarter: {q}')"
+        run: |
+          python -c "from datetime import date; q_map = {(4,5,6): 'Q4FY', (7,8,9): 'Q1FY', (10,11,12): 'Q2FY', (1,2,3): 'Q3FY'}; m = date.today().month; q = next((l for months, l in q_map.items() if m in months), 'NONE'); print(f'Current quarter: {q}')"
         env:
           TZ: 'Asia/Kolkata'
 
