@@ -2027,12 +2027,13 @@ def page_graphs():
         results_df  = load_results_summary()    # has yoy_pct, qoq_pct per metric row
         guidance_df = load_guidance_tracker()   # structured guidance rows
 
-        def _fund_line(sym: str) -> str:
-            """Return one compact HTML line: quarter + Sales/PAT YoY/QoQ + guidance."""
+        def _fund_line_inner(sym: str) -> str:
             parts = []
 
             # ── Results: latest Sales + Net Profit row for this symbol ────────
-            if not results_df.empty and "symbol" in results_df.columns:
+            if (not results_df.empty
+                    and "symbol" in results_df.columns
+                    and "metric" in results_df.columns):
                 sym_res = results_df[results_df["symbol"] == sym]
                 for metric_kw, label in [
                     ("sales|revenue|income from operations", "Sales"),
@@ -2058,7 +2059,10 @@ def page_graphs():
                         parts.append(f"{qtr_tag}{label}: {sub}")
 
             # ── Guidance: active revenue/PAT/EPS rows ─────────────────────────
-            if not guidance_df.empty and "symbol" in guidance_df.columns:
+            if (not guidance_df.empty
+                    and "symbol" in guidance_df.columns
+                    and "metric" in guidance_df.columns
+                    and "horizon_fy" in guidance_df.columns):
                 sym_g = guidance_df[guidance_df["symbol"] == sym]
                 sym_g = sym_g[sym_g["horizon_fy"].apply(_guidance_is_active)]
                 sym_g = sym_g[
@@ -2077,6 +2081,12 @@ def page_graphs():
                     parts.append("📋 " + " | ".join(g_bits))
 
             return "  ·  ".join(parts) if parts else ""
+
+        def _fund_line(sym: str) -> str:
+            try:
+                return _fund_line_inner(sym)
+            except Exception:
+                return ""
 
         # ── Strategy chip builder ─────────────────────────────────────────────
         def _strat_chips(sym_sigs_df) -> str:
