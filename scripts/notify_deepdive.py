@@ -26,6 +26,9 @@ from email import encoders
 from dotenv import load_dotenv
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
 load_dotenv(os.path.join(os.path.dirname(SCRIPTS_DIR), ".env"))
 
 from daily_research_summary import drive_service, drive_download, _folder_id

@@ -27,13 +27,19 @@ Deps:  google-generativeai pandas pyarrow requests + the Drive stack
 from __future__ import annotations
 import os, io, re, sys, json, argparse, datetime as dt, tempfile, webbrowser
 
+# Ensure scripts/ is on sys.path whether run as `python scripts/foo.py` (CI/root)
+# or as `python foo.py` (local, already in scripts/)
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
 import pandas as pd
 import requests
 
 from daily_research_summary import (drive_service, drive_download, drive_upload, _folder_id)
 from gemini_pool import BucketPool, AllBucketsExhausted, FatalCallError, load_keys
 
-SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS_DIR = _SCRIPTS_DIR
 INTER_CALL_SLEEP = 6.0
 
 # Best model first; pool only downgrades when current model is dead on ALL keys.
