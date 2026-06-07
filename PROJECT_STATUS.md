@@ -732,5 +732,27 @@ SEC 10-K). Root cause: no real documents in context + unconstrained prompt.
 8136225 (weasyprint Windows DLL) · also 56edbe6/0975ee9/1665d16 (CI key + call_text fixes).
 
 **Still pending:**
-- Trigger a CI deepdive run to confirm the email path (PDF+PPTX) end-to-end in Actions.
 - CRISIL ratings stored as text (PDFs are HTML interstitials) — acceptable.
+
+### Session 2026-06-07 — Screener cross-check + format cleanup + reconciliation
+
+**Feedback from review of Venus report:** (1) format artifacts (==== / ---- divider
+bars, raw $$ LaTeX weighted-score, [BRACKET] headings); (2) financials sourced only
+from Annual Reports — Screener's structured tables not pulled; (3) want AR primary +
+Screener cross-check that calls out differences.
+
+**Delivered (commit 96868af), TESTED on Venus:**
+- **Screener live cross-check (`company_deep_report.py`):** `screener_financials_block`
+  live-scrapes the 6 Screener tables (P&L/BS/CF/ratios/quarters/shareholding, 10-12 yr)
+  each dive, caches to `company_repo/<ISIN>/screener_financials.txt`, falls back to cache
+  if live fails. (Screener Excel export needs premium auth → HTML scrape used instead.)
+- **Reconciliation (prompt):** AR = PRIMARY for numbers; Screener = independent
+  cross-check; prompt flags >2% AR-vs-Screener differences in a "Source Reconciliation"
+  section. Result: 5 reconciliation [WARNING]s (e.g. FY17-20 revenue AR vs Screener), 8
+  [Screener] citations.
+- **Format cleanup:** prompt rules (clean GH-markdown, no ====/----/$$/[BRACKET]) +
+  `_clean_report_md()` post-processor. Result: 0 divider bars, 0 LaTeX, 0 bracket
+  headings; weighted formula now plain text. PDF 7 tables, PPTX 9/9 slides.
+
+**Still pending:** trigger a CI deepdive run to confirm the email path end-to-end with
+the new Screener cross-check + clean format.
