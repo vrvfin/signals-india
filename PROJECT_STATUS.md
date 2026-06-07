@@ -696,3 +696,41 @@ company_mentions, company_page, synthesis_latest + dated, deep_dive_queue. Sourc
 - Fix 2B: BSE Direct API secondary ingestion
 - OT9: Streamlit performance optimisation (P2, deferred)
 - Known gaps: typed prompts no JSON tag tail; no OCR for scanned PDFs
+
+### Session 2026-06-06 (cont.) — Deep Dive v2: document-grounded + chunking + PDF/PPTX
+
+**Problem found:** OT7 deep dive trusted a thin `company_page.md` (Venus had 1 doc) →
+gemini-3.5-flash ignored the real ₹-Crore data and hallucinated a US company (SMCI,
+SEC 10-K). Root cause: no real documents in context + unconstrained prompt.
+
+**Fix delivered (4 phases + chunking + rendering), TESTED on Venus:**
+- **Phase 1 — `backfill_company_docs.py` (NEW):** on-demand full Screener doc history
+  (parses #documents: annual-reports / credit-ratings / concalls) → downloads to
+  `company_repo/<ISIN>/documents/` + appends pending rows to processing_queue.
+  CRISIL rating pages stored as text; retries download_failed; idempotent.
+  Venus: 1 → 19 docs (14 ARs FY12-25 + 4 CRISIL ratings).
+- **Phase 2 — per-doc summariser (`company_deep_report.py`):** reuse cached sidecar
+  (`company_repo/<ISIN>/doc_summaries/`) else run the doc-type prompt; results cached.
+- **Phase 3 — assembly:** all summaries → provenance-tagged `[DOCUMENT_SUMMARIES]`
+  block + Screener financials into the dive; auto-backfill before a dive (`--no-backfill`).
+- **Phase 4 — prompt hardening (`comapnydeepdive_prompt.txt`):** SUBJECT LOCK (only this
+  company/ISIN, ₹ Crore, no SEC/10-K), trace-or-DATA_MISSING, no emoji, ANCHOR line
+  (restate company + latest revenue), PHASE 5 "Physical Documents Used" table.
+- **Chunking:** docs >45pp split into 35-page sub-PDFs → summarise each → merge, so the
+  back-of-report notes are read not skimmed. TESTED: FY25 AR (131pp) → 4 chunks → merged.
+- **PDF fix (`format_deepdive_pdf.py`):** drop nl2br + isolate pipe-tables → real tables
+  (7 rendered, was 0). weasyprint GTK DLLs loaded on Windows via env Library/bin.
+- **PPTX fix (`format_deepdive_pptx.py`):** SECTION_MAP → numbered headings + heading-gated
+  switching → all 9 slides populated (were empty). Email attaches .md + .pdf + .pptx.
+- **Deps:** local conda-forge weasyprint + pip markdown/python-docx/python-pptx (verified);
+  CI: PyMuPDF added to requirements.txt + deepdive.yml.
+
+**Result (Venus):** report now 100% Venus, ₹ Crore, cites real ARs (Elores/Cipla deal,
+₹9.91 Cr FCCB write-off, CWIP/Sunev RPT), 0 emoji, 0 SMCI/SEC, 18-doc provenance table.
+
+**Commits:** edd361e (Phases 1-3) · 5bb6ede (Phase 4) · e98bbe7 (chunking+PDF/PPTX) ·
+8136225 (weasyprint Windows DLL) · also 56edbe6/0975ee9/1665d16 (CI key + call_text fixes).
+
+**Still pending:**
+- Trigger a CI deepdive run to confirm the email path (PDF+PPTX) end-to-end in Actions.
+- CRISIL ratings stored as text (PDFs are HTML interstitials) — acceptable.
