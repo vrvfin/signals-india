@@ -31,6 +31,13 @@ GLOBAL NON-NEGOTIABLE RULES
 • Follow phases strictly in sequence; do NOT skip, merge, or reorder phases.
 • Phase 0, 1 & 2 outputs are INTERNAL ONLY. Visible output begins only in Phase 3.
 • Use professional Markdown formatting. Prefer tables and bullet points.
+• OUTPUT CLEAN GITHUB-FLAVORED MARKDOWN ONLY:
+  - Section titles use ## and ### headings. Do NOT draw divider bars of "====" or
+    "----" around titles, and do NOT print "END OF LAYER" separators.
+  - Do NOT use LaTeX or $$...$$ / $...$ math. Write any formula inline in plain text,
+    e.g. "Weighted = CFQ×0.25 + AI×0.25 + BS×0.20 + GP×0.20 + RD×0.10".
+  - Do NOT use [BRACKET] labels as headings; use a ### heading instead. (Bracket
+    tokens are reserved for [COMFORT]/[WARNING]/[INFO] and source citations only.)
 • No paragraph or text block may be longer than 3 lines.
 • Every quantitative fact must cite a source category. Interpretations must cite
   the supporting source(s) used to derive the conclusion.
@@ -63,9 +70,16 @@ already summarised in the Company Page.
 The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
 
 [SCREENER_FINANCIAL_DATA]
-<Structured financials from Screener.in — 5-yr P&L, balance sheet, cash flows, ratios,
- shareholding, quarterly results. PRIMARY source for numbers.>
+<Top-line snapshot from Screener (market cap, PE, latest-quarter numbers).>
 [/SCREENER_FINANCIAL_DATA]
+
+[SCREENER_CROSSCHECK]
+<Full structured Screener.in tables (10-12 yr P&L, balance sheet, cash flow, ratios,
+ quarterly, shareholding), fetched LIVE. This is an INDEPENDENT CROSS-CHECK, not the
+ primary number source. Compare each Annual-Report figure against this; where they
+ differ materially (>2%), raise a [WARNING] showing BOTH numbers so the user can
+ decide which to trust. Use it to fill gaps only where Annual Reports are silent.>
+[/SCREENER_CROSSCHECK]
 
 [COMPANY_PAGE_BRIEF]
 <company_page.md — cumulative per-company brief built by the pipeline: prior concall
@@ -99,8 +113,15 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
  If empty, rely on Screener + Company Page.>
 [/RAW_ANNUAL_REPORTS_FOR_GAPS]
 
-DATA HIERARCHY: Raw Annual Reports (gap years) > Screener > Company Page brief >
-Research Index > BSE Announcements. If sources conflict, note the discrepancy explicitly.
+DATA HIERARCHY (numbers): Annual Reports / Document Summaries = PRIMARY source for
+all figures. Screener Cross-check = INDEPENDENT validation, and the fallback only
+where Annual Reports are silent. Company Page brief > Research Index > BSE Announcements.
+SOURCE RECONCILIATION (mandatory): for the key metrics (Revenue, PAT, EBITDA, CFO,
+ROE/ROCE, Debt) compare the Annual-Report figure with the Screener Cross-check figure.
+Where they differ by >2%, raise [WARNING] "AR vs Screener: <metric> FY## = ₹A (AR) vs
+₹B (Screener)". Add a short "Source Reconciliation" note in Section 1 listing every
+material mismatch so the user can decide which to trust. Always cite which source a
+number came from, e.g. [Annual Report FY25] or [Screener].
 
 ================================
 PHASE 0 — RULE-BASED COVERAGE CHECK (INTERNAL)

@@ -195,6 +195,82 @@ def screener_block(fund, results, isin, symbol):
         out.append(r.head(8).to_string(index=False))
     return "\n".join(out) if out else "DATA_MISSING"
 
+# ---- Screener structured financials (independent cross-check source) -------
+SCREENER_SECTIONS = [
+    ("profit-loss",  "PROFIT & LOSS"),
+    ("balance-sheet", "BALANCE SHEET"),
+    ("cash-flow",    "CASH FLOW"),
+    ("ratios",       "RATIOS"),
+    ("quarters",     "QUARTERLY"),
+    ("shareholding", "SHAREHOLDING"),
+]
+
+def _screener_session():
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.screener.in/"})
+    for part in os.environ.get("SCREENER_SESSION_COOKIE", "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            s.cookies.set(k.strip(), v.strip(), domain=".screener.in")
+    return s
+
+def _fmt_screener_table(table) -> str:
+    from bs4 import BeautifulSoup  # noqa
+    heads = [th.get_text(strip=True) for th in table.select("thead th")]
+    period = " | ".join(h for h in heads[1:] if h)
+    lines = [f"Period: {period}"]
+    for tr in table.select("tbody tr"):
+        cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
+        if not cells:
+            continue
+        label = cells[0].replace("\xa0", " ").strip().rstrip("+")
+        vals = " | ".join(cells[1:])
+        lines.append(f"{label}: {vals}")
+    return "\n".join(lines)
+
+def _scrape_screener_financials(symbol: str) -> str | None:
+    """Live-scrape the 6 Screener financial tables into a compact text block."""
+    from bs4 import BeautifulSoup
+    sess = _screener_session()
+    for view in ("consolidated/", ""):
+        url = f"https://www.screener.in/company/{symbol}/{view}"
+        try:
+            r = sess.get(url, timeout=30)
+        except Exception:
+            continue
+        if r.status_code != 200 or 'id="profit-loss"' not in r.text:
+            continue
+        soup = BeautifulSoup(r.text, "lxml")
+        blocks = [f"SCREENER STRUCTURED FINANCIALS ({'consolidated' if view else 'standalone'}) "
+                  f"— fetched {dt.date.today().isoformat()}:"]
+        got = False
+        for sec_id, label in SCREENER_SECTIONS:
+            sec = soup.find(id=sec_id)
+            tbl = sec.find("table") if sec else None
+            if tbl is None:
+                continue
+            blocks.append(f"\n== {label} ==\n{_fmt_screener_table(tbl)}")
+            got = True
+        return "\n".join(blocks) if got else None
+    return None
+
+def screener_financials_block(svc, root, isin, symbol) -> str:
+    """Always try a LIVE Screener fetch; cache it to Drive on success; fall back
+    to the cached copy if live fails (Screener down / no cookie / unreachable)."""
+    cache_path = f"{DRIVE['company_page']}/{isin}/screener_financials.txt"
+    live = _scrape_screener_financials(symbol)
+    if live:
+        try:
+            drive_upload(svc, cache_path, root, live.encode("utf-8"), "text/plain")
+        except Exception:
+            pass
+        return live
+    cached = drive_download(svc, cache_path, root)
+    if cached:
+        return ("[STALE CACHE — live Screener fetch failed this run]\n"
+                + cached.decode("utf-8", "ignore"))
+    return "DATA_MISSING (Screener live fetch failed and no cache available)."
+
 def research_block(ridx, isin, symbol, name):
     if ridx is None or ridx.empty:
         return "No external research context provided."
@@ -395,13 +471,15 @@ def fill_section(tpl, tag, content):
                   lambda m: f"[{tag}]\n{content}\n[/{tag}]",
                   tpl, flags=re.DOTALL)
 
-def build_prompt(name, symbol, isin, screener, page, research, bse, docs="DATA_MISSING"):
+def build_prompt(name, symbol, isin, screener, page, research, bse,
+                 docs="DATA_MISSING", screener_cross="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
               .replace("[NSE_SYMBOL]", symbol)
               .replace("[ISIN]", isin))
     tpl = fill_section(tpl, "SCREENER_FINANCIAL_DATA", screener)
+    tpl = fill_section(tpl, "SCREENER_CROSSCHECK", screener_cross)
     tpl = fill_section(tpl, "COMPANY_PAGE_BRIEF", page[:MAX_PAGE_CHARS] or "DATA_MISSING")
     tpl = fill_section(tpl, "RESEARCH_INDEX_CONTEXT", research)
     tpl = fill_section(tpl, "DOCUMENT_SUMMARIES", docs)
@@ -409,6 +487,38 @@ def build_prompt(name, symbol, isin, screener, page, research, bse, docs="DATA_M
     tpl = fill_section(tpl, "RAW_ANNUAL_REPORTS_FOR_GAPS",
                        "None supplied. Rely on Screener + Document Summaries + Company Page.")
     return tpl
+
+def _clean_report_md(md: str) -> str:
+    """Strip raw template artifacts the model echoes: ====/---- divider bars,
+    'END OF LAYER' separators, $$ LaTeX, and [BRACKET] labels used as headings.
+    Keeps inline citations like [Annual Report FY25] and tokens [COMFORT]/[WARNING]."""
+    out = []
+    for ln in md.splitlines():
+        s = ln.strip()
+        # title wrapped in divider bars:  ==== TITLE ====  /  ---- TITLE ----
+        m = re.match(r"^[=\-_]{3,}\s*(.+?)\s*[=\-_]{3,}$", s)
+        if m:
+            title = m.group(1).strip()
+            if not title or re.search(r"END OF (LAYER|PHASE)", title, re.I):
+                continue                       # drop pure dividers / END markers
+            out.append(f"## {title}")
+            continue
+        if re.match(r"^[=_]{3,}$", s):         # pure ==== / ____ line -> drop
+            continue
+        if re.match(r"^-{4,}$", s):            # ---- (4+) -> markdown hr
+            out.append("---"); continue
+        out.append(ln)
+    text = "\n".join(out)
+    # $$ ... $$ block math -> remove (the weighted matrix table already shows it)
+    text = re.sub(r"\$\$.*?\$\$", "", text, flags=re.DOTALL)
+    # inline $...$ -> drop the $ delimiters
+    text = re.sub(r"\$(?!\$)([^$\n]{1,120})\$", r"\1", text)
+    # full-line [ALL CAPS LABEL] -> ### Label  (inline citations are safe)
+    text = re.sub(r"(?m)^\s*\[([A-Z][A-Z &/]{3,})\]\s*$",
+                  lambda m: f"### {m.group(1).title()}", text)
+    # collapse 3+ blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
 
 # --------------------------------------------------------------------------
 def process_one(svc, root, pool, universe, fund, results, ridx, token,
@@ -438,13 +548,21 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     doc_block, used_docs = assemble_doc_summaries(svc, root, pool, isin)
     print(f"    documents: {len(used_docs)} summarised/reused")
 
+    # Screener structured financials — LIVE fetch (cache to Drive), used as an
+    # independent cross-check the model reconciles against the Annual Reports.
+    screener_cross = screener_financials_block(svc, root, isin, symbol)
+    print(f"    screener cross-check: "
+          f"{'live' if not screener_cross.startswith(('DATA_MISSING','[STALE')) else screener_cross[:40]}")
+
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
                           page,
                           research_block(ridx, isin, symbol, name),
                           bse_announcements(bse_code),
-                          docs=doc_block)
+                          docs=doc_block,
+                          screener_cross=screener_cross)
     report, model_used = pool.call_text(prompt)
+    report = _clean_report_md(report)
 
     stamp = dt.datetime.now().strftime("%d%b%y")
     out_path = f"{DRIVE['company_page']}/{isin}/company_deepdive_{stamp}.md"
