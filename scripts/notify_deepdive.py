@@ -114,6 +114,15 @@ def _build_email(name: str, symbol: str, isin: str,
     except Exception as e:
         print(f"  pdf generation skipped: {e}")
 
+    # .pptx attachment
+    try:
+        from format_deepdive_pptx import md_to_pptx
+        pptx_bytes = md_to_pptx(report_md, name, symbol, isin)
+        _attach_bytes(msg, pptx_bytes, f"{slug}.pptx",
+                      "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    except Exception as e:
+        print(f"  pptx generation skipped: {e}")
+
     return msg
 
 

@@ -94,19 +94,34 @@ def _bullet_box(slide, lines: list[str], left, top, width, height,
 # --------------------------------------------------------------------------
 # Section extraction
 # --------------------------------------------------------------------------
+# Patterns match the ACTUAL numbered Layer-1 headings emitted by
+# comapnydeepdive_prompt.txt (e.g. "### 1. SOURCE COVERAGE & DATA INTEGRITY").
 SECTION_MAP = {
-    "source_coverage":  [r"A\.\s*Source Coverage"],
-    "business_profile": [r"B\.\s*Business Profile"],
-    "capital_eff":      [r"C\.\s*Capital Efficiency"],
-    "forensic":         [r"D\.\s*Forensic Findings"],
-    "fraud_gov":        [r"E\.\s*Fraud.*?Governance"],
-    "risk":             [r"F\.\s*Risk Scorecard"],
-    "thesis":           [r"G\.\s*Investment Thesis"],
-    "earnings_quality": [r"H\.\s*Earnings Quality"],
-    "data_reliability": [r"I\.\s*Data Reliability"],
-    "analytical_notes": [r"LAYER\s+2.*?ANALYTICAL NOTES", r"ANALYTICAL NOTES"],
-    "pm_onepager":      [r"PM ONE[-\s]PAGER"],
+    "source_coverage":  [r"SOURCE COVERAGE", r"\b1\.\s*SOURCE"],
+    "business_profile": [r"BUSINESS PROFILE"],
+    "capital_eff":      [r"CAPITAL EFFICIENCY"],
+    "forensic":         [r"FORENSIC FINANCIAL", r"SHENANIGANS"],
+    "fraud_gov":        [r"FRAUD\s*&?\s*GOVERNANCE"],
+    "risk":             [r"FORENSIC RISK SCORECARD", r"RISK SCORECARD"],
+    "thesis":           [r"INVESTMENT THESIS"],
+    "earnings_quality": [r"EARNINGS QUALITY"],
+    "data_reliability": [r"DATA RELIABILITY"],
+    "analytical_notes": [r"ANALYTICAL NOTES", r"LAYER\s*2"],
+    "pm_onepager":      [r"PM ONE[-\s]?PAGER", r"PHASE\s*4"],
 }
+
+
+def _is_heading(line: str) -> bool:
+    """True only for actual section headings — NOT body prose that happens to
+    contain a section keyword (e.g. a bullet mentioning 'earnings quality').
+    Tolerates headings wrapped in divider chars (### / ==== / ----)."""
+    s = line.strip()
+    if s.startswith("#"):                          return True   # markdown heading
+    clean = re.sub(r"[=\-#*|]+", " ", s).strip()   # strip divider runs first
+    if re.match(r"^\d+\.\s+[A-Z]", clean):         return True   # "4. FORENSIC ..."
+    if re.match(r"^(LAYER|PHASE)\b", clean, re.I):  return True   # "LAYER 2 ...", "PHASE 4"
+    if re.match(r"^[A-Z][A-Z &/().-]{8,}$", clean): return True   # standalone ALL-CAPS line
+    return False
 
 
 def _extract_sections(md_text: str) -> dict[str, str]:
@@ -114,13 +129,14 @@ def _extract_sections(md_text: str) -> dict[str, str]:
     sections: dict[str, list[str]] = {k: [] for k in SECTION_MAP}
     current = None
     for line in lines:
-        clean = re.sub(r"[=\-#*|]+", " ", line).strip()
         matched = False
-        for key, patterns in SECTION_MAP.items():
-            for pat in patterns:
-                if re.search(pat, clean, re.IGNORECASE):
-                    current = key; matched = True; break
-            if matched: break
+        if _is_heading(line):                   # only headings can switch section
+            clean = re.sub(r"[=\-#*|]+", " ", line).strip()
+            for key, patterns in SECTION_MAP.items():
+                for pat in patterns:
+                    if re.search(pat, clean, re.IGNORECASE):
+                        current = key; matched = True; break
+                if matched: break
         if not matched and current:
             sections[current].append(line)
     return {k: "\n".join(v).strip() for k, v in sections.items()}

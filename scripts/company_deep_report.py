@@ -77,9 +77,14 @@ DOC_PROMPTS = {
     "presentation":  "presentation_prompt.txt",
 }
 MAX_INLINE_PDF      = 18 * 1024 * 1024   # Gemini inline-data ceiling (~20MB)
-MAX_DOC_TEXT_CHARS  = 80_000             # cap text extracted from big PDFs / html
+MAX_DOC_TEXT_CHARS  = 80_000             # cap text extracted from html / per chunk
 MAX_DOC_SUMMARY_CHARS = 6_000            # cap each per-doc summary fed to deep dive
 DO_BACKFILL         = True               # pull full Screener doc history before a dive
+# Chunking — long annual reports (financial-statement notes / RPT schedules sit at
+# the BACK) are read shallowly in a single pass. Split into page-range chunks so
+# every page is actually attended to, then merge the partials into one summary.
+CHUNK_TRIGGER_PAGES = 45                 # only chunk docs longer than this
+CHUNK_PAGES         = 35                 # pages per sub-PDF chunk
 
 # --------------------------------------------------------------------------
 def _read_parquet(svc, path, root):
@@ -255,6 +260,60 @@ def _sidecar_path(isin: str, row) -> str:
     return (f"{DRIVE['company_page']}/{isin}/doc_summaries/"
             f"{row['doc_type']}__{d}__{row['doc_id']}.md")
 
+def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label) -> str | None:
+    """Summarise a PDF completely. Short docs -> single call_pdf. Long docs ->
+    split into CHUNK_PAGES page-range sub-PDFs, summarise each (so every page is
+    read), then merge the partials into one coherent summary. Guarantees the back
+    of the annual report (notes, RPT schedules, auditor remarks) is covered."""
+    import fitz
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n = src.page_count
+    # short enough -> one pass (best table fidelity)
+    if n <= CHUNK_TRIGGER_PAGES and len(pdf_bytes) <= MAX_INLINE_PDF:
+        src.close()
+        try:
+            return pool.call_pdf(pdf_bytes, prompt)[0]
+        except FatalCallError as e:
+            print(f"      {label}: FATAL ({str(e)[:70]}) — skip"); return None
+
+    partials = []
+    for start in range(0, n, CHUNK_PAGES):
+        end = min(start + CHUNK_PAGES, n)
+        cprompt = (prompt + f"\n\n>>> This is PAGES {start+1}-{end} of {n} of the "
+                   f"{label}. Summarise THIS portion faithfully and completely; "
+                   f"other passes cover the remaining pages. Keep ALL figures, "
+                   f"tables, related-party items, and auditor notes verbatim.")
+        try:
+            sub = fitz.open(); sub.insert_pdf(src, from_page=start, to_page=end - 1)
+            sub_bytes = sub.tobytes(); sub.close()
+            if len(sub_bytes) <= MAX_INLINE_PDF:
+                txt, _ = pool.call_pdf(sub_bytes, cprompt)
+            else:
+                page_text = "\n".join(src[p].get_text()
+                                      for p in range(start, end))[:MAX_DOC_TEXT_CHARS]
+                txt, _ = pool.call_text(cprompt + "\n\n=== TEXT ===\n" + page_text)
+            partials.append(f"--- pages {start+1}-{end} ---\n{txt.strip()}")
+            print(f"      {label}: chunk pages {start+1}-{end}/{n} ok")
+        except FatalCallError as e:
+            print(f"      {label}: chunk {start+1}-{end} FATAL ({str(e)[:50]}) — skip chunk")
+    src.close()
+    if not partials:
+        return None
+    if len(partials) == 1:
+        return partials[0].split("\n", 1)[-1]
+
+    merge_prompt = (prompt + "\n\nThe sections below are page-by-page summaries "
+        f"covering the ENTIRE {label} (no page skipped). Synthesise them into ONE "
+        "coherent document summary in the format above. Preserve every material "
+        "financial figure, multi-year trend, related-party transaction, accounting "
+        "policy change, and auditor/rating remark. Do not omit the back-of-report "
+        "notes.\n\n=== PAGE-RANGE SUMMARIES ===\n" + "\n\n".join(partials))
+    try:
+        return pool.call_text(merge_prompt)[0]
+    except FatalCallError:
+        # merge failed — return the concatenated partials rather than nothing
+        return "\n\n".join(partials)[:MAX_DOC_TEXT_CHARS]
+
 def summarise_doc(svc, root, pool, isin, row) -> str | None:
     """Return a per-doc summary. Reuse cached sidecar if present, else fetch the
     raw file (PDF or extracted-HTML text) and run its doc-type prompt. Caches the
@@ -275,26 +334,23 @@ def summarise_doc(svc, root, pool, isin, row) -> str | None:
     doc_type = str(row["doc_type"])
     prompt = _load_doc_prompt(doc_type)
     label = f"{doc_type} {str(row['announcement_date'])[:10]}"
-    try:
-        is_pdf = data[:5].startswith(b"%PDF")
-        if is_pdf and len(data) <= MAX_INLINE_PDF:
-            summ, _ = pool.call_pdf(data, prompt)
-        else:
-            if is_pdf:
-                import fitz
-                doc = fitz.open(stream=data, filetype="pdf")
-                text = "\n".join(p.get_text() for p in doc)[:MAX_DOC_TEXT_CHARS]
-                doc.close()
-            else:
-                text = data.decode("utf-8", "ignore")[:MAX_DOC_TEXT_CHARS]
-            if len(text.strip()) < 100:
-                print(f"      {label}: no extractable text — skip (needs OCR?)")
-                return None
+    is_pdf = data[:5].startswith(b"%PDF")
+    if is_pdf:
+        # complete-read with page-range chunking for long reports
+        summ = _summarise_pdf_chunked(pool, prompt, data, label)
+        if not summ:
+            return None
+    else:
+        text = data.decode("utf-8", "ignore")[:MAX_DOC_TEXT_CHARS]
+        if len(text.strip()) < 100:
+            print(f"      {label}: no extractable text — skip (needs OCR?)")
+            return None
+        try:
             summ, _ = pool.call_text(
                 prompt + f"\n\n=== DOCUMENT CONTENT ({label}) ===\n{text}")
-    except FatalCallError as e:
-        print(f"      {label}: FATAL ({str(e)[:80]}) — skip")
-        return None
+        except FatalCallError as e:
+            print(f"      {label}: FATAL ({str(e)[:80]}) — skip")
+            return None
 
     try:
         drive_upload(svc, sidecar, root, summ.encode("utf-8"), "text/markdown")

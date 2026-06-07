@@ -202,12 +202,31 @@ def _make_cover(name: str, symbol: str, isin: str, coverage: str = "") -> str:
 """
 
 
+def _normalise_tables(md_text: str) -> str:
+    """python-markdown's `tables` extension only fires when a pipe-table is a
+    standalone block (blank line before AND after). Models often glue a table to
+    the heading above it. Insert the required blank lines so every table renders."""
+    out, lines = [], md_text.splitlines()
+    for i, line in enumerate(lines):
+        is_tbl = line.lstrip().startswith("|")
+        prev_tbl = out and out[-1].lstrip().startswith("|")
+        if is_tbl and out and out[-1].strip() and not prev_tbl:
+            out.append("")                       # blank line before table starts
+        if (not is_tbl) and prev_tbl and line.strip():
+            out.append("")                       # blank line after table ends
+        out.append(line)
+    return "\n".join(out)
+
+
 def _md_to_html_body(md_text: str) -> str:
+    md_text = _normalise_tables(md_text)
     try:
         import markdown as md_lib
+        # NOTE: no `nl2br` — it converts table newlines to <br> and breaks the
+        # tables extension. Paragraph spacing is handled by CSS instead.
         return md_lib.markdown(
             md_text,
-            extensions=["tables", "fenced_code", "nl2br", "sane_lists"],
+            extensions=["tables", "fenced_code", "sane_lists"],
         )
     except ImportError:
         # minimal fallback — convert markdown tables manually
