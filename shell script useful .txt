@@ -1,4 +1,0 @@
-cd /d D:\EMA_Screener\claude\signals-india
-   conda activate signals-india
-   pip install -r requirements.txt
-   python scripts\smoke_test.py

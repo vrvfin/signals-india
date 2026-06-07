@@ -1,3 +1,6 @@
+# Claude local plans / session notes (never commit)
+.claude/
+
 # Python
 __pycache__/
 *.pyc
@@ -11,9 +14,38 @@ signals/
 logs/
 charts/
 portfolio/
+research/
 *.parquet
 *.csv
 # Secrets (never commit)
 *.json
 !package.json
 *.key
+
+# Local-only utilities & docs (kept local until project close)
+*.bat
+*.vbs
+*.xls
+*.xlsx
+PROJECT_STATUS.md
+CLAUDE.md
+shell script useful .txt
+API_QUOTA_SYSTEM_GUIDE.md
+QUOTA_QUICK_REFERENCE.md
+DOCUMENTATION_SUMMARY.md
+scripts/CLAUDE_CODE_BRIEF.md
+scripts/OT7_OT8.txt
+scripts/_local_tools/
+DailyResearch_Task.xml
+
+# Scratch
+files.zip
+job-logs.txt
+
+# PF Tracking — kept local for reference only (not wired into app; uses Gemini, no Claude key)
+scripts/screener_scraper.py
+scripts/social_signals.py
+scripts/fetch_pf_tracking.py
+scripts/build_screener_map.py
+scripts/backfill_pf_concalls.py
+scripts/page_pf_tracking_snippet.py
