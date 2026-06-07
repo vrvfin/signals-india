@@ -2922,7 +2922,6 @@ def main():
         "Doc Library",
         "Deep Dive",
         "My Portfolio",
-        "PF Tracking",
         "Graphs",
         "Stock Detail",
         "Strategy Docs",
@@ -2954,8 +2953,6 @@ def main():
         _safe_render(page_stock_detail)
     elif page == "Strategy Docs":
         _safe_render(page_strategy_docs)
-    elif page == "PF Tracking":
-        _safe_render(page_pf_tracking)
 
 
 
