@@ -16,6 +16,8 @@ plotly==5.24.0
 xlrd==2.0.1
 beautifulsoup4==4.12.3
 lxml==5.3.0
+# IMPORTANT: keep pandas < 3.0. pandas 3.0 wheels are built against the numpy 2.x
+# ABI; with numpy<2.0.0 below that mismatch SEGFAULTs Streamlit Cloud on import.
 numpy<2.0.0
-pandas>=2.2.3
-pyarrow>=18.0.0
+pandas>=2.2.3,<3.0
+pyarrow>=18.0.0,<19.0.0
