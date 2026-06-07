@@ -756,3 +756,19 @@ Screener cross-check that calls out differences.
 
 **Still pending:** trigger a CI deepdive run to confirm the email path end-to-end with
 the new Screener cross-check + clean format.
+
+### Session 2026-06-07 (cont.) — BSE fix + NSE + reputable news feed
+
+- **BSE announcements FIXED** (commit a3c8cab): old `AnnGetData` endpoint returns
+  "No Record Found"; switched to `AnnSubCategoryGetData` (subcategory=-1), use NEWSSUB
+  subject + category tag. Venus now returns real announcements (was DATA_MISSING).
+- **NSE added** (commit 9ced1ed): best-effort `corporate-announcements` API with cookie
+  bootstrap; merged with BSE into the exchange-announcements source; silent on failure
+  (NSE 403s datacenter IPs, so may be skipped in CI — BSE covers the same filings).
+- **News feed added**: Google News RSS filtered to a reputable-source whitelist
+  (ET/BusinessLine/Mint/Moneycontrol/Reuters/etc.) → dated headlines. Article bodies are
+  JS-redirected (not reliably fetchable) so we use curated headlines, not PDF conversion.
+  New `[NEWS_CONTEXT]` prompt section + mandatory "Recent Developments" digest in Section 2.
+- TESTED on Venus: Saudi FDA / Argentina / Indonesia approvals, ₹11.78 Cr PLI incentive,
+  Sunev promoter-group merger surfaced and tied to the existing RPT flag.
+- Open: news full-text (would need headless browser / paid API); OCR for scanned PDFs.
