@@ -14,6 +14,23 @@ Or import:
 from __future__ import annotations
 import os, io, re, sys, argparse, datetime as dt
 
+
+def _ensure_native_libs() -> None:
+    """On Windows, weasyprint needs the GTK/Pango DLLs (gobject, pango, cairo).
+    When this env is invoked via a full python.exe path (our .bat pattern) rather
+    than `conda activate`, the env's Library\\bin is NOT on the DLL search path.
+    Add it so weasyprint imports. No-op off Windows / outside conda."""
+    if os.name != "nt":
+        return
+    libbin = os.path.join(sys.prefix, "Library", "bin")
+    if os.path.isdir(libbin):
+        try:
+            os.add_dll_directory(libbin)
+        except Exception:
+            pass
+        os.environ["PATH"] = libbin + os.pathsep + os.environ.get("PATH", "")
+
+
 # --------------------------------------------------------------------------
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -305,10 +322,11 @@ def _build_full_html(name: str, symbol: str, isin: str,
 
 def md_to_pdf(md_text: str, name: str = "", symbol: str = "",
               isin: str = "", coverage: str = "") -> bytes:
+    _ensure_native_libs()
     try:
         from weasyprint import HTML as WP_HTML
-    except ImportError:
-        sys.exit("weasyprint not installed. Run: pip install weasyprint")
+    except (ImportError, OSError) as e:
+        raise RuntimeError(f"weasyprint unavailable: {e}")
 
     html = _build_full_html(
         name or "Company", symbol or "", isin or "", md_text, coverage)
