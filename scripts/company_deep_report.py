@@ -393,6 +393,108 @@ def news_block(name, symbol, limit=25, days=365):
     except Exception as e:
         return f"DATA_MISSING (news fetch failed: {type(e).__name__})"
 
+# Trusted equity-research / business-media YouTube channels (edit to taste).
+# Match is a case-insensitive substring of the channelTitle; the company's own
+# official channel is always allowed in addition to these.
+YOUTUBE_CHANNEL_WHITELIST = (
+    # business media
+    "cnbc-tv18", "cnbctv18", "et now", "etnow", "moneycontrol", "ndtv profit",
+    "zee business", "bloomberg", "livemint", "mint", "business standard",
+    "bqprime", "bq prime", "the economic times",
+    # reputable research / analysis
+    "soic", "finology", "rachana ranade", "equitymaster", "zerodha",
+    "sahil bhadviya", "convexity", "valueinvesting", "sysematix", "smart sync",
+)
+
+def _fetch_yt_transcript(vid) -> str:
+    """Fetch a transcript across youtube-transcript-api versions (>=1.0 uses an
+    instance .fetch(); <1.0 used the classmethod .get_transcript())."""
+    from youtube_transcript_api import YouTubeTranscriptApi
+    langs = ["en", "en-IN", "hi"]
+    try:                                  # new API (>= 1.0)
+        fetched = YouTubeTranscriptApi().fetch(vid, languages=langs)
+        try:
+            return " ".join(s.text for s in fetched)
+        except Exception:
+            return " ".join(s["text"] for s in fetched.to_raw_data())
+    except AttributeError:                # old API (< 1.0)
+        segs = YouTubeTranscriptApi.get_transcript(vid, languages=langs)
+        return " ".join(s["text"] for s in segs)
+
+def _youtube_summary(svc, root, isin, pool, vid, channel, title, pub) -> str | None:
+    """Transcript -> research summary, cached as a sidecar per video id."""
+    sidecar = f"{DRIVE['company_page']}/{isin}/yt_summaries/{vid}.md"
+    cached = drive_download(svc, sidecar, root)
+    if cached:
+        return cached.decode("utf-8", "ignore")
+    try:
+        text = _fetch_yt_transcript(vid)[:MAX_DOC_TEXT_CHARS]
+    except Exception:
+        return None                       # no transcript / blocked
+    if len(text.strip()) < 200:
+        return None
+    prompt = (
+        "Summarise this YouTube video transcript about a listed INDIAN company as "
+        "concise EQUITY-RESEARCH notes: management guidance, key claims, numbers cited, "
+        "risks, and sentiment. Be strictly factual; explicitly flag any promotional, "
+        "speculative, or unverified 'tip/target' claims as [UNVERIFIED]. Treat this as a "
+        "LOW-confidence external view, not audited fact.\n"
+        f"Channel: {channel} | Title: {title} | Published: {pub}\n\nTRANSCRIPT:\n{text}")
+    try:
+        summ, _ = pool.call_text(prompt)
+    except FatalCallError:
+        return None
+    try:
+        drive_upload(svc, sidecar, root, summ.encode("utf-8"), "text/markdown")
+    except Exception:
+        pass
+    return summ
+
+def youtube_block(svc, root, isin, symbol, name, pool, max_videos=8, months=24):
+    """Search YouTube for the company, keep videos from whitelisted/official
+    channels, summarise their transcripts (cached). External LOW-confidence source."""
+    key = os.environ.get("YOUTUBE_API_KEY", "")
+    if not key:
+        return "DATA_MISSING (no YouTube API key)."
+    try:
+        import urllib.parse
+        after = (dt.datetime.utcnow() - dt.timedelta(days=months * 30)
+                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q = urllib.parse.quote(f"{name} {symbol}")
+        u = ("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video"
+             f"&order=relevance&maxResults=25&publishedAfter={after}&q={q}"
+             f"&relevanceLanguage=en&key={key}")
+        r = requests.get(u, timeout=20)
+        if r.status_code != 200:
+            return f"DATA_MISSING (YouTube API {r.status_code})."
+        name_tok = re.sub(r"[^a-z]", "", name.split()[0].lower())
+        picked = []
+        for it in r.json().get("items", []):
+            sn = it.get("snippet", {})
+            vid = it.get("id", {}).get("videoId", "")
+            ch = sn.get("channelTitle", "")
+            chl = ch.lower()
+            official = (name_tok and name_tok in re.sub(r"[^a-z]", "", chl)) \
+                or symbol.lower() in chl
+            if not vid or not (official or any(w in chl for w in YOUTUBE_CHANNEL_WHITELIST)):
+                continue
+            picked.append((vid, ch, sn.get("title", ""), sn.get("publishedAt", "")[:10]))
+            if len(picked) >= max_videos:
+                break
+        if not picked:
+            return "No videos from whitelisted/official channels."
+        out = []
+        for vid, ch, title, pub in picked:
+            summ = _youtube_summary(svc, root, isin, pool, vid, ch, title, pub)
+            if summ:
+                out.append(f"### [YouTube | {ch} | {pub}] {title}\n"
+                           f"{summ.strip()[:MAX_DOC_SUMMARY_CHARS]}")
+        if not out:
+            return "Whitelisted videos found but no usable transcripts."
+        return "\n\n".join(out)
+    except Exception as e:
+        return f"DATA_MISSING (YouTube fetch failed: {type(e).__name__})."
+
 # ---- PHASE 2: document-grounded summarisation -----------------------------
 def _download_file_id(svc, file_id: str) -> bytes | None:
     from googleapiclient.http import MediaIoBaseDownload
@@ -556,7 +658,8 @@ def fill_section(tpl, tag, content):
                   tpl, flags=re.DOTALL)
 
 def build_prompt(name, symbol, isin, screener, page, research, bse,
-                 docs="DATA_MISSING", screener_cross="DATA_MISSING", news="DATA_MISSING"):
+                 docs="DATA_MISSING", screener_cross="DATA_MISSING", news="DATA_MISSING",
+                 youtube="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
@@ -569,6 +672,7 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
     tpl = fill_section(tpl, "DOCUMENT_SUMMARIES", docs)
     tpl = fill_section(tpl, "BSE_ANNOUNCEMENTS", bse)
     tpl = fill_section(tpl, "NEWS_CONTEXT", news)
+    tpl = fill_section(tpl, "YOUTUBE_RESEARCH", youtube)
     tpl = fill_section(tpl, "RAW_ANNUAL_REPORTS_FOR_GAPS",
                        "None supplied. Rely on Screener + Document Summaries + Company Page.")
     return tpl
@@ -645,8 +749,12 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     exchange = bse if not nse else f"BSE:\n{bse}\n\nNSE:\n{nse}"
     # Recent news from reputable sources (headlines only).
     news = news_block(name, symbol)
+    # YouTube research — whitelisted/official channels, transcript summaries (cached).
+    youtube = youtube_block(svc, root, isin, symbol, name, pool)
+    yt_ok = not youtube.startswith(("DATA_MISSING", "No videos", "Whitelisted"))
     print(f"    exchange: BSE={'ok' if not bse.startswith('DATA_MISSING') else 'miss'} "
-          f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'}")
+          f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'} "
+          f"· youtube={'ok' if yt_ok else 'none'}")
 
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
@@ -655,7 +763,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           exchange,
                           docs=doc_block,
                           screener_cross=screener_cross,
-                          news=news)
+                          news=news,
+                          youtube=youtube)
     report, model_used = pool.call_text(prompt)
     report = _clean_report_md(report)
 

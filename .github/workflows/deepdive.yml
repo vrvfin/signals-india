@@ -43,6 +43,8 @@ jobs:
           GMAIL_USER:              ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+          YOUTUBE_API_KEY:         ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -54,6 +56,8 @@ jobs:
             echo "GMAIL_USER=$GMAIL_USER"
             echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
             echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+            echo "YOUTUBE_API_KEY=$YOUTUBE_API_KEY"
           } > .env
 
       - name: Install system deps for PDF rendering
@@ -68,7 +72,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
           pip install google-generativeai requests weasyprint markdown \
-            python-pptx python-docx PyMuPDF
+            python-pptx python-docx PyMuPDF youtube-transcript-api
 
       - name: Run deep-dive queue
         id: run_deepdive
