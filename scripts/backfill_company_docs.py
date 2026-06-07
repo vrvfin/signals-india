@@ -68,6 +68,13 @@ def fetch_document(session, url: str) -> tuple[bytes, str, str] | None:
     head = r.content[:5]
     if head.startswith(b"%PDF"):
         return r.content, "application/pdf", ".pdf"
+    # NSE annual reports are .zip archives wrapping the AR PDF — extract it.
+    if head[:2] == b"PK":
+        pdf = _pdf_from_zip(r.content)
+        if pdf:
+            return pdf, "application/pdf", ".pdf"
+        log("    zip had no usable PDF — skipping")
+        return None
     ctype = r.headers.get("content-type", "").lower()
     if "html" in ctype or r.content[:14].lower().startswith(b"<html") \
             or b"<html" in r.content[:200].lower():
@@ -81,6 +88,25 @@ def fetch_document(session, url: str) -> tuple[bytes, str, str] | None:
         return text.encode("utf-8"), "text/plain", ".txt"
     log(f"    unrecognised content ({r.content[:20]!r})")
     return None
+
+
+def _pdf_from_zip(data: bytes) -> bytes | None:
+    """Extract the annual-report PDF from an NSE archive zip. Prefer a file whose
+    name looks like the AR (AR_/Annual), else the largest PDF in the archive."""
+    import io as _io, zipfile
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(data))
+    except Exception:
+        return None
+    pdfs = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+    if not pdfs:
+        return None
+    pref = [n for n in pdfs if re.search(r"(?i)\bAR[_\s]|annual", n)]
+    pick = (pref or sorted(pdfs, key=lambda n: zf.getinfo(n).file_size, reverse=True))[0]
+    try:
+        return zf.read(pick)
+    except Exception:
+        return None
 
 # class on the subsection div  ->  queue doc_type
 SUBSECTION_TYPES = {
@@ -147,18 +173,22 @@ def parse_company_documents(html: str, run_date: dt.date,
             # skip the section's "All" listing link (not a document)
             if not href or text.lower() == "all" or "corp-announc" in href:
                 continue
-            # skip obvious non-PDF archives (NSE annual-report zips); download_pdf
-            # also rejects non-PDF bytes, this just avoids a wasted request.
-            if href.lower().endswith(".zip"):
-                continue
+            is_zip = href.lower().endswith(".zip")   # NSE annual-report archive
             out.append({
                 "doc_id":   _doc_id(href),
                 "doc_type": doc_type,
                 "title":    text,
                 "announcement_date": _date_from_text(text, doc_type, run_date),
                 "pdf_url":  href,
+                "is_zip":   is_zip,
             })
-    return out
+    # Annual reports: a year may appear as both a BSE PDF and an NSE .zip. Prefer
+    # the direct PDF; keep the zip ONLY for years with no PDF (NSE-only companies).
+    ar = [d for d in out if d["doc_type"] == "annual_report"]
+    pdf_years = {d["announcement_date"] for d in ar if not d["is_zip"]}
+    deduped = [d for d in out if not (d["doc_type"] == "annual_report"
+                                      and d["is_zip"] and d["announcement_date"] in pdf_years)]
+    return deduped
 
 
 def fetch_company_page(session, symbol: str) -> str:
