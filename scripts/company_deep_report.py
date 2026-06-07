@@ -286,26 +286,34 @@ def research_block(ridx, isin, symbol, name):
                      f"{r.get('doc_date','NA')}] {str(r.get('file_name',''))}")
     return "\n".join(lines)
 
-def bse_announcements(bse_code):
+def bse_announcements(bse_code, limit=40):
+    """Recent BSE corporate announcements via BSE Direct API.
+    Uses AnnSubCategoryGetData (AnnGetData was retired -> 'No Record Found').
+    The meaningful text is NEWSSUB (subject), not HEADLINE ('PDF enclosed')."""
     if not bse_code:
         return "DATA_MISSING (no BSE scrip code resolved)."
     try:
-        today = dt.date.today()
-        prev = today - dt.timedelta(days=365 * 5)
-        url = "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
-        params = {"strCat": "-1", "strPrevDate": prev.strftime("%Y%m%d"),
-                  "strScrip": str(bse_code), "strSearch": "P",
-                  "strToDate": today.strftime("%Y%m%d"), "strType": "C"}
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
-                   "Referer": "https://www.bseindia.com/",
+        url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+        params = {"pageno": 1, "strCat": "-1", "subcategory": "-1",
+                  "strPrevDate": "", "strToDate": "", "strSearch": "P",
+                  "strScrip": str(bse_code), "strType": "C"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                   "Accept": "application/json, text/plain, */*",
+                   "Referer": "https://www.bseindia.com/corporates/ann.html",
                    "Origin": "https://www.bseindia.com"}
         rsp = requests.get(url, params=params, headers=headers, timeout=30)
         rsp.raise_for_status()
-        rows = rsp.json().get("Table", [])[:40]
+        data = rsp.json()
+        rows = data.get("Table", []) if isinstance(data, dict) else []
         if not rows:
             return "No announcements returned."
-        return "\n".join(f"- {r.get('NEWS_DT','')[:10]} | {r.get('HEADLINE','')[:140]}"
-                         for r in rows)
+        out = []
+        for r in rows[:limit]:
+            subj = (r.get("NEWSSUB") or r.get("HEADLINE") or "").strip()
+            cat = (r.get("CATEGORYNAME") or "").strip()
+            tag = f" [{cat}]" if cat and cat.lower() not in subj.lower() else ""
+            out.append(f"- {str(r.get('NEWS_DT',''))[:10]} | {subj[:160]}{tag}")
+        return "\n".join(out)
     except Exception as e:
         return f"DATA_MISSING (BSE fetch failed: {type(e).__name__})"
 
