@@ -118,3 +118,38 @@ Mandatory sub-sections:
 - Key Management KPIs
 
 Each point must be transcript-grounded, concise, and measurable wherever possible.
+
+---
+Section GF_TRACK — Mgmt Said vs Delivered (CONDITIONAL OUTPUT)
+
+IMPORTANT: Only produce this section if a [HISTORICAL_CONTEXT] block appears after the transcript text.
+If no [HISTORICAL_CONTEXT] block is present, DO NOT produce this section at all — leave it out entirely.
+
+Using ONLY the historical GF1 guidance statements and actual delivered results in the [HISTORICAL_CONTEXT] block
+(do not use the current concall transcript for historical comparisons), produce the following:
+
+| Qtr Guided | Metric | Guidance Given | Target Period | Actual Delivered | Delta | Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+
+Verdict values (strict — no others allowed):
+- DELIVERED: actual within ±2 percentage points of guidance
+- EXCEEDED: actual exceeded guidance by more than 2 percentage points
+- MISSED: actual fell short of guidance by more than 2 percentage points
+- PARTIAL: directionally correct but magnitude meaningfully off
+- TOO_EARLY: the target period has not yet been reported in the actuals data
+- NA: metric or actuals not available for comparison
+
+Rules:
+* Map guidance timeframe to a specific future quarter: IMMEDIATE → next quarter, NEAR_TERM → 1-2 quarters ahead, MEDIUM_TERM → 3-4 quarters ahead.
+* If multiple quarters of actuals exist for the same metric, use the one closest to the guided target period.
+* Do not invent actuals. If the actuals block does not contain data for the relevant period, use TOO_EARLY or NA.
+* Include only rows where both a guidance statement and a plausible matching actual exist (or TOO_EARLY is warranted).
+
+After the table, add a compact summary:
+
+## Mgmt Credibility Summary
+- Overall score: X.X/5 (EXCEEDED=5, DELIVERED=4, PARTIAL=3, MISSED=1; exclude TOO_EARLY and NA from avg)
+- Pattern: one of [Calibrated | Optimistic Bias | Conservative Bias | Erratic | Insufficient Data]
+- Strongest area: <metric or NA>
+- Recurring miss: <metric or NA>
+- Note: only scored metrics are included in the average; TOO_EARLY rows excluded

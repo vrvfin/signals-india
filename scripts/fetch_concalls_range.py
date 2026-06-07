@@ -107,7 +107,7 @@ _MONTH_MAP = {
 
 def parse_date(s: str) -> datetime | None:
     """Parse flexible date strings into datetime. Returns None on failure."""
-    s = s.strip().lower().replace("-", "").replace("/", "").replace(" ", "")
+    s = s.strip().lower().replace("-", "").replace("/", "").replace(" ", "").replace("_", "")
     # Try YYYYMMDD
     if len(s) == 8 and s.isdigit():
         try:
@@ -140,10 +140,15 @@ def filename_to_date(name: str) -> datetime | None:
 # ---------- Open in Obsidian ----------
 
 def open_in_obsidian(path: Path) -> None:
+    log(f"Opening in Obsidian: {path.name}")
     uri = "obsidian://open?path=" + urllib.parse.quote(
         str(path).replace("\\", "/"), safe=":/"
     )
-    subprocess.run(["cmd", "/c", "start", "", uri], shell=False)
+    try:
+        subprocess.run(["cmd", "/c", "start", "", uri], shell=False)
+    except Exception as e:
+        log(f"Could not open ({e})")
+        log(f"Open manually: {path}")
 
 
 # ---------- Main ----------
@@ -245,7 +250,11 @@ def main() -> None:
         for i, path in enumerate(downloaded):
             open_in_obsidian(path)
             if i < len(downloaded) - 1:
-                time.sleep(0.8)   # small gap so Obsidian can handle each URI
+                time.sleep(2.0)   # gap so Obsidian can handle each URI
+
+    print(f"\nDownloaded files (copy paths for manual open if needed):")
+    for p in downloaded:
+        print(f"  {p}")
 
 
 if __name__ == "__main__":
