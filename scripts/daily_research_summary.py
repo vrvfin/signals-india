@@ -41,8 +41,21 @@ try:
 except Exception:
     pass
 
-# Phase-2 bucket engine: (key, model) daily-quota buckets with error-typed fallback
-from gemini_pool import BucketPool, AllBucketsExhausted, FatalCallError
+# Phase-2 bucket engine: (key, model) daily-quota buckets with error-typed fallback.
+# Guarded: gemini_pool needs google-genai. This module is imported by
+# company_deep_report for its Drive helpers (drive_service/_folder_id), which the
+# Streamlit queue path uses — and Streamlit Cloud has no google-genai. Don't let the
+# pool import break those consumers; only build_daily_pool() actually needs it.
+try:
+    from gemini_pool import BucketPool, AllBucketsExhausted, FatalCallError
+except Exception:  # google-genai not installed here
+    BucketPool = None
+
+    class AllBucketsExhausted(Exception):
+        pass
+
+    class FatalCallError(Exception):
+        pass
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -122,6 +135,8 @@ def daily_keys() -> list[str]:
 
 def build_daily_pool() -> BucketPool:
     """BucketPool over the dedicated daily keys × DAILY_MODELS (best model first)."""
+    if BucketPool is None:
+        raise RuntimeError("google-genai not installed — cannot build the Gemini pool here.")
     return BucketPool(daily_keys(), DAILY_MODELS, inter_call_s=INTER_CALL_SLEEP)
 
 # ----------------------------------------------------------------------------

@@ -37,7 +37,22 @@ import pandas as pd
 import requests
 
 from daily_research_summary import (drive_service, drive_download, drive_upload, _folder_id)
-from gemini_pool import BucketPool, AllBucketsExhausted, FatalCallError, load_keys
+
+# gemini_pool pulls in google-genai. The queue/resolve paths (used by Streamlit to
+# enqueue a company) do NOT need it — only the actual dive does, which runs in CI.
+# Guard the import so importing this module works in environments without
+# google-genai (e.g. Streamlit Cloud): "cannot import name 'genai' from 'google'".
+try:
+    from gemini_pool import BucketPool, AllBucketsExhausted, FatalCallError, load_keys
+except Exception:  # google-genai not installed here
+    BucketPool = None
+    load_keys = None
+
+    class AllBucketsExhausted(Exception):
+        pass
+
+    class FatalCallError(Exception):
+        pass
 
 SCRIPTS_DIR = _SCRIPTS_DIR
 INTER_CALL_SLEEP = 6.0
@@ -927,6 +942,10 @@ def main():
         drive_upload(svc, DRIVE["queue"], root, buf.getvalue(), "application/octet-stream")
         print(f"Enqueued {len(rows)}."); return
 
+    if BucketPool is None or load_keys is None:
+        print("ERROR: google-genai not installed — cannot run the deep dive here. "
+              "Install it (pip install google-genai) or run via CI/local with deps.")
+        sys.exit(1)
     api_keys = load_keys(os.environ)
     if not api_keys:
         print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
