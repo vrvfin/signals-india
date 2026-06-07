@@ -104,9 +104,18 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
 [/DOCUMENT_SUMMARIES]
 
 [BSE_ANNOUNCEMENTS]
-<Recent exchange announcements (orders, capacity, ratings, board actions) from the
- BSE Direct API. Factual events only.>
+<Recent exchange announcements (orders, capacity, ratings, board/dividend actions)
+ from BSE Direct and (best-effort) NSE. Factual filed events only.>
 [/BSE_ANNOUNCEMENTS]
+
+[NEWS_CONTEXT]
+<Recent news headlines about the company from REPUTABLE sources only (major financial
+ dailies, markets portals, wire services), with source + date. EXTERNAL signal — use
+ to corroborate or contrast the filings/financials (e.g. approvals, expansions, M&A,
+ promoter/related-party actions, litigation). Headlines only; do not over-infer beyond
+ what a headline states, and cite as [News: <source>, <date>]. If a headline contradicts
+ the financials or flags a governance/RPT event, raise it as [WARNING].>
+[/NEWS_CONTEXT]
 
 [RAW_ANNUAL_REPORTS_FOR_GAPS]
 <Optional. Only present for AR years NOT already summarised in the Company Page.
@@ -195,6 +204,12 @@ Dense tables and 1-3 line bullets; no long paragraphs.
 2. BUSINESS PROFILE & GROWTH TRAJECTORY
    • Table: 5-yr Revenue, PAT, Margin. Identify the most material structural shift, else:
      NO_MATERIAL_STRUCTURAL_SHIFT_IDENTIFIED
+   • RECENT DEVELOPMENTS (MANDATORY if NEWS_CONTEXT / BSE-NSE announcements are present):
+     a 3-6 bullet dated digest of material recent events — regulatory approvals, capacity/
+     plant expansions, order wins, M&A / promoter-group actions, dividends, litigation —
+     each cited [News: <source>, <date>] or [BSE/NSE, <date>]. Do NOT leave this empty when
+     news/announcements were supplied. Flag any item that corroborates or contradicts a
+     forensic finding (e.g. a related-party/promoter merger → tie to the RPT analysis).
 
 3. CAPITAL EFFICIENCY & MANAGEMENT ALLOCATION
    • Table: 3-yr ROE & ROCE. Evaluate allocation behaviour and macro-stress response.

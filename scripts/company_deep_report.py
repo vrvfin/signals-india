@@ -317,6 +317,82 @@ def bse_announcements(bse_code, limit=40):
     except Exception as e:
         return f"DATA_MISSING (BSE fetch failed: {type(e).__name__})"
 
+# Reputable sources only (user-chosen whitelist: dailies + markets + wires,
+# plus the Economic Times pharma/business verticals which are the same publisher).
+NEWS_WHITELIST = (
+    "economic times", "etmarkets", "etpharma", "express pharma",       # ET family
+    "business standard", "mint", "livemint", "hindu businessline",
+    "businessline", "financial express",                               # dailies
+    "moneycontrol", "cnbc", "ndtv profit", "bq prime", "quint",        # markets
+    "reuters", "press trust", "pti", "bloomberg",                      # wires
+)
+
+def nse_announcements(symbol, limit=20):
+    """Best-effort NSE corporate announcements. NSE blocks datacenter IPs often
+    (CI) and needs cookie bootstrap — failures are silent (returns '')."""
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                          "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"})
+        s.get("https://www.nseindia.com", timeout=12)               # bootstrap cookies
+        r = s.get("https://www.nseindia.com/api/corporate-announcements",
+                  params={"index": "equities", "symbol": symbol.upper()}, timeout=18)
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", [])
+        out = []
+        for a in rows[:limit]:
+            raw = str(a.get("an_dt") or a.get("sort_date") or "").strip()
+            d = raw.split(" ")[0]                       # "DD-Mon-YYYY HH:MM" -> date
+            subj = (a.get("desc") or "").strip()
+            detail = (a.get("attchmntText") or "").strip()
+            line = f"- {d} | {subj}" + (f": {detail[:120]}" if detail else "")
+            out.append(line)
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+def news_block(name, symbol, limit=25, days=365):
+    """Recent company news headlines from Google News RSS, filtered to reputable
+    sources. Headlines + source + date only (article bodies are JS-redirected and
+    not reliably fetchable). External signal — corroborate/contrast vs financials."""
+    import urllib.parse
+    try:
+        from bs4 import BeautifulSoup
+        q = urllib.parse.quote(f'"{name}" OR {symbol}')
+        url = (f"https://news.google.com/rss/search?q={q}%20when:{days}d"
+               "&hl=en-IN&gl=IN&ceid=IN:en")
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        if r.status_code != 200:
+            return "DATA_MISSING (news fetch failed)."
+        soup = BeautifulSoup(r.text, "lxml-xml")
+        seen, out = set(), []
+        for it in soup.find_all("item"):
+            title = (it.title.get_text() if it.title else "").strip()
+            src = (it.source.get_text() if it.source else "").strip()
+            pub = (it.pubDate.get_text() if it.pubDate else "")
+            if not title or not src:
+                continue
+            if not any(w in src.lower() for w in NEWS_WHITELIST):
+                continue
+            headline = re.sub(r"\s*-\s*[^-]+$", "", title).strip()   # drop " - Source"
+            key = headline.lower()[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                d = dt.datetime.strptime(pub[:16], "%a, %d %b %Y").strftime("%Y-%m-%d")
+            except Exception:
+                d = pub[:16]
+            out.append((d, f"- {d} | {headline} [{src}]"))
+            if len(out) >= limit:
+                break
+        if not out:
+            return "No recent news from whitelisted sources."
+        out.sort(reverse=True)
+        return "\n".join(line for _, line in out)
+    except Exception as e:
+        return f"DATA_MISSING (news fetch failed: {type(e).__name__})"
+
 # ---- PHASE 2: document-grounded summarisation -----------------------------
 def _download_file_id(svc, file_id: str) -> bytes | None:
     from googleapiclient.http import MediaIoBaseDownload
@@ -480,7 +556,7 @@ def fill_section(tpl, tag, content):
                   tpl, flags=re.DOTALL)
 
 def build_prompt(name, symbol, isin, screener, page, research, bse,
-                 docs="DATA_MISSING", screener_cross="DATA_MISSING"):
+                 docs="DATA_MISSING", screener_cross="DATA_MISSING", news="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
@@ -492,6 +568,7 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
     tpl = fill_section(tpl, "RESEARCH_INDEX_CONTEXT", research)
     tpl = fill_section(tpl, "DOCUMENT_SUMMARIES", docs)
     tpl = fill_section(tpl, "BSE_ANNOUNCEMENTS", bse)
+    tpl = fill_section(tpl, "NEWS_CONTEXT", news)
     tpl = fill_section(tpl, "RAW_ANNUAL_REPORTS_FOR_GAPS",
                        "None supplied. Rely on Screener + Document Summaries + Company Page.")
     return tpl
@@ -562,13 +639,23 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     print(f"    screener cross-check: "
           f"{'live' if not screener_cross.startswith(('DATA_MISSING','[STALE')) else screener_cross[:40]}")
 
+    # Exchange announcements — BSE Direct + best-effort NSE.
+    bse = bse_announcements(bse_code)
+    nse = nse_announcements(symbol)
+    exchange = bse if not nse else f"BSE:\n{bse}\n\nNSE:\n{nse}"
+    # Recent news from reputable sources (headlines only).
+    news = news_block(name, symbol)
+    print(f"    exchange: BSE={'ok' if not bse.startswith('DATA_MISSING') else 'miss'} "
+          f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'}")
+
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
                           page,
                           research_block(ridx, isin, symbol, name),
-                          bse_announcements(bse_code),
+                          exchange,
                           docs=doc_block,
-                          screener_cross=screener_cross)
+                          screener_cross=screener_cross,
+                          news=news)
     report, model_used = pool.call_text(prompt)
     report = _clean_report_md(report)
 
