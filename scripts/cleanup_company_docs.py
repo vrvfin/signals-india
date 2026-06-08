@@ -1,13 +1,15 @@
 """
 Phase 2 / Stage A — Storage hygiene.
 
-Deletes raw document PDFs older than RETAIN_DAYS (default 10) from every
+Deletes raw document PDFs older than RETAIN_DAYS (default 2 — see the constant
+below; phase2.yml runs this with no flag, so 2 days is the live rule) from every
 company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
-raw PDF is no longer needed — the company page and the structured indexes hold
-the lasting value.
+raw PDF is no longer needed — the company page, per-doc summaries, and the
+structured indexes hold the lasting value.
 
 NEVER touches: _daily/ digest .md files, company_page.md/.docx,
-               deep_report.*, summaries, _index/*.
+               doc_summaries/ (the per-doc summary sidecars), deep_report.*,
+               summaries, _index/*.
 
 Daily digest files (_daily/*.md) are persisted forever — only raw PDFs are
 transient.

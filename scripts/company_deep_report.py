@@ -510,6 +510,144 @@ def youtube_block(svc, root, isin, symbol, name, pool, max_videos=8, months=24):
     except Exception as e:
         return f"DATA_MISSING (YouTube fetch failed: {type(e).__name__})."
 
+# ---- DRHP / RHP prospectus (auto-discovery + content guardrail) ------------
+PROSPECTUS_AUTH_DOMAINS = ("nseindia.com", "bseindia.com", "sebi.gov.in")
+MAX_PROSPECTUS_BYTES = 280 * 1024 * 1024     # cap a single download (~280MB)
+MAX_PROSPECTUS_SUMMARY_CHARS = 11_000        # richer than other docs
+
+def _ddg_results(query):
+    """DuckDuckGo HTML search -> list of (title, url). No API key."""
+    import urllib.parse
+    from bs4 import BeautifulSoup
+    try:
+        r = requests.post("https://html.duckduckgo.com/html/", data={"q": query},
+                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                          timeout=25)
+    except Exception:
+        return []
+    soup = BeautifulSoup(r.text, "lxml")
+    out = []
+    for a in soup.select("a.result__a"):
+        h = a.get("href", "")
+        m = re.search(r"uddg=([^&]+)", h)
+        url = urllib.parse.unquote(m.group(1)) if m else h
+        out.append((a.get_text(" ", strip=True), url))
+    return out
+
+def _discover_prospectus_urls(name):
+    """Ranked candidate PDF URLs for a company's DRHP/RHP (authoritative first)."""
+    import urllib.parse
+    cands = []
+    for q in (f'"{name}" red herring prospectus', f'"{name}" DRHP prospectus filetype:pdf'):
+        cands += _ddg_results(q)
+    name_tok = re.sub(r"[^a-z]", "", name.lower().split()[0]) if name.split() else ""
+    seen, ranked = set(), []
+    for text, url in cands:
+        low = url.lower()
+        if ".pdf" not in low and "pdf" not in low:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        dom = urllib.parse.urlparse(url).netloc.lower()
+        score = 0
+        if any(d in dom for d in PROSPECTUS_AUTH_DOMAINS):
+            score += 10
+        if name_tok and len(name_tok) >= 4 and name_tok in dom.replace(".", ""):
+            score += 8                              # company's own website
+        if any(b in dom for b in ("scribd", "helpstudent", "hellobanker", "ssjfinance")):
+            score -= 12
+        if re.search(r"rhp|herring|prospectus", low + text.lower()):
+            score += 3
+        ranked.append((score, url))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [u for s, u in ranked if s > -5][:4]
+
+def _download_prospectus(url):
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                         timeout=120, stream=True)
+        if r.status_code != 200:
+            return None
+        buf = bytearray()
+        for chunk in r.iter_content(131072):
+            buf += chunk
+            if len(buf) > MAX_PROSPECTUS_BYTES:
+                break
+        return bytes(buf) if buf[:5].startswith(b"%PDF") else None
+    except Exception:
+        return None
+
+def _verify_prospectus(pdf_bytes, name):
+    """GUARDRAIL: confirm this PDF is a DRHP/RHP AND names THIS company on the
+    cover (defends against symbol/name mismatch grabbing the wrong document).
+    Returns 'drhp' | 'rhp' | None."""
+    try:
+        import fitz
+        d = fitz.open(stream=pdf_bytes, filetype="pdf")
+        head = " ".join(d[i].get_text() for i in range(min(6, d.page_count)))
+        d.close()
+    except Exception:
+        return None
+    H = head.upper()
+    is_drhp = "DRAFT RED HERRING PROSPECTUS" in H
+    is_rhp = (not is_drhp) and ("RED HERRING PROSPECTUS" in H
+                                or ("PROSPECTUS" in H and "PUBLIC ISSUE" in H))
+    if not (is_drhp or is_rhp):
+        return None
+    core = re.sub(r"\b(limited|ltd|private|pvt)\b", "", name.lower())
+    core = re.sub(r"[^a-z ]", "", core)
+    flat_head = re.sub(r"[^a-z]", "", head.lower())
+    toks = [t for t in core.split() if len(t) >= 4]
+    contiguous = core.replace(" ", "") and core.replace(" ", "") in flat_head
+    all_tokens = bool(toks) and all(t in head.lower() for t in toks)
+    if not (contiguous or all_tokens):
+        return None                                 # wrong company — reject
+    return "drhp" if is_drhp else "rhp"
+
+def drhp_block(svc, root, isin, symbol, name, pool):
+    """Best-effort: discover the company's DRHP and/or RHP, verify it's the right
+    document, summarise (chunked) with the risk/fraud prompt, cache the summary as a
+    permanent sidecar. Raw PDF is NOT stored (huge); only the summary persists."""
+    found = {}
+    for typ in ("rhp", "drhp"):
+        side = f"{DRIVE['company_page']}/{isin}/doc_summaries/prospectus_{typ}.md"
+        c = drive_download(svc, side, root)
+        if c:
+            found[typ] = c.decode("utf-8", "ignore")
+    if found:                                       # already have a cached prospectus
+        return _fmt_prospectus(found, name)
+    try:
+        prompt = open(os.path.join(SCRIPTS_DIR, "drhp_prompt.txt"), encoding="utf-8").read()
+        for url in _discover_prospectus_urls(name):
+            data = _download_prospectus(url)
+            if not data:
+                continue
+            typ = _verify_prospectus(data, name)
+            if not typ or typ in found:
+                continue
+            summ = _summarise_pdf_chunked(pool, prompt, data, f"{typ.upper()} {name}",
+                                          prefer_text=True)
+            if summ:
+                found[typ] = summ
+                try:
+                    drive_upload(svc, f"{DRIVE['company_page']}/{isin}/doc_summaries/"
+                                 f"prospectus_{typ}.md", root, summ.encode("utf-8"),
+                                 "text/markdown")
+                except Exception:
+                    pass
+            if "rhp" in found and "drhp" in found:
+                break
+    except Exception as e:
+        if not found:
+            return f"DATA_MISSING (prospectus fetch failed: {type(e).__name__})."
+    return _fmt_prospectus(found, name) if found else "DATA_MISSING (no DRHP/RHP found)."
+
+def _fmt_prospectus(found, name):
+    return "\n\n".join(
+        f"### [{t.upper()} | {name}]\n{s.strip()[:MAX_PROSPECTUS_SUMMARY_CHARS]}"
+        for t, s in found.items())
+
 # ---- PHASE 2: document-grounded summarisation -----------------------------
 def _download_file_id(svc, file_id: str) -> bytes | None:
     from googleapiclient.http import MediaIoBaseDownload
@@ -537,38 +675,50 @@ def _sidecar_path(isin: str, row) -> str:
     return (f"{DRIVE['company_page']}/{isin}/doc_summaries/"
             f"{row['doc_type']}__{d}__{row['doc_id']}.md")
 
-def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label) -> str | None:
-    """Summarise a PDF completely. Short docs -> single call_pdf. Long docs ->
-    split into CHUNK_PAGES page-range sub-PDFs, summarise each (so every page is
-    read), then merge the partials into one coherent summary. Guarantees the back
-    of the annual report (notes, RPT schedules, auditor remarks) is covered."""
+def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False) -> str | None:
+    """Summarise a PDF completely. Short docs -> single pass. Long docs -> split
+    into CHUNK_PAGES page-range chunks, summarise each, then merge.
+
+    prefer_text=True extracts TEXT per chunk and uses call_text (fast, light) —
+    right for large text-based documents like DRHP/RHP where uploading PDF chunks
+    via call_pdf is slow. Default (False) uses call_pdf for best table fidelity
+    (annual reports)."""
     import fitz
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     n = src.page_count
-    # short enough -> one pass (best table fidelity)
-    if n <= CHUNK_TRIGGER_PAGES and len(pdf_bytes) <= MAX_INLINE_PDF:
+    # short enough -> one pass
+    if n <= CHUNK_TRIGGER_PAGES and len(pdf_bytes) <= MAX_INLINE_PDF and not prefer_text:
         src.close()
         try:
             return pool.call_pdf(pdf_bytes, prompt)[0]
         except FatalCallError as e:
             print(f"      {label}: FATAL ({str(e)[:70]}) — skip"); return None
 
+    # In text mode, summarise larger page windows per call (text is cheap).
+    step = (CHUNK_PAGES * 2) if prefer_text else CHUNK_PAGES
     partials = []
-    for start in range(0, n, CHUNK_PAGES):
-        end = min(start + CHUNK_PAGES, n)
+    for start in range(0, n, step):
+        end = min(start + step, n)
         cprompt = (prompt + f"\n\n>>> This is PAGES {start+1}-{end} of {n} of the "
                    f"{label}. Summarise THIS portion faithfully and completely; "
                    f"other passes cover the remaining pages. Keep ALL figures, "
-                   f"tables, related-party items, and auditor notes verbatim.")
+                   f"tables, related-party items, litigation and auditor notes verbatim.")
         try:
-            sub = fitz.open(); sub.insert_pdf(src, from_page=start, to_page=end - 1)
-            sub_bytes = sub.tobytes(); sub.close()
-            if len(sub_bytes) <= MAX_INLINE_PDF:
-                txt, _ = pool.call_pdf(sub_bytes, cprompt)
-            else:
+            if prefer_text:
                 page_text = "\n".join(src[p].get_text()
                                       for p in range(start, end))[:MAX_DOC_TEXT_CHARS]
+                if len(page_text.strip()) < 100:
+                    continue                      # scanned/empty page range
                 txt, _ = pool.call_text(cprompt + "\n\n=== TEXT ===\n" + page_text)
+            else:
+                sub = fitz.open(); sub.insert_pdf(src, from_page=start, to_page=end - 1)
+                sub_bytes = sub.tobytes(); sub.close()
+                if len(sub_bytes) <= MAX_INLINE_PDF:
+                    txt, _ = pool.call_pdf(sub_bytes, cprompt)
+                else:
+                    page_text = "\n".join(src[p].get_text()
+                                          for p in range(start, end))[:MAX_DOC_TEXT_CHARS]
+                    txt, _ = pool.call_text(cprompt + "\n\n=== TEXT ===\n" + page_text)
             partials.append(f"--- pages {start+1}-{end} ---\n{txt.strip()}")
             print(f"      {label}: chunk pages {start+1}-{end}/{n} ok")
         except FatalCallError as e:
@@ -674,7 +824,7 @@ def fill_section(tpl, tag, content):
 
 def build_prompt(name, symbol, isin, screener, page, research, bse,
                  docs="DATA_MISSING", screener_cross="DATA_MISSING", news="DATA_MISSING",
-                 youtube="DATA_MISSING"):
+                 youtube="DATA_MISSING", drhp="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
@@ -684,6 +834,7 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
     tpl = fill_section(tpl, "SCREENER_CROSSCHECK", screener_cross)
     tpl = fill_section(tpl, "COMPANY_PAGE_BRIEF", page[:MAX_PAGE_CHARS] or "DATA_MISSING")
     tpl = fill_section(tpl, "RESEARCH_INDEX_CONTEXT", research)
+    tpl = fill_section(tpl, "DRHP_PROSPECTUS", drhp)
     tpl = fill_section(tpl, "DOCUMENT_SUMMARIES", docs)
     tpl = fill_section(tpl, "BSE_ANNOUNCEMENTS", bse)
     tpl = fill_section(tpl, "NEWS_CONTEXT", news)
@@ -767,9 +918,12 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     # YouTube research — whitelisted/official channels, transcript summaries (cached).
     youtube = youtube_block(svc, root, isin, symbol, name, pool)
     yt_ok = not youtube.startswith(("DATA_MISSING", "No videos", "Whitelisted"))
+    # DRHP/RHP prospectus — auto-discover + content guardrail, summary cached (best-effort).
+    drhp = drhp_block(svc, root, isin, symbol, name, pool)
+    drhp_ok = not drhp.startswith("DATA_MISSING")
     print(f"    exchange: BSE={'ok' if not bse.startswith('DATA_MISSING') else 'miss'} "
           f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'} "
-          f"· youtube={'ok' if yt_ok else 'none'}")
+          f"· youtube={'ok' if yt_ok else 'none'} · drhp={'ok' if drhp_ok else 'none'}")
 
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
@@ -779,7 +933,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           docs=doc_block,
                           screener_cross=screener_cross,
                           news=news,
-                          youtube=youtube)
+                          youtube=youtube,
+                          drhp=drhp)
     report, model_used = pool.call_text(prompt)
     report = _clean_report_md(report)
 

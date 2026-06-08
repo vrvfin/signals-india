@@ -93,6 +93,16 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
  summaries mentioning this name or its theme. Treat as external perspective.>
 [/RESEARCH_INDEX_CONTEXT]
 
+[DRHP_PROSPECTUS]
+<Forensic summary of the company's DRAFT/RED HERRING PROSPECTUS (DRHP/RHP), if found
+ and verified to belong to THIS company. For a recently-listed company this is the
+ RICHEST single source — full risk factors, litigation against company/promoters/
+ directors, related-party web, promoter track record, restatements, contingent
+ liabilities, and use-of-proceeds. Treat as PRIMARY for new listings. Surface its
+ risk/fraud findings prominently in Sections 4-7 and cite as [DRHP]/[RHP]. If
+ DATA_MISSING, the company likely listed long ago or no prospectus was found — skip.>
+[/DRHP_PROSPECTUS]
+
 [DOCUMENT_SUMMARIES]
 <Per-document summaries generated on demand from the company's ACTUAL filings —
  annual reports (multi-year), credit-rating rationales, concall transcripts,
