@@ -870,6 +870,12 @@ def load_results_summary() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_financials_3stmt() -> pd.DataFrame:
+    """Phase 3 T2 — quarterly/annual/TTM 3-statement line items."""
+    return load_parquet(["company_repo", "_index", "financials_3stmt.parquet"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_quarterly_index() -> list[dict]:
     """List quarterly guidance .md files from company_repo/_quarterly/."""
     def _do():
@@ -1830,6 +1836,50 @@ def page_stock_detail():
                     st.markdown("**Signal values:**")
                     st.json({c: (float(sig[c]) if isinstance(sig[c], (int, float))
                                  else str(sig[c])) for c in cols_to_show})
+
+    # ── Quarterly Financials (last 12Q) — Phase 3 T2.3 ───────────────────
+    st.markdown("---")
+    st.subheader("Quarterly Financials (last 12Q)")
+    fin_sd = load_financials_3stmt()
+    if fin_sd.empty or "symbol" not in fin_sd.columns:
+        st.info("Quarterly financials not available yet "
+                "(run `scripts/backfill_results_3stmt.py`).")
+    else:
+        q = fin_sd[(fin_sd["symbol"] == symbol)
+                   & (fin_sd["statement"] == "income")
+                   & (fin_sd["period_type"] == "quarterly")]
+        if q.empty:
+            st.info(f"No quarterly financials for {symbol} yet.")
+        else:
+            def _q_series(li):
+                s = q[q["line_item"] == li]
+                return s["period"].tolist(), s["value"].tolist()
+            periods, sales_v = _q_series("Sales")
+            _, pat_v = _q_series("Net Profit")
+            _, eps_v = _q_series("EPS")
+            figq = go.Figure()
+            figq.add_bar(x=periods, y=sales_v, name="Sales (₹Cr)", marker_color="#2980b9")
+            figq.add_bar(x=periods, y=pat_v, name="PAT (₹Cr)", marker_color="#27ae60")
+            if any(pd.notna(x) for x in eps_v):
+                figq.add_trace(go.Scatter(
+                    x=periods, y=eps_v, name="EPS (₹)", yaxis="y2",
+                    mode="lines+markers", line=dict(color="#e67e22")))
+                figq.update_layout(yaxis2=dict(overlaying="y", side="right",
+                                               showgrid=False, title="EPS"))
+            figq.update_layout(barmode="group", height=300,
+                               margin=dict(l=10, r=10, t=10, b=10),
+                               legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(figq, use_container_width=True)
+            ttm = fin_sd[(fin_sd["symbol"] == symbol)
+                         & (fin_sd["period_type"] == "ttm")]
+            if not ttm.empty:
+                bits = []
+                for li in ["Sales", "Operating Profit", "Net Profit", "EPS"]:
+                    r = ttm[ttm["line_item"] == li]
+                    if not r.empty and pd.notna(r["value"].iloc[0]):
+                        bits.append(f"{li} {float(r['value'].iloc[0]):,.0f}")
+                if bits:
+                    st.caption("TTM — " + "  ·  ".join(bits))
 
     # ── Management Guidance section ──────────────────────────────────────
     st.markdown("---")

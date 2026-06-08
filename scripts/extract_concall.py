@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import io
 import os
 import re
@@ -168,7 +169,10 @@ def upload_bytes(drive, folder_id, filename, data, mimetype, existing_id=None):
 
 QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "title", "description", "announcement_date", "pdf_url",
-              "drive_file_id", "status", "discovered_at", "processed_at"]
+              "drive_file_id", "status", "discovered_at", "processed_at",
+              # Phase 3 T1: stamped (=date) only when a row is processed by a
+              # backfill run; blank for normal Phase 2 live processing.
+              "backfill_process_date"]
 
 
 def load_queue(drive, index_id) -> pd.DataFrame:
@@ -198,6 +202,52 @@ def save_queue(drive, index_id, df: pd.DataFrame) -> None:
         drive.files().create(body={"name": "processing_queue.parquet",
                                    "parents": [index_id]},
                              media_body=media, fields="id").execute()
+
+
+# ------------------------------------------------------------------ #
+#  Mutual-exclusion lock (T1.4)                                        #
+#  One extractor (live OR backfill) writes the shared _index parquets  #
+#  at a time, so concurrent runs can't clobber each other. Night-run   #
+#  scheduling is the primary defense; this is the safety guard. Stale   #
+#  locks (crashed run) are auto-stolen after LOCK_MAX_AGE_MIN.         #
+# ------------------------------------------------------------------ #
+
+_LOCK_NAME = "_extract.lock"
+LOCK_MAX_AGE_MIN = 360   # 6h — long enough for a big backfill night run
+
+
+def acquire_extract_lock(drive, index_id, mode: str) -> bool:
+    """Try to claim the extractor lock. Returns True on success.
+
+    A fresh lock owned by another run blocks acquisition; a lock older than
+    LOCK_MAX_AGE_MIN is considered stale and stolen."""
+    fid = find_file(drive, index_id, _LOCK_NAME)
+    if fid:
+        try:
+            content = download_bytes(drive, fid).decode("utf-8", errors="replace")
+            ts_str = content.split("|", 2)[1] if "|" in content else ""
+            ts = datetime.fromisoformat(ts_str) if ts_str else None
+            age_min = ((datetime.now() - ts).total_seconds() / 60.0) if ts else 1e9
+            if age_min < LOCK_MAX_AGE_MIN:
+                log(f"  LOCK held by '{content.split('|')[0]}' "
+                    f"({age_min:.0f} min old) — another extraction is running. "
+                    f"Exiting cleanly; will resume next run.")
+                return False
+            log(f"  LOCK is stale ({age_min:.0f} min) — stealing it.")
+        except Exception as e:
+            log(f"  LOCK read failed ({str(e)[:60]}) — overwriting.")
+    payload = f"{mode}|{datetime.now().isoformat(timespec='seconds')}".encode("utf-8")
+    upload_bytes(drive, index_id, _LOCK_NAME, payload, "text/plain", existing_id=fid)
+    return True
+
+
+def release_extract_lock(drive, index_id) -> None:
+    try:
+        fid = find_file(drive, index_id, _LOCK_NAME)
+        if fid:
+            drive.files().delete(fileId=fid).execute()
+    except Exception as e:
+        log(f"  LOCK release failed ({str(e)[:60]}) — will be auto-stolen later.")
 
 
 # ------------------------------------------------------------------ #
@@ -245,6 +295,18 @@ GF3_COLS = [
 GF4_COLS = [
     "isin", "symbol", "company_name", "quarter",
     "flag_type", "evidence",
+    "processed_at", "source_doc_id",
+]
+
+# GF_TRACK — Mgmt Said vs Delivered (credibility). One row per verdict-table row;
+# the four summary fields (cred_score/pattern/strongest_area/recurring_miss) are
+# duplicated onto every row of the same concall for easy per-company lookup.
+# Produced only when a [HISTORICAL_CONTEXT] block was injected (history exists).
+MGMT_CRED_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "qtr_guided", "metric", "guidance_given", "target_period",
+    "actual_delivered", "delta", "verdict",
+    "cred_score", "pattern", "strongest_area", "recurring_miss",
     "processed_at", "source_doc_id",
 ]
 
@@ -334,6 +396,10 @@ def upsert_gf4(drive, index_id, rows: list[dict]) -> None:
     _upsert_gf(drive, index_id, "gf4_quality_flags.parquet", GF4_COLS, rows)
 
 
+def upsert_mgmt_credibility(drive, index_id, rows: list[dict]) -> None:
+    _upsert_gf(drive, index_id, "mgmt_credibility.parquet", MGMT_CRED_COLS, rows)
+
+
 def write_csv_exports(drive, index_id) -> None:
     """Write CSV snapshots of all guidance parquets to Drive. Called once per run."""
     exports = [
@@ -342,6 +408,7 @@ def write_csv_exports(drive, index_id) -> None:
         ("gf2_historical_guidance.parquet",  "gf2_historical_guidance.csv",  GF2_COLS),
         ("gf3_operational_visibility.parquet","gf3_operational_visibility.csv",GF3_COLS),
         ("gf4_quality_flags.parquet",        "gf4_quality_flags.csv",        GF4_COLS),
+        ("mgmt_credibility.parquet",         "mgmt_credibility.csv",         MGMT_CRED_COLS),
     ]
     for pq_name, csv_name, cols in exports:
         try:
@@ -405,13 +472,16 @@ def _build_index_with_runs(entries: list[tuple[str, str]]) -> list[str]:
     return lines
 
 
-def _day_filename(announcement_date: str) -> str:
-    """Return e.g. 'concall_26_may2026.md' from '2026-05-26'."""
+def _day_filename(announcement_date: str, prefix: str = "concall") -> str:
+    """Return e.g. 'concall_26_may2026.md' from '2026-05-26'.
+
+    prefix='daily_backfill' routes backfill output to its own digest file so it
+    stays distinct from the live Phase 2 daily concall digest (T1.3)."""
     try:
         dt = datetime.strptime(str(announcement_date)[:10], "%Y-%m-%d")
-        return f"concall_{dt.day:02d}_{dt.strftime('%b').lower()}{dt.year}.md"
+        return f"{prefix}_{dt.day:02d}_{dt.strftime('%b').lower()}{dt.year}.md"
     except Exception:
-        return f"concall_{str(announcement_date)[:10].replace('-', '_')}.md"
+        return f"{prefix}_{str(announcement_date)[:10].replace('-', '_')}.md"
 
 
 def _quarter_filename(quarter: str) -> str:
@@ -425,7 +495,7 @@ def _quarter_filename(quarter: str) -> str:
 
 def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
                     company_name: str, quarter: str, content: str,
-                    run_time: str = "") -> None:
+                    run_time: str = "", backfill: bool = False) -> None:
     """Append this company's analysis to the daily digest file in _daily/.
 
     UPDATED: Uses EXTRACTION_DATE (today) for filename, not announcement_date.
@@ -457,7 +527,10 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
     # USE EXTRACTION DATE (today) for the daily digest filename
     # This groups concalls by "when processed" not "when announced"
     extraction_date = datetime.now().strftime("%Y-%m-%d")  # e.g., "2026-06-06"
-    fname = _day_filename(extraction_date)
+    # Backfill output goes to its own digest file/title (T1.3); live Phase 2 unchanged.
+    digest_prefix = "daily_backfill" if backfill else "concall"
+    digest_title = "Daily Backfill Digest" if backfill else "Daily Concall Digest"
+    fname = _day_filename(extraction_date, digest_prefix)
     now_str = datetime.now().strftime("%d %b %Y %H:%M")
     date_str = extraction_date[:10]  # "2026-06-06"
 
@@ -482,7 +555,7 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
         total = (f"*Total: {new_num} concall{'s' if new_num != 1 else ''}"
                  f" — last updated {now_str} IST*")
         new_header = (
-            f"# Daily Concall Digest — {date_str}\n"
+            f"# {digest_title} — {date_str}\n"
             f"{total}\n\n"
             f"**Index:**\n"
             + "\n".join(index_lines)
@@ -507,7 +580,7 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
         # First entry of the day — write fresh file
         index_run_header = f"*Run 1 — {run_time}*\n" if run_time else ""
         header = (
-            f"# Daily Concall Digest — {date_str}\n"
+            f"# {digest_title} — {date_str}\n"
             f"*Total: 1 concall — last updated {now_str} IST*\n\n"
             f"**Index:**\n"
             f"{index_run_header}"
@@ -798,6 +871,19 @@ _GF4_MAP = {
     "evidence":      "evidence",
 }
 
+# GF_TRACK (Mgmt Said vs Delivered) header → schema column mapping.
+# Prompt table header: Qtr Guided | Metric | Guidance Given | Target Period |
+#                      Actual Delivered | Delta | Verdict
+_GF_TRACK_MAP = {
+    "qtr_guided":       "qtr_guided",
+    "metric":           "metric",
+    "guidance_given":   "guidance_given",
+    "target_period":    "target_period",
+    "actual_delivered": "actual_delivered",
+    "delta":            "delta",
+    "verdict":          "verdict",
+}
+
 
 def parse_gf_sections(
     text: str, row: pd.Series, quarter: str, now_str: str
@@ -845,6 +931,67 @@ def parse_gf_sections(
     gf4_rows = _parse_gf_table(gf4_tbl, _GF4_MAP, fixed)
 
     return gf1_rows, gf2_rows, gf3_rows, gf4_rows
+
+
+# Summary lines under "## Mgmt Credibility Summary" (see concall_prompt.txt §GF_TRACK)
+_CRED_SCORE_RE = re.compile(r"Overall\s+score:\s*([\d.]+)\s*/\s*5", re.IGNORECASE)
+_CRED_PATTERN_RE = re.compile(r"Pattern:\s*(.+)", re.IGNORECASE)
+_CRED_STRONG_RE = re.compile(r"Strongest\s+area:\s*(.+)", re.IGNORECASE)
+_CRED_MISS_RE = re.compile(r"Recurring\s+miss:\s*(.+)", re.IGNORECASE)
+
+
+def _first_line(s: str) -> str:
+    """First non-empty line of a regex capture, stripped of markdown bullets/emphasis."""
+    line = (s or "").splitlines()[0] if s else ""
+    return line.strip().strip("*[]").strip()
+
+
+def parse_gf_track(text: str, row: pd.Series, quarter: str, now_str: str) -> list[dict]:
+    """Extract the GF_TRACK 'Said vs Delivered' verdict table + credibility summary.
+
+    Returns one dict per verdict-table row (MGMT_CRED_COLS), with the four summary
+    fields duplicated onto each. Empty list if the section is absent (it is only
+    produced when a [HISTORICAL_CONTEXT] block was injected).
+    """
+    fixed = {
+        "isin": str(row.get("isin") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "company_name": str(row.get("company_name") or ""),
+        "quarter": quarter,
+        "processed_at": now_str,
+        "source_doc_id": str(row.get("doc_id") or ""),
+    }
+
+    tbl = _find_section_table(
+        text,
+        r"Section\s+GF_TRACK", r"GF_TRACK\s*[—–\-]", r"Mgmt\s+Said\s+vs\s+Delivered",
+    )
+    rows = _parse_gf_table(tbl, _GF_TRACK_MAP, fixed)
+
+    # Credibility summary block (after the table)
+    summary_txt = _find_section_text(
+        text, r"Mgmt\s+Credibility\s+Summary", r"Credibility\s+Summary", max_chars=600
+    )
+    cred = {"cred_score": "NA", "pattern": "NA",
+            "strongest_area": "NA", "recurring_miss": "NA"}
+    if summary_txt:
+        m = _CRED_SCORE_RE.search(summary_txt)
+        if m:
+            cred["cred_score"] = m.group(1)
+        for key, rx in (("pattern", _CRED_PATTERN_RE),
+                        ("strongest_area", _CRED_STRONG_RE),
+                        ("recurring_miss", _CRED_MISS_RE)):
+            m = rx.search(summary_txt)
+            if m:
+                cred[key] = _first_line(m.group(1))
+
+    # If there is a summary but no parseable table rows, still record one summary row
+    # so the company's credibility score is queryable.
+    if not rows and cred["cred_score"] != "NA":
+        rows = [dict(fixed)]
+    for r in rows:
+        r.update(cred)
+    return rows
 
 
 def build_quarterly_guidance_content(text: str, symbol: str, company_name: str,
@@ -1163,18 +1310,38 @@ def main() -> None:
                         help="Process at most N pending rows then stop.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run Gemini but skip all Drive writes.")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Backfill mode: use the dedicated key pool "
+                             "(BACKFILL_GEMINI_KEY*), route the daily digest to "
+                             "daily_backfill_*.md, and stamp backfill_process_date "
+                             "on each processed queue row. Same extractor/prompt/"
+                             "tables as Phase 2 otherwise.")
+    parser.add_argument("--key-prefix", default=None,
+                        help="Env-var prefix for the Gemini key pool. Defaults to "
+                             "GEMINI_API_KEY (Phase 2), or BACKFILL_GEMINI_KEY when "
+                             "--backfill is set. Override here if needed.")
+    parser.add_argument("--no-lock", action="store_true",
+                        help="Skip the Drive mutual-exclusion lock (testing only).")
     args = parser.parse_args()
+
+    # Backfill defaults to the dedicated key pool unless an explicit prefix is given.
+    key_prefix = args.key_prefix or ("BACKFILL_GEMINI_KEY" if args.backfill
+                                     else "GEMINI_API_KEY")
 
     print("Phase 2 / Stage B — Concall extraction via Gemini")
     print("-" * 56)
 
     drive = get_drive()
 
-    # Load Gemini API keys and build the bucket pool (keys × CONCALL_MODELS)
-    api_keys = load_keys(os.environ)
+    # Load Gemini API keys and build the bucket pool (keys × CONCALL_MODELS).
+    # Backfill uses a dedicated pool (separate Cloud projects) so its quota is
+    # fully independent of the live Phase 2 pool — T1.4.
+    api_keys = load_keys(os.environ, prefix=key_prefix)
     if not api_keys:
-        print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
+        print(f"ERROR: no {key_prefix} or {key_prefix}_* found in .env")
         sys.exit(1)
+    log(f"Key pool: prefix '{key_prefix}'"
+        + ("  [BACKFILL MODE]" if args.backfill else ""))
     gemini = BucketPool(api_keys, CONCALL_MODELS,
                         inter_call_s=INTER_CALL_SLEEP, logger=log)
     log(f"Loaded {len(api_keys)} key(s) × {len(CONCALL_MODELS)} model(s) "
@@ -1192,12 +1359,30 @@ def main() -> None:
     repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
 
+    # Mutual-exclusion lock so a live run and a backfill run can't clobber the
+    # shared _index parquets concurrently (T1.4). Released on exit via atexit.
+    if not args.no_lock and not args.dry_run:
+        mode = "backfill" if args.backfill else "live"
+        if not acquire_extract_lock(drive, index_id, mode):
+            sys.exit(0)
+        atexit.register(release_extract_lock, drive, index_id)
+
     # Load queue and filter to pending concalls
     queue = load_queue(drive, index_id)
     pending_mask = (queue["status"] == "pending") & (queue["doc_type"] == "concall")
-    pending_idx = queue.index[pending_mask].tolist()
+    # Process OLDEST -> NEWEST per company so each company's GF1 guidance history
+    # accrues before its latest concall is processed; only then does the latest
+    # concall see prior history and emit GF_TRACK. Harmless for Phase 2's 2-day
+    # window; essential for backfill. Sort key: (isin, announcement_date ASC).
+    pending = queue[pending_mask].copy()
+    pending["_ann"] = pd.to_datetime(
+        pending["announcement_date"].astype(str).str[:10], errors="coerce"
+    )
+    pending = pending.sort_values(["isin", "_ann"], na_position="first")
+    pending_idx = pending.index.tolist()
 
-    log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending concalls")
+    log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending concalls "
+        f"(processed oldest->newest per company)")
 
     if args.limit:
         pending_idx = pending_idx[: args.limit]
@@ -1216,7 +1401,8 @@ def main() -> None:
     log(f"Context caches: GF1={len(_gf1_cache)} rows · "
         f"facts={len(_qfacts_cache)} rows · results={len(_results_cache)} rows")
 
-    counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0, "gf3": 0, "gf4": 0, "gf_track": 0}
+    counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0,
+              "gf3": 0, "gf4": 0, "gf_track": 0, "mgmt_cred": 0}
 
     # Fixed run-time label for this execution — used to group today's digest entries
     # by run (Run 1 / Run 2 / …) so the user can see what each scheduled slot added.
@@ -1279,14 +1465,16 @@ def main() -> None:
             log(f"  GF parsed: GF1={len(gf1_rows)} GF2={len(gf2_rows)} "
                 f"GF3={len(gf3_rows)} GF4={len(gf4_rows)}")
 
-            # 4c. Count GF_TRACK presence (credibility section, only when history was injected)
-            if _hist and _find_section_text(
-                markdown_text,
-                r"Section\s+GF_TRACK", r"GF_TRACK\s*[—–\-]", r"Mgmt\s+Said\s+vs\s+Delivered",
-                max_chars=50,
-            ):
-                counts["gf_track"] += 1
-                log("  GF_TRACK section: present")
+            # 4c. Parse GF_TRACK "Said vs Delivered" -> mgmt_credibility rows.
+            # Only present when historical context was injected (history exists).
+            mgmt_cred_rows: list[dict] = []
+            if _hist:
+                mgmt_cred_rows = parse_gf_track(markdown_text, row, quarter, now_str)
+                if mgmt_cred_rows:
+                    counts["gf_track"] += 1
+                    counts["mgmt_cred"] += len(mgmt_cred_rows)
+                    log(f"  GF_TRACK section: present "
+                        f"({len(mgmt_cred_rows)} credibility row(s))")
 
             # 5a. Company page (persisted forever)
             if OUTPUT_COMPANY_MD:
@@ -1308,6 +1496,7 @@ def main() -> None:
                     quarter=quarter,
                     content=markdown_text,
                     run_time=run_time,
+                    backfill=args.backfill,
                 )
 
             # 5c. Quarterly guidance tracker
@@ -1336,10 +1525,16 @@ def main() -> None:
                 upsert_gf2(drive, index_id, gf2_rows)
                 upsert_gf3(drive, index_id, gf3_rows)
                 upsert_gf4(drive, index_id, gf4_rows)
+                # GF_TRACK credibility (only populated when history existed)
+                if mgmt_cred_rows:
+                    upsert_mgmt_credibility(drive, index_id, mgmt_cred_rows)
 
             # 7. Mark done
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = now_str
+            if args.backfill:
+                queue.loc[queue_idx, "backfill_process_date"] = \
+                    datetime.now().strftime("%Y-%m-%d")
             save_queue(drive, index_id, queue)
 
             counts["processed"] += 1
@@ -1382,7 +1577,8 @@ def main() -> None:
     print(f"Skipped   : {counts['skipped']}  (no drive_file_id / download fail)")
     print(f"GF rows   : GF1={counts['gf1']} GF2={counts['gf2']} "
           f"GF3={counts['gf3']} GF4={counts['gf4']}")
-    print(f"GF_TRACK  : {counts['gf_track']} credibility sections written "
+    print(f"GF_TRACK  : {counts['gf_track']} credibility sections · "
+          f"{counts['mgmt_cred']} mgmt_credibility rows "
           f"(0 = no prior history yet; expected once backfill is processed)")
     print(f"Calls OK by model : {pool['by_model'] or '{}'}")
     print(f"Buckets   : {pool['buckets_alive']} alive · "
@@ -1396,6 +1592,7 @@ def main() -> None:
         print("Output: company_repo/_index/gf2_historical_guidance.parquet (.csv)")
         print("Output: company_repo/_index/gf3_operational_visibility.parquet (.csv)")
         print("Output: company_repo/_index/gf4_quality_flags.parquet (.csv)")
+        print("Output: company_repo/_index/mgmt_credibility.parquet (.csv)")
         print("Output: company_repo/<key>/company_page.md")
         print("Output: company_repo/_daily/concall_DD_MMMYYYY.md")
         print("Output: company_repo/_quarterly/QXFY_mgmt_guidance.md")

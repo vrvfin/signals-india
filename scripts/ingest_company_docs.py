@@ -248,7 +248,9 @@ def download_pdf(session, url) -> bytes | None:
 
 QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "title", "description", "announcement_date", "pdf_url",
-              "drive_file_id", "status", "discovered_at", "processed_at"]
+              "drive_file_id", "status", "discovered_at", "processed_at",
+              # Phase 3 T1: set only when a row is processed by a backfill run.
+              "backfill_process_date"]
 
 
 def load_queue(drive, index_id) -> pd.DataFrame:
