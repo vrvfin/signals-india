@@ -312,11 +312,20 @@ def load_keys(env: dict, prefix: str = "GEMINI_API_KEY") -> list[str]:
     backfill pool (separate Cloud projects) so its quota is independent of Phase 2.
     """
     num_re = re.compile(rf"{re.escape(prefix)}_\d+$")
-    keys = [v for _, v in sorted(
+    raw = [v for _, v in sorted(
         ((k, v) for k, v in env.items()
          if num_re.match(k) and v.strip()),
         key=lambda kv: kv[0])]
     plain = env.get(prefix, "").strip()
-    if plain and plain not in keys:
-        keys.append(plain)
+    if plain:
+        raw.append(plain)
+    # Expand comma-separated values (Phase 1/2 guideline: a single var may hold a
+    # comma-list of keys) and de-dupe, preserving first-seen order. Gemini keys
+    # never contain commas, so splitting is safe.
+    keys: list[str] = []
+    for v in raw:
+        for part in v.split(","):
+            p = part.strip()
+            if p and p not in keys:
+                keys.append(p)
     return keys

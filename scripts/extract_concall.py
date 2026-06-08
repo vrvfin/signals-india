@@ -1322,11 +1322,21 @@ def main() -> None:
                              "--backfill is set. Override here if needed.")
     parser.add_argument("--no-lock", action="store_true",
                         help="Skip the Drive mutual-exclusion lock (testing only).")
+    parser.add_argument("--check-keys", action="store_true",
+                        help="Print the selected key-pool size and exit (no Gemini, no Drive).")
     args = parser.parse_args()
 
     # Backfill defaults to the dedicated key pool unless an explicit prefix is given.
     key_prefix = args.key_prefix or ("BACKFILL_GEMINI_KEY" if args.backfill
                                      else "GEMINI_API_KEY")
+
+    # Zero-cost pool verification: confirm the keys loaded, then exit.
+    if args.check_keys:
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+        ks = load_keys(os.environ, prefix=key_prefix)
+        print(f"Key pool '{key_prefix}': {len(ks)} key(s) × {len(CONCALL_MODELS)} "
+              f"model(s) = {len(ks) * len(CONCALL_MODELS)} daily buckets")
+        sys.exit(0 if ks else 1)
 
     print("Phase 2 / Stage B — Concall extraction via Gemini")
     print("-" * 56)

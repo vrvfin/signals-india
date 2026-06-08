@@ -1,0 +1,100 @@
+name: phase3-test
+
+# Manual, BOUNDED end-to-end test of Phase 3 T1 (concall backfill on the dedicated
+# BACKFILL_GEMINI_KEY pool) + T2 (3-statement + derived). Dispatch-only (no cron) so
+# the heavy full-universe backfill never auto-runs. Defaults process only a couple of
+# companies so you can verify the pool, quota and Drive writes on git safely.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_companies:
+        description: "Companies to process (T1 fetch + T2 scrape)"
+        default: "2"
+      quarters:
+        description: "Concalls per company to backfill (T1)"
+        default: "4"
+      extract_limit:
+        description: "Concalls to EXTRACT via Gemini (T1, spends BACKFILL quota)"
+        default: "2"
+      run_t1:
+        description: "Run T1 concall backfill (fetch + Gemini extract)?"
+        type: boolean
+        default: true
+      run_t2:
+        description: "Run T2 3-statement + derived?"
+        type: boolean
+        default: true
+
+concurrency:
+  group: phase3-test
+  cancel-in-progress: false
+
+jobs:
+  phase3-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
+          BACKFILL_GEMINI_KEY_1:   ${{ secrets.BACKFILL_GEMINI_KEY_1 }}
+          BACKFILL_GEMINI_KEY_2:   ${{ secrets.BACKFILL_GEMINI_KEY_2 }}
+          BACKFILL_GEMINI_KEY_3:   ${{ secrets.BACKFILL_GEMINI_KEY_3 }}
+          BACKFILL_GEMINI_KEY_4:   ${{ secrets.BACKFILL_GEMINI_KEY_4 }}
+          BACKFILL_GEMINI_KEY_5:   ${{ secrets.BACKFILL_GEMINI_KEY_5 }}
+          BACKFILL_GEMINI_KEY_6:   ${{ secrets.BACKFILL_GEMINI_KEY_6 }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+            echo "BACKFILL_GEMINI_KEY=$BACKFILL_GEMINI_KEY"
+            echo "BACKFILL_GEMINI_KEY_1=$BACKFILL_GEMINI_KEY_1"
+            echo "BACKFILL_GEMINI_KEY_2=$BACKFILL_GEMINI_KEY_2"
+            echo "BACKFILL_GEMINI_KEY_3=$BACKFILL_GEMINI_KEY_3"
+            echo "BACKFILL_GEMINI_KEY_4=$BACKFILL_GEMINI_KEY_4"
+            echo "BACKFILL_GEMINI_KEY_5=$BACKFILL_GEMINI_KEY_5"
+            echo "BACKFILL_GEMINI_KEY_6=$BACKFILL_GEMINI_KEY_6"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+          pip install google-genai requests beautifulsoup4 lxml pandas pyarrow \
+            google-api-python-client google-auth google-auth-oauthlib python-dotenv PyMuPDF
+
+      - name: Verify BACKFILL key pool (no Gemini, no Drive)
+        run: python scripts/extract_concall.py --backfill --check-keys
+
+      - name: T1 — fetch concalls (no Gemini)
+        if: ${{ github.event.inputs.run_t1 == 'true' }}
+        run: python scripts/run_backfill.py --max-companies ${{ github.event.inputs.max_companies }} --quarters ${{ github.event.inputs.quarters }}
+
+      - name: T1 — extract concalls (BACKFILL Gemini pool; prints bucket/quota summary)
+        if: ${{ github.event.inputs.run_t1 == 'true' }}
+        run: python scripts/extract_concall.py --backfill --limit ${{ github.event.inputs.extract_limit }}
+
+      - name: T2 — 3-statement backfill (no Gemini)
+        if: ${{ github.event.inputs.run_t2 == 'true' }}
+        run: python scripts/backfill_results_3stmt.py --max-companies ${{ github.event.inputs.max_companies }}
+
+      - name: T2 — derived metrics
+        if: ${{ github.event.inputs.run_t2 == 'true' }}
+        run: python scripts/build_derived_metrics.py
