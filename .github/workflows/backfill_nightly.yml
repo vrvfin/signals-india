@@ -1,0 +1,137 @@
+name: backfill-nightly
+
+# Phase 3 T1+T2 production backfill.
+#
+# NIGHTLY (cron, 23:30 IST = 18:00 UTC):
+#   T1 extract — drain the pending queue until BACKFILL keys exhaust for the day.
+#   T2 incremental — refresh financials for any company that reported today.
+#
+# INITIAL SETUP (manual dispatch, do_fetch=true):
+#   T1 fetch — queue the full universe (Screener/BSE only, no Gemini).
+#   T2 full — scrape financials for every company.
+#   Then T1 extract runs as normal.
+#
+# Key facts:
+#   * T1 extract stops cleanly (AllBucketsExhausted) when daily quota is spent; pending
+#     rows stay in the queue and are picked up the next night automatically.
+#   * T1 fetch is idempotent (dedup via ledger); re-running skips already-queued docs.
+#   * With 8 keys x 3 models = 24 buckets, ~3,600 concalls process per night.
+#     Priority: portfolio ~56 → conviction ~498 → market-cap tail.
+#     Estimated: priority names done in nights 1-2; full universe ~6-7 nights.
+
+on:
+  schedule:
+    - cron: '0 18 * * *'    # 23:30 IST every night
+  workflow_dispatch:
+    inputs:
+      do_fetch:
+        description: "T1: queue new concalls from Screener/BSE (initial or catch-up run)"
+        type: boolean
+        default: false
+      max_fetch:
+        description: "Max companies to fetch this run (0 = all ~5700)"
+        default: "0"
+      do_t2_full:
+        description: "T2: full 3-statement scrape (not just today's reporters)"
+        type: boolean
+        default: false
+      max_t2:
+        description: "Max companies for T2 full scrape (0 = all)"
+        default: "0"
+
+concurrency:
+  group: backfill-nightly
+  cancel-in-progress: false          # queue rather than cancel
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340             # ~5h40m; GitHub cap is 360min per job
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
+          BACKFILL_GEMINI_KEY_1:   ${{ secrets.BACKFILL_GEMINI_KEY_1 }}
+          BACKFILL_GEMINI_KEY_2:   ${{ secrets.BACKFILL_GEMINI_KEY_2 }}
+          BACKFILL_GEMINI_KEY_3:   ${{ secrets.BACKFILL_GEMINI_KEY_3 }}
+          BACKFILL_GEMINI_KEY_4:   ${{ secrets.BACKFILL_GEMINI_KEY_4 }}
+          BACKFILL_GEMINI_KEY_5:   ${{ secrets.BACKFILL_GEMINI_KEY_5 }}
+          BACKFILL_GEMINI_KEY_6:   ${{ secrets.BACKFILL_GEMINI_KEY_6 }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+            echo "BACKFILL_GEMINI_KEY=$BACKFILL_GEMINI_KEY"
+            echo "BACKFILL_GEMINI_KEY_1=$BACKFILL_GEMINI_KEY_1"
+            echo "BACKFILL_GEMINI_KEY_2=$BACKFILL_GEMINI_KEY_2"
+            echo "BACKFILL_GEMINI_KEY_3=$BACKFILL_GEMINI_KEY_3"
+            echo "BACKFILL_GEMINI_KEY_4=$BACKFILL_GEMINI_KEY_4"
+            echo "BACKFILL_GEMINI_KEY_5=$BACKFILL_GEMINI_KEY_5"
+            echo "BACKFILL_GEMINI_KEY_6=$BACKFILL_GEMINI_KEY_6"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+          pip install google-genai requests beautifulsoup4 lxml pandas pyarrow \
+            google-api-python-client google-auth google-auth-oauthlib python-dotenv PyMuPDF
+
+      - name: Verify BACKFILL key pool
+        run: python scripts/extract_concall.py --backfill --check-keys
+
+      # ── T1 FETCH (manual / catch-up only) ────────────────────────────────────
+      - name: T1 — fetch concalls from Screener/BSE (queue full universe)
+        if: ${{ github.event.inputs.do_fetch == 'true' }}
+        run: |
+          MAX=${{ github.event.inputs.max_fetch || '0' }}
+          if [ "$MAX" -gt 0 ]; then
+            python scripts/run_backfill.py --max-companies "$MAX" --quarters 4
+          else
+            python scripts/run_backfill.py --quarters 4
+          fi
+
+      # ── T1 EXTRACT (every run — drain queue until quota exhausted) ──────────
+      - name: T1 — extract concalls via Gemini (BACKFILL pool; runs until quota done)
+        run: |
+          # No --limit: run until AllBucketsExhausted. Pending rows stay for tomorrow.
+          python scripts/extract_concall.py --backfill || true
+          # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
+
+      # ── T2 FULL SCRAPE (manual only — initial setup or quarterly refresh) ────
+      - name: T2 — full 3-statement scrape (all companies)
+        if: ${{ github.event.inputs.do_t2_full == 'true' }}
+        run: |
+          MAX=${{ github.event.inputs.max_t2 || '0' }}
+          if [ "$MAX" -gt 0 ]; then
+            python scripts/backfill_results_3stmt.py --max-companies "$MAX"
+          else
+            python scripts/backfill_results_3stmt.py
+          fi
+
+      # ── T2 INCREMENTAL (every run — refresh today's reporters) ──────────────
+      - name: T2 — refresh financials for today's reporters (incremental)
+        run: python scripts/backfill_results_3stmt.py --incremental
+
+      # ── T2 DERIVED (every run — recomputes from latest 3stmt) ───────────────
+      - name: T2 — derived metrics
+        run: python scripts/build_derived_metrics.py
+
+      # NOTE: PEAD flags + emails are handled by pead.yml at 20:00 IST (the right
+      # post-market-close window). No email step here — avoid duplicate sends.
