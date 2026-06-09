@@ -621,9 +621,11 @@ def _verify_prospectus(pdf_bytes, name):
     return "drhp" if is_drhp else "rhp"
 
 def drhp_block(svc, root, isin, symbol, name, pool):
-    """Best-effort: discover the company's DRHP and/or RHP, verify it's the right
-    document, summarise (chunked) with the risk/fraud prompt, cache the summary as a
-    permanent sidecar. Raw PDF is NOT stored (huge); only the summary persists."""
+    """Best-effort: discover the company's prospectus, verify it's the right
+    document, summarise (chunked) with the risk/fraud prompt, cache the summary.
+    RHP-PRIMARY: the final RHP supersedes the draft, so we summarise the RHP and
+    only fall back to the DRHP when no RHP is found — this halves the cost. Raw PDF
+    is never stored; only the summary sidecar persists."""
     found = {}
     for typ in ("rhp", "drhp"):
         side = f"{DRIVE['company_page']}/{isin}/doc_summaries/prospectus_{typ}.md"
@@ -633,14 +635,22 @@ def drhp_block(svc, root, isin, symbol, name, pool):
     if found:                                       # already have a cached prospectus
         return _fmt_prospectus(found, name)
     try:
-        prompt = open(os.path.join(SCRIPTS_DIR, "drhp_prompt.txt"), encoding="utf-8").read()
+        # Verify candidates WITHOUT summarising; prefer an RHP, hold a DRHP as backup.
+        chosen = None                               # (typ, data)
         for url in _discover_prospectus_urls(name):
             data = _download_prospectus(url)
             if not data:
                 continue
             typ = _verify_prospectus(data, name)
-            if not typ or typ in found:
-                continue
+            if typ == "rhp":
+                chosen = ("rhp", data)
+                break                               # final doc found — stop
+            if typ == "drhp" and chosen is None:
+                chosen = ("drhp", data)             # keep looking for an RHP
+        if chosen:
+            prompt = open(os.path.join(SCRIPTS_DIR, "drhp_prompt.txt"),
+                          encoding="utf-8").read()
+            typ, data = chosen
             summ = _summarise_pdf_chunked(pool, prompt, data, f"{typ.upper()} {name}",
                                           prefer_text=True)
             if summ:
@@ -651,8 +661,6 @@ def drhp_block(svc, root, isin, symbol, name, pool):
                                  "text/markdown")
                 except Exception:
                     pass
-            if "rhp" in found and "drhp" in found:
-                break
     except Exception as e:
         if not found:
             return f"DATA_MISSING (prospectus fetch failed: {type(e).__name__})."
