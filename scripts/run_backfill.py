@@ -97,7 +97,23 @@ def _load_universe_df(drive, root_id) -> pd.DataFrame:
         for c in ("company", "company_name"):
             if c in df.columns:
                 df = df.rename(columns={c: "name"}); break
+    if "bse_code" not in df.columns:
+        for c in ("scrip_code", "bsecode", "bse"):
+            if c in df.columns:
+                df = df.rename(columns={c: "bse_code"}); break
     return df
+
+
+def _screener_token(row) -> str:
+    """Screener-resolvable token for a universe row: NSE symbol if present, else
+    BSE scrip code (Screener accepts /company/<bse_code>/). '' if neither."""
+    nse = str(row.get("symbol") or "").strip()
+    if nse and nse.lower() not in ("nan", "none"):
+        return nse
+    bse = str(row.get("bse_code") or "").strip()
+    if bse and bse.replace(".", "").isdigit():
+        return str(int(float(bse)))
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -107,19 +123,20 @@ def build_company_order(drive, root_id) -> list[dict]:
     """Return ordered list of {symbol, isin, name}:
     portfolio holdings first → strong (conviction) names → market-cap tail."""
     universe = _load_universe_df(drive, root_id)
-    if universe.empty or "symbol" not in universe.columns:
+    if universe.empty:
         log("  ERROR: no usable universe (company_universe.csv / master_list.csv).")
         return []
-    universe["symbol"] = universe["symbol"].astype(str).str.strip()
-    universe = universe[~universe["symbol"].str.lower().isin(["", "nan", "none"])]
-    if "isin" not in universe.columns:
-        universe["isin"] = ""
-    if "name" not in universe.columns:
-        universe["name"] = universe["symbol"]
-    sym2row = {r["symbol"]: {"symbol": r["symbol"],
-                             "isin": str(r.get("isin") or ""),
-                             "name": str(r.get("name") or r["symbol"])}
-               for _, r in universe.iterrows()}
+    for c in ("isin", "symbol", "name"):
+        if c not in universe.columns:
+            universe[c] = ""
+    # ALL listed companies: NSE by symbol, BSE-only by bse_code (Screener token).
+    sym2row: dict[str, dict] = {}
+    for _, r in universe.iterrows():
+        tok = _screener_token(r)
+        if not tok or tok in sym2row:
+            continue
+        sym2row[tok] = {"symbol": tok, "isin": str(r.get("isin") or ""),
+                        "name": str(r.get("name") or tok)}
     isin2row = {row["isin"]: row for row in sym2row.values() if row["isin"]}
 
     ordered: list[dict] = []

@@ -319,12 +319,12 @@ def load_keys(env: dict, prefix: str = "GEMINI_API_KEY") -> list[str]:
     plain = env.get(prefix, "").strip()
     if plain:
         raw.append(plain)
-    # Expand comma-separated values (Phase 1/2 guideline: a single var may hold a
-    # comma-list of keys) and de-dupe, preserving first-seen order. Gemini keys
-    # never contain commas, so splitting is safe.
+    # A single var may hold MANY keys separated by comma, semicolon, newline or
+    # spaces (one git secret with 8 keys = the common case). Gemini keys contain
+    # none of those, so splitting on any separator is safe. De-dupe, keep order.
     keys: list[str] = []
     for v in raw:
-        for part in v.split(","):
+        for part in re.split(r"[,\s;]+", v):
             p = part.strip()
             if p and p not in keys:
                 keys.append(p)
