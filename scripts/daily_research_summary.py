@@ -57,6 +57,9 @@ except Exception:  # google-genai not installed here
     class FatalCallError(Exception):
         pass
 
+# Shared OCR fallback (T1.5) — import-safe (no heavy deps).
+from pdf_ocr import ocr_pdf_via_gemini
+
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
@@ -534,11 +537,18 @@ def main():
 
         text, npages = extract_pdf(pdf)
         if len(text) < MIN_TEXT_CHARS:
-            print(f"   SKIP (needs OCR / empty): {pdf.name}")
-            add_ledger(research_n=0, doc_hash=h, fuzzy_fp="", content_key="",
-                       file_name=pdf.name, source=source, doc_type="needs_ocr",
-                       processed_at=dt.datetime.now().isoformat(), status="needs_ocr")
-            seen_hash.add(h); prior_status[h] = "needs_ocr"; counts["ocr"] += 1; continue
+            # T1.5 OCR fallback: scanned/image PDF -> recover text via Gemini vision
+            # (shared pdf_ocr helper) before giving up. Uses the same daily pool.
+            ocr_text = ocr_pdf_via_gemini(pool, pdf.read_bytes())
+            if len(ocr_text) >= MIN_TEXT_CHARS:
+                print(f"   OCR recovered {len(ocr_text)} chars via Gemini: {pdf.name}")
+                text = ocr_text
+            else:
+                print(f"   SKIP (needs OCR / empty): {pdf.name}")
+                add_ledger(research_n=0, doc_hash=h, fuzzy_fp="", content_key="",
+                           file_name=pdf.name, source=source, doc_type="needs_ocr",
+                           processed_at=dt.datetime.now().isoformat(), status="needs_ocr")
+                seen_hash.add(h); prior_status[h] = "needs_ocr"; counts["ocr"] += 1; continue
 
         fp = fuzzy_fingerprint(text, npages)
         if fp in seen_fp:

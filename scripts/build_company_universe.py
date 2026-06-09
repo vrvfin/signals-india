@@ -190,16 +190,18 @@ def fetch_bse() -> pd.DataFrame:
             if any(s in c.lower() for s in subs):
                 return c
         return None
-    c_isin = col("isin")
-    c_code = col("scrip_cd", "scripcd", "scrip_code", "sc_code")
-    c_name = col("sc_name", "scrip_name", "securityname", "company")
+    c_isin   = col("isin")
+    c_code   = col("scrip_cd", "scripcd", "scrip_code", "sc_code")
+    c_sym    = col("scrip_id")          # text ticker used by TradingView (e.g. "ROBU")
+    c_name   = col("sc_name", "scrip_name", "securityname", "company")
     if not (c_isin and c_code):
         log(f"  BSE: unexpected columns {list(df.columns)} — skipping.")
         return pd.DataFrame(columns=cols)
     out = pd.DataFrame({
-        "isin": df[c_isin].astype(str).str.strip(),
-        "bse_code": df[c_code].astype(str).str.strip(),
-        "name": df[c_name].astype(str).str.strip() if c_name else "",
+        "isin":       df[c_isin].astype(str).str.strip(),
+        "bse_code":   df[c_code].astype(str).str.strip(),
+        "bse_symbol": df[c_sym].astype(str).str.strip() if c_sym else "",
+        "name":       df[c_name].astype(str).str.strip() if c_name else "",
     })
     out = out[out["isin"].str.match(ISIN_RE, na=False)].reset_index(drop=True)
     log(f"  BSE: {len(out)} equities")
@@ -227,7 +229,7 @@ def main() -> None:
 
     # Merge on ISIN — NSE is primary for symbol/name/board.
     if not nse.empty and not bse.empty:
-        merged = nse.merge(bse[["isin", "bse_code"]].drop_duplicates("isin"),
+        merged = nse.merge(bse[["isin", "bse_code", "bse_symbol"]].drop_duplicates("isin"),
                            on="isin", how="outer")
         bse_names = bse.drop_duplicates("isin").set_index("isin")["name"].to_dict()
         merged["name"] = merged.apply(
@@ -241,7 +243,7 @@ def main() -> None:
         merged["nse_symbol"] = ""
         merged["board"] = ""
 
-    for c in ["nse_symbol", "bse_code", "name", "board"]:
+    for c in ["nse_symbol", "bse_code", "bse_symbol", "name", "board"]:
         if c not in merged.columns:
             merged[c] = ""
         merged[c] = merged[c].fillna("").astype(str)
@@ -260,7 +262,7 @@ def main() -> None:
 
     merged["board"] = merged.apply(board_of, axis=1)
     merged["exchange"] = merged.apply(exch, axis=1)
-    merged = (merged[["isin", "name", "nse_symbol", "bse_code", "board", "exchange"]]
+    merged = (merged[["isin", "name", "nse_symbol", "bse_code", "bse_symbol", "board", "exchange"]]
               .drop_duplicates("isin").sort_values("name").reset_index(drop=True))
 
     drive = get_drive()

@@ -74,7 +74,11 @@ DRIVE = dict(
     proc_queue   = "company_repo/_index/processing_queue.parquet",
     fundamentals = "fundamentals/summary.parquet",
     results      = "company_repo/_index/results.parquet",
-    universe     = "universe/master_list.csv",
+    # FULL listed universe (NSE main + NSE Emerge SME + BSE, with bse_code) built by
+    # build_company_universe.py. Use this, NOT universe/master_list.csv, which Phase 1
+    # (build_universe.py) overwrites DAILY with an NSE-only list (no bse_code, no SME).
+    universe     = "company_repo/_index/company_universe.csv",
+    universe_fallback = "universe/master_list.csv",
     company_page = "company_repo",   # /<ISIN>/company_page.md  &  output report
 )
 
@@ -110,6 +114,14 @@ def _read_csv(svc, path, root):
     b = drive_download(svc, path, root)
     return pd.read_csv(io.BytesIO(b)) if b else pd.DataFrame()
 
+def _load_universe(svc, root):
+    """Full listed universe (NSE+SME+BSE w/ bse_code); fall back to the NSE-only
+    master_list if the full file is missing."""
+    uni = _read_csv(svc, DRIVE["universe"], root)
+    if uni is None or uni.empty:
+        uni = _read_csv(svc, DRIVE["universe_fallback"], root)
+    return uni
+
 def resolve_isin(token, universe, interactive=False):
     """token may be ISIN / NSE symbol / BSE code / name -> (isin, symbol, name, bse_code).
 
@@ -130,8 +142,11 @@ def resolve_isin(token, universe, interactive=False):
             bse_out = str(int(float(s))) if s.replace(".", "").isdigit() else s
         else:
             bse_out = None
+        sym = str(r[sym_c]) if sym_c else t
+        if sym.lower() in ("nan", "none", ""):        # BSE-only co: no NSE symbol
+            sym = ""
         return (str(r[isin_c]) if isin_c else t,
-                str(r[sym_c]) if sym_c else t,
+                sym,
                 str(r[name_c]) if name_c else t,
                 bse_out)
     # exact matches first
@@ -534,34 +549,198 @@ def _ddg_results(query):
         out.append((a.get_text(" ", strip=True), url))
     return out
 
-def _discover_prospectus_urls(name):
-    """Ranked candidate PDF URLs for a company's DRHP/RHP (authoritative first)."""
+def _screener_drhp_urls(symbol: str) -> list[str]:
+    """Scrape Screener company page #documents section for DRHP/prospectus PDF links.
+    Screener often lists the DRHP under the Annual Reports subsection, linking
+    directly to the BSE/NSE-hosted PDF — very reliable when present."""
+    if not symbol:
+        return []
+    from bs4 import BeautifulSoup
+    out = []
+    for view in ("consolidated/", ""):
+        url = f"https://www.screener.in/company/{symbol}/{view}"
+        try:
+            r = requests.get(url,
+                             headers={"User-Agent": "Mozilla/5.0",
+                                      "Referer": "https://www.screener.in/"},
+                             timeout=25)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "lxml")
+            # Look inside #documents section (and anywhere on the page as fallback)
+            doc_sec = soup.find(id="documents") or soup
+            for a in doc_sec.find_all("a", href=True):
+                href = a["href"]
+                text = a.get_text(" ", strip=True).lower()
+                low = href.lower()
+                is_prosp = (
+                    "drhp" in low or "drhp" in text
+                    or "red herring" in text
+                    or "prospectus" in low or "prospectus" in text
+                    or "rhp" in text
+                )
+                is_pdf = ".pdf" in low or "pdf" in low
+                if is_prosp and is_pdf:
+                    if href.startswith("//"):
+                        href = "https:" + href
+                    elif href.startswith("/"):
+                        href = "https://www.screener.in" + href
+                    out.append(href)
+        except Exception:
+            pass
+        if out:
+            break
+    return out[:4]
+
+
+def _bse_offer_urls(bse_code: str) -> list[str]:
+    """BSE Prospectus/Offer Document API — returns direct PDF links for the company's
+    filed offer documents (DRHP, RHP, Prospectus). No rate-limit risk."""
+    if not bse_code:
+        return []
+    out = []
+    try:
+        # BSE ProspectusData endpoint (documented in BSE developer portal)
+        api = (f"https://api.bseindia.com/BseIndiaAPI/api/ProspectusData/w"
+               f"?scripcd={bse_code}&type=FP")
+        r = requests.get(api, headers={"User-Agent": "Mozilla/5.0",
+                                        "Referer": "https://www.bseindia.com/"},
+                         timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            # Response is usually a list of {PDFLINKDATA, DOCUMENT_TYPE, ...}
+            items = data if isinstance(data, list) else data.get("Table", [])
+            for item in items:
+                link = item.get("PDFLINKDATA") or item.get("PDF_LINK") or ""
+                dtype = (item.get("DOCUMENT_TYPE") or item.get("Doc_Type") or "").upper()
+                if not link:
+                    continue
+                # Prefer DRHP/RHP entries; include Prospectus entries too
+                if any(k in dtype for k in ("DRHP", "RED HERRING", "PROSP", "OFFER")):
+                    if not link.startswith("http"):
+                        link = "https://www.bseindia.com" + link
+                    out.append(link)
+    except Exception:
+        pass
+    if not out:
+        # Fallback: scrape BSE Prospectus page directly
+        try:
+            from bs4 import BeautifulSoup
+            page = (f"https://www.bseindia.com/corporates/"
+                    f"Prospectus_Subs.aspx?scripcd={bse_code}")
+            r = requests.get(page, headers={"User-Agent": "Mozilla/5.0",
+                                             "Referer": "https://www.bseindia.com/"},
+                             timeout=20)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "lxml")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    text = a.get_text(" ", strip=True).lower()
+                    low = href.lower()
+                    if (".pdf" in low or "pdf" in low) and any(
+                        k in low + text for k in ("drhp", "herring", "prosp", "offer")
+                    ):
+                        if not href.startswith("http"):
+                            href = "https://www.bseindia.com" + href
+                        out.append(href)
+        except Exception:
+            pass
+    return out[:4]
+
+
+def _nse_emerge_urls(symbol: str) -> list[str]:
+    """NSE Emerge archive: well-known patterns for SME DRHP/RHP PDFs.
+    Also queries the NSE Emerge listing documents API."""
+    if not symbol:
+        return []
+    out = []
+    sym = symbol.upper()
+    # Direct archive patterns that NSE Emerge uses for listing documents
+    for pat in (
+        f"https://nsearchives.nseindia.com/emerge/content/{sym}_DRHP.pdf",
+        f"https://nsearchives.nseindia.com/emerge/content/{sym}_RHP.pdf",
+        f"https://nsearchives.nseindia.com/emerge/content/{sym}-DRHP.pdf",
+        f"https://nsearchives.nseindia.com/emerge/content/{sym}-RHP.pdf",
+    ):
+        try:
+            r = requests.head(pat, headers={"User-Agent": "Mozilla/5.0"},
+                              timeout=15, allow_redirects=True)
+            if r.status_code == 200:
+                out.append(pat)
+        except Exception:
+            pass
+    # NSE Emerge API for listing documents
+    try:
+        api = (f"https://www.nseindia.com/api/emerge-content-details"
+               f"?symbol={sym}&type=drhp")
+        r = requests.get(api, headers={"User-Agent": "Mozilla/5.0",
+                                        "Referer": "https://www.nseindia.com/"},
+                         timeout=20)
+        if r.status_code == 200:
+            items = r.json() if isinstance(r.json(), list) else []
+            for item in items:
+                link = item.get("link") or item.get("url") or ""
+                if link and ".pdf" in link.lower():
+                    if not link.startswith("http"):
+                        link = "https://www.nseindia.com" + link
+                    out.append(link)
+    except Exception:
+        pass
+    return out[:4]
+
+
+def _discover_prospectus_urls(name, symbol=None, bse_code=None):
+    """Ranked candidate PDF URLs for a company's DRHP/RHP.
+    Priority: Screener docs (user-visible, reliable) → BSE offer API → NSE Emerge
+    archives → DDG as last resort. Returns deduplicated list, authoritative first."""
     import urllib.parse
-    cands = []
-    for q in (f'"{name}" red herring prospectus', f'"{name}" DRHP prospectus filetype:pdf'):
-        cands += _ddg_results(q)
-    name_tok = re.sub(r"[^a-z]", "", name.lower().split()[0]) if name.split() else ""
-    seen, ranked = set(), []
-    for text, url in cands:
-        low = url.lower()
-        if ".pdf" not in low and "pdf" not in low:
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        dom = urllib.parse.urlparse(url).netloc.lower()
-        score = 0
-        if any(d in dom for d in PROSPECTUS_AUTH_DOMAINS):
-            score += 10
-        if name_tok and len(name_tok) >= 4 and name_tok in dom.replace(".", ""):
-            score += 8                              # company's own website
-        if any(b in dom for b in ("scribd", "helpstudent", "hellobanker", "ssjfinance")):
-            score -= 12
-        if re.search(r"rhp|herring|prospectus", low + text.lower()):
-            score += 3
-        ranked.append((score, url))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [u for s, u in ranked if s > -5][:4]
+    seen: set[str] = set()
+    results: list[tuple[int, str]] = []   # (score, url)
+
+    def _add(url: str, score: int):
+        if url and url not in seen:
+            seen.add(url)
+            results.append((score, url))
+
+    # --- Tier 1: Screener #documents section (user's suggestion; links to exchange PDFs) ---
+    for u in _screener_drhp_urls(symbol or ""):
+        _add(u, 12)
+
+    # --- Tier 2: BSE offer documents API ---
+    for u in _bse_offer_urls(str(bse_code) if bse_code else ""):
+        _add(u, 11)
+
+    # --- Tier 3: NSE Emerge archive (SME) ---
+    for u in _nse_emerge_urls(symbol or ""):
+        _add(u, 10)
+
+    # --- Tier 4: DDG fallback (rate-limited; only if nothing found yet) ---
+    if not results:
+        cands = []
+        for q in (f'"{name}" red herring prospectus site:bseindia.com OR site:nseindia.com',
+                  f'"{name}" DRHP filetype:pdf'):
+            cands += _ddg_results(q)
+        name_tok = re.sub(r"[^a-z]", "", name.lower().split()[0]) if name.split() else ""
+        for text, url in cands:
+            low = url.lower()
+            if ".pdf" not in low and "pdf" not in low:
+                continue
+            if url in seen:
+                continue
+            dom = urllib.parse.urlparse(url).netloc.lower()
+            score = 0
+            if any(d in dom for d in PROSPECTUS_AUTH_DOMAINS):
+                score += 10
+            if name_tok and len(name_tok) >= 4 and name_tok in dom.replace(".", ""):
+                score += 8
+            if any(b in dom for b in ("scribd", "helpstudent", "hellobanker", "ssjfinance")):
+                score -= 12
+            if re.search(r"rhp|herring|prospectus", low + text.lower()):
+                score += 3
+            _add(url, score)
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [u for s, u in results if s > -5][:6]
 
 def _download_prospectus(url):
     try:
@@ -605,10 +784,12 @@ def _verify_prospectus(pdf_bytes, name):
         return None                                 # wrong company — reject
     return "drhp" if is_drhp else "rhp"
 
-def drhp_block(svc, root, isin, symbol, name, pool):
-    """Best-effort: discover the company's DRHP and/or RHP, verify it's the right
-    document, summarise (chunked) with the risk/fraud prompt, cache the summary as a
-    permanent sidecar. Raw PDF is NOT stored (huge); only the summary persists."""
+def drhp_block(svc, root, isin, symbol, name, pool, bse_code=None):
+    """Best-effort: discover the company's prospectus, verify it's the right
+    document, summarise (chunked) with the risk/fraud prompt, cache the summary.
+    RHP-PRIMARY: the final RHP supersedes the draft, so we summarise the RHP and
+    only fall back to the DRHP when no RHP is found — this halves the cost. Raw PDF
+    is never stored; only the summary sidecar persists."""
     found = {}
     for typ in ("rhp", "drhp"):
         side = f"{DRIVE['company_page']}/{isin}/doc_summaries/prospectus_{typ}.md"
@@ -618,14 +799,22 @@ def drhp_block(svc, root, isin, symbol, name, pool):
     if found:                                       # already have a cached prospectus
         return _fmt_prospectus(found, name)
     try:
-        prompt = open(os.path.join(SCRIPTS_DIR, "drhp_prompt.txt"), encoding="utf-8").read()
-        for url in _discover_prospectus_urls(name):
+        # Verify candidates WITHOUT summarising; prefer an RHP, hold a DRHP as backup.
+        chosen = None                               # (typ, data)
+        for url in _discover_prospectus_urls(name, symbol=symbol, bse_code=bse_code):
             data = _download_prospectus(url)
             if not data:
                 continue
             typ = _verify_prospectus(data, name)
-            if not typ or typ in found:
-                continue
+            if typ == "rhp":
+                chosen = ("rhp", data)
+                break                               # final doc found — stop
+            if typ == "drhp" and chosen is None:
+                chosen = ("drhp", data)             # keep looking for an RHP
+        if chosen:
+            prompt = open(os.path.join(SCRIPTS_DIR, "drhp_prompt.txt"),
+                          encoding="utf-8").read()
+            typ, data = chosen
             summ = _summarise_pdf_chunked(pool, prompt, data, f"{typ.upper()} {name}",
                                           prefer_text=True)
             if summ:
@@ -636,8 +825,6 @@ def drhp_block(svc, root, isin, symbol, name, pool):
                                  "text/markdown")
                 except Exception:
                     pass
-            if "rhp" in found and "drhp" in found:
-                break
     except Exception as e:
         if not found:
             return f"DATA_MISSING (prospectus fetch failed: {type(e).__name__})."
@@ -919,7 +1106,7 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     youtube = youtube_block(svc, root, isin, symbol, name, pool)
     yt_ok = not youtube.startswith(("DATA_MISSING", "No videos", "Whitelisted"))
     # DRHP/RHP prospectus — auto-discover + content guardrail, summary cached (best-effort).
-    drhp = drhp_block(svc, root, isin, symbol, name, pool)
+    drhp = drhp_block(svc, root, isin, symbol, name, pool, bse_code=bse_code)
     drhp_ok = not drhp.startswith("DATA_MISSING")
     print(f"    exchange: BSE={'ok' if not bse.startswith('DATA_MISSING') else 'miss'} "
           f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'} "
@@ -1080,7 +1267,7 @@ def main():
     svc = drive_service(); root = os.environ["GDRIVE_FOLDER_ID"]
 
     if args.resolve_only and args.names:
-        universe = _read_csv(svc, DRIVE["universe"], root)
+        universe = _load_universe(svc, root)
         for t in [x.strip() for x in args.names.split(",") if x.strip()]:
             isin, symbol, name, _ = resolve_isin(t, universe, interactive=args.interactive)
             if isin == t and symbol == t:
@@ -1109,7 +1296,7 @@ def main():
     print(f"Pool: {len(api_keys)} key(s) × {len(DEEPDIVE_MODELS)} model(s) "
           f"= {len(api_keys) * len(DEEPDIVE_MODELS)} daily buckets")
 
-    universe = _read_csv(svc, DRIVE["universe"], root)
+    universe = _load_universe(svc, root)
     fund     = _read_parquet(svc, DRIVE["fundamentals"], root)
     results  = _read_parquet(svc, DRIVE["results"], root)
     ridx     = _read_parquet(svc, DRIVE["research_idx"], root)

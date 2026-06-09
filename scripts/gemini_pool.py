@@ -304,13 +304,28 @@ class BucketPool:
         }
 
 
-def load_keys(env: dict) -> list[str]:
-    """Collect GEMINI_API_KEY_<n> (sorted) + plain GEMINI_API_KEY, de-duped."""
-    keys = [v for _, v in sorted(
+def load_keys(env: dict, prefix: str = "GEMINI_API_KEY") -> list[str]:
+    """Collect <prefix>_<n> (sorted) + plain <prefix>, de-duped.
+
+    Default prefix preserves the original Phase 2 behaviour (GEMINI_API_KEY_<n>
+    + GEMINI_API_KEY). Pass prefix="BACKFILL_GEMINI_KEY" to load the dedicated
+    backfill pool (separate Cloud projects) so its quota is independent of Phase 2.
+    """
+    num_re = re.compile(rf"{re.escape(prefix)}_\d+$")
+    raw = [v for _, v in sorted(
         ((k, v) for k, v in env.items()
-         if re.match(r"GEMINI_API_KEY_\d+$", k) and v.strip()),
+         if num_re.match(k) and v.strip()),
         key=lambda kv: kv[0])]
-    plain = env.get("GEMINI_API_KEY", "").strip()
-    if plain and plain not in keys:
-        keys.append(plain)
+    plain = env.get(prefix, "").strip()
+    if plain:
+        raw.append(plain)
+    # A single var may hold MANY keys separated by comma, semicolon, newline or
+    # spaces (one git secret with 8 keys = the common case). Gemini keys contain
+    # none of those, so splitting on any separator is safe. De-dupe, keep order.
+    keys: list[str] = []
+    for v in raw:
+        for part in re.split(r"[,\s;]+", v):
+            p = part.strip()
+            if p and p not in keys:
+                keys.append(p)
     return keys

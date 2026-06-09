@@ -495,3 +495,40 @@ def load_api_keys() -> list[str]:
     if plain and plain not in keys:
         keys.append(plain)
     return keys
+
+
+# ------------------------------------------------------------------ #
+#  Generic Drive mutual-exclusion lock (Phase 3)                      #
+#  For scripts that read-modify-write the SAME _index parquet so two  #
+#  runs can't clobber each other. Stale locks auto-steal after        #
+#  max_age_min (crashed run). Acquire returns True on success.        #
+# ------------------------------------------------------------------ #
+
+def acquire_lock(drive, index_id: str, lock_name: str, owner: str,
+                 max_age_min: int = 180) -> bool:
+    fid = find_file(drive, index_id, lock_name)
+    if fid:
+        try:
+            content = download_bytes(drive, fid).decode("utf-8", errors="replace")
+            ts_str = content.split("|", 2)[1] if "|" in content else ""
+            ts = datetime.fromisoformat(ts_str) if ts_str else None
+            age_min = ((datetime.now() - ts).total_seconds() / 60.0) if ts else 1e9
+            if age_min < max_age_min:
+                log(f"  LOCK {lock_name} held by '{content.split('|')[0]}' "
+                    f"({age_min:.0f} min) — exiting cleanly.")
+                return False
+            log(f"  LOCK {lock_name} stale ({age_min:.0f} min) — stealing.")
+        except Exception as e:
+            log(f"  LOCK {lock_name} read failed ({str(e)[:60]}) — overwriting.")
+    payload = f"{owner}|{datetime.now().isoformat(timespec='seconds')}".encode("utf-8")
+    upload_bytes(drive, index_id, lock_name, payload, "text/plain", existing_id=fid)
+    return True
+
+
+def release_lock(drive, index_id: str, lock_name: str) -> None:
+    try:
+        fid = find_file(drive, index_id, lock_name)
+        if fid:
+            drive.files().delete(fileId=fid).execute()
+    except Exception as e:
+        log(f"  LOCK {lock_name} release failed ({str(e)[:60]}) — auto-stolen later.")
