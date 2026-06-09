@@ -262,7 +262,15 @@ QFACTS_COLS = [
     "isin", "symbol", "company_name", "quarter", "fy_year",
     "revenue_q", "ebitda_q", "pat_q", "margin_pct", "volume_q", "capacity_q",
     "revenue_12m", "pat_12m", "processed_at", "source_doc_id",
+    # Gemini response length (chars). Used as a richness proxy: if a second
+    # document for the same company+quarter is >20% longer, it supersedes the
+    # existing entry (full transcript beats a short announcement). Legacy rows
+    # that pre-date this column have response_chars=0 and are always superseded.
+    "response_chars",
 ]
+
+# Minimum ratio new/old response length to supersede an existing quarter entry.
+SUPERSEDE_THRESHOLD = 1.2   # new must be >20% longer than existing
 
 GUIDANCE_COLS = [
     "isin", "symbol", "company_name", "quarter", "metric",
@@ -619,6 +627,71 @@ def append_company_page(drive, repo_id, key: str, content: str,
         initial = f"# {key} — Company Intelligence\n" + header + content
         upload_bytes(drive, comp_id, "company_page.md",
                      initial.encode("utf-8"), "text/markdown")
+
+
+def replace_company_page_section(drive, repo_id, key: str, quarter: str,
+                                  content: str, doc_title: str) -> None:
+    """Replace an existing quarter's section in company_page.md in-place.
+
+    Called when a richer document supersedes a previously processed one for the
+    same quarter. Finds the section by its ## header, replaces everything up to
+    the next section separator (---) or end of file, and re-uploads.
+    Falls back to append if the section header is not found (e.g. first time).
+    """
+    if not key:
+        return
+    comp_id = get_or_create_subfolder(drive, repo_id, key)
+    new_header = (
+        f"\n\n---\n## {quarter} Concall — {doc_title}\n"
+        f"*Processed: {datetime.now().strftime('%Y-%m-%d')} (superseded)*\n\n"
+    )
+    new_section = new_header + content
+    fid = find_file(drive, comp_id, "company_page.md")
+    if not fid:
+        initial = f"# {key} — Company Intelligence\n" + new_section
+        upload_bytes(drive, comp_id, "company_page.md",
+                     initial.encode("utf-8"), "text/markdown")
+        return
+    existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+    # Match from the section's --- separator + ## header through to the next ---
+    # separator or end of file. re.DOTALL so .* crosses newlines.
+    pattern = (rf'\n\n---\n## {re.escape(quarter)} Concall[^\n]*\n'
+               rf'\*Processed:[^\n]*\n\n'
+               rf'.*?'
+               rf'(?=\n\n---\n##|\Z)')
+    if re.search(pattern, existing, re.DOTALL):
+        updated = re.sub(pattern, new_section, existing, count=1, flags=re.DOTALL)
+        log(f"  Replaced {quarter} section in company_page.md (superseded).")
+    else:
+        # Section not found — append (handles edge cases like different date format)
+        updated = existing + new_section
+        log(f"  WARN: {quarter} section not found in company_page.md — appending.")
+    upload_bytes(drive, comp_id, "company_page.md",
+                 updated.encode("utf-8"), "text/markdown", existing_id=fid)
+
+
+def _purge_quarter_records(drive, index_id, isin: str, quarter: str) -> None:
+    """Remove ALL records for (isin, quarter) from every structured parquet table.
+
+    Called before writing a superseding document so old data is fully replaced,
+    not accumulated. The new document's write path then adds fresh rows as normal.
+    """
+    def _drop(fname, cols):
+        df = _load_parquet(drive, index_id, fname, cols)
+        if df.empty:
+            return
+        mask = ((df["isin"].astype(str) == str(isin)) &
+                (df["quarter"].astype(str) == str(quarter)))
+        if mask.any():
+            _save_parquet(drive, index_id, fname, df[~mask].reset_index(drop=True))
+
+    _drop("quarterly_facts.parquet",              QFACTS_COLS)
+    _drop("guidance_tracker.parquet",             GUIDANCE_COLS)
+    _drop("gf1_guidance_statements.parquet",      GF1_COLS)
+    _drop("gf2_historical_guidance.parquet",      GF2_COLS)
+    _drop("gf3_operational_visibility.parquet",   GF3_COLS)
+    _drop("gf4_quality_flags.parquet",            GF4_COLS)
+    log(f"  Purged old {quarter} records from all parquets.")
 
 
 def append_quarterly_guidance_page(drive, repo_id, symbol: str, company_name: str,
@@ -1424,7 +1497,8 @@ def main() -> None:
     log(f"Context caches: GF1={len(_gf1_cache)} rows · "
         f"facts={len(_qfacts_cache)} rows · results={len(_results_cache)} rows")
 
-    counts = {"processed": 0, "error": 0, "skipped": 0, "skipped_dup": 0, "gf1": 0,
+    counts = {"processed": 0, "error": 0, "skipped": 0, "skipped_dup": 0,
+              "superseded": 0, "gf1": 0,
               "gf2": 0, "gf3": 0, "gf4": 0, "gf_track": 0, "mgmt_cred": 0}
 
     # Run-local guard: (isin, quarter) already written THIS run. Combined with the
@@ -1480,30 +1554,64 @@ def main() -> None:
             # 4. Parse Table_A → quarterly facts + guidance rows
             facts, guidance_rows = parse_gemini_response(markdown_text, row)
             quarter = facts["quarter"]
+            facts["response_chars"] = len(markdown_text)   # richness proxy
             log(f"  Parsed: quarter={quarter or 'unknown'}, "
-                f"guidance_rows={len(guidance_rows)}")
+                f"guidance_rows={len(guidance_rows)}, "
+                f"response_chars={len(markdown_text):,}")
 
-            # DUP-QUARTER BACKSTOP: if this company+quarter was already summarised
-            # by a DIFFERENT document, skip ALL writes (markdown appends would show
-            # the quarter twice; a parquet upsert would add a competing row since
-            # upserts key on source_doc_id). Mark done and move on — a duplicate
-            # document for an already-covered quarter contributes nothing.
+            # DUP-QUARTER / SUPERSEDE: if this company+quarter was already summarised
+            # by a DIFFERENT document, decide whether to replace or skip.
+            #
+            # Rule (mirrors user policy):
+            #   • Same run (_seen_quarter_keys): always skip — no comparison possible.
+            #   • Cross-run: compare response_chars.
+            #       new >= existing * SUPERSEDE_THRESHOLD → SUPERSEDE (richer doc wins,
+            #         old .md section replaced in-place, old parquet rows purged).
+            #       new < threshold → skip (true duplicate, shorter/same doc).
+            #       Legacy rows with no response_chars → always supersede (unknown richness).
             _this_doc = str(facts.get("source_doc_id") or row.get("doc_id") or "")
             _isin_key = str(row.get("isin") or row.get("key") or "").strip()
+            _this_chars = len(markdown_text)
             _dup_quarter = False
+            _supersede = False
+            _old_source_doc_id = ""
+
             if quarter and _isin_key:
                 _qkey = (_isin_key, str(quarter))
                 if _qkey in _seen_quarter_keys:
-                    _dup_quarter = True
+                    _dup_quarter = True   # same run — always skip
                 elif not _qfacts_cache.empty:
                     _m = ((_qfacts_cache["isin"].astype(str) == _isin_key)
                           & (_qfacts_cache["quarter"].astype(str) == str(quarter))
                           & (_qfacts_cache["source_doc_id"].astype(str) != _this_doc))
-                    _dup_quarter = bool(_m.any())
+                    if _m.any():
+                        _old_chars = pd.to_numeric(
+                            _qfacts_cache.loc[_m, "response_chars"], errors="coerce"
+                        ).fillna(0).max()
+                        _old_source_doc_id = str(
+                            _qfacts_cache.loc[_m, "source_doc_id"].iloc[0])
+                        if _old_chars == 0 or _this_chars >= _old_chars * SUPERSEDE_THRESHOLD:
+                            _supersede = True
+                            log(f"  SUPERSEDE: {row.get('symbol')} {quarter} — "
+                                f"new {_this_chars:,} chars vs existing "
+                                f"{int(_old_chars):,} — replacing.")
+                        else:
+                            _dup_quarter = True
+                            log(f"  DUP-QUARTER (skip): {row.get('symbol')} {quarter} — "
+                                f"new {_this_chars:,} not >{SUPERSEDE_THRESHOLD:.0%} "
+                                f"of existing {int(_old_chars):,} — skipping.")
                 _seen_quarter_keys.add(_qkey)
-            if _dup_quarter:
-                log(f"  DUP-QUARTER: {row.get('symbol')} {quarter} already "
-                    f"summarised by another document — skipping all writes, marking done.")
+
+            if _supersede:
+                # Purge old quarter data from all parquets + mark old queue row
+                _purge_quarter_records(drive, index_id, _isin_key, str(quarter))
+                _old_mask = queue["doc_id"].astype(str) == _old_source_doc_id
+                if _old_mask.any():
+                    queue.loc[_old_mask, "status"] = "superseded"
+                counts["superseded"] = counts.get("superseded", 0) + 1
+                # Fall through — normal write path below handles the new document.
+
+            elif _dup_quarter:
                 queue.loc[queue_idx, "status"] = "done"
                 queue.loc[queue_idx, "processed_at"] = now_str
                 if args.backfill:
@@ -1537,13 +1645,25 @@ def main() -> None:
 
             # 5a. Company page (persisted forever)
             if OUTPUT_COMPANY_MD:
-                append_company_page(
-                    drive, repo_id,
-                    key=str(row.get("key") or row.get("isin") or row.get("symbol") or ""),
-                    content=markdown_text,
-                    doc_title=str(row.get("title", "")),
-                    quarter=quarter,
-                )
+                _cp_key = str(
+                    row.get("key") or row.get("isin") or row.get("symbol") or "")
+                if _supersede and quarter:
+                    # Replace the existing quarter section in-place (richer doc wins)
+                    replace_company_page_section(
+                        drive, repo_id,
+                        key=_cp_key,
+                        quarter=quarter,
+                        content=markdown_text,
+                        doc_title=str(row.get("title", "")),
+                    )
+                else:
+                    append_company_page(
+                        drive, repo_id,
+                        key=_cp_key,
+                        content=markdown_text,
+                        doc_title=str(row.get("title", "")),
+                        quarter=quarter,
+                    )
 
             # 5b. Daily digest
             if OUTPUT_DAY_MD:
@@ -1635,6 +1755,7 @@ def main() -> None:
     print(f"Errors    : {counts['error']}  (bad PDF / deterministic)")
     print(f"Skipped   : {counts['skipped']}  (no drive_file_id / download fail)")
     print(f"Dup-qtr   : {counts['skipped_dup']}  (quarter already summarised — marked done)")
+    print(f"Superseded: {counts.get('superseded', 0)}  (richer doc replaced existing quarter section)")
     print(f"GF rows   : GF1={counts['gf1']} GF2={counts['gf2']} "
           f"GF3={counts['gf3']} GF4={counts['gf4']}")
     print(f"GF_TRACK  : {counts['gf_track']} credibility sections · "
