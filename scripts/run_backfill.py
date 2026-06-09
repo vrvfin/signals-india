@@ -54,6 +54,7 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 import backfill_company_docs as bcd
 from ingest_company_docs import (
     get_drive, get_or_create_subfolder, find_file, download_bytes,
+    load_queue, save_queue,
 )
 from _extractor_base import load_portfolio_isins   # T1-finish: portfolio-first tier
 
@@ -252,6 +253,35 @@ def main() -> None:
         # dry-run still needs Drive to read the universe / conviction lists
         drive = get_drive()
         root_id = os.environ["GDRIVE_FOLDER_ID"]
+
+    # QUEUE MIGRATION: tag any pending concall rows that have no source column as
+    # "backfill". Rationale: before the source tag was introduced, run_backfill
+    # enqueued rows without it. Those rows must NOT be picked up by Phase 2's live
+    # extractor (wrong digest, wrong key pool). Live rows enqueued by ingest_company_docs
+    # are processed within one Phase 2 run (~2h window), so any pending row with blank
+    # source is almost certainly a backfill orphan. We re-tag them here so the next
+    # extract_concall --backfill run picks them up correctly.
+    if not args.dry_run and index_id:
+        try:
+            queue = load_queue(drive, index_id)
+            if not queue.empty:
+                if "source" not in queue.columns:
+                    queue["source"] = ""
+                blank_mask = (
+                    (queue["source"].astype(str).str.strip() == "")
+                    | (queue["source"].astype(str).str.lower() == "nan")
+                    | (queue["source"].astype(str).str.lower() == "none")
+                )
+                pending_blank = blank_mask & (queue["status"] == "pending")
+                n_retagged = int(pending_blank.sum())
+                if n_retagged:
+                    queue.loc[pending_blank, "source"] = "backfill"
+                    save_queue(drive, index_id, queue)
+                    log(f"Queue migration: re-tagged {n_retagged} pending rows "
+                        f"(no source) -> 'backfill' so Phase 2 live extractor "
+                        f"does not pick them up.")
+        except Exception as _e:
+            log(f"  WARNING: queue migration step failed ({str(_e)[:80]}) — continuing.")
 
     # Build the ordered company list
     explicit = [s for s in args.symbols.split(",") if s.strip()]

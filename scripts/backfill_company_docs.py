@@ -267,10 +267,24 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
     # Retry previously failed downloads: drop their old rows so they re-attempt,
     # and DON'T treat their keys as known. Successful (pending/done) rows stay known.
     def _key(s): return s["doc_id"].astype(str) + "__" + s["announcement_date"].astype(str).str[:10]
+    # CROSS-PATH CONCALL DEDUP: the live recent-feed (ingest_company_docs) and this
+    # company-page path compute doc_id/date from DIFFERENT URLs, so the same concall
+    # can get two different exact keys → it would be queued (and summarised) twice.
+    # A concall is one event per company per month, so we also dedup concalls on a
+    # coarse (key, YYYY-MM) regardless of doc_id, across ANY existing queue row
+    # (live or backfill, pending or done).
+    def _month_key(comp_key, ann): return f"{comp_key}__{str(ann)[:7]}"
+    known_concall_month: set[str] = set()
     if not queue.empty:
         failed_mask = queue["status"].astype(str) == "download_failed"
         queue = queue[~failed_mask].reset_index(drop=True)
         known = set(_key(queue)) if not queue.empty else set()
+        if not queue.empty:
+            cc = queue[queue["doc_type"].astype(str) == "concall"]
+            for _, qr in cc.iterrows():
+                known_concall_month.add(
+                    _month_key(str(qr.get("key") or qr.get("isin") or qr.get("symbol") or ""),
+                               qr.get("announcement_date")))
     else:
         known = set()
 
@@ -280,6 +294,12 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
         if dedup_key in known:
             counts["dup"] += 1
             continue
+        # coarse cross-path guard for concalls (one per company per month)
+        if d["doc_type"] == "concall":
+            mk = _month_key(key, d["announcement_date"])
+            if mk in known_concall_month:
+                counts["dup"] += 1
+                continue
         drive_file_id, status = "", "pending"
         try:
             fetched = fetch_document(session, d["pdf_url"])
@@ -299,6 +319,8 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
             log(f"  ! {d['doc_type']:<14} error ({str(exc)[:80]}) — skip")
             continue
         known.add(dedup_key)
+        if d["doc_type"] == "concall":
+            known_concall_month.add(_month_key(key, d["announcement_date"]))
         new_rows.append({
             "doc_id": d["doc_id"], "key": key, "isin": isin,
             "symbol": symbol, "company_name": symbol,
@@ -308,6 +330,7 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
             "status": status,
             "discovered_at": dt.datetime.now().isoformat(timespec="seconds"),
             "processed_at": "",
+            "source": "backfill",      # enqueue origin -> backfill extractor only
         })
         counts["new"] += 1
         time.sleep(0.4)             # polite to BSE/CRISIL

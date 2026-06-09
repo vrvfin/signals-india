@@ -250,7 +250,13 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "title", "description", "announcement_date", "pdf_url",
               "drive_file_id", "status", "discovered_at", "processed_at",
               # Phase 3 T1: set only when a row is processed by a backfill run.
-              "backfill_process_date"]
+              "backfill_process_date",
+              # Phase 3 T1: who ENQUEUED this row — "live" (Phase 2 recent feed) or
+              # "backfill" (run_backfill/backfill_company_docs). Set at enqueue time
+              # so each extractor only drains its own rows (live -> daily digest +
+              # main key pool; backfill -> daily_backfill digest + BACKFILL pool).
+              # A blank/absent value is treated as "live" (legacy rows).
+              "source"]
 
 
 def load_queue(drive, index_id) -> pd.DataFrame:
@@ -403,6 +409,7 @@ def main() -> None:
                     "status": status,
                     "discovered_at": datetime.now().isoformat(timespec="seconds"),
                     "processed_at": "",
+                    "source": "live",          # Phase 2 recent-feed origin
                 })
                 time.sleep(0.4)            # polite to BSE
             if page_all_old:

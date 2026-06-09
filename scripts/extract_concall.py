@@ -172,7 +172,11 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "drive_file_id", "status", "discovered_at", "processed_at",
               # Phase 3 T1: stamped (=date) only when a row is processed by a
               # backfill run; blank for normal Phase 2 live processing.
-              "backfill_process_date"]
+              "backfill_process_date",
+              # Phase 3 T1: enqueue origin — "live" or "backfill". Each extractor
+              # drains ONLY its own rows so backfill never lands in the daily digest
+              # or burns the main key pool. Blank/absent => treated as "live".
+              "source"]
 
 
 def load_queue(drive, index_id) -> pd.DataFrame:
@@ -1379,7 +1383,15 @@ def main() -> None:
 
     # Load queue and filter to pending concalls
     queue = load_queue(drive, index_id)
-    pending_mask = (queue["status"] == "pending") & (queue["doc_type"] == "concall")
+    # ORIGIN ROUTING (T1 fix): each extractor drains ONLY its own rows so a
+    # backfill-fetched concall never lands in the live daily digest or burns the
+    # main key pool (and vice-versa). A blank/absent source is legacy => "live".
+    _src = queue["source"].astype(str).str.strip().str.lower()
+    is_backfill_row = _src.eq("backfill")
+    origin_mask = is_backfill_row if args.backfill else (~is_backfill_row)
+    pending_mask = ((queue["status"] == "pending")
+                    & (queue["doc_type"] == "concall")
+                    & origin_mask)
     # Process OLDEST -> NEWEST per company so each company's GF1 guidance history
     # accrues before its latest concall is processed; only then does the latest
     # concall see prior history and emit GF_TRACK. Harmless for Phase 2's 2-day
@@ -1391,7 +1403,8 @@ def main() -> None:
     pending = pending.sort_values(["isin", "_ann"], na_position="first")
     pending_idx = pending.index.tolist()
 
-    log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending concalls "
+    log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending "
+        f"{'BACKFILL' if args.backfill else 'LIVE'} concalls "
         f"(processed oldest->newest per company)")
 
     if args.limit:
@@ -1411,8 +1424,14 @@ def main() -> None:
     log(f"Context caches: GF1={len(_gf1_cache)} rows · "
         f"facts={len(_qfacts_cache)} rows · results={len(_results_cache)} rows")
 
-    counts = {"processed": 0, "error": 0, "skipped": 0, "gf1": 0, "gf2": 0,
-              "gf3": 0, "gf4": 0, "gf_track": 0, "mgmt_cred": 0}
+    counts = {"processed": 0, "error": 0, "skipped": 0, "skipped_dup": 0, "gf1": 0,
+              "gf2": 0, "gf3": 0, "gf4": 0, "gf_track": 0, "mgmt_cred": 0}
+
+    # Run-local guard: (isin, quarter) already written THIS run. Combined with the
+    # quarterly_facts cache below, this is the backstop that stops the same concall
+    # quarter being summarised twice (e.g. a doc queued via both live feed and
+    # backfill with different doc_ids) even if it slips past enqueue-time dedup.
+    _seen_quarter_keys: set[tuple[str, str]] = set()
 
     # Fixed run-time label for this execution — used to group today's digest entries
     # by run (Run 1 / Run 2 / …) so the user can see what each scheduled slot added.
@@ -1463,6 +1482,36 @@ def main() -> None:
             quarter = facts["quarter"]
             log(f"  Parsed: quarter={quarter or 'unknown'}, "
                 f"guidance_rows={len(guidance_rows)}")
+
+            # DUP-QUARTER BACKSTOP: if this company+quarter was already summarised
+            # by a DIFFERENT document, skip ALL writes (markdown appends would show
+            # the quarter twice; a parquet upsert would add a competing row since
+            # upserts key on source_doc_id). Mark done and move on — a duplicate
+            # document for an already-covered quarter contributes nothing.
+            _this_doc = str(facts.get("source_doc_id") or row.get("doc_id") or "")
+            _isin_key = str(row.get("isin") or row.get("key") or "").strip()
+            _dup_quarter = False
+            if quarter and _isin_key:
+                _qkey = (_isin_key, str(quarter))
+                if _qkey in _seen_quarter_keys:
+                    _dup_quarter = True
+                elif not _qfacts_cache.empty:
+                    _m = ((_qfacts_cache["isin"].astype(str) == _isin_key)
+                          & (_qfacts_cache["quarter"].astype(str) == str(quarter))
+                          & (_qfacts_cache["source_doc_id"].astype(str) != _this_doc))
+                    _dup_quarter = bool(_m.any())
+                _seen_quarter_keys.add(_qkey)
+            if _dup_quarter:
+                log(f"  DUP-QUARTER: {row.get('symbol')} {quarter} already "
+                    f"summarised by another document — skipping all writes, marking done.")
+                queue.loc[queue_idx, "status"] = "done"
+                queue.loc[queue_idx, "processed_at"] = now_str
+                if args.backfill:
+                    queue.loc[queue_idx, "backfill_process_date"] = \
+                        datetime.now().strftime("%Y-%m-%d")
+                save_queue(drive, index_id, queue)
+                counts["skipped_dup"] += 1
+                continue
 
             # 4b. Parse GF1-4 sections
             gf1_rows, gf2_rows, gf3_rows, gf4_rows = parse_gf_sections(
@@ -1585,6 +1634,7 @@ def main() -> None:
     print(f"Deferred  : {counts.get('deferred', 0)}  (still pending — quota/transient)")
     print(f"Errors    : {counts['error']}  (bad PDF / deterministic)")
     print(f"Skipped   : {counts['skipped']}  (no drive_file_id / download fail)")
+    print(f"Dup-qtr   : {counts['skipped_dup']}  (quarter already summarised — marked done)")
     print(f"GF rows   : GF1={counts['gf1']} GF2={counts['gf2']} "
           f"GF3={counts['gf3']} GF4={counts['gf4']}")
     print(f"GF_TRACK  : {counts['gf_track']} credibility sections · "
