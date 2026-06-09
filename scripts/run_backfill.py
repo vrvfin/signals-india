@@ -80,17 +80,38 @@ def _read_csv_from(drive, parent_id, *path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _load_universe_df(drive, root_id) -> pd.DataFrame:
+    """Full listed universe — mirror company_deep_report: prefer the Phase-2
+    `company_repo/_index/company_universe.csv` (NSE+SME+BSE; column `nse_symbol`),
+    fall back to `universe/master_list.csv` (Phase-1, NSE-only, column `symbol`).
+    Normalises to a `symbol` + `name` column so the rest of the code is uniform.
+    Using _index (which Phase 2 reads/writes every CI run) fixes the CI path issue."""
+    df = _read_csv_from(drive, root_id, "company_repo", "_index", "company_universe.csv")
+    if df.empty:
+        df = _read_csv_from(drive, root_id, "universe", "master_list.csv")
+    if df.empty:
+        return df
+    if "symbol" not in df.columns and "nse_symbol" in df.columns:
+        df = df.rename(columns={"nse_symbol": "symbol"})
+    if "name" not in df.columns:
+        for c in ("company", "company_name"):
+            if c in df.columns:
+                df = df.rename(columns={c: "name"}); break
+    return df
+
+
 # --------------------------------------------------------------------------- #
 #  Build the priority-ordered company list
 # --------------------------------------------------------------------------- #
 def build_company_order(drive, root_id) -> list[dict]:
     """Return ordered list of {symbol, isin, name}:
     portfolio holdings first → strong (conviction) names → market-cap tail."""
-    universe = _read_csv_from(drive, root_id, "universe", "master_list.csv")
+    universe = _load_universe_df(drive, root_id)
     if universe.empty or "symbol" not in universe.columns:
-        log("  ERROR: universe/master_list.csv missing or has no 'symbol' column.")
+        log("  ERROR: no usable universe (company_universe.csv / master_list.csv).")
         return []
     universe["symbol"] = universe["symbol"].astype(str).str.strip()
+    universe = universe[~universe["symbol"].str.lower().isin(["", "nan", "none"])]
     if "isin" not in universe.columns:
         universe["isin"] = ""
     if "name" not in universe.columns:
@@ -144,7 +165,7 @@ def build_company_order(drive, root_id) -> list[dict]:
 def resolve_explicit(drive, root_id, symbols: list[str], token: str) -> list[dict]:
     """Resolve explicit --symbols / --token to {symbol, isin, name} rows."""
     out: list[dict] = []
-    universe = _read_csv_from(drive, root_id, "universe", "master_list.csv")
+    universe = _load_universe_df(drive, root_id)
     by_sym = {}
     if not universe.empty and "symbol" in universe.columns:
         for _, r in universe.iterrows():
