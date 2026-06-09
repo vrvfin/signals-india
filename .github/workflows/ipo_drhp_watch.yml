@@ -1,0 +1,65 @@
+name: ipo-drhp-watch
+
+# Weekday watcher: detect newly-filed IPO prospectuses (via the Chittorgarh IPO
+# calendar — SEBI blocks automated access), summarise each new DRHP/RHP with the
+# forensic risk/fraud prompt, email the summary + archive it to Drive.
+
+on:
+  schedule:
+    - cron: "30 3 * * 1-5"        # 03:30 UTC = 09:00 IST, Mon-Fri
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Seed ledger only (mark current IPOs as seen, no email)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ipo-drhp-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+          pip install google-genai requests beautifulsoup4 lxml PyMuPDF
+
+      - name: Run IPO DRHP watcher
+        run: |
+          if [ "${{ inputs.seed }}" = "true" ]; then
+            python scripts/ipo_drhp_watch.py --seed
+          else
+            python scripts/ipo_drhp_watch.py
+          fi
