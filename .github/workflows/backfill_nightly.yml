@@ -2,22 +2,30 @@ name: backfill-nightly
 
 # Phase 3 T1+T2 production backfill.
 #
+# STORAGE POLICY (mirrors Phase 2 exactly):
+#   Raw PDFs are transient — kept for extraction only, deleted after 2 days.
+#   cleanup_company_docs.py (RETAIN_DAYS=2) runs as the LAST step every night.
+#   The fetch cap (max_fetch default 500) ensures PDFs uploaded tonight are always
+#   fully extracted tonight — nothing sits unprocessed past 2 days.
+#   Math: 500 companies × 4 concalls = 2,000 PDFs/night << ~3,400 extract
+#   capacity/night (8 keys × CI timeout bound). Safe headroom. Adjust max_fetch
+#   higher only if you have more keys / longer CI budget.
+#
 # NIGHTLY (cron, 23:30 IST = 18:00 UTC):
 #   T1 extract — drain the pending queue until BACKFILL keys exhaust for the day.
 #   T2 incremental — refresh financials for any company that reported today.
+#   Cleanup — delete raw PDFs older than 2 days (same as Phase 2).
 #
-# INITIAL SETUP (manual dispatch, do_fetch=true):
-#   T1 fetch — queue the full universe (Screener/BSE only, no Gemini).
-#   T2 full — scrape financials for every company.
-#   Then T1 extract runs as normal.
+# FETCH (manual dispatch, do_fetch=true):
+#   Queues new concalls for the next N companies in priority order (default 500).
+#   Re-run nightly until the full universe is covered (~11 nights at 500/night).
+#   Fetch is idempotent — already-queued docs are skipped.
 #
 # Key facts:
 #   * T1 extract stops cleanly (AllBucketsExhausted) when daily quota is spent; pending
 #     rows stay in the queue and are picked up the next night automatically.
-#   * T1 fetch is idempotent (dedup via ledger); re-running skips already-queued docs.
-#   * With 8 keys x 3 models = 24 buckets, ~3,600 concalls process per night.
+#   * With 8 keys x 3 models = 24 buckets, ~3,400 concalls processed per night.
 #     Priority: portfolio ~56 → conviction ~498 → market-cap tail.
-#     Estimated: priority names done in nights 1-2; full universe ~6-7 nights.
 
 on:
   schedule:
@@ -25,12 +33,12 @@ on:
   workflow_dispatch:
     inputs:
       do_fetch:
-        description: "T1: queue new concalls from Screener/BSE (initial or catch-up run)"
+        description: "T1: queue new concalls from Screener/BSE for next N companies"
         type: boolean
         default: false
       max_fetch:
-        description: "Max companies to fetch this run (0 = all ~5700)"
-        default: "0"
+        description: "Companies to fetch (default 500 = ~2000 PDFs, fits one night's extract)"
+        default: "500"
       do_t2_full:
         description: "T2: full 3-statement scrape (not just today's reporters)"
         type: boolean
@@ -96,16 +104,15 @@ jobs:
       - name: Verify BACKFILL key pool
         run: python scripts/extract_concall.py --backfill --check-keys
 
-      # ── T1 FETCH (manual / catch-up only) ────────────────────────────────────
-      - name: T1 — fetch concalls from Screener/BSE (queue full universe)
+      # ── T1 FETCH (manual only — queues next N companies in priority order) ──────
+      # Default 500 companies = ~2,000 PDFs, guaranteed to fit in one night's extract.
+      # Re-run with do_fetch=true each night until the full universe is covered.
+      # NEVER pass 0 — always cap to stay within 2-day storage policy.
+      - name: T1 — fetch concalls from Screener/BSE (next N companies)
         if: ${{ github.event.inputs.do_fetch == 'true' }}
         run: |
-          MAX=${{ github.event.inputs.max_fetch || '0' }}
-          if [ "$MAX" -gt 0 ]; then
-            python scripts/run_backfill.py --max-companies "$MAX" --quarters 4
-          else
-            python scripts/run_backfill.py --quarters 4
-          fi
+          MAX=${{ github.event.inputs.max_fetch || '500' }}
+          python scripts/run_backfill.py --max-companies "$MAX" --quarters 4
 
       # ── T1 EXTRACT (every run — drain queue until quota exhausted) ──────────
       - name: T1 — extract concalls via Gemini (BACKFILL pool; runs until quota done)
@@ -132,6 +139,14 @@ jobs:
       # ── T2 DERIVED (every run — recomputes from latest 3stmt) ───────────────
       - name: T2 — derived metrics
         run: python scripts/build_derived_metrics.py
+
+      # ── CLEANUP (every run — mirrors Phase 2 exactly) ───────────────────────
+      # Delete raw PDFs older than 2 days. Runs LAST so tonight's processed docs
+      # are cleaned up on the next run (they'll be 24h old then, cleaned at 48h).
+      # Same script, same retention, same policy as Phase 2's cleanup step.
+      - name: Cleanup raw PDFs older than 2 days
+        run: python scripts/cleanup_company_docs.py
+        continue-on-error: true
 
       # NOTE: PEAD flags + emails are handled by pead.yml at 20:00 IST (the right
       # post-market-close window). No email step here — avoid duplicate sends.
