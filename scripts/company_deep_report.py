@@ -74,7 +74,11 @@ DRIVE = dict(
     proc_queue   = "company_repo/_index/processing_queue.parquet",
     fundamentals = "fundamentals/summary.parquet",
     results      = "company_repo/_index/results.parquet",
-    universe     = "universe/master_list.csv",
+    # FULL listed universe (NSE main + NSE Emerge SME + BSE, with bse_code) built by
+    # build_company_universe.py. Use this, NOT universe/master_list.csv, which Phase 1
+    # (build_universe.py) overwrites DAILY with an NSE-only list (no bse_code, no SME).
+    universe     = "company_repo/_index/company_universe.csv",
+    universe_fallback = "universe/master_list.csv",
     company_page = "company_repo",   # /<ISIN>/company_page.md  &  output report
 )
 
@@ -110,6 +114,14 @@ def _read_csv(svc, path, root):
     b = drive_download(svc, path, root)
     return pd.read_csv(io.BytesIO(b)) if b else pd.DataFrame()
 
+def _load_universe(svc, root):
+    """Full listed universe (NSE+SME+BSE w/ bse_code); fall back to the NSE-only
+    master_list if the full file is missing."""
+    uni = _read_csv(svc, DRIVE["universe"], root)
+    if uni is None or uni.empty:
+        uni = _read_csv(svc, DRIVE["universe_fallback"], root)
+    return uni
+
 def resolve_isin(token, universe, interactive=False):
     """token may be ISIN / NSE symbol / BSE code / name -> (isin, symbol, name, bse_code).
 
@@ -130,8 +142,11 @@ def resolve_isin(token, universe, interactive=False):
             bse_out = str(int(float(s))) if s.replace(".", "").isdigit() else s
         else:
             bse_out = None
+        sym = str(r[sym_c]) if sym_c else t
+        if sym.lower() in ("nan", "none", ""):        # BSE-only co: no NSE symbol
+            sym = ""
         return (str(r[isin_c]) if isin_c else t,
-                str(r[sym_c]) if sym_c else t,
+                sym,
                 str(r[name_c]) if name_c else t,
                 bse_out)
     # exact matches first
@@ -1080,7 +1095,7 @@ def main():
     svc = drive_service(); root = os.environ["GDRIVE_FOLDER_ID"]
 
     if args.resolve_only and args.names:
-        universe = _read_csv(svc, DRIVE["universe"], root)
+        universe = _load_universe(svc, root)
         for t in [x.strip() for x in args.names.split(",") if x.strip()]:
             isin, symbol, name, _ = resolve_isin(t, universe, interactive=args.interactive)
             if isin == t and symbol == t:
@@ -1109,7 +1124,7 @@ def main():
     print(f"Pool: {len(api_keys)} key(s) × {len(DEEPDIVE_MODELS)} model(s) "
           f"= {len(api_keys) * len(DEEPDIVE_MODELS)} daily buckets")
 
-    universe = _read_csv(svc, DRIVE["universe"], root)
+    universe = _load_universe(svc, root)
     fund     = _read_parquet(svc, DRIVE["fundamentals"], root)
     results  = _read_parquet(svc, DRIVE["results"], root)
     ridx     = _read_parquet(svc, DRIVE["research_idx"], root)
