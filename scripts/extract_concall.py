@@ -1184,10 +1184,32 @@ def parse_gemini_response(
         m = re.search(r"(Q\d\s*FY\d{2,4})", hdrs[q_col], re.IGNORECASE)
         if m:
             quarter_name = _norm_quarter(m.group(1).strip())
-            facts["quarter"] = quarter_name
-            fy_m = re.search(r"FY(\d{2,4})", quarter_name, re.IGNORECASE)
-            if fy_m:
-                facts["fy_year"] = f"FY{fy_m.group(1)}"
+
+    # Current prompt format: the quarter lives in a 'Current Qtr' CELL (the
+    # header carries no FY), and the metric sits in a dedicated 'metric'
+    # column instead of column 0. Without these two lookups the whole table
+    # was silently skipped: quarter stayed "", dedup never fired, and no
+    # facts/guidance rows were ever written for current-format documents.
+    metric_col = next((i for i, h in enumerate(hdrs)
+                       if h.strip().lower() == "metric"), 0)
+    if not quarter_name:
+        qtr_col = next((i for i, h in enumerate(hdrs)
+                        if ("qtr" in h.lower() or "quarter" in h.lower())
+                        and "growth" not in h.lower()
+                        and "guidance" not in h.lower()), None)
+        if qtr_col is not None:
+            for _cells in t1["rows"]:
+                if qtr_col < len(_cells):
+                    m = re.search(r"([QH]\d\s*FY\s*\d{2,4})",
+                                  _cells[qtr_col], re.IGNORECASE)
+                    if m:
+                        quarter_name = _norm_quarter(m.group(1))
+                        break
+    if quarter_name:
+        facts["quarter"] = quarter_name
+        fy_m = re.search(r"FY(\d{2,4})", quarter_name, re.IGNORECASE)
+        if fy_m:
+            facts["fy_year"] = f"FY{fy_m.group(1)}"
 
     m12_col = next((i for i, h in enumerate(hdrs)
                     if re.search(r"12\s*[Mm]", h)), None)
@@ -1199,6 +1221,29 @@ def parse_gemini_response(
             if m:
                 fy_explicit[f"FY{m.group(1)}"] = i
 
+    # Current prompt format: horizon-based growth-guidance columns (no FY in the
+    # header, so the fy_explicit regex above never matches them). Map each to a
+    # horizon tag stored in horizon_fy. Additive — legacy FY-header parsing kept.
+    growth_cols: dict[str, int] = {}
+    gtype_col: int | None = None
+    for i, h in enumerate(hdrs):
+        hl = h.lower()
+        if "guidance type" in hl:
+            gtype_col = i
+            continue
+        if "guidance" not in hl:
+            continue
+        if "next quarter" in hl:
+            growth_cols["NEXT_QTR"] = i
+        elif ">3" in hl.replace(" ", ""):
+            growth_cols["3Y+"] = i
+        elif "1yr" in hl.replace(" ", "") or "1 yr" in hl:
+            growth_cols["1Y"] = i
+        elif "2yr" in hl.replace(" ", "") or "2 yr" in hl:
+            growth_cols["2Y"] = i
+        elif "3yr" in hl.replace(" ", "") or "3 yr" in hl:
+            growth_cols["3Y"] = i
+
     Q_FIELD = {"revenue": "revenue_q", "ebitda": "ebitda_q", "pat": "pat_q",
                "margin": "margin_pct", "volume": "volume_q", "capacity": "capacity_q"}
     M12_FIELD = {"revenue": "revenue_12m", "pat": "pat_12m"}
@@ -1206,7 +1251,8 @@ def parse_gemini_response(
     for cells in t1["rows"]:
         if not cells:
             continue
-        metric = _identify_metric(cells[0])
+        metric = _identify_metric(cells[metric_col]
+                                  if metric_col < len(cells) else cells[0])
         if not metric:
             continue
 
@@ -1224,6 +1270,26 @@ def parse_gemini_response(
                     "guidance_type": "explicit", "horizon_fy": fy,
                     "value": _clean_val(cells[col]), "unit": "",
                     "cagr_pct": None, "notes": "",
+                    "processed_at": now_str, "source_doc_id": source_doc_id,
+                })
+
+        # Horizon growth-guidance columns (current format). Only rows with an
+        # actual value — no NA bloat (the legacy FY parser above predates this).
+        _gtype = ""
+        if gtype_col is not None and gtype_col < len(cells):
+            _gtype = _clean_val(cells[gtype_col]).lower()
+        for hz, col in growth_cols.items():
+            if col < len(cells):
+                raw = _clean_val(cells[col])
+                if raw == "NA":
+                    continue
+                guidance_rows.append({
+                    "isin": isin, "symbol": symbol, "company_name": company_name,
+                    "quarter": quarter_name, "metric": metric,
+                    "guidance_type": _gtype if _gtype not in ("", "na") else "explicit",
+                    "horizon_fy": hz,
+                    "value": raw, "unit": "%",
+                    "cagr_pct": _try_float(raw), "notes": "",
                     "processed_at": now_str, "source_doc_id": source_doc_id,
                 })
 
