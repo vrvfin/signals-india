@@ -3059,6 +3059,51 @@ def page_scorecard():
         "Greyed bars = source parquet not yet populated (auto-lights when data lands)."
     )
 
+    with st.expander("📐 How the maths works (with a worked example)"):
+        st.markdown(
+            """
+Every factor is **0–100, higher = better** (risk factors are flipped so 100 = safe).
+The composite is a weighted average over **only the factors that have data** — the
+weights of missing factors are removed from the denominator, not treated as zero:
+
+```
+composite = Σ (weight × score)  /  Σ (weight of factors present)
+```
+
+| Factor | Weight | Formula (intuition) |
+|---|---|---|
+| 📈 Technical | 18% | (strategies firing ÷ 5 × 100 + signal score) ÷ 2 |
+| 📊 Fundamental | 18% | avg of `50 + growth% × 1.5` for rev/PAT YoY+QoQ, + OPM trend |
+| 🏦 Fin. Health | 13.5% | avg of CFO/PAT×50, int-cover×10, 100−debt/EBITDA×20, ROCE×2.5, 100−WC days |
+| 🎯 Mgmt Cred. | 13.5% | latest said-vs-delivered credibility score (×10 if 0–10 scale) |
+| 💰 Valuation | 9% | avg of P/E rank vs segment peers, PEG rank, own-3y P/E percentile (cheap = high) |
+| 📋 Guidance | 9% | `50 + 15 × (positive − negative guidance flags)` |
+| 🛡️ Fraud Safety | 9% | `100 −` forensic penalty (CFO<PAT, receivables, leverage, WC, coverage, ROCE) |
+| 🔍 Investigative | 10% | `(4 − grade) ÷ 4 × 100` from NSE ASM/ESM/GSM/T2T + BSE lists (0=clean → 100) |
+
+**Worked example — TCS (live run 10-Jun-2026), 5 of 8 factors present (62% complete):**
+
+```
+fundamental 66.7 × 0.18  = 12.01
+fin health  82.3 × 0.135 = 11.11
+valuation   92.2 × 0.09  =  8.30
+fraud safe 100.0 × 0.09  =  9.00
+investig.  100.0 × 0.10  = 10.00
+                  ─────────────
+sum = 50.41   available weight = 0.595
+composite = 50.41 / 0.595 = 84.7
+```
+
+Technical / Mgmt-Cred / Guidance were missing for TCS, so their 45% combined weight
+dropped out of the denominator. As the nightly backfill fills those sources the bars
+light up and the composite re-blends automatically.
+
+⚠️ **Read it honestly:** a high composite at low completeness (≤38%) rests on thin
+evidence — use the *Min completeness* slider. Risk flags **highlight, never filter**:
+a 90-composite company on a watchlist keeps its 90 but shows a low red Investigative bar.
+            """
+        )
+
     sc = load_scorecard()
 
     if sc.empty:

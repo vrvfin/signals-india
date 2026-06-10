@@ -42,6 +42,7 @@ DailyResearch_Task.xml
 files.zip
 job-logs.txt
 .t4_local/
+T4_SCORECARD_MATH.md
 
 # PF Tracking — kept local for reference only (not wired into app; uses Gemini, no Claude key)
 scripts/screener_scraper.py
