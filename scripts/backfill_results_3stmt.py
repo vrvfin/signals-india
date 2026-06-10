@@ -55,6 +55,7 @@ PARQUET_NAME = "financials_3stmt.parquet"
 
 QUARTERS_KEEP = 12     # ≥12 quarters of P&L (Sales/EBITDA/PAT/EPS) for charts/PEAD
 ANNUAL_KEEP   = 7      # 7 FYs of annual 3-statement for deep-dive history
+_CHECKPOINT_N = 500    # flush to Drive every N companies to survive SSL timeouts
 
 # Canonical line_item -> list of candidate Screener row labels (first match wins).
 # 'sum' entries are summed across several Screener rows.
@@ -268,6 +269,28 @@ def incremental_companies(drive, index_id, order, days: int) -> list[dict]:
     return out
 
 
+def _checkpoint_save(drive, index_id: str,
+                     pending_rows: list, checkpoint_isins: set) -> None:
+    """Upsert pending_rows for checkpoint_isins into the Drive parquet.
+
+    Clears both lists in-place on success so the next batch starts fresh.
+    Only replaces rows for ISINs in *this* checkpoint — earlier checkpoints
+    are preserved in the parquet exactly as saved.
+    """
+    if not pending_rows:
+        return
+    new_df = pd.DataFrame(pending_rows, columns=FIN3_COLS)
+    existing = load_parquet(drive, index_id, PARQUET_NAME, FIN3_COLS)
+    if not existing.empty and checkpoint_isins:
+        existing = existing[~existing["isin"].astype(str).isin(checkpoint_isins)]
+    merged = pd.concat([existing, new_df], ignore_index=True)
+    save_parquet(drive, index_id, PARQUET_NAME, merged)
+    log(f"  [checkpoint] flushed {len(pending_rows)} rows "
+        f"({len(checkpoint_isins)} co), parquet total: {len(merged)}")
+    pending_rows.clear()
+    checkpoint_isins.clear()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -324,8 +347,10 @@ def main() -> None:
         sys.exit(f"Screener client error: {e}")
 
     log(f"Companies this run: {len(companies)} (start={args.start})")
-    all_rows: list[dict] = []
-    done_isins: set[str] = set()
+    checkpoint_rows: list[dict] = []   # rows since last checkpoint (cleared on flush)
+    checkpoint_isins: set[str] = set() # ISINs since last checkpoint (cleared on flush)
+    done_isins: set[str] = set()       # all processed ISINs (for summary + dry-run)
+    dry_all_rows: list[dict] = []      # dry-run accumulator (not used in live mode)
     for i, co in enumerate(companies, 1):
         sym, isin = co["symbol"], co.get("isin", "")
         log(f"[{i}/{len(companies)}] {sym}  ISIN={isin or '?'}")
@@ -336,15 +361,24 @@ def main() -> None:
         except Exception as e:
             log(f"    error: {str(e)[:100]}")
             continue
-        all_rows += rows
+        if args.dry_run:
+            dry_all_rows += rows
+        else:
+            checkpoint_rows += rows
+            if isin:
+                checkpoint_isins.add(str(isin))
         if isin:
             done_isins.add(str(isin))
         if args.sleep and i < len(companies):
             time.sleep(args.sleep)
 
-    new_df = pd.DataFrame(all_rows, columns=FIN3_COLS)
+        # Periodic checkpoint — flush every _CHECKPOINT_N companies to avoid
+        # losing all data if a large final Drive upload hits an SSL timeout.
+        if not args.dry_run and i % _CHECKPOINT_N == 0 and checkpoint_rows:
+            _checkpoint_save(drive, index_id, checkpoint_rows, checkpoint_isins)
 
     if args.dry_run:
+        new_df = pd.DataFrame(dry_all_rows, columns=FIN3_COLS)
         print("-" * 60)
         print(f"DRY RUN — {len(new_df)} rows scraped (no Drive write). Sample:")
         print(new_df.head(20).to_string(index=False))
@@ -353,20 +387,17 @@ def main() -> None:
             print(new_df.groupby(["statement", "period_type"])["line_item"].nunique().to_string())
         return
 
-    if new_df.empty:
+    # Flush any remaining rows not covered by the last periodic checkpoint.
+    if checkpoint_rows:
+        _checkpoint_save(drive, index_id, checkpoint_rows, checkpoint_isins)
+    elif not done_isins:
         print("No rows scraped — nothing written.")
         return
 
-    # Upsert: drop existing rows for the ISINs processed this run, append new.
-    existing = load_parquet(drive, index_id, PARQUET_NAME, FIN3_COLS)
-    if not existing.empty and done_isins:
-        existing = existing[~existing["isin"].astype(str).isin(done_isins)]
-    merged = pd.concat([existing, new_df], ignore_index=True)
-    save_parquet(drive, index_id, PARQUET_NAME, merged)
-
+    final = load_parquet(drive, index_id, PARQUET_NAME, FIN3_COLS)
     print("-" * 60)
     print(f"Companies scraped : {len(done_isins)}")
-    print(f"Rows written      : {len(new_df)} (total {len(merged)})")
+    print(f"Parquet total rows: {len(final)}")
     print(f"Output: company_repo/_index/{PARQUET_NAME}")
 
 

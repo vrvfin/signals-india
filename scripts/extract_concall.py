@@ -272,6 +272,18 @@ QFACTS_COLS = [
 # Minimum ratio new/old response length to supersede an existing quarter entry.
 SUPERSEDE_THRESHOLD = 1.2   # new must be >20% longer than existing
 
+
+def _norm_quarter(q: str) -> str:
+    """Canonical form for quarter strings used in dedup comparisons.
+
+    Converts any of 'Q4FY26', 'Q4 FY26', 'Q4 FY 26', 'q4fy26' → 'Q4 FY26'.
+    Handles half-year 'H1 FY26' similarly.  Returns the input unchanged if the
+    pattern is not recognised (so non-quarter strings don't get mangled).
+    """
+    s = str(q).strip().upper()
+    normed = re.sub(r"([QH]\d)\s*(FY\s*\d+)", lambda m: m.group(1) + " " + re.sub(r"\s+", "", m.group(2)), s)
+    return normed
+
 GUIDANCE_COLS = [
     "isin", "symbol", "company_name", "quarter", "metric",
     "guidance_type", "horizon_fy", "value", "unit", "cagr_pct", "notes",
@@ -1165,12 +1177,12 @@ def parse_gemini_response(
     hdrs = t1["headers"]
 
     q_col = next((i for i, h in enumerate(hdrs)
-                  if re.search(r"Q\d\s+FY\d{2,4}", h, re.IGNORECASE)), None)
+                  if re.search(r"Q\d\s*FY\d{2,4}", h, re.IGNORECASE)), None)
     quarter_name = ""
     if q_col is not None:
-        m = re.search(r"(Q\d\s+FY\d{2,4})", hdrs[q_col], re.IGNORECASE)
+        m = re.search(r"(Q\d\s*FY\d{2,4})", hdrs[q_col], re.IGNORECASE)
         if m:
-            quarter_name = m.group(1).strip()
+            quarter_name = _norm_quarter(m.group(1).strip())
             facts["quarter"] = quarter_name
             fy_m = re.search(r"FY(\d{2,4})", quarter_name, re.IGNORECASE)
             if fy_m:
@@ -1576,13 +1588,14 @@ def main() -> None:
             _supersede = False
             _old_source_doc_id = ""
 
-            if quarter and _isin_key:
-                _qkey = (_isin_key, str(quarter))
+            _norm_q = _norm_quarter(str(quarter)) if quarter else ""
+            if _norm_q and _isin_key:
+                _qkey = (_isin_key, _norm_q)
                 if _qkey in _seen_quarter_keys:
                     _dup_quarter = True   # same run — always skip
                 elif not _qfacts_cache.empty:
                     _m = ((_qfacts_cache["isin"].astype(str) == _isin_key)
-                          & (_qfacts_cache["quarter"].astype(str) == str(quarter))
+                          & (_qfacts_cache["quarter"].astype(str).map(_norm_quarter) == _norm_q)
                           & (_qfacts_cache["source_doc_id"].astype(str) != _this_doc))
                     if _m.any():
                         _old_chars = pd.to_numeric(

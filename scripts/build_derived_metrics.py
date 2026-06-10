@@ -98,7 +98,7 @@ def derive_company(df_c: pd.DataFrame, isin: str, symbol: str, now: str) -> list
     opm_q   = _ordered(df_c, "income", "OPM %", "quarterly")
     npd     = _dict(np_q)
     for p, s in sales_q:                       # npm_pct quarterly
-        emit("npm_pct", p, "quarterly", (npd.get(p) / s * 100) if s else None, "%")
+        emit("npm_pct", p, "quarterly", (npd.get(p) / s * 100) if (s and npd.get(p) is not None) else None, "%")
     for i, (p, s) in enumerate(sales_q):       # revenue growth
         emit("rev_qoq_pct", p, "quarterly", _pct(s, sales_q[i-1][1]) if i >= 1 else None, "%")
         emit("rev_yoy_pct", p, "quarterly", _pct(s, sales_q[i-4][1]) if i >= 4 else None, "%")
@@ -119,7 +119,7 @@ def derive_company(df_c: pd.DataFrame, isin: str, symbol: str, now: str) -> list
     cfi_a = _dict(_ordered(df_c, "cashflow", "CFI", "annual"))
 
     for i, (p, s) in enumerate(sales_a):
-        emit("npm_pct", p, "annual", (np_a.get(p) / s * 100) if s else None, "%")
+        emit("npm_pct", p, "annual", (np_a.get(p) / s * 100) if (s and np_a.get(p) is not None) else None, "%")
         emit("fcf_sales_pct", p, "annual",
              ((cfo_a.get(p, 0) + cfi_a.get(p, 0)) / s * 100) if s else None, "%")
         if i >= 3 and sales_a[i-3][1] not in (None, 0) and s not in (None, 0):
@@ -139,7 +139,7 @@ def derive_company(df_c: pd.DataFrame, isin: str, symbol: str, now: str) -> list
     for p, op in op_a.items():
         emit("interest_coverage", p, "annual", _ratio(op, int_a.get(p)), "x")
     for p, nw in nw_a.items():
-        emit("roe_pct", p, "annual", (np_a.get(p) / nw * 100) if nw else None, "%")
+        emit("roe_pct", p, "annual", (np_a.get(p) / nw * 100) if (nw and np_a.get(p) is not None) else None, "%")
 
     # ---------- Passthrough from Screener "ratios" ----------
     for li, (metric, unit) in RATIO_PASSTHROUGH.items():
