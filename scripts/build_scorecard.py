@@ -346,9 +346,10 @@ def main():
 
     def _coerce_num(v):
         try:
-            return float(v)
+            f = float(v)
         except (TypeError, ValueError):
             return None
+        return f if f == f else None   # NaN (from parquet nulls) -> None, not a factor
 
     rows = []
     for sym in symbols:
