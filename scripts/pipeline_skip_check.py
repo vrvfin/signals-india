@@ -19,7 +19,7 @@ status from Drive and decides whether the run should proceed or be skipped.
 │                                                                         │
 │  Off-season:                                                            │
 │    Runs are suppressed to 3/day for ALL day types.                      │
-│    Allowed windows: IST 08:00 ±75 min, 14:00 ±75 min, 20:00 ±75 min   │
+│    Allowed windows: IST 09:00 ±75 min, 14:00 ±75 min, 20:00 ±75 min   │
 │    Runs outside those windows are skipped immediately.                   │
 │    Within a window, skip threshold = 90 min (one run per window max).   │
 │                                                                         │
@@ -70,7 +70,8 @@ PEAK_SEASONS = [
 ]
 
 # Off-season: only allow runs within ±WINDOW_RADIUS_MIN of these IST hours
-OFFSEASON_WINDOW_HOURS_IST = [8, 14, 20]   # 3 designated daily slots
+# First slot 8 → 9 (2026-06-10): backfill owns 23:00–08:30 IST overnight.
+OFFSEASON_WINDOW_HOURS_IST = [9, 14, 20]   # 3 designated daily slots
 OFFSEASON_WINDOW_RADIUS_MIN = 75           # ±75 min absorbs GitHub job delays
 
 # Skip thresholds: if queue is empty AND last run was this recent → skip
@@ -160,7 +161,7 @@ def _is_peak_season(ist_now: datetime) -> bool:
 
 def _in_offseason_window(ist_now: datetime) -> bool:
     """Return True if ist_now is within ±OFFSEASON_WINDOW_RADIUS_MIN of a
-    designated off-season run slot (08:00, 14:00, 20:00 IST)."""
+    designated off-season run slot (09:00, 14:00, 20:00 IST)."""
     current_min = ist_now.hour * 60 + ist_now.minute
     for target_hour in OFFSEASON_WINDOW_HOURS_IST:
         target_min = target_hour * 60
@@ -183,7 +184,7 @@ def check_phase2(drive, folder_id: str) -> None:
     if not is_peak and not _in_offseason_window(ist_now):
         return skip_run(
             f"off-season ({ist_str}): outside designated windows "
-            f"(08:00 / 14:00 / 20:00 IST ±{OFFSEASON_WINDOW_RADIUS_MIN} min)"
+            f"(09:00 / 14:00 / 20:00 IST ±{OFFSEASON_WINDOW_RADIUS_MIN} min)"
         )
 
     # Choose skip threshold based on season

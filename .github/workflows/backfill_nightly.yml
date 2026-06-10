@@ -11,25 +11,31 @@ name: backfill-nightly
 #   capacity/night (8 keys × CI timeout bound). Safe headroom. Adjust max_fetch
 #   higher only if you have more keys / longer CI budget.
 #
-# NIGHTLY (cron, 23:30 IST = 18:00 UTC):
-#   T1 extract — drain the pending queue until BACKFILL keys exhaust for the day.
-#   T2 incremental — refresh financials for any company that reported today.
-#   Cleanup — delete raw PDFs older than 2 days (same as Phase 2).
+# NIGHTLY (two crons — backfill owns 23:00–08:30 IST; Phase 2 first slot is 09:00 IST):
+#   Run 1  23:00 IST (17:30 UTC): fetch ~110 companies + extract until job timeout
+#          (340 min → ends 04:40 IST worst case; saves are per-doc, ≤1 doc lost on kill).
+#   Run 2  04:45 IST (23:15 UTC): extract only, --deadline-min capped to end by
+#          08:25 IST — BEFORE Phase 2's first cron fires (09:00 IST; 35-min buffer;
+#          the _extract.lock is the safety net if anything still overlaps).
+#   Both: T2 incremental + cleanup. Cleanup is queue-aware (pending PDFs exempt).
 #
-# FETCH (manual dispatch, do_fetch=true):
-#   Queues new concalls for the next N companies in priority order (default 500).
-#   Re-run nightly until the full universe is covered (~11 nights at 500/night).
+# CAPACITY (measured 2026-06-09, see PROJECT_STATUS):
+#   ~50 premium calls/day/PROJECT (~20+15+20 across the 3 models), NOT per key —
+#   plus lite-model quota (unmeasured). Runtime is the other cap: ~75 s/concall →
+#   ~270/run-1 + ~180/run-2 ≈ ~450/night when quota allows.
+#   Fetch is sized to match: 110 companies ≈ 440 PDFs ≈ one night's extract.
+#   Tune max_fetch after the first 7–8-key night shows real quota throughput.
+#
+# FETCH (scheduled run 1 automatically; manual dispatch via do_fetch=true):
+#   Queues new concalls for the next N companies in priority order, then the
+#   SAME run extracts them immediately (pull → summarise in one go).
 #   Fetch is idempotent — already-queued docs are skipped.
-#
-# Key facts:
-#   * T1 extract stops cleanly (AllBucketsExhausted) when daily quota is spent; pending
-#     rows stay in the queue and are picked up the next night automatically.
-#   * With 8 keys x 3 models = 24 buckets, ~3,400 concalls processed per night.
-#     Priority: portfolio ~56 → conviction ~498 → market-cap tail.
+#   Priority: portfolio ~56 → conviction ~498 → market-cap tail.
 
 on:
   schedule:
-    - cron: '0 18 * * *'    # 23:30 IST every night
+    - cron: '30 17 * * *'   # Run 1 — 23:00 IST: fetch + extract (timeout-bound)
+    - cron: '15 23 * * *'   # Run 2 — 04:45 IST: extract only (deadline 08:25 IST)
   workflow_dispatch:
     inputs:
       do_fetch:
@@ -37,8 +43,8 @@ on:
         type: boolean
         default: false
       max_fetch:
-        description: "Companies to fetch (default 500 = ~2000 PDFs, fits one night's extract)"
-        default: "500"
+        description: "Companies to fetch (default 110 = ~440 PDFs ≈ one night's extract window)"
+        default: "110"
       do_t2_full:
         description: "T2: full 3-statement scrape (not just today's reporters)"
         type: boolean
@@ -108,21 +114,34 @@ jobs:
       - name: Verify BACKFILL key pool
         run: python scripts/extract_concall.py --backfill --check-keys
 
-      # ── T1 FETCH (manual only — queues next N companies in priority order) ──────
-      # Default 500 companies = ~2,000 PDFs, guaranteed to fit in one night's extract.
-      # Re-run with do_fetch=true each night until the full universe is covered.
+      # ── T1 FETCH (scheduled run 1 + manual dispatch) ────────────────────────
+      # Sized to nightly extract capacity (~110 cos ≈ 440 PDFs ≈ ~450 extracts/night)
+      # so no PDF waits unprocessed past the 2-day retention. Run 2 (early morning,
+      # UTC hour >= 20) skips fetch — its short window only drains the queue.
       # NEVER pass 0 — always cap to stay within 2-day storage policy.
       - name: T1 — fetch concalls from Screener/BSE (next N companies)
-        if: ${{ github.event.inputs.do_fetch == 'true' }}
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.do_fetch == 'true' }}
         run: |
-          MAX=${{ github.event.inputs.max_fetch || '500' }}
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%H)" -ge 20 ]; then
+            echo "Run 2 (early-morning slot) — skipping fetch, extract-only."
+            exit 0
+          fi
+          MAX=${{ github.event.inputs.max_fetch || '110' }}
           python scripts/run_backfill.py --max-companies "$MAX" --quarters 4
 
-      # ── T1 EXTRACT (every run — drain queue until quota exhausted) ──────────
+      # ── T1 EXTRACT (every run — drain queue until quota/deadline) ───────────
+      # Deadline: minutes until 02:55 UTC (08:25 IST), so the early-morning run
+      # always exits cleanly BEFORE Phase 2's first cron (09:00 IST = 03:30 UTC).
+      # For run 1 this computes ~560 min — harmless, the 340-min job timeout
+      # governs (saves are per-document, a timeout kill loses at most 1 doc).
       - name: T1 — extract concalls via Gemini (BACKFILL pool; runs until quota done)
         run: |
-          # No --limit: run until AllBucketsExhausted. Pending rows stay for tomorrow.
-          python scripts/extract_concall.py --backfill || true
+          NOW=$(date -u +%s)
+          TARGET=$(date -u -d "02:55" +%s)
+          if [ "$TARGET" -le "$NOW" ]; then TARGET=$(date -u -d "tomorrow 02:55" +%s); fi
+          DEADLINE_MIN=$(( (TARGET - NOW) / 60 ))
+          echo "Extract deadline: $DEADLINE_MIN min (ends by 08:25 IST)"
+          python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
       # ── T2 FULL SCRAPE (manual only — initial setup or quarterly refresh) ────

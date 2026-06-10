@@ -1412,6 +1412,12 @@ def main() -> None:
                              "--backfill is set. Override here if needed.")
     parser.add_argument("--no-lock", action="store_true",
                         help="Skip the Drive mutual-exclusion lock (testing only).")
+    parser.add_argument("--deadline-min", type=float, default=None,
+                        help="Soft wall-clock cap in minutes: stop starting new "
+                             "Gemini calls after this long and exit cleanly "
+                             "(rows stay pending). Default: no cap — run until "
+                             "AllBucketsExhausted. Used by the backfill early-"
+                             "morning run to end before Phase 2's first window.")
     parser.add_argument("--check-keys", action="store_true",
                         help="Print the selected key-pool size and exit (no Gemini, no Drive).")
     args = parser.parse_args()
@@ -1449,7 +1455,11 @@ def main() -> None:
     log(f"Key pool: prefix '{key_prefix}'"
         + ("  [BACKFILL MODE]" if args.backfill else ""))
     gemini = BucketPool(api_keys, pool_models,
-                        inter_call_s=INTER_CALL_SLEEP, logger=log)
+                        inter_call_s=INTER_CALL_SLEEP, logger=log,
+                        stage_deadline_s=(args.deadline_min * 60
+                                          if args.deadline_min else None))
+    if args.deadline_min:
+        log(f"Wall-clock cap: {args.deadline_min:.0f} min — exits cleanly after.")
     log(f"Loaded {len(api_keys)} key(s) × {len(pool_models)} model(s) "
         f"= {len(api_keys) * len(pool_models)} buckets")
 

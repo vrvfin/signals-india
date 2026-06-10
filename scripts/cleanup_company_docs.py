@@ -108,6 +108,35 @@ def list_children(drive, parent_id, only_folders=False):
     return out
 
 
+def load_pending_pdf_ids(drive, repo_id) -> set[str] | None:
+    """drive_file_ids of processing_queue rows still 'pending'.
+
+    These PDFs have NOT been processed yet — the 2-day retention clock starts
+    at processing, so they must survive cleanup regardless of age (otherwise
+    the queue row becomes a zombie: pending forever with its PDF gone).
+    Returns None if the queue cannot be read — caller must then ABORT the
+    deletion pass (fail-safe: losing a night of cleanup is recoverable,
+    deleting unprocessed PDFs is not).
+    """
+    index_id = find_subfolder(drive, repo_id, "_index")
+    if not index_id:
+        return set()
+    fid = next((f["id"] for f in list_children(drive, index_id)
+                if f["name"] == "processing_queue.parquet"), None)
+    if not fid:
+        return set()
+    try:
+        import io
+        import pandas as pd
+        raw = drive.files().get_media(fileId=fid).execute()
+        q = pd.read_parquet(io.BytesIO(raw))
+        pending = q[q["status"].astype(str) == "pending"]
+        return set(pending["drive_file_id"].dropna().astype(str)) - {""}
+    except Exception as e:
+        log(f"  ERROR reading processing_queue.parquet: {str(e)[:100]}")
+        return None
+
+
 def hours_old(modified_time_iso: str) -> float:
     dt = datetime.fromisoformat(modified_time_iso.replace("Z", "+00:00"))
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
@@ -137,6 +166,15 @@ def main() -> None:
         print("company_repo/ does not exist yet — nothing to clean.")
         return
 
+    # PDFs still pending in the queue are exempt — not yet processed, so the
+    # retention clock hasn't started for them. Fail-safe: abort if unreadable.
+    pending_ids = load_pending_pdf_ids(drive, repo_id)
+    if pending_ids is None:
+        print("ABORT: queue unreadable — skipping deletion pass entirely "
+              "(fail-safe: never delete PDFs that might still be pending).")
+        return
+    log(f"Pending-queue PDFs exempt from deletion: {len(pending_ids)}")
+
     company_folders = [f for f in list_children(drive, repo_id, only_folders=True)
                        if f["name"] not in ("_index", "_daily")]
     log(f"Scanning {len(company_folders)} company folders...")
@@ -156,6 +194,9 @@ def main() -> None:
                 continue
             if age_h <= cutoff_h:
                 kept += 1
+                continue
+            if f["id"] in pending_ids:
+                kept += 1   # still pending in queue — retention clock not started
                 continue
             if args.dry_run:
                 log(f"  would delete: {cf['name']}/documents/{f['name']} "

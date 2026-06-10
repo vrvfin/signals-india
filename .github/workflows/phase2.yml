@@ -29,8 +29,9 @@ name: Phase 2 — Company Intelligence
 on:
   schedule:
     # ── Base slots (all days, year-round) — serve as off-season pattern ──
-    # IST 08:00 / 14:00 / 20:00  (UTC 02:30 / 08:30 / 14:30)
-    - cron: '30 2,8,14 * * *'
+    # IST 09:00 / 14:00 / 20:00  (UTC 03:30 / 08:30 / 14:30)
+    # First slot moved 08:00 → 09:00 (2026-06-10) so backfill owns 23:00–08:30 IST.
+    - cron: '30 3,8,14 * * *'
 
     # ── Weekday peak extras (Mon–Fri) ──
     # Adds IST 11:00 / 17:00 / 22:00  (UTC 05:30 / 11:30 / 16:30)
@@ -40,9 +41,12 @@ on:
     # Adds IST 11:30 / 16:30  (UTC 06:00 / 11:00)
     - cron: '0 6,11 * * 6'
 
-    # ── Overnight Mon–Sat: 03:00 IST ──
-    # (UTC 21:30 on Sun–Fri)
-    - cron: '30 21 * * 0-5'
+    # ── Overnight 03:00 IST slot REMOVED (2026-06-10) ──
+    # The 23:00 → 06:40 IST window now belongs to backfill_nightly.yml.
+    # Off-season this slot always self-skipped anyway (outside the 08/14/20
+    # IST windows — verified in run logs); in-season late-night backlog now
+    # waits for the 08:00 IST run. Re-add '30 21 * * 0-5' after the Phase 3
+    # backfill completes if earnings-season backlogs need the overnight drain.
 
   workflow_dispatch:          # manual trigger (bypasses skip check)
   repository_dispatch:
