@@ -77,6 +77,8 @@ jobs:
           BACKFILL_GEMINI_KEY_4:   ${{ secrets.BACKFILL_GEMINI_KEY_4 }}
           BACKFILL_GEMINI_KEY_5:   ${{ secrets.BACKFILL_GEMINI_KEY_5 }}
           BACKFILL_GEMINI_KEY_6:   ${{ secrets.BACKFILL_GEMINI_KEY_6 }}
+          BACKFILL_GEMINI_KEY_7:   ${{ secrets.BACKFILL_GEMINI_KEY_7 }}
+          BACKFILL_GEMINI_KEY_8:   ${{ secrets.BACKFILL_GEMINI_KEY_8 }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -92,6 +94,8 @@ jobs:
             echo "BACKFILL_GEMINI_KEY_4=$BACKFILL_GEMINI_KEY_4"
             echo "BACKFILL_GEMINI_KEY_5=$BACKFILL_GEMINI_KEY_5"
             echo "BACKFILL_GEMINI_KEY_6=$BACKFILL_GEMINI_KEY_6"
+            echo "BACKFILL_GEMINI_KEY_7=$BACKFILL_GEMINI_KEY_7"
+            echo "BACKFILL_GEMINI_KEY_8=$BACKFILL_GEMINI_KEY_8"
           } > .env
 
       - name: Install deps

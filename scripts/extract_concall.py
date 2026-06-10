@@ -55,6 +55,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
                          load_keys)
+from _extractor_base import P1_MODELS   # lite chain — backfill-only fallback
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -1419,12 +1420,18 @@ def main() -> None:
     key_prefix = args.key_prefix or ("BACKFILL_GEMINI_KEY" if args.backfill
                                      else "GEMINI_API_KEY")
 
+    # Backfill-only: extend the chain with the lite models (P1_MODELS) so the
+    # dedicated pool's lite quota isn't wasted — premium first, lite LAST so
+    # quality degrades last. Phase 2 (no --backfill) keeps premium-only chain.
+    pool_models = (CONCALL_MODELS + [m for m in P1_MODELS if m not in CONCALL_MODELS]
+                   if args.backfill else CONCALL_MODELS)
+
     # Zero-cost pool verification: confirm the keys loaded, then exit.
     if args.check_keys:
         load_dotenv(Path(__file__).resolve().parent.parent / ".env")
         ks = load_keys(os.environ, prefix=key_prefix)
-        print(f"Key pool '{key_prefix}': {len(ks)} key(s) × {len(CONCALL_MODELS)} "
-              f"model(s) = {len(ks) * len(CONCALL_MODELS)} daily buckets")
+        print(f"Key pool '{key_prefix}': {len(ks)} key(s) × {len(pool_models)} "
+              f"model(s) = {len(ks) * len(pool_models)} daily buckets")
         sys.exit(0 if ks else 1)
 
     print("Phase 2 / Stage B — Concall extraction via Gemini")
@@ -1441,10 +1448,10 @@ def main() -> None:
         sys.exit(1)
     log(f"Key pool: prefix '{key_prefix}'"
         + ("  [BACKFILL MODE]" if args.backfill else ""))
-    gemini = BucketPool(api_keys, CONCALL_MODELS,
+    gemini = BucketPool(api_keys, pool_models,
                         inter_call_s=INTER_CALL_SLEEP, logger=log)
-    log(f"Loaded {len(api_keys)} key(s) × {len(CONCALL_MODELS)} model(s) "
-        f"= {len(api_keys) * len(CONCALL_MODELS)} buckets")
+    log(f"Loaded {len(api_keys)} key(s) × {len(pool_models)} model(s) "
+        f"= {len(api_keys) * len(pool_models)} buckets")
 
     # Load prompt
     prompt_path = Path(__file__).resolve().parent / "concall_prompt.txt"
