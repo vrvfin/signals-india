@@ -41,6 +41,7 @@ DailyResearch_Task.xml
 # Scratch
 files.zip
 job-logs.txt
+.t4_local/
 
 # PF Tracking — kept local for reference only (not wired into app; uses Gemini, no Claude key)
 scripts/screener_scraper.py

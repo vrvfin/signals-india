@@ -876,6 +876,12 @@ def load_financials_3stmt() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_scorecard() -> pd.DataFrame:
+    """Phase 3 T4 — 8-factor company scorecard."""
+    return load_parquet(["company_repo", "_index", "company_scorecard.parquet"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_quarterly_index() -> list[dict]:
     """List quarterly guidance .md files from company_repo/_quarterly/."""
     def _do():
@@ -1043,12 +1049,51 @@ def _guidance_is_active(horizon_fy) -> bool:
     return yr >= fy_end_yr
 
 
+def _current_india_quarter() -> str:
+    """Current India FY quarter tag, e.g. 'Q1FY27' (Phase 3 T3.1).
+    Duplicated from extract_concall.py on purpose: importing that module here
+    would pull Phase-2 Gemini deps (google.genai) that are NOT installed in the
+    Streamlit Cloud env (root requirements.txt), crashing the dashboard.
+    India FY: Apr-Jun=Q1, Jul-Sep=Q2, Oct-Dec=Q3, Jan-Mar=Q4."""
+    m, y = datetime.now().month, datetime.now().year
+    if m in (4, 5, 6):    return f"Q1FY{str(y + 1)[2:]}"
+    if m in (7, 8, 9):    return f"Q2FY{str(y + 1)[2:]}"
+    if m in (10, 11, 12): return f"Q3FY{str(y + 1)[2:]}"
+    return f"Q4FY{str(y)[2:]}"  # Jan–Mar
+
+
+def _norm_q(q) -> str:
+    """Normalise a quarter tag for comparison: 'Q4 FY26' -> 'Q4FY26'."""
+    return re.sub(r"\s+", "", str(q)).upper()
+
+
+def _style_current_q(df: pd.DataFrame, cur_q: str):
+    """Return a Styler highlighting rows whose `quarter` is the running quarter.
+    Falls back to the plain DataFrame if there is no quarter column or styling
+    is unavailable — never breaks the existing table render."""
+    if df.empty or "quarter" not in df.columns:
+        return df
+    target = _norm_q(cur_q)
+
+    def _hl(row):
+        hit = _norm_q(row.get("quarter", "")) == target
+        return ["background-color: #fff3cd" if hit else "" for _ in row]
+
+    try:
+        return df.style.apply(_hl, axis=1)
+    except Exception:
+        return df
+
+
 def page_guidance():
     st.title("Management Guidance")
     st.caption(
         "Structured guidance extracted from concall transcripts. "
         "Updated as new concalls are processed by the Phase 2 pipeline."
     )
+
+    cur_q = _current_india_quarter()
+    st.caption(f"📆 Running quarter: **{cur_q}** — rows for this quarter are highlighted.")
 
     tab_tracker, tab_watchlist, tab_momentum = st.tabs([
         "📋 Guidance Tracker",
@@ -1100,8 +1145,8 @@ def page_guidance():
                     "guidance_type", "horizon_fy", "value", "unit",
                     "cagr_pct", "notes",
                 ] if c in gf.columns]
-                st.dataframe(gf[show_cols], use_container_width=True,
-                             hide_index=True, height=400)
+                st.dataframe(_style_current_q(gf[show_cols], cur_q),
+                             use_container_width=True, hide_index=True, height=400)
 
             if not gf1.empty:
                 with st.expander("📝 Raw forward-looking statements (GF1)"):
@@ -1174,7 +1219,8 @@ def page_guidance():
                     "quarter", "metric", "guidance_type",
                     "horizon_fy", "value", "unit", "cagr_pct", "notes",
                 ] if c in detail.columns]
-                st.dataframe(detail[detail_cols], use_container_width=True, hide_index=True)
+                st.dataframe(_style_current_q(detail[detail_cols], cur_q),
+                             use_container_width=True, hide_index=True)
 
     # ── Tab 3: Guidance × Momentum ────────────────────────────────────
     with tab_momentum:
@@ -1757,6 +1803,11 @@ def page_stock_detail():
         c4.metric("Dist from 52w high", f"{r['dist_from_52w_high_pct']:.1f}%")
         c5.metric("ADR%(20)", f"{r['adr_pct_20']:.2f}%")
 
+    # T4 — conviction scorecard badge
+    _sc_badge = _scorecard_badge(symbol, load_scorecard())
+    if _sc_badge:
+        st.markdown(_sc_badge, unsafe_allow_html=True)
+
     signals = load_all_strategy_signals()
     sym_sigs = signals[signals["symbol"] == symbol] if not signals.empty else pd.DataFrame()
 
@@ -2073,9 +2124,10 @@ def page_graphs():
 
         tf_days = TIMEFRAME_DAYS[tf]
 
-        # ── Pre-load fundamentals (two already-cached parquets, no Drive calls) ──
-        results_df  = load_results_summary()    # has yoy_pct, qoq_pct per metric row
-        guidance_df = load_guidance_tracker()   # structured guidance rows
+        # ── Pre-load fundamentals (already-cached parquets, no Drive calls) ──
+        results_df   = load_results_summary()    # has yoy_pct, qoq_pct per metric row
+        guidance_df  = load_guidance_tracker()   # structured guidance rows
+        scorecard_df = load_scorecard()          # T4 conviction scores (empty until built)
 
         def _fund_line_inner(sym: str) -> str:
             parts = []
@@ -2163,10 +2215,10 @@ def page_graphs():
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
             with st.container():
-                # Line 1 — strategy chips
-                chips_html = _strat_chips(sym_sigs)
-                if chips_html:
-                    st.markdown(chips_html, unsafe_allow_html=True)
+                # Line 1 — strategy chips + T4 conviction badge
+                line1_html = _strat_chips(sym_sigs) + _scorecard_badge(sym, scorecard_df)
+                if line1_html:
+                    st.markdown(line1_html, unsafe_allow_html=True)
 
                 # Line 2 — fundamentals (results YoY/QoQ + guidance)
                 fund = _fund_line(sym)
@@ -2945,6 +2997,226 @@ def page_deep_dive():
                 st.warning("No report path recorded in index.")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# T4 — Scorecard helpers + page
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _scorecard_badge(symbol: str, sc_df: pd.DataFrame) -> str:
+    """Return a coloured composite-score HTML chip, or '' if data is absent."""
+    if sc_df is None or sc_df.empty or "symbol" not in sc_df.columns:
+        return ""
+    row = sc_df[sc_df["symbol"].astype(str).str.upper() == symbol.upper()]
+    if row.empty:
+        return ""
+    v = row.iloc[0].get("composite_score")
+    if pd.isna(v):
+        return ""
+    score = float(v)
+    color = (
+        "#27ae60" if score >= 75 else
+        "#f39c12" if score >= 55 else
+        "#e67e22" if score >= 35 else
+        "#e74c3c"
+    )
+    return (
+        f'<span title="Conviction scorecard" style="background:{color};color:white;'
+        f'padding:2px 8px;border-radius:8px;font-size:11px;'
+        f'margin-left:4px;font-weight:600;">⭐ {score:.0f}</span>'
+    )
+
+
+_SCORE_FACTORS: list[tuple[str, str, str]] = [
+    ("score_technical",     "Technical",     "📈"),
+    ("score_fundamental",   "Fundamental",   "📊"),
+    ("score_fin_health",    "Fin. Health",   "🏦"),
+    ("score_mgmt_cred",     "Mgmt Cred.",    "🎯"),
+    ("score_valuation",     "Valuation",     "💰"),
+    ("score_guidance",      "Guidance",      "📋"),
+    ("score_fraud_risk",    "Fraud Safety",  "🛡️"),
+    ("score_investigative", "Investigative", "🔍"),
+]
+
+
+def _score_band_color(v) -> str:
+    """Hex color for a 0–100 score, or grey for missing."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "#aaaaaa"
+    try:
+        s = float(v)
+    except (TypeError, ValueError):
+        return "#aaaaaa"
+    if s >= 75: return "#27ae60"
+    if s >= 55: return "#f39c12"
+    if s >= 35: return "#e67e22"
+    return "#e74c3c"
+
+
+def page_scorecard():
+    st.title("🏆 Company Scorecard")
+    st.caption(
+        "8-factor conviction blend — **Technical · Fundamental · Financial Health · "
+        "Mgmt Credibility · Valuation · Guidance · Fraud Safety · Investigative**. "
+        "Greyed bars = source parquet not yet populated (auto-lights when data lands)."
+    )
+
+    sc = load_scorecard()
+
+    if sc.empty:
+        st.info(
+            "No scorecard data yet — `company_scorecard.parquet` hasn't been generated.\n\n"
+            "Run `python scripts/build_scorecard.py` (or wait for the nightly CI job). "
+            "This page auto-refreshes once Drive data is available.",
+            icon="🔄",
+        )
+        return
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    f1, f2 = st.columns([2, 1])
+    with f1:
+        seg_opts = ["All"] + sorted(
+            sc["mcap_segment"].dropna().unique().tolist()
+        ) if "mcap_segment" in sc.columns else ["All"]
+        seg_filter = st.selectbox("Segment", seg_opts, key="sc_seg")
+    with f2:
+        min_comp = st.slider("Min completeness %", 0, 100, 0, 10, key="sc_min_comp")
+
+    df = sc.copy()
+    if seg_filter != "All" and "mcap_segment" in df.columns:
+        df = df[df["mcap_segment"] == seg_filter]
+    if "data_completeness_pct" in df.columns:
+        df = df[df["data_completeness_pct"].fillna(0) >= min_comp]
+
+    if df.empty:
+        st.warning("No companies match the selected filters.")
+        return
+
+    df = df.sort_values(
+        "composite_score", ascending=False, na_position="last"
+    ).reset_index(drop=True)
+
+    # ── Ranked table ──────────────────────────────────────────────────────────
+    st.subheader(f"Ranked — {len(df)} companies")
+
+    tbl_cols = ["symbol"]
+    if "company_name" in df.columns:
+        tbl_cols.append("company_name")
+    tbl_cols += ["composite_score", "data_completeness_pct"]
+    tbl_cols += [c for c, _, _ in _SCORE_FACTORS if c in df.columns]
+    tbl = df[[c for c in tbl_cols if c in df.columns]].copy()
+
+    for col in ["composite_score"] + [c for c, _, _ in _SCORE_FACTORS]:
+        if col in tbl.columns:
+            tbl[col] = tbl[col].apply(
+                lambda v: round(float(v), 1) if pd.notna(v) else None
+            )
+    if "data_completeness_pct" in tbl.columns:
+        tbl["data_completeness_pct"] = tbl["data_completeness_pct"].apply(
+            lambda v: round(float(v), 0) if pd.notna(v) else None
+        )
+
+    rename_map = {
+        "symbol": "Symbol", "company_name": "Company",
+        "composite_score": "Composite ▼", "data_completeness_pct": "Complete %",
+    }
+    rename_map.update({c: lbl for c, lbl, _ in _SCORE_FACTORS})
+    tbl = tbl.rename(columns=rename_map)
+    st.dataframe(tbl, use_container_width=True, height=420)
+
+    # ── Per-company drill-down ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Factor Breakdown")
+
+    default_sym = df["symbol"].iloc[0] if not df.empty else ""
+    drill_sym = st.text_input(
+        "Symbol", default_sym, key="sc_drill_sym",
+        help="Type any symbol to see its full 7-factor breakdown.",
+    ).upper().strip()
+
+    if not drill_sym:
+        return
+
+    r_rows = sc[sc["symbol"].astype(str).str.upper() == drill_sym]
+    if r_rows.empty:
+        st.warning(
+            f"No scorecard row for **{drill_sym}** — "
+            "run `build_scorecard.py --names \"{drill_sym}\"` to add it."
+        )
+        return
+
+    r = r_rows.iloc[0]
+    comp_v = r.get("composite_score")
+    comp_s = f"{float(comp_v):.1f}" if pd.notna(comp_v) else "N/A"
+    cplt_v = r.get("data_completeness_pct")
+    cplt_s = f"{float(cplt_v):.0f}%" if pd.notna(cplt_v) else "N/A"
+    seg_s  = str(r.get("mcap_segment", "")) \
+        if pd.notna(r.get("mcap_segment", float("nan"))) else ""
+
+    badge_html = _scorecard_badge(drill_sym, sc)
+    st.markdown(
+        f"<h4>{drill_sym}&nbsp;{badge_html}&nbsp;&nbsp;"
+        f"<span style='font-size:13px;color:#888;font-weight:normal'>"
+        f"{seg_s}{' · ' if seg_s else ''}Completeness: {cplt_s}</span></h4>",
+        unsafe_allow_html=True,
+    )
+
+    # 7-metric summary row
+    factor_cols = st.columns(len(_SCORE_FACTORS))
+    for fc, (col_key, label, icon) in zip(factor_cols, _SCORE_FACTORS):
+        v = r.get(col_key)
+        if pd.isna(v):
+            fc.metric(f"{icon} {label}", "—", help="Source data not yet available")
+        else:
+            fc.metric(f"{icon} {label}", f"{float(v):.0f}")
+
+    # Horizontal bar chart
+    labels = [f"{icon} {lbl}" for _, lbl, icon in _SCORE_FACTORS]
+    vals   = [r.get(c) for c, _, _ in _SCORE_FACTORS]
+    colors = [_score_band_color(v) for v in vals]
+    y_vals = [float(v) if pd.notna(v) else 0.0 for v in vals]
+    text_  = [f"{float(v):.0f}" if pd.notna(v) else "N/A" for v in vals]
+
+    fig_sc = go.Figure(go.Bar(
+        x=y_vals,
+        y=labels,
+        orientation="h",
+        marker_color=colors,
+        text=text_,
+        textposition="outside",
+        cliponaxis=False,
+    ))
+    for i, v in enumerate(vals):
+        if pd.isna(v):
+            fig_sc.add_shape(
+                type="rect",
+                x0=0, x1=112,
+                y0=i - 0.45, y1=i + 0.45,
+                fillcolor="rgba(200,200,200,0.15)",
+                line_width=0,
+                layer="below",
+            )
+    fig_sc.add_vline(
+        x=50, line_dash="dot", line_color="#aaa",
+        annotation_text="50", annotation_position="top right",
+    )
+    fig_sc.update_layout(
+        xaxis=dict(range=[0, 115], title="Score (0–100)"),
+        yaxis=dict(autorange="reversed"),
+        height=360,
+        margin=dict(t=20, b=20, l=10, r=55),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_sc, use_container_width=True, key=f"sc_bar_{drill_sym}")
+
+    missing = [lbl for c, lbl, _ in _SCORE_FACTORS if pd.isna(r.get(c))]
+    if missing:
+        st.caption(
+            "⚠️ Missing factors (source not yet populated): "
+            + ", ".join(f"**{m}**" for m in missing)
+            + ".  Weights auto-renormalize — composite reflects available data only."
+        )
+
+
 def _safe_render(page_fn):
     """Run a page function; show a recoverable error instead of crashing."""
     try:
@@ -2973,6 +3245,7 @@ def main():
         "Deep Dive",
         "My Portfolio",
         "Graphs",
+        "Scorecard",
         "Stock Detail",
         "Strategy Docs",
     ])
@@ -2999,6 +3272,8 @@ def main():
         _safe_render(page_portfolio)
     elif page == "Graphs":
         _safe_render(page_graphs)
+    elif page == "Scorecard":
+        _safe_render(page_scorecard)
     elif page == "Stock Detail":
         _safe_render(page_stock_detail)
     elif page == "Strategy Docs":
