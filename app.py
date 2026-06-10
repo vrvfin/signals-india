@@ -882,6 +882,12 @@ def load_scorecard() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_catalyst_index() -> pd.DataFrame:
+    """Phase 3 T5 — catalyst notes index (why is it moving)."""
+    return load_parquet(["company_repo", "_index", "catalyst_index.parquet"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_quarterly_index() -> list[dict]:
     """List quarterly guidance .md files from company_repo/_quarterly/."""
     def _do():
@@ -1807,6 +1813,17 @@ def page_stock_detail():
     _sc_badge = _scorecard_badge(symbol, load_scorecard())
     if _sc_badge:
         st.markdown(_sc_badge, unsafe_allow_html=True)
+
+    # T5 — latest catalyst note headline
+    _cat = load_catalyst_index()
+    if not _cat.empty and "symbol" in _cat.columns:
+        _crows = _cat[_cat["symbol"].astype(str).str.upper() == symbol]
+        if not _crows.empty:
+            _cr = _crows.sort_values("as_of").iloc[-1]
+            st.caption(
+                f"💡 **{_cr.get('headline', '')}** · "
+                f"{_cr.get('catalyst_type', '')} · {_cr.get('as_of', '')}"
+            )
 
     signals = load_all_strategy_signals()
     sym_sigs = signals[signals["symbol"] == symbol] if not signals.empty else pd.DataFrame()
@@ -3260,6 +3277,17 @@ a 90-composite company on a watchlist keeps its 90 but shows a low red Investiga
             + ", ".join(f"**{m}**" for m in missing)
             + ".  Weights auto-renormalize — composite reflects available data only."
         )
+
+    # T5 — latest catalyst note for the drilled symbol
+    cat = load_catalyst_index()
+    if not cat.empty and "symbol" in cat.columns:
+        crows = cat[cat["symbol"].astype(str).str.upper() == drill_sym]
+        if not crows.empty:
+            cr = crows.sort_values("as_of").iloc[-1]
+            st.markdown(
+                f"💡 **Latest catalyst** ({cr.get('as_of', '')}, "
+                f"{cr.get('catalyst_type', '')}): {cr.get('headline', '')}"
+            )
 
 
 def _safe_render(page_fn):

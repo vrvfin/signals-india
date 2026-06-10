@@ -28,14 +28,25 @@ Scorecard wiring (Option A — highlight, never filter): build_scorecard.py read
 this parquet as an 8th factor, score_investigative = (4 - grade) / 4 * 100,
 weight 10%. NO hard cap on the composite.
 
-Stage 2 (open items, columns reserved here but always 0/empty for now):
-  sebi_actions (SEBI enforcement scrape), nfra_actions (NFRA orders),
-  news_hits / news_snippets (Google News RSS keyword scan), MCA SFIO.
+Stage 2 (built 2026-06-10, each behind a flag, all fail-soft):
+  --with-news  Google News RSS fraud-keyword scan via shared news_fetch.py.
+               ROLLING refresh (user decision 2026-06-10): portfolio companies
+               every run (7-day lookback); the rest of the universe rotates
+               stalest-first on a ~90-day cycle (--news-budget per run, default 40).
+               Companies not scanned this run carry forward their previous news
+               fields from the existing parquet. Hit -> grade max(grade, 2);
+               SFIO keyword included but headlines alone NEVER auto-grade 4.
+  --with-sebi  SEBI enforcement-orders listing scrape: recent order titles
+               matched against normalized universe names -> sebi_actions;
+               hit -> grade max(grade, 3).
+  --with-nfra  NFRA orders listing scrape, same matching -> nfra_actions;
+               hit -> grade max(grade, 3).
 
 Usage:
     python scripts/build_investigative_fraud.py --dry-run        # fetch + grade, no writes
     python scripts/build_investigative_fraud.py --local          # write to .t4_local mirror
     python scripts/build_investigative_fraud.py                  # real Drive write
+    python scripts/build_investigative_fraud.py --with-news --with-sebi --with-nfra
     python scripts/build_investigative_fraud.py --lists-from DIR # offline: read cached
         asm.json / esm.json / gsm.json / t2t.csv / bse.json snapshots instead of network
 """
@@ -57,16 +68,44 @@ from dotenv import load_dotenv
 # Shared Drive layer (CLAUDE.md global rule #4 — reuse, never raw API calls).
 from _extractor_base import (
     get_drive, get_or_create_subfolder, find_file, download_bytes, upload_bytes,
+    load_portfolio_isins,
 )
+import news_fetch
 
 DATA_MISSING = "DATA_MISSING"
 
 INVESTIGATIVE_COLS = [
     "isin", "symbol", "company_name",
     "asm_level", "esm_level", "gsm_stage", "t2t", "bse_group",
-    "sebi_actions", "nfra_actions", "news_hits", "news_snippets",
+    "sebi_actions", "nfra_actions", "news_hits", "news_snippets", "news_checked_at",
     "investigative_grade", "grade_reason", "checked_at",
 ]
+
+# Specific phrases only — a bare "sebi" matched exonerations and unrelated
+# regulator news in live testing (RELIANCE false-positived at grade 2).
+FRAUD_NEWS_KEYWORDS = [
+    "fraud", "scam", "embezzle", "auditor resign", "forensic",
+    "sfio", "enforcement directorate", "show cause", "show-cause",
+    "irregularit", "insolvency", "sebi bars", "sebi ban", "sebi probe",
+    "sebi penal", "sebi fine", "sebi investigat", "debt default",
+    "loan default", "promoter pledge", "pledged shares",
+]
+# Titles with exoneration/relief language are NOT fraud signals.
+NEWS_NEGATIVE_TERMS = [
+    "sets aside", "set aside", "quash", "clears", "cleared", "dismiss",
+    "exonerat", "refund", "withdraw", "approves", "relief", "acquit",
+]
+NEWS_QUERY_TERMS = ('(SEBI OR fraud OR "auditor resignation" OR "forensic audit" '
+                    'OR SFIO OR insolvency OR "enforcement directorate")')
+
+SEBI_ORDERS_URL = ("https://www.sebi.gov.in/sebiweb/home/HomeAction.do"
+                   "?doListing=yes&sid=2&ssid=5&smid=0")
+NFRA_ORDERS_URL = "https://nfra.gov.in/orders-circulars/orders"
+
+# Words stripped when normalizing company names for order-title matching.
+_NAME_STOPWORDS = re.compile(
+    r"\b(limited|ltd|private|pvt|india|industries|company|co|corp|corporation)\b\.?",
+    re.I)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -117,6 +156,16 @@ class Store:
         if not fid:
             return None
         return pd.read_csv(io.BytesIO(download_bytes(self.drive, fid)))
+
+    def read_parquet(self, path_parts):
+        *folder, name = path_parts
+        if self.local:
+            fp = self.local_dir.joinpath(*path_parts)
+            return pd.read_parquet(fp) if fp.exists() else None
+        fid = find_file(self.drive, self._folder(folder), name)
+        if not fid:
+            return None
+        return pd.read_parquet(io.BytesIO(download_bytes(self.drive, fid)))
 
     def write_df(self, path_parts, df: pd.DataFrame):
         *folder, name = path_parts
@@ -307,13 +356,121 @@ def fetch_bse_groups(lists_from: Path | None) -> dict[str, str]:
 
 
 # ------------------------------------------------------------------ #
+#  Stage 2 — news scan (rolling) + SEBI/NFRA order-title matching     #
+# ------------------------------------------------------------------ #
+
+def _norm_name(name: str) -> str:
+    """Normalize a company name for order-title matching. Returns '' when the
+    remainder is too short to match safely (avoids false positives like 'ABC')."""
+    n = _NAME_STOPWORDS.sub(" ", str(name))
+    n = re.sub(r"[^A-Za-z0-9 ]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip().upper()
+    return n if len(n) >= 5 else ""
+
+
+def _title_about_company(title: str, company_name: str, symbol: str) -> bool:
+    """Google's query matching is loose — require the company to actually appear
+    in the headline (first meaningful name token, or the NSE symbol)."""
+    t = title.upper()
+    norm = _norm_name(company_name)
+    if norm:
+        first = norm.split()[0]
+        if len(first) >= 4 and first in t:
+            return True
+        if norm in t:
+            return True
+    return len(symbol) >= 4 and symbol.upper() in t
+
+
+def scan_company_news(company_name: str, symbol: str, days_back: int) -> tuple[int, str]:
+    """One Google News RSS call for a company; returns (n_hits, snippets_json).
+    Best-effort: any failure returns (0, ''). Three filters fight false
+    positives (all hit live testing): specific keywords only, headline must
+    name the company, exoneration/relief language disqualifies the title."""
+    query = f'"{company_name or symbol}" {NEWS_QUERY_TERMS}'
+    try:
+        items = news_fetch.fetch_news(query, days_back=days_back)
+    except news_fetch.NewsFetchBudgetExceeded:
+        raise                       # caller stops the rolling loop cleanly
+    except Exception:
+        return 0, ""
+    items = [i for i in items
+             if _title_about_company(i["title"], company_name, symbol)
+             and not any(neg in i["title"].lower() for neg in NEWS_NEGATIVE_TERMS)]
+    hits = news_fetch.keyword_hits(items, FRAUD_NEWS_KEYWORDS)
+    if not hits:
+        return 0, ""
+    snippets = [{"headline": h["title"][:160], "source": h["source"],
+                 "date": h["published"][:25], "matched": h["matched"][:3]}
+                for h in hits[:5]]
+    return len(hits), json.dumps(snippets, ensure_ascii=False)
+
+
+def _fetch_listing_titles(url: str, label: str) -> list[str]:
+    """Anchor/title texts from a regulator's orders listing page. Fail-soft []."""
+    try:
+        r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html"},
+                         timeout=25)
+        if r.status_code != 200:
+            log(f"  {label}: HTTP {r.status_code} — skipping")
+            return []
+        html = r.text
+        # anchor text + title attributes — regulator sites vary; take both.
+        texts = re.findall(r"<a[^>]*>([^<]{15,300})</a>", html)
+        texts += re.findall(r'title="([^"]{15,300})"', html)
+        out = [re.sub(r"\s+", " ", t).strip() for t in texts]
+        log(f"  {label}: {len(out)} listing titles fetched")
+        return out
+    except Exception as e:
+        log(f"  {label}: fetch failed ({str(e)[:80]}) — skipping")
+        return []
+
+
+def match_orders_to_universe(titles: list[str],
+                             universe: list[tuple[str, str, str]]) -> dict[str, int]:
+    """{symbol: n_matching_order_titles} via normalized-name substring match."""
+    if not titles:
+        return {}
+    norm_titles = [_norm_name(t) or t.upper() for t in titles]
+    counts: dict[str, int] = {}
+    for _, sym, cname in universe:
+        norm = _norm_name(cname)
+        if not norm:
+            continue
+        n = sum(1 for t in norm_titles if norm in t)
+        if n:
+            counts[sym] = n
+    return counts
+
+
+def pick_news_scan_set(universe: list[tuple[str, str, str]],
+                       prev: "pd.DataFrame | None",
+                       pf_isins: "set[str] | None",
+                       budget: int) -> tuple[set[str], set[str]]:
+    """(pf_symbols, rolling_symbols): PF names every run; the rest stalest-first
+    by news_checked_at within budget (~90-day full-universe cycle at 40/day)."""
+    pf_syms = {sym for isin, sym, _ in universe
+               if pf_isins and isin in pf_isins}
+    last = {}
+    if prev is not None and not prev.empty and "news_checked_at" in prev.columns:
+        for _, r in prev.iterrows():
+            ts = str(r.get("news_checked_at") or "")
+            last[str(r["symbol"]).upper()] = ts
+    rest = [(last.get(sym, ""), sym) for _, sym, _ in universe if sym not in pf_syms]
+    rest.sort()                      # '' (never scanned) sorts first
+    rolling = {sym for _, sym in rest[:max(0, budget)]}
+    return pf_syms, rolling
+
+
+# ------------------------------------------------------------------ #
 #  Grading (pure — unit-testable offline)                             #
 # ------------------------------------------------------------------ #
 
 def grade_company(asm_lt_stage: int | None, asm_st_stage: int | None,
                   esm_stage: int | None, gsm_stage: int | None,
                   t2t: bool, bse_group: str = "",
-                  sebi_actions: int = 0, nfra_actions: int = 0) -> tuple[int, str]:
+                  sebi_actions: int = 0, nfra_actions: int = 0,
+                  news_hits: int = 0) -> tuple[int, str]:
     """Apply the locked rubric. Returns (grade 0-4, human-readable reason)."""
     grade, reasons = 0, []
 
@@ -343,13 +500,17 @@ def grade_company(asm_lt_stage: int | None, asm_st_stage: int | None,
         grade = max(grade, 3)
         reasons.append(f"BSE group {bse_group} (non-compliant)")
 
-    # Stage 2 inputs — always 0 today, wired so the rubric is already complete.
+    # Stage 2 inputs (news/SEBI/NFRA). Headlines alone never auto-grade 4 —
+    # Grade 4 stays exchange-list-driven (GSM 5-6); worse needs manual review.
     if sebi_actions > 0:
         grade = max(grade, 3)
         reasons.append(f"{sebi_actions} SEBI action(s)")
     if nfra_actions > 0:
         grade = max(grade, 3)
         reasons.append(f"{nfra_actions} NFRA order(s)")
+    if news_hits > 0:
+        grade = max(grade, 2)
+        reasons.append(f"{news_hits} fraud-news hit(s)")
 
     return grade, "; ".join(reasons) if reasons else "clean"
 
@@ -369,6 +530,15 @@ def main():
     ap.add_argument("--lists-from", type=str, default=None,
                     help="Offline: dir with asm.json/esm.json/gsm.json/t2t.csv/bse.json "
                          "snapshots — no network calls at all.")
+    ap.add_argument("--with-news", action="store_true",
+                    help="Rolling Google News fraud scan: PF names every run (7d "
+                         "lookback) + stalest non-PF up to --news-budget (90d lookback).")
+    ap.add_argument("--news-budget", type=int, default=40,
+                    help="Non-PF companies scanned per run (40/day ≈ 90-day cycle).")
+    ap.add_argument("--with-sebi", action="store_true",
+                    help="Match recent SEBI enforcement-order titles against universe.")
+    ap.add_argument("--with-nfra", action="store_true",
+                    help="Match recent NFRA order titles against universe.")
     args = ap.parse_args()
 
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -419,21 +589,82 @@ def main():
             "NOT writing. (Use --lists-from with cached snapshots to test offline.)")
         return
 
+    # ---- Stage 2: previous parquet = carry-forward store for rolling news ----
+    prev = store.read_parquet(["company_repo", "_index", "investigative_fraud.parquet"])
+    prev_by_sym: dict[str, dict] = {}
+    if prev is not None and not prev.empty:
+        for _, r in prev.iterrows():
+            prev_by_sym[str(r["symbol"]).upper()] = r.to_dict()
+
+    # ---- Stage 2: SEBI / NFRA order-title matching (one fetch per regulator) ----
+    sebi_counts: dict[str, int] = {}
+    nfra_counts: dict[str, int] = {}
+    if args.with_sebi:
+        titles = _fetch_listing_titles(SEBI_ORDERS_URL, "SEBI")
+        sebi_counts = match_orders_to_universe(titles, universe)
+        log(f"  SEBI: {len(sebi_counts)} universe names matched in recent orders")
+    if args.with_nfra:
+        titles = _fetch_listing_titles(NFRA_ORDERS_URL, "NFRA")
+        nfra_counts = match_orders_to_universe(titles, universe)
+        log(f"  NFRA: {len(nfra_counts)} universe names matched in recent orders")
+
+    # ---- Stage 2: rolling news scan set ----
+    pf_syms: set[str] = set()
+    rolling_syms: set[str] = set()
+    if args.with_news:
+        pf_isins = None
+        if not args.local:
+            try:
+                pf_isins = load_portfolio_isins(store.drive, store.root)
+            except Exception as e:
+                log(f"  portfolio load failed ({str(e)[:60]}) — PF tier skipped")
+        pf_syms, rolling_syms = pick_news_scan_set(
+            universe, prev, pf_isins, args.news_budget)
+        log(f"  news scan set: {len(pf_syms)} PF (7d) + {len(rolling_syms)} "
+            f"rolling (90d, stalest-first)")
+
     # NOTE: NSE reportASM mixes long-term and short-term blocks; _extract_records
     # flattens both, so a symbol's stage here is the max across blocks. We treat
     # stage>=2 as long-term-equivalent severity (grade 3 per rubric) — conservative.
     rows = []
+    news_scanned = news_budget_hit = 0
     for isin, sym, cname in universe:
         asm_stage = nse["asm"].get(sym)
         esm_stage = nse["esm"].get(sym)
         gsm_stage = nse["gsm"].get(sym)
         t2t = sym in t2t_set
         bse_group = bse_map.get(isin, "")
+        pv = prev_by_sym.get(sym, {})
+
+        # news: scan if selected this run, else carry forward previous result
+        news_hits = int(pv.get("news_hits") or 0)
+        news_snippets = str(pv.get("news_snippets") or "")
+        news_checked_at = str(pv.get("news_checked_at") or "")
+        if args.with_news and not news_budget_hit and (sym in pf_syms or sym in rolling_syms):
+            try:
+                days = 7 if sym in pf_syms else 90
+                news_hits, news_snippets = scan_company_news(cname, sym, days)
+                news_checked_at = datetime.now().isoformat(timespec="seconds")
+                news_scanned += 1
+            except news_fetch.NewsFetchBudgetExceeded:
+                news_budget_hit = 1
+                log("  news RSS per-run budget hit — remaining names carry forward")
+
+        # SEBI/NFRA: fresh match when fetched this run, else carry forward
+        if args.with_sebi:
+            sebi_n = sebi_counts.get(sym, 0)
+        else:
+            sebi_n = int(pv.get("sebi_actions") or 0)
+        if args.with_nfra:
+            nfra_n = nfra_counts.get(sym, 0)
+        else:
+            nfra_n = int(pv.get("nfra_actions") or 0)
 
         grade, reason = grade_company(
             asm_lt_stage=asm_stage, asm_st_stage=None,
             esm_stage=esm_stage, gsm_stage=gsm_stage,
             t2t=t2t, bse_group=bse_group,
+            sebi_actions=sebi_n, nfra_actions=nfra_n, news_hits=news_hits,
         )
         rows.append({
             "isin": isin, "symbol": sym, "company_name": cname,
@@ -442,14 +673,18 @@ def main():
             "gsm_stage": gsm_stage or 0,
             "t2t": bool(t2t),
             "bse_group": bse_group,
-            "sebi_actions": 0,      # Stage 2
-            "nfra_actions": 0,      # Stage 2
-            "news_hits": 0,         # Stage 2
-            "news_snippets": "",    # Stage 2
+            "sebi_actions": sebi_n,
+            "nfra_actions": nfra_n,
+            "news_hits": news_hits,
+            "news_snippets": news_snippets,
+            "news_checked_at": news_checked_at,
             "investigative_grade": grade,
             "grade_reason": reason,
             "checked_at": datetime.now().isoformat(timespec="seconds"),
         })
+    if args.with_news:
+        log(f"  news scanned this run: {news_scanned} companies "
+            f"({news_fetch.calls_made()} RSS calls)")
 
     out = pd.DataFrame(rows, columns=INVESTIGATIVE_COLS)
     dist = out["investigative_grade"].value_counts().sort_index().to_dict()
@@ -460,7 +695,8 @@ def main():
         log("DRY-RUN — not writing. Flagged sample:")
         sample = (flagged if not flagged.empty else out).head(15)
         cols = ["symbol", "investigative_grade", "grade_reason",
-                "asm_level", "esm_level", "gsm_stage", "t2t", "bse_group"]
+                "asm_level", "esm_level", "gsm_stage", "t2t", "bse_group",
+                "sebi_actions", "nfra_actions", "news_hits"]
         print(sample[cols].to_string(index=False))
         return
 
