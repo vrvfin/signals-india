@@ -145,6 +145,7 @@ jobs:
       # are cleaned up on the next run (they'll be 24h old then, cleaned at 48h).
       # Same script, same retention, same policy as Phase 2's cleanup step.
       - name: Cleanup raw PDFs older than 2 days
+        if: always()   # retention rule must hold even when an earlier step fails
         run: python scripts/cleanup_company_docs.py
         continue-on-error: true
 
