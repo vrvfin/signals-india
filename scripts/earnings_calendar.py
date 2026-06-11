@@ -5,10 +5,9 @@ Primary source: NSE event-calendar API (official; works from residential IPs,
 may 403 from CI datacenter IPs — degrades gracefully). Filters to "Financial
 Results" board meetings within the next N days.
 
-BSE-only names: BSE's forthcoming-board-meeting API endpoint is not yet wired
-(the obvious paths return an error page) — `bse_results_calendar()` is a graceful
-stub returning []. TODO: capture the real BSE network call (or ingest the
-myalerts/Tijori feed) to cover BSE-only companies.
+BSE source: api.bseindia.com Corpforthresults (the Forth_Results.aspx page's
+own XHR; needs a bseindia.com Referer). Merged with NSE, deduped on
+(symbol, date) — dual-listed names keep the NSE row.
 
 Usage:
     python scripts/earnings_calendar.py --days-ahead 1            # tomorrow
@@ -66,9 +65,30 @@ def nse_results_calendar(start: date, end: date) -> list[dict]:
     return out
 
 
+BSE_FORTH_RESULTS = ("https://api.bseindia.com/BseIndiaAPI/api/"
+                     "Corpforthresults/w?scripcode=")
+
+
 def bse_results_calendar(start: date, end: date) -> list[dict]:
-    """TODO: wire BSE forthcoming-board-meetings (Results). Graceful stub for now."""
-    return []
+    """BSE forthcoming results board meetings with date in [start, end]."""
+    try:
+        r = requests.get(BSE_FORTH_RESULTS, timeout=20,
+                         headers={**UA, "Referer": "https://www.bseindia.com/"})
+        rows = r.json()
+        if not isinstance(rows, list):
+            rows = []
+    except Exception as e:
+        print(f"  BSE calendar fetch failed ({type(e).__name__}) — skipping.")
+        return []
+    out = []
+    for x in rows:
+        dt = _parse_date(x.get("meeting_date"))
+        if dt and start <= dt <= end:
+            sym = str(x.get("short_name", "")).strip() or str(x.get("scrip_Code", ""))
+            out.append({"date": dt.isoformat(), "symbol": sym,
+                        "company": str(x.get("Long_Name", "")).strip(),
+                        "purpose": "Financial Results", "source": "BSE"})
+    return out
 
 
 def get_results_calendar(days_ahead: int = 1) -> list[dict]:

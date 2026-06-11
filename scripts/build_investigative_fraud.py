@@ -101,7 +101,12 @@ NEWS_QUERY_TERMS = ('(SEBI OR fraud OR "auditor resignation" OR "forensic audit"
 
 SEBI_ORDERS_URL = ("https://www.sebi.gov.in/sebiweb/home/HomeAction.do"
                    "?doListing=yes&sid=2&ssid=5&smid=0")
+SEBI_RSS_URL = "https://www.sebi.gov.in/sebirss.xml"
 NFRA_ORDERS_URL = "https://nfra.gov.in/orders-circulars/orders"
+
+# RSS carries ALL SEBI updates; only adverse order-like titles may count.
+SEBI_RSS_ORDER_TERMS = ("order", "adjudicat", "settlement", "penal",
+                        "prohibit", "debar", "enforcement")
 
 # Words stripped when normalizing company names for order-title matching.
 _NAME_STOPWORDS = re.compile(
@@ -489,6 +494,31 @@ def _fetch_listing_titles(url: str, label: str) -> list[str]:
         return []
 
 
+def _fetch_sebi_rss_titles() -> list[str]:
+    """Order-like titles from SEBI's RSS feed — supplements the listing page,
+    whose HTML yields only ~4 anchors per fetch. Exonerations/relief language
+    is dropped (same NEWS_NEGATIVE_TERMS rule as the news scan). Fail-soft []."""
+    try:
+        r = requests.get(SEBI_RSS_URL, headers={"User-Agent": UA}, timeout=25)
+        if r.status_code != 200:
+            log(f"  SEBI-RSS: HTTP {r.status_code} — skipping")
+            return []
+        import xml.etree.ElementTree as ET
+        out = []
+        for el in ET.fromstring(r.content).iter("title"):
+            t = re.sub(r"\s+", " ", el.text or "").strip()
+            tl = t.lower()
+            if (len(t) >= 15
+                    and any(k in tl for k in SEBI_RSS_ORDER_TERMS)
+                    and not any(neg in tl for neg in NEWS_NEGATIVE_TERMS)):
+                out.append(t)
+        log(f"  SEBI-RSS: {len(out)} order-like feed titles fetched")
+        return out
+    except Exception as e:
+        log(f"  SEBI-RSS: fetch failed ({str(e)[:80]}) — skipping")
+        return []
+
+
 def match_orders_to_universe(titles: list[str],
                              universe: list[tuple[str, str, str]]) -> dict[str, list[str]]:
     """{symbol: [matching order titles]} via normalized-name substring match.
@@ -737,6 +767,7 @@ def main():
     nfra_matches: dict[str, list[str]] = {}
     if args.with_sebi:
         titles = _fetch_listing_titles(SEBI_ORDERS_URL, "SEBI")
+        titles += _fetch_sebi_rss_titles()
         sebi_matches = match_orders_to_universe(titles, universe)
         log(f"  SEBI: {len(sebi_matches)} universe names matched in recent orders")
     if args.with_nfra:
