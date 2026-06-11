@@ -52,7 +52,8 @@ jobs:
             echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
             echo "GEMINI_API_KEY=$GEMINI_API_KEY"
-            echo "BACKFILL_GEMINI_KEY=$BACKFILL_GEMINI_KEY"
+            # flatten multi-line secret (KEY_N=value lines) to one comma-joined line
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
             echo "FRAUD_API_KEY_1=$FRAUD_API_KEY_1"
             echo "FRAUD_API_KEY_2=$FRAUD_API_KEY_2"
           } > .env

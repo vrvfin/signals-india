@@ -64,7 +64,8 @@ jobs:
             echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
             echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
-            echo "BACKFILL_GEMINI_KEY=$BACKFILL_GEMINI_KEY"
+            # flatten multi-line secret (KEY_N=value lines) to one comma-joined line
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
             echo "BACKFILL_GEMINI_KEY_1=$BACKFILL_GEMINI_KEY_1"
             echo "BACKFILL_GEMINI_KEY_2=$BACKFILL_GEMINI_KEY_2"
             echo "BACKFILL_GEMINI_KEY_3=$BACKFILL_GEMINI_KEY_3"

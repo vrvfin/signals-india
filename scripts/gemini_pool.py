@@ -321,11 +321,18 @@ def load_keys(env: dict, prefix: str = "GEMINI_API_KEY") -> list[str]:
         raw.append(plain)
     # A single var may hold MANY keys separated by comma, semicolon, newline or
     # spaces (one git secret with 8 keys = the common case). Gemini keys contain
-    # none of those, so splitting on any separator is safe. De-dupe, keep order.
+    # none of those, so splitting on any separator is safe. The secret may also
+    # be pasted as .env-style lines ("BACKFILL_GEMINI_KEY_1=AIza..."): strip the
+    # NAME= prefix and drop bare NAME tokens (real keys always have lowercase,
+    # never '='). De-dupe, keep order.
     keys: list[str] = []
     for v in raw:
         for part in re.split(r"[,\s;]+", v):
-            p = part.strip()
-            if p and p not in keys:
+            p = part.strip().strip('"').strip("'")
+            if "=" in p:
+                p = p.split("=")[-1].strip().strip('"').strip("'")
+            if not p or re.fullmatch(r"[A-Z0-9_]+", p):
+                continue  # empty, or an env-var NAME fragment — not a key
+            if p not in keys:
                 keys.append(p)
     return keys
