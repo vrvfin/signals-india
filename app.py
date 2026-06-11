@@ -3212,7 +3212,10 @@ def page_fraud_tracker():
         "Standalone company-wise fraud signal (T7) — the **worst** of the two engines: "
         "exchange/regulator surveillance (investigative grade 0–4) and T2 forensic "
         "accounting rules (0–100). Bands: 🔴 RED ≥70 · 🟠 ALERT ≥45 · 🟡 WATCH ≥20. "
-        "Refreshed nightly after the scorecard."
+        "Refreshed nightly after the scorecard. **Read the why column** — ASM/ESM/GSM/"
+        "T2T listings are price-volatility *control measures*, often speculative price "
+        "action rather than fraud; only SEBI/NFRA orders, forensic flags and fraud-news "
+        "are integrity signals."
     )
     snap = load_parquet(["company_repo", "_index", "fraud_tracker.parquet"])
     if snap.empty:

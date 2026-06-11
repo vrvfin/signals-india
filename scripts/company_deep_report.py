@@ -1039,15 +1039,62 @@ def phase3_block(svc, root, isin, symbol) -> str:
         parts.append(f"SCORECARD: composite={_fmt(r.get('composite_score'))}/100 "
                      f"(data completeness {_fmt(r.get('data_completeness_pct'))}%)"
                      f" | factors: {facs}")
+    # Fraud & surveillance — exact reasons, split by NATURE of the signal:
+    # exchange surveillance = price/volatility control (NOT fraud per se);
+    # regulatory orders / forensic flags / fraud-news = integrity signals.
     ft = _by_co(f"{P}/fraud_tracker.parquet")
+    inv = _by_co(f"{P}/investigative_fraud.parquet")
+    fr = _by_co(f"{P}/fraud_risk.parquet")
+    fl = []
     if not ft.empty:
         r = ft.iloc[0]
-        parts.append(f"FRAUD TRACKER: {r.get('band')} {_fmt(r.get('fraud_score'))}/100"
-                     f" (flagged since {r.get('first_flagged_at')}) — "
-                     f"{str(r.get('reason', ''))[:300]}")
+        fl.append(f"score: {r.get('band')} {_fmt(r.get('fraud_score'))}/100 "
+                  f"(driver: {r.get('score_driver', '?')}; "
+                  f"flagged since {r.get('first_flagged_at')})")
+    if not inv.empty:
+        r = inv.iloc[0]
+        surv = []
+        for v in (r.get("asm_level"), r.get("esm_level")):
+            if str(v) not in ("none", "", "nan", "None"):
+                surv.append(str(v))
+        gsm = pd.to_numeric(r.get("gsm_stage"), errors="coerce")
+        if pd.notna(gsm) and int(gsm):
+            surv.append(f"GSM-{int(gsm)}")
+        if bool(r.get("t2t")):
+            surv.append("T2T")
+        if str(r.get("bse_group", "")).strip() not in ("", "nan"):
+            surv.append(f"BSE group {r.get('bse_group')}")
+        fl.append("exchange surveillance (price/volatility control measures — "
+                  "NOT fraud per se): " + (", ".join(surv) if surv else "none"))
+        integ = []
+        for col, lbl in (("sebi_actions", "SEBI order match(es)"),
+                         ("nfra_actions", "NFRA order(s)")):
+            n = pd.to_numeric(r.get(col), errors="coerce")
+            if pd.notna(n) and int(n):
+                integ.append(f"{int(n)} {lbl}")
+        n_news = pd.to_numeric(r.get("news_hits"), errors="coerce")
+        if pd.notna(n_news) and int(n_news):
+            heads = ""
+            try:
+                snips = json.loads(str(r.get("news_snippets") or "[]"))
+                heads = " — " + "; ".join(s.get("headline", "")[:90]
+                                          for s in snips[:3])
+            except Exception:
+                pass
+            integ.append(f"{int(n_news)} fraud-keyword news hit(s){heads}")
+        fl.append("integrity signals (adverse): "
+                  + ("; ".join(integ) if integ else "none"))
+    if not fr.empty:
+        r = fr.iloc[0]
+        flags = str(r.get("forensic_flags", "")).strip()
+        if flags:
+            fl.append(f"forensic accounting flags (score "
+                      f"{_fmt(r.get('fraud_risk_score'))}/100, higher=worse): {flags}")
+    if fl:
+        parts.append("FRAUD & SURVEILLANCE:\n  - " + "\n  - ".join(fl))
     else:
-        parts.append("FRAUD TRACKER: not on the tracker (no active surveillance/"
-                     "forensic flags above threshold).")
+        parts.append("FRAUD & SURVEILLANCE: clean — no surveillance listing, no "
+                     "regulatory order match, no forensic flag.")
     mc = _by_co(f"{P}/mgmt_credibility.parquet")
     if not mc.empty and "cred_score" in mc.columns:
         r = mc.sort_values("quarter").iloc[-1]

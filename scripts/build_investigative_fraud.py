@@ -675,6 +675,9 @@ def _fraud_mail_html(out: pd.DataFrame, changes: list[dict],
     parts.append("<p style='font-size:11px;color:#999'>Grades: 0 clean · 1 T2T · "
                  "2 ASM-1/GSM-1-2/news-hit · 3 ASM-2+/ESM/GSM-3-4/BSE-Z/SEBI/NFRA · "
                  "4 GSM-5-6. News hits cap at grade 2 — verify before acting. "
+                 "NOTE: ASM/ESM/GSM/T2T are price-volatility control measures, often "
+                 "speculative price action rather than fraud — only SEBI/NFRA orders, "
+                 "forensic flags and fraud-news are integrity signals. "
                  "Toggle this mail in the app sidebar (📧 Email toggles).</p>")
     return "".join(parts)
 

@@ -92,7 +92,25 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
  conclusion disagrees with any of them — e.g. your view is positive but the fraud
  tracker is RED/ALERT, or the credibility score is poor while guidance is rosy —
  raise an explicit [WARNING] naming BOTH sides; (c) cite as [SYSTEM]. If
- DATA_MISSING, say the quantitative pipeline has no coverage yet and continue.>
+ DATA_MISSING, say the quantitative pipeline has no coverage yet and continue.
+
+ FRAUD & SURVEILLANCE — MANDATORY TREATMENT in the risk/fraud section of the report:
+ 1. Never present the fraud score alone — always reproduce the EXACT named reasons
+    from the FRAUD & SURVEILLANCE lines (which list, which stage, which order,
+    which forensic rule, which headline). The score is a pointer; the rationale
+    is the finding.
+ 2. Distinguish the two natures EXPLICITLY:
+    - "exchange surveillance" items (ASM/ESM/GSM stages, T2T, BSE groups) are
+      price-movement / volatility / liquidity CONTROL measures imposed by the
+      exchanges. They often reflect speculative price action in small caps and
+      are NOT evidence of fraud by themselves. Treat them as tradability and
+      volatility risk; mention the practical effect (delivery-only settlement,
+      price bands, additional margins).
+    - "integrity signals" (SEBI/NFRA order matches, forensic accounting flags,
+      fraud-keyword news) DO bear on financial integrity — weigh these in the
+      fraud assessment proper, with their named causes.
+ 3. If surveillance items exist but integrity signals are "none", say exactly
+    that: flagged for price action, no integrity signal on record.>
 [/PHASE3_QUANT_SNAPSHOT]
 
 [COMPANY_PAGE_BRIEF]
