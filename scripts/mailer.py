@@ -38,6 +38,7 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "catalyst":        "Catalyst notes digest (nightly 21:30 IST)",
     "growth_guidance": "High-growth guidance >30% from fresh concalls (daily 20:00 IST)",
     "guidance_digest": "Concall guidance table, last 24h (daily 20:00 IST)",
+    "ops_digest":      "Ops digest: runs pass/fail + freshness + samples (daily 08:30 IST)",
 }
 
 

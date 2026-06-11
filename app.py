@@ -3544,6 +3544,7 @@ _MAIL_TOGGLES = [
     ("catalyst",        "💡 Catalyst notes (21:30)"),
     ("growth_guidance", "🚀 High-growth guidance (20:00)"),
     ("guidance_digest", "🎯 Concall guidance table (20:00)"),
+    ("ops_digest",      "🩺 Ops digest (08:30)"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"
 
@@ -3602,6 +3603,49 @@ def render_mail_toggles_sidebar():
                 st.error(f"Save failed: {str(e)[:120]}")
 
 
+def render_review_flag_sidebar():
+    """🚩 One-box channel to Claude: rows land in _index/review_flags.csv on
+    Drive; Claude reads them at session start and the morning ops digest lists
+    the open ones."""
+    with st.sidebar.expander("🚩 Flag for review"):
+        txt = st.text_area("What should Claude look at?", "",
+                           key="review_flag_text",
+                           placeholder="e.g. WOCKPHARMA growth mail looks wrong")
+        if st.button("Submit flag", key="review_flag_btn",
+                     use_container_width=True) and txt.strip():
+            try:
+                drive = drive_service()
+                idx, _ = _mail_settings_loc(drive)   # same _index folder
+                if not idx:
+                    st.error("Drive _index folder not found.")
+                    return
+                q = f"name='review_flags.csv' and '{idx}' in parents and trashed=false"
+                files = drive.files().list(q=q, fields="files(id)").execute() \
+                    .get("files", [])
+                fid = files[0]["id"] if files else None
+                if fid:
+                    old = pd.read_csv(io.BytesIO(_download_bytes(drive, fid)))
+                else:
+                    old = pd.DataFrame(columns=["ts", "flag", "status"])
+                row = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                       "flag": txt.strip()[:500], "status": "open"}
+                out = pd.concat([old, pd.DataFrame([row])], ignore_index=True)
+                from googleapiclient.http import MediaIoBaseUpload
+                media = MediaIoBaseUpload(
+                    io.BytesIO(out.to_csv(index=False).encode("utf-8")),
+                    mimetype="text/csv", resumable=False)
+                if fid:
+                    drive.files().update(fileId=fid, media_body=media).execute()
+                else:
+                    drive.files().create(body={"name": "review_flags.csv",
+                                               "parents": [idx]},
+                                         media_body=media, fields="id").execute()
+                st.success("Flagged — appears in the morning ops digest and "
+                           "Claude's next session.")
+            except Exception as e:
+                st.error(f"Flag failed: {str(e)[:120]}")
+
+
 def main():
     st.sidebar.title("Signals India")
 
@@ -3623,6 +3667,7 @@ def main():
     ])
     render_health_sidebar()
     render_mail_toggles_sidebar()
+    render_review_flag_sidebar()
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Loaded at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     st.sidebar.caption("Data refreshes from Drive every 5 min (cache TTL)")
