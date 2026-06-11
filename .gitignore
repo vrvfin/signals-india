@@ -51,3 +51,11 @@ scripts/fetch_pf_tracking.py
 scripts/build_screener_map.py
 scripts/backfill_pf_concalls.py
 scripts/page_pf_tracking_snippet.py
+# Local-only workflows — run from Task Scheduler / .bat, never CI (user 2026-06-11)
+scripts/daily_research_summary.py
+scripts/generate_tv_watchlist.py
+scripts/sync_pf.py
+tv_watchlist.txt
+1_PF.txt
+07-06-2026.txt
+NETWORK_ERROR_TROUBLESHOOTING.md
