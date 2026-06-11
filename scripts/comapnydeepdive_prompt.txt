@@ -81,6 +81,20 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
  decide which to trust. Use it to fill gaps only where Annual Reports are silent.>
 [/SCREENER_CROSSCHECK]
 
+[PHASE3_QUANT_SNAPSHOT]
+<Pre-computed nightly metrics from THIS system's own pipelines — 8-factor scorecard
+ composite, fraud-tracker band with named causes, management said-vs-delivered
+ credibility score, valuation vs segment peers, management's CURRENT quantified
+ guidance, guided-vs-actual verdicts (PEAD), recent catalyst notes, derived ratios.
+ These are DETERMINISTIC COMPUTED FACTS, not opinions — do NOT recompute them.
+ You MUST reconcile your narrative against them: (a) open the report with a one-line
+ "system view" quoting composite score and fraud band; (b) if your qualitative
+ conclusion disagrees with any of them — e.g. your view is positive but the fraud
+ tracker is RED/ALERT, or the credibility score is poor while guidance is rosy —
+ raise an explicit [WARNING] naming BOTH sides; (c) cite as [SYSTEM]. If
+ DATA_MISSING, say the quantitative pipeline has no coverage yet and continue.>
+[/PHASE3_QUANT_SNAPSHOT]
+
 [COMPANY_PAGE_BRIEF]
 <company_page.md — cumulative per-company brief built by the pipeline: prior concall
  summaries, GF guidance tables, quarterly tracker, and any appended research-doc

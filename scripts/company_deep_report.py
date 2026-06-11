@@ -1002,6 +1002,96 @@ def assemble_doc_summaries(svc, root, pool, isin) -> tuple[str, list[dict]]:
     return "\n\n".join(blocks), used
 
 # ---- prompt assembly ------------------------------------------------------
+def _fmt(v, spec="{:.0f}"):
+    try:
+        f = float(v)
+        return spec.format(f) if f == f else "?"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def phase3_block(svc, root, isin, symbol) -> str:
+    """Pre-computed Phase 3 nightly metrics for THIS company — scorecard, fraud
+    tracker, mgmt credibility, valuation, current guidance, guided-vs-actual,
+    catalysts, derived ratios. Injected as authoritative quant facts the model
+    must reconcile its narrative against (zero extra Gemini calls)."""
+    sym = str(symbol).upper()
+
+    def _by_co(path):
+        df = _read_parquet(svc, path, root)
+        if df.empty:
+            return df
+        if "isin" in df.columns:
+            m = df[df["isin"].astype(str) == isin]
+            if not m.empty:
+                return m
+        if "symbol" in df.columns:
+            return df[df["symbol"].astype(str).str.upper() == sym]
+        return df.iloc[0:0]
+
+    P = "company_repo/_index"
+    parts = []
+    sc = _by_co(f"{P}/company_scorecard.parquet")
+    if not sc.empty:
+        r = sc.iloc[0]
+        facs = ", ".join(f"{c[6:]}={_fmt(r[c])}" for c in sc.columns
+                         if c.startswith("score_") and pd.notna(r[c]))
+        parts.append(f"SCORECARD: composite={_fmt(r.get('composite_score'))}/100 "
+                     f"(data completeness {_fmt(r.get('data_completeness_pct'))}%)"
+                     f" | factors: {facs}")
+    ft = _by_co(f"{P}/fraud_tracker.parquet")
+    if not ft.empty:
+        r = ft.iloc[0]
+        parts.append(f"FRAUD TRACKER: {r.get('band')} {_fmt(r.get('fraud_score'))}/100"
+                     f" (flagged since {r.get('first_flagged_at')}) — "
+                     f"{str(r.get('reason', ''))[:300]}")
+    else:
+        parts.append("FRAUD TRACKER: not on the tracker (no active surveillance/"
+                     "forensic flags above threshold).")
+    mc = _by_co(f"{P}/mgmt_credibility.parquet")
+    if not mc.empty and "cred_score" in mc.columns:
+        r = mc.sort_values("quarter").iloc[-1]
+        parts.append(f"MGMT CREDIBILITY (said-vs-delivered, {r.get('quarter')}): "
+                     f"score={r.get('cred_score')} pattern={r.get('pattern')} "
+                     f"strongest={r.get('strongest_area')} "
+                     f"recurring_miss={r.get('recurring_miss')}")
+    val = _by_co(f"{P}/valuation.parquet")
+    if not val.empty:
+        r = val.iloc[0]
+        parts.append(f"VALUATION: P/E={_fmt(r.get('pe'), '{:.1f}')} "
+                     f"({r.get('mcap_segment')}); cheaper than "
+                     f"{_fmt(r.get('pe_pctile_segment'))}% of segment peers; "
+                     f"PEG~{_fmt(r.get('peg_proxy'), '{:.2f}')}; "
+                     f"valuation_score={_fmt(r.get('valuation_score'))}/100")
+    gt = _by_co(f"{P}/guidance_tracker.parquet")
+    if not gt.empty and "quarter" in gt.columns:
+        latest_q = gt.sort_values("quarter")["quarter"].iloc[-1]
+        rows = gt[gt["quarter"] == latest_q].head(8)
+        gl = "; ".join(f"{r.get('metric')}={r.get('value')}"
+                       f" ({r.get('horizon_fy')})" for _, r in rows.iterrows())
+        parts.append(f"CURRENT GUIDANCE ({latest_q}): {gl}")
+    pead = _by_co(f"{P}/pead_flags.parquet")
+    if not pead.empty:
+        rows = pead.sort_values("as_of").tail(6)
+        pl = "; ".join(f"{r.get('metric')}: guided {r.get('guided_value')} vs "
+                       f"actual {r.get('actual_value')} = {r.get('verdict')}"
+                       for _, r in rows.iterrows())
+        parts.append(f"GUIDED vs ACTUAL (PEAD): {pl}")
+    cat = _by_co(f"{P}/catalyst_index.parquet")
+    if not cat.empty:
+        rows = cat.sort_values("as_of").tail(2)
+        cl = " | ".join(f"[{r.get('as_of')}] {r.get('catalyst_type')}: "
+                        f"{str(r.get('headline', ''))[:120]}" for _, r in rows.iterrows())
+        parts.append(f"RECENT CATALYSTS: {cl}")
+    der = _by_co(f"{P}/financials_derived.parquet")
+    if not der.empty and "metric" in der.columns:
+        latest = (der.sort_values("period").groupby("metric").tail(1))
+        dl = "; ".join(f"{r.get('metric')}={_fmt(r.get('value'), '{:.1f}')}"
+                       for _, r in latest.head(12).iterrows())
+        parts.append(f"DERIVED RATIOS (latest period each): {dl}")
+    return "\n".join(parts) if parts else "DATA_MISSING"
+
+
 def fill_section(tpl, tag, content):
     # function replacement -> content is inserted literally (no \g/\1 backref
     # interpretation, which would crash on summaries containing backslashes).
@@ -1011,7 +1101,7 @@ def fill_section(tpl, tag, content):
 
 def build_prompt(name, symbol, isin, screener, page, research, bse,
                  docs="DATA_MISSING", screener_cross="DATA_MISSING", news="DATA_MISSING",
-                 youtube="DATA_MISSING", drhp="DATA_MISSING"):
+                 youtube="DATA_MISSING", drhp="DATA_MISSING", phase3="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
@@ -1019,6 +1109,7 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
               .replace("[ISIN]", isin))
     tpl = fill_section(tpl, "SCREENER_FINANCIAL_DATA", screener)
     tpl = fill_section(tpl, "SCREENER_CROSSCHECK", screener_cross)
+    tpl = fill_section(tpl, "PHASE3_QUANT_SNAPSHOT", phase3)
     tpl = fill_section(tpl, "COMPANY_PAGE_BRIEF", page[:MAX_PAGE_CHARS] or "DATA_MISSING")
     tpl = fill_section(tpl, "RESEARCH_INDEX_CONTEXT", research)
     tpl = fill_section(tpl, "DRHP_PROSPECTUS", drhp)
@@ -1090,6 +1181,12 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     doc_block, used_docs = assemble_doc_summaries(svc, root, pool, isin)
     print(f"    documents: {len(used_docs)} summarised/reused")
 
+    # Phase 3 nightly tables — pre-computed scorecard/fraud/credibility/guidance
+    # facts the report must reconcile against (no extra Gemini calls).
+    p3 = phase3_block(svc, root, isin, symbol)
+    print(f"    phase3 snapshot: "
+          f"{'ok (' + str(p3.count(chr(10)) + 1) + ' lines)' if p3 != 'DATA_MISSING' else 'missing'}")
+
     # Screener structured financials — LIVE fetch (cache to Drive), used as an
     # independent cross-check the model reconciles against the Annual Reports.
     screener_cross = screener_financials_block(svc, root, isin, symbol)
@@ -1121,7 +1218,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           screener_cross=screener_cross,
                           news=news,
                           youtube=youtube,
-                          drhp=drhp)
+                          drhp=drhp,
+                          phase3=p3)
     report, model_used = pool.call_text(prompt)
     report = _clean_report_md(report)
 
