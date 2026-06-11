@@ -582,7 +582,7 @@ def _drive_call(fn, attempts=4):
                 pass
             time.sleep(1.5 * (i + 1))
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=16)
 def load_csv(path_parts):
     def _do():
         drive = drive_service()
@@ -599,7 +599,7 @@ def load_csv(path_parts):
     return _drive_call(_do)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=24)
 def load_parquet(path_parts):
     def _do():
         drive = drive_service()
@@ -645,7 +645,7 @@ def load_all_strategy_signals():
 
 # ---------- Bulk OHLCV loader (traverses Drive path ONCE for N symbols) ----------
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=3)
 def load_ohlcv_bulk(symbols: tuple) -> dict:
     """Download OHLCV for multiple symbols in a single Drive session.
     Folder lookups happen once; only the needed parquets are downloaded.
@@ -724,7 +724,7 @@ def load_daily_index() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False, max_entries=20)
 def load_md_content(file_id: str) -> str:
     """Download and return markdown content of a Drive file."""
     def _do():
@@ -735,7 +735,7 @@ def load_md_content(file_id: str) -> str:
         return f"*Could not load file: {e}*"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=10)
 def find_company_page(key: str) -> str | None:
     """Return company_page.md content for a given ISIN or symbol key, or None."""
     if not key:
@@ -849,39 +849,37 @@ _DOC_TYPE_SLUG = {
 
 # ---------- Guidance / Results data loaders ----------
 
-@st.cache_data(ttl=300, show_spinner=False)
+# NOTE (2026-06-11 memory fix): these thin wrappers are deliberately UNcached.
+# load_parquet() already caches the frame (ttl=1800); decorating the wrappers
+# too stored a SECOND pickled copy of every big table for zero freshness gain
+# (the inner cache governed anyway) — a Streamlit-Cloud OOM contributor.
+
 def load_guidance_tracker() -> pd.DataFrame:
     return load_parquet(["company_repo", "_index", "guidance_tracker.parquet"])
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_gf1_statements() -> pd.DataFrame:
     return load_parquet(["company_repo", "_index", "gf1_guidance_statements.parquet"])
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_gf4_flags() -> pd.DataFrame:
     return load_parquet(["company_repo", "_index", "gf4_quality_flags.parquet"])
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_results_summary() -> pd.DataFrame:
     return load_parquet(["company_repo", "_index", "results.parquet"])
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_financials_3stmt() -> pd.DataFrame:
     """Phase 3 T2 — quarterly/annual/TTM 3-statement line items."""
     return load_parquet(["company_repo", "_index", "financials_3stmt.parquet"])
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_scorecard() -> pd.DataFrame:
     """Phase 3 T4 — 8-factor company scorecard."""
     return load_parquet(["company_repo", "_index", "company_scorecard.parquet"])
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_catalyst_index() -> pd.DataFrame:
     """Phase 3 T5 — catalyst notes index (why is it moving)."""
     return load_parquet(["company_repo", "_index", "catalyst_index.parquet"])
