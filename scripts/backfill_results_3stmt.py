@@ -241,8 +241,10 @@ def scrape_company(client: ScreenerClient, isin: str, symbol: str) -> list[dict]
 
 
 def incremental_companies(drive, index_id, order, days: int) -> list[dict]:
-    """Today's reporters from results.parquet (written by scrape_results_table) —
-    ISINs whose results were refreshed within `days`. Maps to {symbol,isin,name}."""
+    """NEW reporters from results.parquet (written by scrape_results_table) —
+    ISINs whose results FIRST appeared on the feed within `days` (first_seen_at;
+    scraped_at fallback for parquets predating that column). Maps to
+    {symbol,isin,name}. An empty result is valid: nothing newly declared."""
     fid = find_file(drive, index_id, "results.parquet")
     if not fid:
         log("  --incremental: results.parquet not found — nothing to refresh.")
@@ -254,18 +256,20 @@ def incremental_companies(drive, index_id, order, days: int) -> list[dict]:
         return []
     if res.empty or "isin" not in res.columns:
         return []
-    isins: list[str] = []
-    if "scraped_at" in res.columns:
+    ts_col = "first_seen_at" if "first_seen_at" in res.columns else (
+        "scraped_at" if "scraped_at" in res.columns else None)
+    if ts_col is None:      # very old parquet, no timestamps: refresh everything
+        isins = res["isin"].astype(str).str.strip().unique().tolist()
+    else:
         res = res.copy()
-        res["_d"] = pd.to_datetime(res["scraped_at"], errors="coerce")
+        res["_d"] = pd.to_datetime(res[ts_col], errors="coerce")
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
         recent = res[res["_d"] >= cutoff]
-        isins = recent["isin"].astype(str).str.strip().unique().tolist()
-    if not isins:   # fallback: all in results.parquet (already the recent-results set)
-        isins = res["isin"].astype(str).str.strip().unique().tolist()
+        isins = [i for i in recent["isin"].astype(str).str.strip().unique().tolist() if i]
     by_isin = {c["isin"]: c for c in order if c.get("isin")}
     out = [by_isin[i] for i in isins if i in by_isin]
-    log(f"  --incremental: {len(out)} reporter(s) to refresh (within {days}d)")
+    log(f"  --incremental: {len(out)} reporter(s) to refresh "
+        f"({ts_col or 'no-timestamp'} within {days}d)")
     return out
 
 

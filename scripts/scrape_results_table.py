@@ -45,7 +45,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 OUT_COLS = ["slug", "isin", "company_name", "metric",
             "latest_q", "latest_val", "prev_q", "prev_val",
-            "yearago_q", "yearago_val", "yoy_pct", "qoq_pct", "scraped_at"]
+            "yearago_q", "yearago_val", "yoy_pct", "qoq_pct",
+            "scraped_at", "first_seen_at"]
 
 
 def log(msg: str) -> None:
@@ -232,6 +233,7 @@ def parse_results_page(html: str, run_ts: str) -> list[dict]:
                 "prev_q": prev_q, "prev_val": prev_val,
                 "yearago_q": yearago_q, "yearago_val": yearago_val,
                 "yoy_pct": yoy, "qoq_pct": qoq, "scraped_at": run_ts,
+                "first_seen_at": run_ts,
             })
     return rows
 
@@ -310,14 +312,25 @@ def main() -> None:
     fresh = pd.DataFrame(new_rows)
     fresh["isin"] = fresh["slug"].map(lambda s: slug2isin.get(s, ""))
 
-    # upsert into existing results.parquet, keyed by (slug, metric, latest_q)
+    # upsert into existing results.parquet, keyed by (slug, metric, latest_q).
+    # scraped_at = this run; first_seen_at = when the key FIRST appeared on the
+    # feed (preserved across re-scrapes — proxy for the declaration date).
     existing_id = find_file(drive, index_id, "results.parquet")
+    old = None
     if existing_id:
         try:
             old = pd.read_parquet(io.BytesIO(download_bytes(drive, existing_id)))
-            combined = pd.concat([old, fresh], ignore_index=True)
         except Exception:
-            combined = fresh
+            old = None
+    if old is not None and not old.empty:
+        if "first_seen_at" not in old.columns:        # one-time backfill proxy
+            old["first_seen_at"] = old["scraped_at"]
+        prev_seen = {(r.slug, r.metric, r.latest_q): r.first_seen_at
+                     for r in old.itertuples()}
+        fresh["first_seen_at"] = [
+            prev_seen.get(k, run_ts)
+            for k in zip(fresh["slug"], fresh["metric"], fresh["latest_q"])]
+        combined = pd.concat([old, fresh], ignore_index=True)
     else:
         combined = fresh
     combined = (combined.drop_duplicates(subset=["slug", "metric", "latest_q"],
