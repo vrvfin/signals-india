@@ -3242,15 +3242,18 @@ def page_fraud_tracker():
     disp["days_on_tracker"] = (
         pd.to_datetime(disp["as_of"], errors="coerce")
         - pd.to_datetime(disp["first_flagged_at"], errors="coerce")).dt.days
-    cols = ["symbol", "company_name", "fraud_score", "band", "trend",
-            "investigative_grade", "forensic_score", "news_hits",
-            "sebi_actions", "nfra_actions", "days_on_tracker", "first_flagged_at"]
+    cols = ["symbol", "company_name", "fraud_score", "band", "reason", "trend",
+            "investigative_grade", "forensic_score", "days_on_tracker",
+            "first_flagged_at"]
+    cols = [c for c in cols if c in disp.columns]   # older parquet w/o reason
     styled = (disp[cols].style
               .map(lambda b: f"color:white;background-color:"
                              f"{_BAND_COLORS.get(b, '#777')}", subset=["band"])
               .format({"fraud_score": "{:.0f}", "forensic_score": "{:.0f}"}))
     st.dataframe(styled, use_container_width=True, hide_index=True,
-                 height=min(38 * (len(disp) + 1), 600))
+                 height=min(38 * (len(disp) + 1), 600),
+                 column_config={"reason": st.column_config.TextColumn(
+                     "why (engine(points): causes)", width="large")})
 
     # ---- drill-down: score history + reasons ----
     st.markdown("---")
@@ -3268,6 +3271,9 @@ def page_fraud_tracker():
     m2.metric("Investigative grade", f"{int(r['investigative_grade'])}/4")
     m3.metric("Forensic score", f"{r['forensic_score']:.0f}/100")
     m4.metric("First flagged", str(r["first_flagged_at"]))
+    if str(r.get("reason", "")).strip():
+        st.markdown(f"**Why {r['band']}** (driver: {r.get('score_driver', '?')}): "
+                    f"{r['reason']}")
     if str(r.get("grade_reason", "")).strip():
         st.markdown(f"**Surveillance / regulator:** {r['grade_reason']}")
     if str(r.get("forensic_flags", "")).strip():

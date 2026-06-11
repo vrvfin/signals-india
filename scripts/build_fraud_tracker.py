@@ -46,6 +46,7 @@ from _extractor_base import (
 
 TRACKER_COLS = [
     "isin", "symbol", "company_name", "fraud_score", "band",
+    "score_driver", "reason",
     "investigative_grade", "grade_reason", "forensic_score",
     "n_forensic_flags", "forensic_flags",
     "news_hits", "sebi_actions", "nfra_actions",
@@ -68,6 +69,21 @@ def band_of(score: float) -> str:
         if score >= cut:
             return name
     return "CLEAN"
+
+
+def explain(inv_pts: float, grade_reason: str,
+            for_pts: float, forensic_flags: str) -> tuple[str, str]:
+    """(score_driver, one-line reason) — which engine set the score and why.
+    Both engines are named whenever both contributed >= TRACK_MIN, so a
+    surveillance RED with forensic smoke still shows the forensic part."""
+    driver = ("both" if inv_pts == for_pts
+              else "investigative" if inv_pts > for_pts else "forensic")
+    parts = []
+    if inv_pts > 0 and (inv_pts >= TRACK_MIN or inv_pts >= for_pts):
+        parts.append(f"surveillance({inv_pts:.0f}): {grade_reason or 'flagged'}")
+    if for_pts > 0 and (for_pts >= TRACK_MIN or for_pts >= inv_pts):
+        parts.append(f"forensics({for_pts:.0f}): {forensic_flags or 'flagged'}")
+    return driver, " | ".join(parts)
 
 
 # ------------------------------------------------------------------ #
@@ -185,10 +201,13 @@ def build_tracker(inv: pd.DataFrame | None, fraud: pd.DataFrame | None,
 
     rows, hist_rows = [], []
     for sym, e in by_sym.items():
-        score = round(max(e["investigative_grade"] / 4 * 100,
-                          e.get("forensic_score", 0.0)), 1)
+        inv_pts = e["investigative_grade"] / 4 * 100
+        for_pts = e.get("forensic_score", 0.0)
+        score = round(max(inv_pts, for_pts), 1)
         if score < TRACK_MIN:
             continue
+        driver, reason = explain(inv_pts, e["grade_reason"],
+                                 for_pts, e.get("forensic_flags", ""))
         pv = prev_by_sym.get(sym, {})
         prev_score = pd.to_numeric(pv.get("fraud_score"), errors="coerce")
         first = str(pv.get("first_flagged_at") or "") or as_of
@@ -205,6 +224,7 @@ def build_tracker(inv: pd.DataFrame | None, fraud: pd.DataFrame | None,
         rows.append({
             "isin": e["isin"], "symbol": sym, "company_name": e["company_name"],
             "fraud_score": score, "band": band_of(score),
+            "score_driver": driver, "reason": reason,
             "investigative_grade": e["investigative_grade"],
             "grade_reason": e["grade_reason"],
             "forensic_score": e.get("forensic_score", 0.0),
@@ -276,9 +296,9 @@ def main():
     log(f"tracked: {len(snap)} companies {dist}; history rows: {len(out_h)}")
 
     if args.dry_run:
-        cols = ["symbol", "fraud_score", "band", "trend", "investigative_grade",
-                "forensic_score", "first_flagged_at"]
-        print(snap[cols].head(20).to_string(index=False))
+        for _, r in snap.head(20).iterrows():
+            print(f"  {r['symbol']:<12} {r['fraud_score']:>5.0f} {r['band']:<6} "
+                  f"{r['trend']:<5} {str(r['reason'])[:110]}")
         return
 
     store.write_df(["company_repo", "_index", "fraud_tracker.parquet"], snap)
