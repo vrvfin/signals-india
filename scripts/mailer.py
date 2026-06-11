@@ -32,10 +32,12 @@ NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", GMAIL_USER)
 
 SETTINGS_NAME = "mail_settings.json"
 MAIL_KEYS = {                      # key -> human label (app.py shows these)
-    "pead_guidance": "Results last 24h vs guidance (daily 20:00 IST)",
-    "pead_tomorrow": "Results tomorrow calendar (daily 20:00 IST)",
-    "fraud_scan":    "Fraud scan findings (nightly 21:30 IST)",
-    "catalyst":      "Catalyst notes digest (nightly 21:30 IST)",
+    "pead_guidance":   "Results last 24h vs guidance (daily 20:00 IST)",
+    "pead_tomorrow":   "Results tomorrow calendar (daily 20:00 IST)",
+    "fraud_scan":      "Fraud scan findings (nightly 21:30 IST)",
+    "catalyst":        "Catalyst notes digest (nightly 21:30 IST)",
+    "growth_guidance": "High-growth guidance >30% from fresh concalls (daily 20:00 IST)",
+    "guidance_digest": "Concall guidance table, last 24h (daily 20:00 IST)",
 }
 
 

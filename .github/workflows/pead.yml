@@ -76,3 +76,10 @@ jobs:
         if: always()    # an earlier email failure must not block this one
         run: python scripts/guidance_digest_email.py
         continue-on-error: true
+
+      # Fourth daily email — high-growth flag: GF1 max % > 30 (margin/utilization
+      # excluded), fresh Phase 2 concalls only. Skips itself when nothing crosses.
+      - name: Send high-growth guidance mail (>30%, last 24h)
+        if: always()
+        run: python scripts/run_growth_guidance_mail.py
+        continue-on-error: true

@@ -36,7 +36,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _extractor_base import (get_drive, get_or_create_subfolder,  # noqa: E402
                              load_parquet, log)
-from mailer import send_email  # noqa: E402
+from mailer import send_email, load_mail_settings  # noqa: E402
 
 GUIDANCE_COLS = ["isin", "symbol", "company_name", "quarter", "metric",
                  "guidance_type", "horizon_fy", "value", "unit", "cagr_pct",
@@ -201,6 +201,9 @@ def main() -> None:
         print(f"\nDRY RUN — preview saved to {prev}; no email sent.")
         return
 
+    if not load_mail_settings(drive, index_id).get("guidance_digest", True):
+        log("guidance_digest mail toggled OFF — skipped.")
+        return
     sent = send_email(subject, html)
     log(f"Email {'sent' if sent else 'FAILED'}: {subject}")
 

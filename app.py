@@ -3444,10 +3444,12 @@ def _safe_render(page_fn):
 # ---------- Email toggles (CI mailers read mail_settings.json from Drive) ----------
 
 _MAIL_TOGGLES = [
-    ("pead_guidance", "📊 Results vs guidance (20:00)"),
-    ("pead_tomorrow", "📅 Results tomorrow (20:00)"),
-    ("fraud_scan",    "🚨 Fraud scan findings (21:30)"),
-    ("catalyst",      "💡 Catalyst notes (21:30)"),
+    ("pead_guidance",   "📊 Results vs guidance (20:00)"),
+    ("pead_tomorrow",   "📅 Results tomorrow (20:00)"),
+    ("fraud_scan",      "🚨 Fraud scan findings (21:30)"),
+    ("catalyst",        "💡 Catalyst notes (21:30)"),
+    ("growth_guidance", "🚀 High-growth guidance (20:00)"),
+    ("guidance_digest", "🎯 Concall guidance table (20:00)"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"
 
