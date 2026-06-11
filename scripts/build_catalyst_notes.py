@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html as html_mod
 import io
 import os
 from datetime import datetime
@@ -37,6 +38,7 @@ from dotenv import load_dotenv
 
 from _extractor_base import (
     get_drive, get_or_create_subfolder, find_file, download_bytes, upload_bytes,
+    load_portfolio_isins,
 )
 import news_fetch
 
@@ -180,6 +182,34 @@ point. If the headlines do not show a clear catalyst, say so honestly (TYPE=unkn
 """
 
 
+def _esc(s, n=120) -> str:
+    return html_mod.escape(str(s)[:n])
+
+
+def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
+                        n_selected: int, skipped_quiet: int) -> str:
+    parts = [f"<p><b>Catalyst notes — nightly digest.</b><br>"
+             f"Eligible (≥{MIN_STRATEGIES} strategies): {n_eligible} · "
+             f"PF daily: {n_pf} · scanned: {n_selected} · "
+             f"quiet (no trusted news): {skipped_quiet} · "
+             f"notes written: <b>{len(new_rows)}</b></p>"]
+    if new_rows:
+        rows = "".join(
+            f"<tr><td><b>{_esc(r['symbol'])}</b></td><td>{_esc(r['catalyst_type'])}</td>"
+            f"<td>{_esc(r['headline'], 160)}</td><td>{_esc(r['tags'], 60)}</td>"
+            f"<td align=center>{r['n_sources']}</td></tr>" for r in new_rows)
+        parts.append("<table border=1 cellpadding=4 cellspacing=0>"
+                     "<tr><th>Symbol</th><th>Type</th><th>Headline</th>"
+                     "<th>Tags</th><th>Src</th></tr>" + rows + "</table>")
+    else:
+        parts.append("<p>No catalysts found tonight — every scanned name was quiet.</p>")
+    parts.append("<p style='font-size:11px;color:#999'>Full notes live on the Stock "
+                 "Detail / Scorecard pages. Quiet = no trusted-source news in "
+                 f"{NEWS_DAYS} days (no Gemini call spent). "
+                 "Toggle this mail in the app sidebar (📧 Email toggles).</p>")
+    return "".join(parts)
+
+
 def make_note(pool, company: str, symbol: str, items: list[dict],
               brief: str) -> tuple[str, str, str, str] | None:
     """Returns (catalyst_type, headline, tags, md_body) or None on failure."""
@@ -225,6 +255,9 @@ def main():
     ap.add_argument("--local-dir", type=str, default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="List the eligible/selected names. No network, no writes.")
+    ap.add_argument("--email", action="store_true",
+                    help="Mail tonight's notes digest. Respects the 'catalyst' "
+                         "toggle in mail_settings.json.")
     args = ap.parse_args()
 
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -266,14 +299,26 @@ def main():
         for _, r in idx.sort_values("as_of").iterrows():
             last_note[str(r["symbol"]).upper()] = str(r["as_of"])
 
+    # ---- PF companies: scanned EVERY run on top of the cap (user 2026-06-11) ----
+    pf_syms: list[str] = []
+    if not args.local:
+        try:
+            pf_isins = load_portfolio_isins(store.drive, store.root) or set()
+            sym_by_isin = {v[0]: k for k, v in isin_map.items() if v[0]}
+            pf_syms = sorted(sym_by_isin[i] for i in pf_isins if i in sym_by_isin)
+        except Exception as e:
+            log(f"portfolio load failed ({str(e)[:60]}) — PF tier skipped")
+
     if args.names:
         selected = [s.strip().upper() for s in args.names.split(",") if s.strip()]
     else:
-        todo = [s for s in elig_syms if last_note.get(s, "") != as_of]
+        pf_todo = [s for s in pf_syms if last_note.get(s, "") != as_of]
+        todo = [s for s in elig_syms
+                if last_note.get(s, "") != as_of and s not in set(pf_todo)]
         todo.sort(key=lambda s: last_note.get(s, ""))      # never-noted first
-        selected = todo[:max(0, args.limit)]
+        selected = pf_todo + todo[:max(0, args.limit)]
     log(f"eligible (n_strategies>={MIN_STRATEGIES}): {len(elig_syms)}; "
-        f"selected this run: {len(selected)}")
+        f"PF daily: {len(pf_syms)}; selected this run: {len(selected)}")
 
     if args.dry_run:
         log("DRY-RUN — would generate notes for:")
@@ -327,20 +372,32 @@ def main():
 
     log(f"notes written: {len(new_rows)}; quiet names skipped (no trusted news): "
         f"{skipped_quiet}; RSS calls: {news_fetch.calls_made()}")
-    if not new_rows:
-        return
 
-    # ---- upsert index: replace same (symbol, as_of) rows, append the rest ----
-    new_df = pd.DataFrame(new_rows, columns=CATALYST_COLS)
-    if idx is not None and not idx.empty:
-        keep = idx[~((idx["symbol"].astype(str).str.upper().isin(new_df["symbol"]))
-                     & (idx["as_of"] == as_of))]
-        out = pd.concat([keep, new_df], ignore_index=True)
-    else:
-        out = new_df
-    store.write_df(["company_repo", "_index", "catalyst_index.parquet"], out)
-    store.write_df(["company_repo", "_index", "catalyst_index.csv"], out)
-    log(f"catalyst_index updated: {len(out)} total rows.")
+    if new_rows:
+        # ---- upsert index: replace same (symbol, as_of) rows, append the rest ----
+        new_df = pd.DataFrame(new_rows, columns=CATALYST_COLS)
+        if idx is not None and not idx.empty:
+            keep = idx[~((idx["symbol"].astype(str).str.upper().isin(new_df["symbol"]))
+                         & (idx["as_of"] == as_of))]
+            out = pd.concat([keep, new_df], ignore_index=True)
+        else:
+            out = new_df
+        store.write_df(["company_repo", "_index", "catalyst_index.parquet"], out)
+        store.write_df(["company_repo", "_index", "catalyst_index.csv"], out)
+        log(f"catalyst_index updated: {len(out)} total rows.")
+
+    if args.email:
+        if args.local or store.drive is None:
+            log("--email: local mode, no Drive/toggles — mail skipped.")
+            return
+        from mailer import send_email, load_mail_settings
+        index_id = store._folder(["company_repo", "_index"])
+        if not load_mail_settings(store.drive, index_id).get("catalyst", True):
+            log("catalyst mail toggled OFF — skipped.")
+            return
+        send_email(f"💡 Catalyst notes — {len(new_rows)} new — {datetime.now():%d-%b}",
+                   _catalyst_mail_html(new_rows, len(elig_syms), len(pf_syms),
+                                       len(selected), skipped_quiet))
 
 
 if __name__ == "__main__":

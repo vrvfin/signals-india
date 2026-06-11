@@ -39,7 +39,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, load_parquet, log)
 from build_pead_flags import PEAD_COLS
 from earnings_calendar import get_results_calendar, _html_table
-from mailer import send_email
+from mailer import send_email, load_mail_settings
 
 _VERDICT_COLOR = {"BEAT": "#27ae60", "MISS": "#e74c3c", "INLINE": "#777", "NA": "#aaa"}
 
@@ -198,11 +198,18 @@ def main() -> None:
         print(html_b or "(no reporters today)")
         return
 
+    toggles = load_mail_settings(drive, index_id)
     sent = 0
     if html_b:
-        sent += send_email(f"📊 Results last 24h vs guidance — {date.today()}", html_b)
+        if toggles.get("pead_guidance", True):
+            sent += send_email(f"📊 Results last 24h vs guidance — {date.today()}", html_b)
+        else:
+            print("pead_guidance mail toggled OFF — skipped.")
     if html_a:
-        sent += send_email(f"📅 Results tomorrow ({len(events)} cos)", html_a)
+        if toggles.get("pead_tomorrow", True):
+            sent += send_email(f"📅 Results tomorrow ({len(events)} cos)", html_a)
+        else:
+            print("pead_tomorrow mail toggled OFF — skipped.")
     print(f"run_pead_daily: {sent} email(s) sent "
           f"(reporters today={0 if reporters is None else len(reporters)}, "
           f"calendar={len(events)}).")

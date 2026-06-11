@@ -4,9 +4,18 @@ notify_deepdive.py (GMAIL_USER / GMAIL_APP_PASSWORD / NOTIFY_EMAIL). Import-safe
 
     from mailer import send_email
     send_email("Subject", "<b>html</b>", "plain fallback")
+
+Per-mail on/off toggles live in company_repo/_index/mail_settings.json on Drive
+(written by the Streamlit app's "Email toggles" sidebar). Senders check:
+
+    from mailer import load_mail_settings
+    if load_mail_settings(drive, index_id).get("catalyst", True): send_email(...)
+
+Missing file / unknown key = ON (mails only go quiet when explicitly toggled off).
 """
 from __future__ import annotations
 
+import json
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -20,6 +29,34 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", GMAIL_USER)
+
+SETTINGS_NAME = "mail_settings.json"
+MAIL_KEYS = {                      # key -> human label (app.py shows these)
+    "pead_guidance": "Results last 24h vs guidance (daily 20:00 IST)",
+    "pead_tomorrow": "Results tomorrow calendar (daily 20:00 IST)",
+    "fraud_scan":    "Fraud scan findings (nightly 21:30 IST)",
+    "catalyst":      "Catalyst notes digest (nightly 21:30 IST)",
+}
+
+
+def default_mail_settings() -> dict:
+    return {k: True for k in MAIL_KEYS}
+
+
+def load_mail_settings(drive, index_id) -> dict:
+    """Read company_repo/_index/mail_settings.json -> {key: bool}. Any failure
+    (file absent, Drive hiccup) returns all-ON so a toggle bug never silences
+    mails accidentally."""
+    settings = default_mail_settings()
+    try:
+        from _extractor_base import find_file, download_bytes
+        fid = find_file(drive, index_id, SETTINGS_NAME)
+        if fid:
+            data = json.loads(download_bytes(drive, fid).decode("utf-8"))
+            settings.update({k: bool(v) for k, v in data.items() if k in settings})
+    except Exception as e:
+        print(f"mailer: could not read {SETTINGS_NAME} ({str(e)[:60]}) — all ON.")
+    return settings
 
 
 def send_email(subject: str, html_body: str, plain_body: str = "",

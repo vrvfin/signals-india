@@ -44,6 +44,9 @@ jobs:
           BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
           FRAUD_API_KEY_1:         ${{ secrets.FRAUD_API_KEY_1 }}
           FRAUD_API_KEY_2:         ${{ secrets.FRAUD_API_KEY_2 }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -56,6 +59,9 @@ jobs:
             echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
             echo "FRAUD_API_KEY_1=$FRAUD_API_KEY_1"
             echo "FRAUD_API_KEY_2=$FRAUD_API_KEY_2"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
           } > .env
 
       - name: Install deps
@@ -67,7 +73,7 @@ jobs:
         run: >
           python scripts/build_investigative_fraud.py
           --with-news --news-budget "${{ github.event.inputs.news_budget || '40' }}"
-          --with-sebi --with-nfra
+          --with-sebi --with-nfra --with-gemini --email
         continue-on-error: true
 
       - name: Valuation (segment + own-history P/E)
@@ -81,8 +87,8 @@ jobs:
       - name: 8-factor scorecard blend
         run: python scripts/build_scorecard.py
 
-      - name: Catalyst notes (strong stocks, Gemini lite)
+      - name: Catalyst notes (strong stocks + PF daily, Gemini lite)
         run: >
           python scripts/build_catalyst_notes.py
-          --limit "${{ github.event.inputs.catalyst_limit || '30' }}"
+          --limit "${{ github.event.inputs.catalyst_limit || '30' }}" --email
         continue-on-error: true

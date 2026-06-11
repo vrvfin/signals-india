@@ -54,6 +54,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html as html_mod
 import io
 import json
 import os
@@ -406,6 +407,68 @@ def scan_company_news(company_name: str, symbol: str, days_back: int) -> tuple[i
     return len(hits), json.dumps(snippets, ensure_ascii=False)
 
 
+def _build_fraud_gemini_pool():
+    """FRAUD_API_KEY -> GEMINI_API_KEY -> BACKFILL_GEMINI_KEY cascade, lite models."""
+    try:
+        from gemini_pool import BucketPool, load_keys
+        keys = load_keys(os.environ, prefix="FRAUD_API_KEY")
+        for prefix in ("GEMINI_API_KEY", "BACKFILL_GEMINI_KEY"):
+            keys += [k for k in load_keys(os.environ, prefix=prefix) if k not in keys]
+        if not keys:
+            log("  --with-gemini: no keys found — verification disabled")
+            return None
+        return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"],
+                          inter_call_s=6.0, logger=log)
+    except Exception as e:
+        log(f"  --with-gemini: pool init failed ({str(e)[:80]}) — disabled")
+        return None
+
+
+GEMINI_VERIFY_PROMPT = """You verify fraud-screening news hits for Indian listed companies.
+Company: {company} (NSE symbol {symbol})
+For EACH numbered headline below answer YES only if BOTH hold:
+  (a) the headline is about THIS company — not a similarly named firm, not a
+      different company that merely appears alongside it; AND
+  (b) it reports an ADVERSE fraud / regulatory / financial-integrity event for
+      the company (probe, penalty, ban, default, auditor exit, insolvency, ED/SFIO
+      action). Exonerations, reliefs, dismissals of charges, or ordinary business
+      news are NO.
+Reply with one line per headline, format "<number>: YES" or "<number>: NO". Nothing else.
+
+{headlines}"""
+
+
+def gemini_verify_hits(pool, company: str, symbol: str,
+                       n_hits: int, snippets_json: str) -> tuple[int, str]:
+    """Second-opinion pass on rule-based news hits. FAIL-OPEN: any error or an
+    unparseable reply keeps the rule-based result (filters already ran)."""
+    try:
+        snippets = json.loads(snippets_json) if snippets_json else []
+        if not snippets:
+            return n_hits, snippets_json
+        headlines = "\n".join(f"{i + 1}. {s.get('headline', '')}"
+                              for i, s in enumerate(snippets))
+        text, _ = pool.call_text(GEMINI_VERIFY_PROMPT.format(
+            company=company or symbol, symbol=symbol, headlines=headlines))
+        verdicts: dict[int, bool] = {}
+        for line in text.strip().splitlines():
+            m = re.match(r"\s*(\d+)\s*[:.\-]\s*(YES|NO)\b", line.strip(), re.I)
+            if m:
+                verdicts[int(m.group(1))] = m.group(2).upper() == "YES"
+        if not verdicts:
+            return n_hits, snippets_json
+        keep = [s for i, s in enumerate(snippets) if verdicts.get(i + 1, True)]
+        if len(keep) < len(snippets):
+            log(f"  {symbol}: Gemini dropped {len(snippets) - len(keep)}/"
+                f"{len(snippets)} ambiguous news hit(s)")
+        if not keep:
+            return 0, ""
+        return len(keep), json.dumps(keep, ensure_ascii=False)
+    except Exception as e:
+        log(f"  {symbol}: Gemini verify failed ({str(e)[:60]}) — keeping rule-based hits")
+        return n_hits, snippets_json
+
+
 def _fetch_listing_titles(url: str, label: str) -> list[str]:
     """Anchor/title texts from a regulator's orders listing page. Fail-soft []."""
     try:
@@ -427,20 +490,21 @@ def _fetch_listing_titles(url: str, label: str) -> list[str]:
 
 
 def match_orders_to_universe(titles: list[str],
-                             universe: list[tuple[str, str, str]]) -> dict[str, int]:
-    """{symbol: n_matching_order_titles} via normalized-name substring match."""
+                             universe: list[tuple[str, str, str]]) -> dict[str, list[str]]:
+    """{symbol: [matching order titles]} via normalized-name substring match.
+    Callers count len() for the grade; the titles feed the --email digest."""
     if not titles:
         return {}
-    norm_titles = [_norm_name(t) or t.upper() for t in titles]
-    counts: dict[str, int] = {}
+    norm_titles = [(_norm_name(t) or t.upper(), t) for t in titles]
+    matches: dict[str, list[str]] = {}
     for _, sym, cname in universe:
         norm = _norm_name(cname)
         if not norm:
             continue
-        n = sum(1 for t in norm_titles if norm in t)
-        if n:
-            counts[sym] = n
-    return counts
+        hit = [orig for nt, orig in norm_titles if norm in nt]
+        if hit:
+            matches[sym] = hit
+    return matches
 
 
 def pick_news_scan_set(universe: list[tuple[str, str, str]],
@@ -519,6 +583,72 @@ def grade_company(asm_lt_stage: int | None, asm_st_stage: int | None,
 #  Main                                                                #
 # ------------------------------------------------------------------ #
 
+def _esc(s, n=120) -> str:
+    return html_mod.escape(str(s)[:n])
+
+
+def _fraud_mail_html(out: pd.DataFrame, changes: list[dict],
+                     fresh_hits: list[dict], scan_stats: str,
+                     reg_matches: list[dict] | None = None) -> str:
+    """Nightly scan digest: distribution, grade changes, regulator order matches,
+    fresh news hits, red list."""
+    dist = out["investigative_grade"].value_counts().sort_index().to_dict()
+    dist_str = " · ".join(f"G{int(g)}: {n}" for g, n in dist.items())
+    parts = [f"<p><b>Nightly investigative fraud scan</b> — {len(out)} companies "
+             f"graded.<br>Grades: {dist_str}<br>{scan_stats}</p>"]
+    if changes:
+        rows = "".join(
+            f"<tr><td><b>{_esc(c['symbol'])}</b></td><td>{_esc(c['name'], 30)}</td>"
+            f"<td align=center>{c['old']} → <b style='color:"
+            f"{'#e74c3c' if c['new'] > c['old'] else '#27ae60'}'>{c['new']}</b></td>"
+            f"<td>{_esc(c['reason'])}</td></tr>" for c in changes[:40])
+        parts.append("<p><b>⚠ Grade changes since last run"
+                     f"{' (top 40)' if len(changes) > 40 else ''}:</b></p>"
+                     "<table border=1 cellpadding=4 cellspacing=0>"
+                     "<tr><th>Symbol</th><th>Company</th><th>Grade</th><th>Why</th></tr>"
+                     + rows + "</table>")
+    else:
+        parts.append("<p>No grade changes since last run.</p>")
+    if reg_matches:
+        rows = "".join(
+            f"<tr><td><b>{_esc(m['symbol'])}</b></td><td>{_esc(m['source'], 6)}</td>"
+            f"<td>{'<br>'.join(_esc(t, 160) for t in m['titles'][:3])}</td></tr>"
+            for m in reg_matches[:30])
+        parts.append("<p><b>🏛 SEBI / NFRA order matches (tonight's listings):</b> "
+                     "name-matched against the universe — these pin the grade at "
+                     "≥3; verify the order is about the listed entity.</p>"
+                     "<table border=1 cellpadding=4 cellspacing=0>"
+                     "<tr><th>Symbol</th><th>Regulator</th><th>Order title(s)</th></tr>"
+                     + rows + "</table>")
+    if fresh_hits:
+        rows = "".join(
+            f"<tr><td><b>{_esc(h['symbol'])}</b></td><td align=center>{h['news_hits']}"
+            f"</td><td>{_esc(h['news_snippets'], 300)}</td></tr>"
+            for h in fresh_hits[:30])
+        parts.append("<p><b>📰 Fraud-keyword news hits (scanned tonight):</b></p>"
+                     "<table border=1 cellpadding=4 cellspacing=0>"
+                     "<tr><th>Symbol</th><th>Hits</th><th>Headlines</th></tr>"
+                     + rows + "</table>")
+    red = (out[out["investigative_grade"] >= 3]
+           .sort_values("investigative_grade", ascending=False))
+    if not red.empty:
+        rows = "".join(
+            f"<tr><td><b>{_esc(r.symbol)}</b></td><td>{_esc(r.company_name, 30)}</td>"
+            f"<td align=center>{int(r.investigative_grade)}</td>"
+            f"<td>{_esc(r.grade_reason)}</td></tr>"
+            for r in red.head(40).itertuples())
+        parts.append(f"<p><b>🔴 Red list (grade ≥ 3): {len(red)} companies"
+                     f"{' — top 40 shown' if len(red) > 40 else ''}</b></p>"
+                     "<table border=1 cellpadding=4 cellspacing=0>"
+                     "<tr><th>Symbol</th><th>Company</th><th>Grade</th><th>Reason</th></tr>"
+                     + rows + "</table>")
+    parts.append("<p style='font-size:11px;color:#999'>Grades: 0 clean · 1 T2T · "
+                 "2 ASM-1/GSM-1-2/news-hit · 3 ASM-2+/ESM/GSM-3-4/BSE-Z/SEBI/NFRA · "
+                 "4 GSM-5-6. News hits cap at grade 2 — verify before acting. "
+                 "Toggle this mail in the app sidebar (📧 Email toggles).</p>")
+    return "".join(parts)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--names", type=str, default=None)
@@ -539,6 +669,12 @@ def main():
                     help="Match recent SEBI enforcement-order titles against universe.")
     ap.add_argument("--with-nfra", action="store_true",
                     help="Match recent NFRA order titles against universe.")
+    ap.add_argument("--with-gemini", action="store_true",
+                    help="Second-opinion pass on news hits (right company? actually "
+                         "adverse?) via FRAUD_API_KEY pool. Fail-open.")
+    ap.add_argument("--email", action="store_true",
+                    help="Mail the scan digest (grade changes, news hits, red list). "
+                         "Respects the 'fraud_scan' toggle in mail_settings.json.")
     args = ap.parse_args()
 
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -597,16 +733,18 @@ def main():
             prev_by_sym[str(r["symbol"]).upper()] = r.to_dict()
 
     # ---- Stage 2: SEBI / NFRA order-title matching (one fetch per regulator) ----
-    sebi_counts: dict[str, int] = {}
-    nfra_counts: dict[str, int] = {}
+    sebi_matches: dict[str, list[str]] = {}
+    nfra_matches: dict[str, list[str]] = {}
     if args.with_sebi:
         titles = _fetch_listing_titles(SEBI_ORDERS_URL, "SEBI")
-        sebi_counts = match_orders_to_universe(titles, universe)
-        log(f"  SEBI: {len(sebi_counts)} universe names matched in recent orders")
+        sebi_matches = match_orders_to_universe(titles, universe)
+        log(f"  SEBI: {len(sebi_matches)} universe names matched in recent orders")
     if args.with_nfra:
         titles = _fetch_listing_titles(NFRA_ORDERS_URL, "NFRA")
-        nfra_counts = match_orders_to_universe(titles, universe)
-        log(f"  NFRA: {len(nfra_counts)} universe names matched in recent orders")
+        nfra_matches = match_orders_to_universe(titles, universe)
+        log(f"  NFRA: {len(nfra_matches)} universe names matched in recent orders")
+    sebi_counts = {s: len(t) for s, t in sebi_matches.items()}
+    nfra_counts = {s: len(t) for s, t in nfra_matches.items()}
 
     # ---- Stage 2: rolling news scan set ----
     pf_syms: set[str] = set()
@@ -623,10 +761,16 @@ def main():
         log(f"  news scan set: {len(pf_syms)} PF (7d) + {len(rolling_syms)} "
             f"rolling (90d, stalest-first)")
 
+    gem_pool = None
+    if args.with_gemini and args.with_news:
+        gem_pool = _build_fraud_gemini_pool()
+
     # NOTE: NSE reportASM mixes long-term and short-term blocks; _extract_records
     # flattens both, so a symbol's stage here is the max across blocks. We treat
     # stage>=2 as long-term-equivalent severity (grade 3 per rubric) — conservative.
     rows = []
+    grade_changes: list[dict] = []   # vs previous run, for the --email digest
+    fresh_hits: list[dict] = []      # news hits found by THIS run's scan
     news_scanned = news_budget_hit = 0
     for isin, sym, cname in universe:
         asm_stage = nse["asm"].get(sym)
@@ -646,6 +790,12 @@ def main():
                 news_hits, news_snippets = scan_company_news(cname, sym, days)
                 news_checked_at = datetime.now().isoformat(timespec="seconds")
                 news_scanned += 1
+                if news_hits and gem_pool is not None:
+                    news_hits, news_snippets = gemini_verify_hits(
+                        gem_pool, cname, sym, news_hits, news_snippets)
+                if news_hits:
+                    fresh_hits.append({"symbol": sym, "news_hits": news_hits,
+                                       "news_snippets": news_snippets})
             except news_fetch.NewsFetchBudgetExceeded:
                 news_budget_hit = 1
                 log("  news RSS per-run budget hit — remaining names carry forward")
@@ -666,6 +816,10 @@ def main():
             t2t=t2t, bse_group=bse_group,
             sebi_actions=sebi_n, nfra_actions=nfra_n, news_hits=news_hits,
         )
+        if pv and int(pv.get("investigative_grade") or 0) != grade:
+            grade_changes.append({"symbol": sym, "name": cname,
+                                  "old": int(pv.get("investigative_grade") or 0),
+                                  "new": grade, "reason": reason})
         rows.append({
             "isin": isin, "symbol": sym, "company_name": cname,
             "asm_level": f"ASM-{asm_stage}" if asm_stage else "none",
@@ -703,6 +857,28 @@ def main():
     store.write_df(["company_repo", "_index", "investigative_fraud.parquet"], out)
     store.write_df(["company_repo", "_index", "investigative_fraud.csv"], out)
     log("Wrote investigative_fraud.parquet + investigative_fraud.csv to _index/.")
+
+    if args.email:
+        if args.local or store.drive is None:
+            log("--email: local mode, no Drive/toggles — mail skipped.")
+            return
+        from mailer import send_email, load_mail_settings
+        index_id = store._folder(["company_repo", "_index"])
+        if not load_mail_settings(store.drive, index_id).get("fraud_scan", True):
+            log("fraud_scan mail toggled OFF — skipped.")
+            return
+        scan_stats = (f"News scanned tonight: {news_scanned} companies "
+                      f"({len(pf_syms)} PF + up to {len(rolling_syms)} rolling); "
+                      f"SEBI matches: {len(sebi_counts)} · NFRA matches: {len(nfra_counts)}")
+        reg_matches = (
+            [{"symbol": s, "source": "SEBI", "titles": t}
+             for s, t in sorted(sebi_matches.items())]
+            + [{"symbol": s, "source": "NFRA", "titles": t}
+               for s, t in sorted(nfra_matches.items())])
+        send_email(f"🚨 Fraud scan — {len(grade_changes)} grade change(s), "
+                   f"{len(fresh_hits)} news hit(s) — {datetime.now():%d-%b}",
+                   _fraud_mail_html(out, grade_changes, fresh_hits, scan_stats,
+                                    reg_matches))
 
 
 if __name__ == "__main__":

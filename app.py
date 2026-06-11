@@ -1511,6 +1511,142 @@ def _fii_dii_panel():
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig, use_container_width=True)
 
+
+# ---------- T6: Market Trends (time-series views) ----------
+
+def _fii_dii_pivot():
+    """date x {FII, DII} net-flow frame from data/macro/FII_DII.csv (or empty)."""
+    df = load_csv(["data", "macro", "FII_DII.csv"])
+    if df.empty or "category" not in df.columns or "net" not in df.columns:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    cat = df["category"].astype(str).str.upper()
+    df = df.assign(grp=pd.NA)
+    df.loc[cat.str.contains("FII") | cat.str.contains("FPI"), "grp"] = "FII"
+    df.loc[cat.str.contains("DII"), "grp"] = "DII"
+    df = df.dropna(subset=["grp"])
+    if df.empty:
+        return pd.DataFrame()
+    return df.groupby(["date", "grp"])["net"].sum().unstack("grp").sort_index()
+
+
+_FLOW_COLORS = {"FII": "#2980b9", "DII": "#e67e22"}
+
+
+def page_market_trends():
+    st.title("📈 Market Trends")
+    st.caption("Time-series of the nightly market-state snapshot "
+               "(`data/market_state/history.csv`) + FII/DII flow trends.")
+
+    hist = load_csv(["data", "market_state", "history.csv"])
+    if hist.empty or "date" not in hist.columns:
+        st.warning("`data/market_state/history.csv` not found yet — it grows one "
+                   "row per market_state.py run.")
+    else:
+        hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+        hist = hist.dropna(subset=["date"]).sort_values("date")
+        window = st.radio("Window", ["30d", "90d", "180d", "All"], index=1,
+                          horizontal=True)
+        view = hist
+        if window != "All":
+            cutoff = hist["date"].max() - pd.Timedelta(days=int(window[:-1]))
+            view = hist[hist["date"] >= cutoff]
+        if view.empty:
+            view = hist
+
+        latest = view.iloc[-1]
+        c1, c2, c3 = st.columns(3)
+        hs = pd.to_numeric(latest.get("health_score"), errors="coerce")
+        c1.metric("Health score", f"{hs:.0f}/100" if pd.notna(hs) else "—")
+        c2.metric("Regime", str(latest.get("regime", "—")))
+        c3.metric("History depth", f"{len(hist)} day(s)")
+
+        fig = go.Figure()
+        fig.add_hrect(y0=0, y1=40, fillcolor="#e74c3c", opacity=0.08, line_width=0)
+        fig.add_hrect(y0=40, y1=60, fillcolor="#f39c12", opacity=0.08, line_width=0)
+        fig.add_hrect(y0=60, y1=100, fillcolor="#27ae60", opacity=0.08, line_width=0)
+        fig.add_trace(go.Scatter(
+            x=view["date"], y=pd.to_numeric(view["health_score"], errors="coerce"),
+            mode="lines+markers", name="Health", line=dict(color="#2c3e50", width=2)))
+        fig.update_layout(height=320, yaxis=dict(range=[0, 100], title="Health score"),
+                          margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Bands: <40 RISK_OFF · 40–60 NEUTRAL · >60 RISK_ON")
+
+        comp_cols = [c for c in view.columns
+                     if c.endswith("_score") and c != "health_score"]
+        if comp_cols:
+            st.subheader("Component scores")
+            pick = st.multiselect("Components", comp_cols, default=comp_cols,
+                                  format_func=lambda c: c[:-6].replace("_", " "))
+            if pick:
+                figc = go.Figure()
+                for c in pick:
+                    figc.add_trace(go.Scatter(
+                        x=view["date"], y=pd.to_numeric(view[c], errors="coerce"),
+                        mode="lines", name=c[:-6].replace("_", " ")))
+                figc.update_layout(height=300, yaxis=dict(range=[0, 100]),
+                                   margin=dict(l=10, r=10, t=10, b=10),
+                                   legend=dict(orientation="h", yanchor="bottom",
+                                               y=1.02))
+                st.plotly_chart(figc, use_container_width=True)
+
+        raw_cols = [c for c in view.columns
+                    if c not in ("date", "regime", "health_score")
+                    and not c.endswith("_score")
+                    and pd.to_numeric(view[c], errors="coerce").notna().any()]
+        if raw_cols:
+            with st.expander("🔬 Raw snapshot metrics over time"):
+                pick2 = st.multiselect("Metrics", raw_cols, default=raw_cols[:2])
+                if pick2:
+                    figr = go.Figure()
+                    for c in pick2:
+                        figr.add_trace(go.Scatter(
+                            x=view["date"], y=pd.to_numeric(view[c], errors="coerce"),
+                            mode="lines", name=c))
+                    figr.update_layout(height=300,
+                                       margin=dict(l=10, r=10, t=10, b=10),
+                                       legend=dict(orientation="h",
+                                                   yanchor="bottom", y=1.02))
+                    st.plotly_chart(figr, use_container_width=True)
+
+    st.markdown("---")
+    pivot = _fii_dii_pivot()
+    if pivot.empty:
+        st.info("`data/macro/FII_DII.csv` not found — FII/DII trends unavailable.")
+        return
+    st.subheader("FII / DII flows — trend (₹ cr)")
+    tab_m, tab_c = st.tabs(["Monthly net", "Cumulative (90d)"])
+    with tab_m:
+        monthly = pivot.resample("ME").sum().tail(12)
+        figm = go.Figure()
+        for grp in ("FII", "DII"):
+            if grp in monthly.columns:
+                figm.add_trace(go.Bar(x=monthly.index.strftime("%b %y"),
+                                      y=monthly[grp], name=grp,
+                                      marker_color=_FLOW_COLORS[grp]))
+        figm.add_hline(y=0, line=dict(color="gray", dash="dot"))
+        figm.update_layout(barmode="group", height=320,
+                           margin=dict(l=10, r=10, t=10, b=10),
+                           legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        st.plotly_chart(figm, use_container_width=True)
+    with tab_c:
+        recent = pivot[pivot.index >= pivot.index.max() - pd.Timedelta(days=90)]
+        figcu = go.Figure()
+        for grp in ("FII", "DII"):
+            if grp in recent.columns:
+                figcu.add_trace(go.Scatter(
+                    x=recent.index, y=recent[grp].fillna(0).cumsum(),
+                    mode="lines", name=f"{grp} cumulative",
+                    line=dict(color=_FLOW_COLORS[grp], width=2)))
+        figcu.add_hline(y=0, line=dict(color="gray", dash="dot"))
+        figcu.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        st.plotly_chart(figcu, use_container_width=True)
+        st.caption("Running sum of daily net flows over the last 90 days.")
+
+
 def _breadth_panel(features):
     if features.empty:
         st.warning("No features to compute breadth.")
@@ -3305,11 +3441,77 @@ def _safe_render(page_fn):
             st.rerun()
 
 
+# ---------- Email toggles (CI mailers read mail_settings.json from Drive) ----------
+
+_MAIL_TOGGLES = [
+    ("pead_guidance", "📊 Results vs guidance (20:00)"),
+    ("pead_tomorrow", "📅 Results tomorrow (20:00)"),
+    ("fraud_scan",    "🚨 Fraud scan findings (21:30)"),
+    ("catalyst",      "💡 Catalyst notes (21:30)"),
+]
+_MAIL_SETTINGS_NAME = "mail_settings.json"
+
+
+def _mail_settings_loc(drive):
+    """(index_folder_id, existing_file_id_or_None) for company_repo/_index."""
+    repo = _find_subfolder(drive, os.environ["GDRIVE_FOLDER_ID"], "company_repo")
+    idx = _find_subfolder(drive, repo, "_index") if repo else None
+    if not idx:
+        return None, None
+    q = f"name='{_MAIL_SETTINGS_NAME}' and '{idx}' in parents and trashed=false"
+    files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    return idx, (files[0]["id"] if files else None)
+
+
+def render_mail_toggles_sidebar():
+    with st.sidebar.expander("📧 Email toggles"):
+        if "mail_settings" not in st.session_state:
+            cur = {}
+            try:
+                drive = drive_service()
+                _, fid = _mail_settings_loc(drive)
+                if fid:
+                    cur = json.loads(_download_bytes(drive, fid).decode("utf-8"))
+            except Exception:
+                pass
+            st.session_state["mail_settings"] = {
+                k: bool(cur.get(k, True)) for k, _ in _MAIL_TOGGLES}
+        saved = st.session_state["mail_settings"]
+        for key, label in _MAIL_TOGGLES:
+            st.toggle(label, value=saved.get(key, True), key=f"mailtog_{key}")
+        if st.button("💾 Save", key="mail_save", use_container_width=True):
+            new = {k: bool(st.session_state.get(f"mailtog_{k}", True))
+                   for k, _ in _MAIL_TOGGLES}
+            try:
+                from googleapiclient.http import MediaIoBaseUpload
+                drive = drive_service()
+                idx, fid = _mail_settings_loc(drive)
+                if not idx:
+                    st.error("Drive _index folder not found.")
+                    return
+                payload = json.dumps(
+                    {**new, "updated_at": datetime.now().isoformat(timespec="seconds")},
+                    indent=2).encode("utf-8")
+                media = MediaIoBaseUpload(io.BytesIO(payload),
+                                          mimetype="application/json", resumable=False)
+                if fid:
+                    drive.files().update(fileId=fid, media_body=media).execute()
+                else:
+                    drive.files().create(body={"name": _MAIL_SETTINGS_NAME,
+                                               "parents": [idx]},
+                                         media_body=media, fields="id").execute()
+                st.session_state["mail_settings"] = new
+                st.success("Saved — applies from the next scheduled run.")
+            except Exception as e:
+                st.error(f"Save failed: {str(e)[:120]}")
+
+
 def main():
     st.sidebar.title("Signals India")
 
     page = st.sidebar.radio("Page", [
         "Market Overview",
+        "Market Trends",
         "Today's Signals",
         "Company Intel",
         "Mgmt Guidance",
@@ -3323,12 +3525,15 @@ def main():
         "Strategy Docs",
     ])
     render_health_sidebar()
+    render_mail_toggles_sidebar()
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Loaded at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     st.sidebar.caption("Data refreshes from Drive every 5 min (cache TTL)")
 
     if page == "Market Overview":
         _safe_render(page_market_overview)
+    elif page == "Market Trends":
+        _safe_render(page_market_trends)
     elif page == "Today's Signals":
         _safe_render(page_signals)
     elif page == "Company Intel":
