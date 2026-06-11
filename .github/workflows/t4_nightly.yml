@@ -87,6 +87,10 @@ jobs:
       - name: 8-factor scorecard blend
         run: python scripts/build_scorecard.py
 
+      - name: Fraud tracker (T7 — snapshot + history)
+        run: python scripts/build_fraud_tracker.py
+        continue-on-error: true
+
       - name: Catalyst notes (strong stocks + PF daily, Gemini lite)
         run: >
           python scripts/build_catalyst_notes.py

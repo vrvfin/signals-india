@@ -3204,6 +3204,94 @@ def _score_band_color(v) -> str:
     return "#e74c3c"
 
 
+_BAND_COLORS = {"RED": "#e74c3c", "ALERT": "#e67e22", "WATCH": "#f39c12"}
+_TREND_ARROW = {"UP": "▲", "DOWN": "▼", "FLAT": "—", "NEW": "★"}
+
+
+def page_fraud_tracker():
+    st.title("🕵️ Fraud Tracker")
+    st.caption(
+        "Standalone company-wise fraud signal (T7) — the **worst** of the two engines: "
+        "exchange/regulator surveillance (investigative grade 0–4) and T2 forensic "
+        "accounting rules (0–100). Bands: 🔴 RED ≥70 · 🟠 ALERT ≥45 · 🟡 WATCH ≥20. "
+        "Refreshed nightly after the scorecard."
+    )
+    snap = load_parquet(["company_repo", "_index", "fraud_tracker.parquet"])
+    if snap.empty:
+        st.info("fraud_tracker.parquet not found yet — it appears after the first "
+                "nightly t4 run (or `python scripts/build_fraud_tracker.py`).")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tracked", len(snap))
+    for col, b in ((c2, "RED"), (c3, "ALERT"), (c4, "WATCH")):
+        col.metric(b.title(), int((snap["band"] == b).sum()))
+
+    f1, f2 = st.columns([1, 2])
+    bands = f1.multiselect("Band", ["RED", "ALERT", "WATCH"],
+                           default=["RED", "ALERT", "WATCH"])
+    search = f2.text_input("Search symbol / company", "")
+    view = snap[snap["band"].isin(bands)]
+    if search.strip():
+        q = search.strip().upper()
+        view = view[view["symbol"].astype(str).str.upper().str.contains(q)
+                    | view["company_name"].astype(str).str.upper().str.contains(q)]
+
+    disp = view.copy()
+    disp["trend"] = disp["trend"].map(lambda t: _TREND_ARROW.get(str(t), str(t)))
+    disp["days_on_tracker"] = (
+        pd.to_datetime(disp["as_of"], errors="coerce")
+        - pd.to_datetime(disp["first_flagged_at"], errors="coerce")).dt.days
+    cols = ["symbol", "company_name", "fraud_score", "band", "trend",
+            "investigative_grade", "forensic_score", "news_hits",
+            "sebi_actions", "nfra_actions", "days_on_tracker", "first_flagged_at"]
+    styled = (disp[cols].style
+              .map(lambda b: f"color:white;background-color:"
+                             f"{_BAND_COLORS.get(b, '#777')}", subset=["band"])
+              .format({"fraud_score": "{:.0f}", "forensic_score": "{:.0f}"}))
+    st.dataframe(styled, use_container_width=True, hide_index=True,
+                 height=min(38 * (len(disp) + 1), 600))
+
+    # ---- drill-down: score history + reasons ----
+    st.markdown("---")
+    st.subheader("🔬 Company drill-down")
+    drill = st.text_input("Symbol", "", key="ft_drill").strip().upper()
+    if not drill:
+        return
+    row = snap[snap["symbol"].astype(str).str.upper() == drill]
+    if row.empty:
+        st.warning(f"{drill} is not on the tracker (score < 20 or no data).")
+        return
+    r = row.iloc[0]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Fraud score", f"{r['fraud_score']:.0f}/100", r["band"])
+    m2.metric("Investigative grade", f"{int(r['investigative_grade'])}/4")
+    m3.metric("Forensic score", f"{r['forensic_score']:.0f}/100")
+    m4.metric("First flagged", str(r["first_flagged_at"]))
+    if str(r.get("grade_reason", "")).strip():
+        st.markdown(f"**Surveillance / regulator:** {r['grade_reason']}")
+    if str(r.get("forensic_flags", "")).strip():
+        st.markdown(f"**Forensic flags:** {r['forensic_flags']}")
+
+    hist = load_parquet(["company_repo", "_index", "fraud_tracker_history.parquet"])
+    if not hist.empty:
+        h = hist[hist["symbol"].astype(str).str.upper() == drill].copy()
+        if not h.empty:
+            h["as_of"] = pd.to_datetime(h["as_of"], errors="coerce")
+            h = h.dropna(subset=["as_of"]).sort_values("as_of")
+            fig = go.Figure()
+            fig.add_hrect(y0=70, y1=100, fillcolor="#e74c3c", opacity=0.08, line_width=0)
+            fig.add_hrect(y0=45, y1=70, fillcolor="#e67e22", opacity=0.08, line_width=0)
+            fig.add_hrect(y0=20, y1=45, fillcolor="#f39c12", opacity=0.08, line_width=0)
+            fig.add_trace(go.Scatter(x=h["as_of"], y=h["fraud_score"],
+                                     mode="lines+markers", name="Fraud score",
+                                     line=dict(color="#c0392b", width=2)))
+            fig.update_layout(height=300, yaxis=dict(range=[0, 100], title="Fraud score"),
+                              margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Score history (a drop to 0 = cleared off the tracker that day).")
+
+
 def page_scorecard():
     st.title("🏆 Company Scorecard")
     st.caption(
@@ -3523,6 +3611,7 @@ def main():
         "My Portfolio",
         "Graphs",
         "Scorecard",
+        "Fraud Tracker",
         "Stock Detail",
         "Strategy Docs",
     ])
@@ -3554,6 +3643,8 @@ def main():
         _safe_render(page_graphs)
     elif page == "Scorecard":
         _safe_render(page_scorecard)
+    elif page == "Fraud Tracker":
+        _safe_render(page_fraud_tracker)
     elif page == "Stock Detail":
         _safe_render(page_stock_detail)
     elif page == "Strategy Docs":
