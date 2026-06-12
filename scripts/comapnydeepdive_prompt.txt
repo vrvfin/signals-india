@@ -125,6 +125,15 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
  summaries mentioning this name or its theme. Treat as external perspective.>
 [/RESEARCH_INDEX_CONTEXT]
 
+[COMMUNITY_RESEARCH]
+<ValuePickr top-contributor posts, curated Indian investing blogs, and (when
+ enabled) X accounts covering this company — each line names its SOURCE and
+ carries a direct link. Treat as experienced-retail OPINION: mine it for
+ channel checks, product/order intel and bear cases the press missed, ALWAYS
+ cite the source name inline (e.g. [ValuePickr · username]), and never adopt
+ price targets or sentiment as fact. If DATA_MISSING, skip.>
+[/COMMUNITY_RESEARCH]
+
 [DRHP_PROSPECTUS]
 <Forensic summary of the company's DRAFT/RED HERRING PROSPECTUS (DRHP/RHP), if found
  and verified to belong to THIS company. For a recently-listed company this is the

@@ -98,3 +98,8 @@ jobs:
           python scripts/build_catalyst_notes.py
           --limit "${{ github.event.inputs.catalyst_limit || '30' }}" --email
         continue-on-error: true
+
+      - name: PF daily digest mail (filings/research/flags/community per holding)
+        if: always()
+        run: python scripts/run_pf_digest.py
+        continue-on-error: true

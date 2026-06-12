@@ -133,6 +133,12 @@ investor-meet intimations, reg. 74(5) certificates, trading-window closures,
 newspaper-publication copies — these are NOT catalysts. Only treat a filing
 as a catalyst if it discloses new business substance.)
 
+--- COMMUNITY COVERAGE (ValuePickr top contributors / curated blogs / X) ---
+{community}
+(Community posts are OPINION from experienced retail researchers — useful for
+catalysts the press missed, but verify substance; never treat price talk as a
+catalyst. Each line carries its direct link.)
+
 --- INTERNAL RESEARCH NOTES (the user's own research intake; may be empty) ---
 {research}
 (Curated analyst/sector notes the user collected — treat as informed internal
@@ -217,7 +223,7 @@ def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
 
 
 def make_note(pool, company: str, symbol: str, items: list[dict],
-              filings: list[str], research: list[str],
+              filings: list[str], research: list[str], community: list[str],
               brief: str) -> tuple[str, str, str, str, str] | None:
     """Returns (catalyst_type, headline, tags, what_to_track, md_body) or None."""
     headlines = "\n".join(
@@ -226,6 +232,7 @@ def make_note(pool, company: str, symbol: str, items: list[dict],
     prompt = PROMPT.format(company=company or symbol, symbol=symbol,
                            days=NEWS_DAYS, headlines=headlines,
                            filings="\n".join(filings) or "(none in window)",
+                           community="\n".join(community) or "(none)",
                            research="\n".join(research) or "(none)",
                            brief=(brief or "")[:6000])
     try:
@@ -365,12 +372,17 @@ def main():
         # Exchange filings (user 2026-06-12): often the catalyst itself.
         filings = _recent_filings(bse_map.get(sym, ""), NEWS_DAYS)
         research = _research_notes(ridx, isin)
-        if not items and not filings and not research:
+        # Community coverage: VP top contributors / blogs / X (user 2026-06-12).
+        import social_sources
+        comm = social_sources.community_items(cname, NEWS_DAYS)
+        community = [f"- [{c['source']} · {c['author']}] {c['date']}: "
+                     f"{c['text'][:250]} ({c['url']})" for c in comm]
+        if not items and not filings and not research and not community:
             skipped_quiet += 1
             continue           # nothing moving anywhere -> save the Gemini call
         brief = store.read_text(["company_repo", isin, "company_page.md"]) or ""
         res = make_note(pool, cname, sym, items[:10], filings, research,
-                        brief[-6000:])
+                        community, brief[-6000:])
         if res is None:
             continue
         ctype, headline, tags, track, body = res
@@ -384,6 +396,7 @@ def main():
               f"### Sources (last {NEWS_DAYS} days)\n"
               + "\n".join(f"- [{i['source']}] {i['title']}" for i in items[:10])
               + (("\n**BSE filings:**\n" + "\n".join(filings)) if filings else "")
+              + (("\n**Community:**\n" + "\n".join(community)) if community else "")
               + f"\n\n*Generated {datetime.now().isoformat(timespec='seconds')}*\n")
         store.write_text(["company_repo", isin, md_name], md)
         new_rows.append({

@@ -1148,7 +1148,8 @@ def fill_section(tpl, tag, content):
 
 def build_prompt(name, symbol, isin, screener, page, research, bse,
                  docs="DATA_MISSING", screener_cross="DATA_MISSING", news="DATA_MISSING",
-                 youtube="DATA_MISSING", drhp="DATA_MISSING", phase3="DATA_MISSING"):
+                 youtube="DATA_MISSING", drhp="DATA_MISSING", phase3="DATA_MISSING",
+                 community="DATA_MISSING"):
     tpl = open(os.path.join(SCRIPTS_DIR, "comapnydeepdive_prompt.txt"),
                encoding="utf-8").read()
     tpl = (tpl.replace("[COMPANY_NAME]", name)
@@ -1157,6 +1158,7 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
     tpl = fill_section(tpl, "SCREENER_FINANCIAL_DATA", screener)
     tpl = fill_section(tpl, "SCREENER_CROSSCHECK", screener_cross)
     tpl = fill_section(tpl, "PHASE3_QUANT_SNAPSHOT", phase3)
+    tpl = fill_section(tpl, "COMMUNITY_RESEARCH", community)
     tpl = fill_section(tpl, "COMPANY_PAGE_BRIEF", page[:MAX_PAGE_CHARS] or "DATA_MISSING")
     tpl = fill_section(tpl, "RESEARCH_INDEX_CONTEXT", research)
     tpl = fill_section(tpl, "DRHP_PROSPECTUS", drhp)
@@ -1246,6 +1248,13 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     exchange = bse if not nse else f"BSE:\n{bse}\n\nNSE:\n{nse}"
     # Recent news from reputable sources (headlines only).
     news = news_block(name, symbol)
+    # Community research — VP top contributors / blogs / X (source-named lines).
+    try:
+        import social_sources
+        community = social_sources.community_block(name, days=30)
+    except Exception as e:
+        community = "DATA_MISSING"
+        print(f"    community fetch failed: {str(e)[:60]}")
     # YouTube research — whitelisted/official channels, transcript summaries (cached).
     youtube = youtube_block(svc, root, isin, symbol, name, pool)
     yt_ok = not youtube.startswith(("DATA_MISSING", "No videos", "Whitelisted"))
@@ -1266,7 +1275,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           news=news,
                           youtube=youtube,
                           drhp=drhp,
-                          phase3=p3)
+                          phase3=p3,
+                          community=community)
     report, model_used = pool.call_text(prompt)
     report = _clean_report_md(report)
 
