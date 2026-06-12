@@ -1,23 +1,16 @@
 """
-Phase 2 / Stage A — Storage hygiene.
+Storage hygiene — DRIVE-WIDE hard PDF retention.
 
-Deletes raw document PDFs older than RETAIN_DAYS (default 2 — see the constant
-below; phase2.yml runs this with no flag, so 2 days is the live rule) from every
-company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
-raw PDF is no longer needed — the company page, per-doc summaries, and the
-structured indexes hold the lasting value.
+USER RULE (2026-06-12): every PDF anywhere under the project Drive root dies
+after RETAIN_DAYS (2), REGARDLESS of which process stored it and regardless of
+queue status. PDFs are transient inputs — the lasting value lives in the
+markdown summaries, company pages and parquet indexes, which are never touched
+(only files that are PDFs by mime type or .pdf extension are deleted).
 
-HARD RETENTION (user rule 2026-06-12): age > RETAIN_DAYS deletes the PDF
-REGARDLESS of queue status — no pending exemption. Queue rows whose PDF was
-deleted are marked status="expired" (under the shared _extract.lock) so they
-never become zombies. Re-fetch re-queues a fresh copy if ever needed.
-
-NEVER touches: _daily/ digest .md files, company_page.md/.docx,
-               doc_summaries/ (the per-doc summary sidecars), deep_report.*,
-               summaries, _index/*.
-
-Daily digest files (_daily/*.md) are persisted forever — only raw PDFs are
-transient.
+The whole tree under GDRIVE_FOLDER_ID is walked (BFS), not just
+company_repo/<ISIN>/documents/. Queue rows whose PDF was deleted are marked
+status="expired" (under the shared _extract.lock) so they never become
+zombies; a re-fetch queues a fresh copy if ever needed.
 
 Usage:
     python scripts/cleanup_company_docs.py
@@ -178,20 +171,22 @@ def main() -> None:
         print("company_repo/ does not exist yet — nothing to clean.")
         return
 
-    # HARD RETENTION (user 2026-06-12): age alone decides — no pending
-    # exemption. Rows whose PDF dies are marked 'expired' afterwards.
-    company_folders = [f for f in list_children(drive, repo_id, only_folders=True)
-                       if f["name"] not in ("_index", "_daily")]
-    log(f"Scanning {len(company_folders)} company folders...")
-
-    scanned = deleted = kept = errors = 0
+    # HARD RETENTION, DRIVE-WIDE (user 2026-06-12): walk the ENTIRE project
+    # tree; age alone decides; only PDFs are candidates. Rows whose PDF dies
+    # are marked 'expired' afterwards.
+    scanned = deleted = kept = errors = folders = 0
     deleted_ids: set[str] = set()
-    for cf in company_folders:
-        docs_id = find_subfolder(drive, cf["id"], "documents")
-        if not docs_id:
-            continue
-        for f in list_children(drive, docs_id):
+    to_visit = [(folder_id, "")]            # (drive folder id, display path)
+    while to_visit:
+        fid, path = to_visit.pop()
+        folders += 1
+        for f in list_children(drive, fid):
             if f.get("mimeType") == "application/vnd.google-apps.folder":
+                to_visit.append((f["id"], f"{path}{f['name']}/"))
+                continue
+            is_pdf = (f.get("mimeType") == "application/pdf"
+                      or str(f.get("name", "")).lower().endswith(".pdf"))
+            if not is_pdf:
                 continue
             scanned += 1
             try:
@@ -202,8 +197,7 @@ def main() -> None:
                 kept += 1
                 continue
             if args.dry_run:
-                log(f"  would delete: {cf['name']}/documents/{f['name']} "
-                    f"({age_h/24:.0f}d old)")
+                log(f"  would delete: {path}{f['name']} ({age_h/24:.0f}d old)")
                 deleted += 1
                 continue
             try:
@@ -213,7 +207,8 @@ def main() -> None:
                 deleted_ids.add(f["id"])
             except Exception as e:
                 errors += 1
-                log(f"  ERROR deleting {cf['name']}/{f['name']}: {str(e)[:100]}")
+                log(f"  ERROR deleting {path}{f['name']}: {str(e)[:100]}")
+    log(f"Walked {folders} folders (entire Drive tree under project root).")
 
     if not args.dry_run:
         mark_expired_rows(drive, repo_id, deleted_ids)

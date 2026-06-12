@@ -30,7 +30,8 @@ import argparse
 import html as html_mod
 import io
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -124,6 +125,14 @@ Then 4-6 markdown bullets, in this priority order:
 --- RECENT TRUSTED HEADLINES (last {days} days) ---
 {headlines}
 
+--- EXCHANGE FILINGS (BSE corporate announcements, last {days} days) ---
+{filings}
+(Filings are PRIMARY evidence — an order win or approval filed with the
+exchange outranks a news story. BUT most filings are routine compliance:
+investor-meet intimations, reg. 74(5) certificates, trading-window closures,
+newspaper-publication copies — these are NOT catalysts. Only treat a filing
+as a catalyst if it discloses new business substance.)
+
 --- COMPANY BRIEF (may be empty) ---
 {brief}
 """
@@ -134,6 +143,27 @@ from mailer import esc as _esc_base
 
 def _esc(s, n=120) -> str:
     return _esc_base(s, n)
+
+
+def _recent_filings(bse_code, days: int) -> list[str]:
+    """BSE corporate announcements for the prompt, last `days` only (user
+    2026-06-12: filings often ARE the catalyst — order wins, approvals,
+    capacity — and reach the exchange before the press). Reuses the deep
+    dive's fetcher. Fail-soft []."""
+    if not bse_code or str(bse_code).lower() in ("", "nan", "none"):
+        return []
+    try:
+        from company_deep_report import bse_announcements
+        block = bse_announcements(bse_code)
+    except Exception as e:
+        log(f"  filings fetch failed ({str(e)[:60]})")
+        return []
+    if not block or block.startswith(("DATA_MISSING", "No announcements")):
+        return []
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    out = [ln for ln in block.splitlines()
+           if (m := re.match(r"- (\d{4}-\d{2}-\d{2})", ln)) and m.group(1) >= cutoff]
+    return out[:12]
 
 
 def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
@@ -164,12 +194,14 @@ def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
 
 
 def make_note(pool, company: str, symbol: str, items: list[dict],
-              brief: str) -> tuple[str, str, str, str] | None:
-    """Returns (catalyst_type, headline, tags, md_body) or None on failure."""
+              filings: list[str], brief: str) -> tuple[str, str, str, str, str] | None:
+    """Returns (catalyst_type, headline, tags, what_to_track, md_body) or None."""
     headlines = "\n".join(
-        f"- [{i['source']}] {i['title']} ({i['published'][:16]})" for i in items)
+        f"- [{i['source']}] {i['title']} ({i['published'][:16]})"
+        for i in items) or "(none in window)"
     prompt = PROMPT.format(company=company or symbol, symbol=symbol,
                            days=NEWS_DAYS, headlines=headlines,
+                           filings="\n".join(filings) or "(none in window)",
                            brief=(brief or "")[:6000])
     try:
         text, _ = pool.call_text(prompt)
@@ -236,9 +268,10 @@ def main():
                 .sort_values("n_strategies", ascending=False))
     elig_syms = list(dict.fromkeys(eligible["symbol"].tolist()))
 
-    # ---- universe lookup (symbol -> isin, name) ----
+    # ---- universe lookup (symbol -> isin, name, bse_code) ----
     cu = store.read_csv(["company_repo", "_index", "company_universe.csv"])
     isin_map = {}
+    bse_map: dict[str, str] = {}
     if cu is not None and not cu.empty:
         sc = "nse_symbol" if "nse_symbol" in cu.columns else "symbol"
         for _, r in cu.iterrows():
@@ -246,6 +279,7 @@ def main():
             if s:
                 isin_map[s] = (str(r.get("isin", "")).strip(),
                                str(r.get("name", "")).strip())
+                bse_map[s] = str(r.get("bse_code", "")).strip()
 
     # ---- previous index: idempotency + stalest-first rotation ----
     idx = store.read_parquet(["company_repo", "_index", "catalyst_index.parquet"])
@@ -300,11 +334,13 @@ def main():
         except news_fetch.NewsFetchBudgetExceeded:
             log("  news RSS budget hit — stopping note generation for this run")
             break
-        if not items:
+        # Exchange filings (user 2026-06-12): often the catalyst itself.
+        filings = _recent_filings(bse_map.get(sym, ""), NEWS_DAYS)
+        if not items and not filings:
             skipped_quiet += 1
-            continue                       # nothing moving -> save the Gemini call
+            continue           # nothing moving anywhere -> save the Gemini call
         brief = store.read_text(["company_repo", isin, "company_page.md"]) or ""
-        res = make_note(pool, cname, sym, items[:10], brief[-6000:])
+        res = make_note(pool, cname, sym, items[:10], filings, brief[-6000:])
         if res is None:
             continue
         ctype, headline, tags, track, body = res
@@ -315,20 +351,21 @@ def main():
               f"**{headline}**\n\n"
               + (f"**👁 What to track:** {track}\n\n" if track else "")
               + f"{body}\n\n---\n"
-              f"### Sources (trusted whitelist, last {NEWS_DAYS} days)\n"
+              f"### Sources (last {NEWS_DAYS} days)\n"
               + "\n".join(f"- [{i['source']}] {i['title']}" for i in items[:10])
+              + (("\n**BSE filings:**\n" + "\n".join(filings)) if filings else "")
               + f"\n\n*Generated {datetime.now().isoformat(timespec='seconds')}*\n")
         store.write_text(["company_repo", isin, md_name], md)
         new_rows.append({
             "isin": isin, "symbol": sym, "as_of": as_of,
             "headline": headline, "catalyst_type": ctype, "tags": tags,
             "what_to_track": track,
-            "md_path": md_path, "n_sources": len(items),
+            "md_path": md_path, "n_sources": len(items) + len(filings),
             "computed_at": datetime.now().isoformat(timespec="seconds"),
         })
         log(f"  {sym}: note written ({ctype}) — {headline[:70]}")
 
-    log(f"notes written: {len(new_rows)}; quiet names skipped (no trusted news): "
+    log(f"notes written: {len(new_rows)}; quiet names skipped (no news, no filings): "
         f"{skipped_quiet}; RSS calls: {news_fetch.calls_made()}")
 
     if new_rows:
