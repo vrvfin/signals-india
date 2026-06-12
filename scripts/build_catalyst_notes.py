@@ -374,7 +374,7 @@ def main():
         research = _research_notes(ridx, isin)
         # Community coverage: VP top contributors / blogs / X (user 2026-06-12).
         import social_sources
-        comm = social_sources.community_items(cname, NEWS_DAYS)
+        comm = social_sources.community_items(cname, NEWS_DAYS, blog_days=21)
         community = [f"- [{c['source']} · {c['author']}] {c['date']}: "
                      f"{c['text'][:250]} ({c['url']})" for c in comm]
         if not items and not filings and not research and not community:

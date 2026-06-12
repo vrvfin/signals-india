@@ -217,10 +217,13 @@ def twitter_items(company_name: str, days: int = 7) -> list[dict]:
 #  Combined                                                            #
 # ------------------------------------------------------------------ #
 
-def community_items(company_name: str, days: int = 7) -> list[dict]:
-    """VP + blogs + X for one company, newest first."""
+def community_items(company_name: str, days: int = 7,
+                    blog_days: int | None = None) -> list[dict]:
+    """VP + blogs + X for one company, newest first. `days` is honoured
+    strictly (PF digest passes 1 = its 24h block); blogs may get a wider
+    window via blog_days (catalysts use it — bloggers post infrequently)."""
     items = (vp_recent_posts(company_name, days)
-             + blog_items(company_name, max(days, 21))
+             + blog_items(company_name, blog_days or days)
              + twitter_items(company_name, days))
     return sorted(items, key=lambda x: x.get("date", ""), reverse=True)
 

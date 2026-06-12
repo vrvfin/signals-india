@@ -72,7 +72,9 @@ def company_section(isin, sym, name, bse_code, ctx, hours) -> str | None:
     # 1. announcements (BSE, with source link)
     try:
         from build_catalyst_notes import _recent_filings
-        filings = _recent_filings(bse_code, max(1, int(hours / 24)) + 1)
+        # strict 24h block (user 2026-06-12): date-granular sources include
+        # only items dated within the block
+        filings = _recent_filings(bse_code, max(1, round(hours / 24)))
     except Exception:
         filings = []
     ann_url = (f"https://www.bseindia.com/corporates/ann.html?scrip={bse_code}"
@@ -125,8 +127,9 @@ def company_section(isin, sym, name, bse_code, ctx, hours) -> str | None:
             bullets.append(f"📄 {esc(x.get('doc_type', '?'), 16)} processed: "
                            f"{esc(x.get('title', ''), 110)}")
 
-    # 5. community (links included)
-    for c in social_sources.community_items(name, days=max(2, int(hours / 24)))[:3]:
+    # 5. community (links included) — same strict 24h block
+    for c in social_sources.community_items(name,
+                                            days=max(1, round(hours / 24)))[:3]:
         bullets.append(f"🗣 [{esc(c['source'], 14)} · {esc(c['author'], 20)}] "
                        f"{esc(c['text'], 170)} (<a href='{esc(c['url'], 200)}'>"
                        f"source</a>)")
