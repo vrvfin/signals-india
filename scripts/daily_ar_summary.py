@@ -82,6 +82,47 @@ Nothing else. Be selective — an empty list is a valid answer.
 """
 
 
+def _md_to_pdf(md_text: str) -> bytes | None:
+    """Render our own markdown digest to a simple A4 PDF via PyMuPDF Story
+    (already a CI dep — no weasyprint needed). None on failure (fail-soft:
+    caller attaches the .md instead)."""
+    try:
+        import fitz
+        out = []
+        for ln in md_text.splitlines():
+            s = ln.rstrip()
+            if s.startswith("### "):
+                out.append(f"<h3>{esc(s[4:], 300)}</h3>")
+            elif s.startswith("## "):
+                out.append(f"<h2>{esc(s[3:], 300)}</h2>")
+            elif s.startswith("# "):
+                out.append(f"<h1>{esc(s[2:], 300)}</h1>")
+            elif s.startswith("- "):
+                out.append(f"<p>&bull; {esc(s[2:], 600)}</p>")
+            elif s.strip() == "---":
+                out.append("<hr>")
+            elif s.strip():
+                out.append(f"<p>{esc(s, 1200)}</p>")
+        html = ("<body style='font-family:sans-serif;font-size:9pt;"
+                "line-height:1.35'>" + "\n".join(out) + "</body>")
+        story = fitz.Story(html=html)
+        buf = io.BytesIO()
+        writer = fitz.DocumentWriter(buf)
+        page = fitz.paper_rect("a4")
+        where = page + (36, 36, -36, -36)
+        more = 1
+        while more:
+            dev = writer.begin_page(page)
+            more, _ = story.place(where)
+            story.draw(dev)
+            writer.end_page()
+        writer.close()
+        return buf.getvalue()
+    except Exception as e:
+        log(f"  PDF render failed ({str(e)[:80]}) — will attach .md instead")
+        return None
+
+
 def _build_pool():
     from gemini_pool import BucketPool, load_keys
     keys = load_keys(os.environ, prefix="BACKFILL_GEMINI_KEY")
@@ -136,12 +177,53 @@ def _judge(pool, blocks: list[tuple[str, str]]) -> list[dict]:
     return out
 
 
+def fetch_range(date_from: str, date_to: str) -> None:
+    """Range-wise AR focus/defocus pull from ar_focus.parquet (get_ar_focus.bat).
+    Writes ar_focus_<from>_<to>.md (+ .pdf when renderable) to the project root.
+    Read-only on Drive; no Gemini."""
+    drive = get_drive()
+    root = os.environ["GDRIVE_FOLDER_ID"]
+    repo_id = get_or_create_subfolder(drive, root, "company_repo")
+    index_id = get_or_create_subfolder(drive, repo_id, "_index")
+    df = load_parquet(drive, index_id, "ar_focus.parquet", AR_FOCUS_COLS)
+    sel = df[(df["as_of"] >= date_from) & (df["as_of"] <= date_to)] \
+        .sort_values(["as_of", "list", "symbol"])
+    log(f"ar_focus rows {date_from}..{date_to}: {len(sel)} "
+        f"(FOCUS {int((sel['list'] == 'FOCUS').sum())} / "
+        f"DEFOCUS {int((sel['list'] == 'DEFOCUS').sum())})")
+    md = [f"# AR Focus/Defocus — {date_from} to {date_to}\n"]
+    for lst, icon, mark in (("FOCUS", "🎯", "+"), ("DEFOCUS", "🚫", "-")):
+        md.append(f"\n## {icon} {lst}")
+        part = sel[sel["list"] == lst]
+        md += [f"- **{r['symbol']}** [{r['as_of']}]: {r['reasons']}"
+               for _, r in part.iterrows()] or ["- (none)"]
+        for _, r in part.iterrows():   # console: ASCII only (cp1252-safe)
+            print(f"  {mark} {str(r['as_of'])} {str(r['symbol']):<14} "
+                  f"{str(r['reasons'])[:90]}".encode('ascii', 'replace').decode())
+    out = Path(__file__).resolve().parent.parent / \
+        f"ar_focus_{date_from}_{date_to}.md"
+    text = "\n".join(md)
+    out.write_text(text, encoding="utf-8")
+    pdf = _md_to_pdf(text)
+    if pdf:
+        out.with_suffix(".pdf").write_bytes(pdf)
+    log(f"wrote {out.name}" + (" + .pdf" if pdf else ""))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--dry-run", action="store_true",
                     help="List today's ARs; no Gemini, no writes.")
+    ap.add_argument("--range-from", type=str, default=None, metavar="YYYY-MM-DD",
+                    help="With --range-to: range-wise focus-list pull, then exit.")
+    ap.add_argument("--range-to", type=str, default=None, metavar="YYYY-MM-DD")
     args = ap.parse_args()
+
+    if args.range_from:
+        fetch_range(args.range_from, args.range_to
+                    or datetime.now().strftime("%Y-%m-%d"))
+        return
 
     drive = get_drive()
     root = os.environ["GDRIVE_FOLDER_ID"]
@@ -249,28 +331,37 @@ def main() -> None:
             save_parquet(drive, index_id, "deep_dive_queue.parquet", dq)
             log(f"deep_dive_queue: +{len(adds)} FOCUS name(s) enqueued")
 
-    # ---- mail ----
+    # ---- mail: body = FOCUS quick summaries with the WHY; full digest PDF attached ----
     if not load_mail_settings(drive, index_id).get("ar_focus", True):
         log("ar_focus mail toggled OFF — skipped.")
         return
     if not verdicts and len(blocks) == 0:
         return
-    rows = "".join(
-        f"<tr><td>{'🎯' if v['list'] == 'FOCUS' else '🚫'} <b>{esc(v['symbol'])}</b>"
-        f"</td><td>{esc(names.get(v['symbol'], ''), 30)}</td>"
-        f"<td>{esc(v['reasons'], 280)}</td></tr>"
-        for v in focus + defocus)
+    focus_html = "".join(
+        f"<p style='margin:6px 0'>🎯 <b>{esc(v['symbol'])}</b> · "
+        f"{esc(names.get(v['symbol'], ''), 40)}<br>"
+        f"<i>why focus:</i> {esc(v['reasons'], 320)}</p>"
+        for v in focus) or "<p>(no FOCUS name today)</p>"
+    defocus_html = "".join(
+        f"<tr><td>🚫 <b>{esc(v['symbol'])}</b></td>"
+        f"<td>{esc(names.get(v['symbol'], ''), 30)}</td>"
+        f"<td>{esc(v['reasons'], 240)}</td></tr>" for v in defocus)
     body = (f"<p><b>{len(blocks)} Annual Report(s)</b> summarised in the last "
-            f"{args.hours:.0f}h → 🎯 {len(focus)} FOCUS · 🚫 {len(defocus)} DEFOCUS."
-            f"</p>"
-            + (f"<table border=1 cellpadding=4 cellspacing=0><tr><th></th>"
-               f"<th>Company</th><th>Why</th></tr>{rows}</table>" if rows else
-               "<p>No company met the focus/defocus bar today.</p>")
-            + f"<p style='font-size:11px;color:#999'>FOCUS names are auto-queued "
-              f"for a deep dive. Full digest: _daily/{fname}. Toggle this mail "
-              f"in the app sidebar.</p>")
+            f"{args.hours:.0f}h → 🎯 {len(focus)} FOCUS · 🚫 {len(defocus)} "
+            f"DEFOCUS.</p><h3>🎯 Focus — why</h3>{focus_html}"
+            + (f"<h3>🚫 Defocus</h3><table border=1 cellpadding=4 cellspacing=0>"
+               f"<tr><th></th><th>Company</th><th>Red flag</th></tr>{defocus_html}"
+               f"</table>" if defocus_html else "")
+            + f"<p style='font-size:11px;color:#999'>Full per-company digest "
+              f"attached as PDF (also at _daily/{fname}). FOCUS names are "
+              f"auto-queued for deep dives. Toggle this mail in the app sidebar."
+              f"</p>")
+    md_text = "\n".join(md)
+    pdf = _md_to_pdf(md_text)
+    atts = ([(fname.replace(".md", ".pdf"), pdf, "pdf")] if pdf
+            else [(fname, md_text.encode("utf-8"), "octet-stream")])
     send_email(f"📚 AR digest — 🎯{len(focus)} / 🚫{len(defocus)} of "
-               f"{len(blocks)} — {as_of}", body)
+               f"{len(blocks)} — {as_of}", body, attachments=atts)
 
 
 if __name__ == "__main__":

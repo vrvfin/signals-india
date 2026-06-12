@@ -69,18 +69,30 @@ def load_mail_settings(drive, index_id) -> dict:
 
 
 def send_email(subject: str, html_body: str, plain_body: str = "",
-               to: str | None = None) -> bool:
-    """Send one email. Returns True on success, False if creds missing / failed."""
+               to: str | None = None,
+               attachments: list[tuple[str, bytes, str]] | None = None) -> bool:
+    """Send one email. attachments = [(filename, bytes, mime_subtype)], e.g.
+    ("digest.pdf", pdf_bytes, "pdf"). Returns True on success."""
     if not GMAIL_USER or not GMAIL_PASS:
         print("mailer: GMAIL_USER / GMAIL_APP_PASSWORD not set — skipping email.")
         return False
     recipient = to or NOTIFY_EMAIL
-    msg = MIMEMultipart("alternative")
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain_body or _strip_html(html_body), "plain"))
+    alt.attach(MIMEText(html_body, "html"))
+    if attachments:
+        from email.mime.application import MIMEApplication
+        msg = MIMEMultipart("mixed")
+        msg.attach(alt)
+        for fname, data, sub in attachments:
+            part = MIMEApplication(data, _subtype=sub)
+            part.add_header("Content-Disposition", "attachment", filename=fname)
+            msg.attach(part)
+    else:
+        msg = alt
     msg["Subject"] = subject
     msg["From"] = GMAIL_USER
     msg["To"] = recipient
-    msg.attach(MIMEText(plain_body or _strip_html(html_body), "plain"))
-    msg.attach(MIMEText(html_body, "html"))
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(GMAIL_USER, GMAIL_PASS)
