@@ -46,6 +46,7 @@ DATA_MISSING = "DATA_MISSING"
 
 CATALYST_COLS = [
     "isin", "symbol", "as_of", "headline", "catalyst_type", "tags",
+    "what_to_track",          # 2026-06-12: concrete monitorables (user ask)
     "md_path", "n_sources", "computed_at",
 ]
 
@@ -90,17 +91,35 @@ def _build_gemini_pool():
         return None
 
 
-PROMPT = """You are an equity research assistant covering Indian listed companies.
-Based ONLY on the recent headlines and the optional company brief below, write a short
-"why is it moving / what changed" catalyst note for {company} ({symbol}).
+PROMPT = """You are a senior equity research analyst covering Indian listed companies.
+Your readers scan many charts quickly — they need the sharpest possible answer to
+"why is {company} ({symbol}) moving, does it matter, and what exactly do I watch
+next". Work ONLY from the recent trusted headlines and the optional company brief
+below. Never invent facts that are not in them.
 
-Reply in EXACTLY this format (3 lines of metadata, then markdown):
+Reply in EXACTLY this format (4 metadata lines, then markdown bullets):
 TYPE=<one of: order_win|mgmt_change|policy|sector|results|corporate_action|unknown>
-HEADLINE=<one factual line, <=120 chars, no hype>
+HEADLINE=<one factual line, <=120 chars, no hype, include the key number if available>
 TAGS=<2-4 comma-separated lowercase tags>
+WHAT_TO_TRACK=<2-4 concrete monitorables separated by " | ". Each must be CHECKABLE —
+  a number, a date, an event or a filing. GOOD: "order-book conversion in Q1FY27
+  results (Jul-26)" / "promoter pledge % in next shareholding filing" / "capacity
+  commissioning timeline for the new line". BAD: "watch performance", "monitor
+  sentiment". If TYPE=unknown, give the disconfirming check instead, e.g.
+  "verify any exchange filing behind the price move".>
 
-Then 3-5 markdown bullets explaining the catalyst, citing which headline supports each
-point. If the headlines do not show a clear catalyst, say so honestly (TYPE=unknown).
+Then 4-6 markdown bullets, in this priority order:
+- WHAT happened — the catalyst itself with its specific numbers (deal size, %,
+  capacity, stake) and which headline supports it [source].
+- HOW MATERIAL — size it against the company (vs revenue / market cap when the brief
+  allows). Needle-moving or routine?
+- DURABILITY — one-off (single order, settlement, block deal) vs structural (new
+  segment, policy tailwind, recurring demand). Say which and why.
+- SKEPTICISM — what makes this LESS bullish than the headline reads: promotional
+  tone, unnamed sources, re-announcement of old news, missing counterparty, or a
+  small-cap price-action story dressed up as fundamentals. Flag it explicitly.
+- If the headlines show NO clear catalyst, say so honestly (TYPE=unknown) and state
+  what the noise actually is (routine AGM coverage, sector listicle, etc.).
 
 --- RECENT TRUSTED HEADLINES (last {days} days) ---
 {headlines}
@@ -127,7 +146,10 @@ def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
     if new_rows:
         rows = "".join(
             f"<tr><td><b>{_esc(r['symbol'])}</b></td><td>{_esc(r['catalyst_type'])}</td>"
-            f"<td>{_esc(r['headline'], 160)}</td><td>{_esc(r['tags'], 60)}</td>"
+            f"<td>{_esc(r['headline'], 160)}"
+            + (f"<br><i style='color:#777'>👁 {_esc(r.get('what_to_track', ''), 200)}"
+               f"</i>" if r.get("what_to_track") else "")
+            + f"</td><td>{_esc(r['tags'], 60)}</td>"
             f"<td align=center>{r['n_sources']}</td></tr>" for r in new_rows)
         parts.append("<table border=1 cellpadding=4 cellspacing=0>"
                      "<tr><th>Symbol</th><th>Type</th><th>Headline</th>"
@@ -154,7 +176,7 @@ def make_note(pool, company: str, symbol: str, items: list[dict],
     except Exception as e:
         log(f"  Gemini failed for {symbol}: {str(e)[:80]}")
         return None
-    ctype, headline, tags = "unknown", "", ""
+    ctype, headline, tags, track = "unknown", "", "", ""
     body_lines = []
     for line in text.strip().splitlines():
         s = line.strip()
@@ -165,11 +187,13 @@ def make_note(pool, company: str, symbol: str, items: list[dict],
             headline = s[9:].strip()[:160]
         elif s.upper().startswith("TAGS="):
             tags = s[5:].strip()[:120]
+        elif s.upper().startswith("WHAT_TO_TRACK="):
+            track = s[14:].strip()[:400]
         else:
             body_lines.append(line)
     if not headline:
         headline = (items[0]["title"][:160] if items else "")
-    return ctype, headline, tags, "\n".join(body_lines).strip()
+    return ctype, headline, tags, track, "\n".join(body_lines).strip()
 
 
 # ------------------------------------------------------------------ #
@@ -283,12 +307,14 @@ def main():
         res = make_note(pool, cname, sym, items[:10], brief[-6000:])
         if res is None:
             continue
-        ctype, headline, tags, body = res
+        ctype, headline, tags, track, body = res
         md_name = f"company_catalyst_{today.strftime('%d%b%y')}.md"
         md_path = f"company_repo/{isin}/{md_name}"
         md = (f"# Catalyst note — {cname or sym} ({sym})\n\n"
               f"*As of {as_of} · type: **{ctype}** · tags: {tags or '-'}*\n\n"
-              f"**{headline}**\n\n{body}\n\n---\n"
+              f"**{headline}**\n\n"
+              + (f"**👁 What to track:** {track}\n\n" if track else "")
+              + f"{body}\n\n---\n"
               f"### Sources (trusted whitelist, last {NEWS_DAYS} days)\n"
               + "\n".join(f"- [{i['source']}] {i['title']}" for i in items[:10])
               + f"\n\n*Generated {datetime.now().isoformat(timespec='seconds')}*\n")
@@ -296,6 +322,7 @@ def main():
         new_rows.append({
             "isin": isin, "symbol": sym, "as_of": as_of,
             "headline": headline, "catalyst_type": ctype, "tags": tags,
+            "what_to_track": track,
             "md_path": md_path, "n_sources": len(items),
             "computed_at": datetime.now().isoformat(timespec="seconds"),
         })

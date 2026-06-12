@@ -2279,6 +2279,28 @@ def page_graphs():
         results_df   = load_results_summary()    # has yoy_pct, qoq_pct per metric row
         guidance_df  = load_guidance_tracker()   # structured guidance rows
         scorecard_df = load_scorecard()          # T4 conviction scores (empty until built)
+        catalyst_df  = load_catalyst_index()     # T5 latest note + what-to-track
+
+        def _catalyst_line(sym: str, cat_df) -> str:
+            """💡 headline · 👁 what-to-track for the latest catalyst note."""
+            try:
+                if cat_df is None or cat_df.empty or "symbol" not in cat_df.columns:
+                    return ""
+                rows = cat_df[cat_df["symbol"].astype(str).str.upper() == sym.upper()]
+                if rows.empty:
+                    return ""
+                r = rows.sort_values("as_of").iloc[-1]
+                head = str(r.get("headline", "")).strip()
+                if not head:
+                    return ""
+                out = (f'💡 <b>{r.get("as_of", "")}</b> '
+                       f'[{r.get("catalyst_type", "?")}] {head[:150]}')
+                track = str(r.get("what_to_track", "") or "").strip()
+                if track and track.lower() != "nan":
+                    out += f'<br>👁 <i>track: {track[:220]}</i>'
+                return out
+            except Exception:
+                return ""
 
         def _fund_line_inner(sym: str) -> str:
             parts = []
@@ -2377,6 +2399,15 @@ def page_graphs():
                     st.markdown(
                         f'<div style="font-size:11px;color:#555;'
                         f'margin:1px 0 3px 0;line-height:1.4">{fund}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Line 3 — latest catalyst (why moving) + what to track (T5)
+                cat_line = _catalyst_line(sym, catalyst_df)
+                if cat_line:
+                    st.markdown(
+                        f'<div style="font-size:11px;color:#555;'
+                        f'margin:1px 0 3px 0;line-height:1.4">{cat_line}</div>',
                         unsafe_allow_html=True,
                     )
 
