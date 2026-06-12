@@ -133,6 +133,12 @@ investor-meet intimations, reg. 74(5) certificates, trading-window closures,
 newspaper-publication copies — these are NOT catalysts. Only treat a filing
 as a catalyst if it discloses new business substance.)
 
+--- INTERNAL RESEARCH NOTES (the user's own research intake; may be empty) ---
+{research}
+(Curated analyst/sector notes the user collected — treat as informed internal
+perspective: corroborate or contrast with the headlines/filings, cite as
+[internal research].)
+
 --- COMPANY BRIEF (may be empty) ---
 {brief}
 """
@@ -143,6 +149,23 @@ from mailer import esc as _esc_base
 
 def _esc(s, n=120) -> str:
     return _esc_base(s, n)
+
+
+def _research_notes(ridx, isin: str, days: int = 14) -> list[str]:
+    """User's own research intake (Workflow A research_index) mentioning this
+    company — third evidence source for catalysts (user 2026-06-12)."""
+    if ridx is None or ridx.empty or not isin:
+        return []
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        hit = ridx[ridx["isins"].astype(str).str.contains(isin, na=False)
+                   & (ridx["processed_at"].astype(str) >= cutoff)]
+        return [f"- [{r.get('doc_type', '?')} {str(r.get('doc_date', ''))[:10]}] "
+                f"{str(r.get('file_name', ''))[:60]}: "
+                f"{str(r.get('summary_md', ''))[:280]}"
+                for _, r in hit.tail(3).iterrows()]
+    except Exception:
+        return []
 
 
 def _recent_filings(bse_code, days: int) -> list[str]:
@@ -194,7 +217,8 @@ def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
 
 
 def make_note(pool, company: str, symbol: str, items: list[dict],
-              filings: list[str], brief: str) -> tuple[str, str, str, str, str] | None:
+              filings: list[str], research: list[str],
+              brief: str) -> tuple[str, str, str, str, str] | None:
     """Returns (catalyst_type, headline, tags, what_to_track, md_body) or None."""
     headlines = "\n".join(
         f"- [{i['source']}] {i['title']} ({i['published'][:16]})"
@@ -202,6 +226,7 @@ def make_note(pool, company: str, symbol: str, items: list[dict],
     prompt = PROMPT.format(company=company or symbol, symbol=symbol,
                            days=NEWS_DAYS, headlines=headlines,
                            filings="\n".join(filings) or "(none in window)",
+                           research="\n".join(research) or "(none)",
                            brief=(brief or "")[:6000])
     try:
         text, _ = pool.call_text(prompt)
@@ -281,6 +306,9 @@ def main():
                                str(r.get("name", "")).strip())
                 bse_map[s] = str(r.get("bse_code", "")).strip()
 
+    # ---- user research intake (third evidence source) ----
+    ridx = store.read_parquet(["company_repo", "_index", "research_index.parquet"])
+
     # ---- previous index: idempotency + stalest-first rotation ----
     idx = store.read_parquet(["company_repo", "_index", "catalyst_index.parquet"])
     last_note: dict[str, str] = {}
@@ -336,11 +364,13 @@ def main():
             break
         # Exchange filings (user 2026-06-12): often the catalyst itself.
         filings = _recent_filings(bse_map.get(sym, ""), NEWS_DAYS)
-        if not items and not filings:
+        research = _research_notes(ridx, isin)
+        if not items and not filings and not research:
             skipped_quiet += 1
             continue           # nothing moving anywhere -> save the Gemini call
         brief = store.read_text(["company_repo", isin, "company_page.md"]) or ""
-        res = make_note(pool, cname, sym, items[:10], filings, brief[-6000:])
+        res = make_note(pool, cname, sym, items[:10], filings, research,
+                        brief[-6000:])
         if res is None:
             continue
         ctype, headline, tags, track, body = res

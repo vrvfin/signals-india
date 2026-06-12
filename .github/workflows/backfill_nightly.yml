@@ -32,15 +32,16 @@ name: backfill-nightly
 #   Fetch is idempotent — already-queued docs are skipped.
 #   Priority: portfolio ~56 → conviction ~498 → market-cap tail.
 
-# 5 slots/night (user 2026-06-12): fetch only what the same night can extract,
-# drain immediately each slot — no PDF lies around. Concurrency queues overlaps.
+# CATCH-UP MODE (user 2026-06-12, until ~2026-07-02): every 4 hours around the
+# clock to chew through the ~2,400-company tail in days. Each slot fetches a
+# small slice and extracts it immediately — no PDF lies around. Quota resets
+# ~13:30 IST, so the day slots tap a second quota-day. Daytime collisions with
+# Phase 2 are serialized by _extract.lock (live extraction skips a slot at
+# worst). AFTER THE TAIL IS DONE: drop back to the night-only slots
+# (30 17 / 30 19 / 30 21 / 30 23 / 0 1).
 on:
   schedule:
-    - cron: '30 17 * * *'   # Slot 1 — 23:00 IST: fetch + extract
-    - cron: '30 19 * * *'   # Slot 2 — 01:00 IST: fetch + extract
-    - cron: '30 21 * * *'   # Slot 3 — 03:00 IST: fetch + extract
-    - cron: '30 23 * * *'   # Slot 4 — 05:00 IST: fetch + extract
-    - cron: '0 1 * * *'     # Slot 5 — 06:30 IST: fetch + extract (deadline 08:25)
+    - cron: '30 1,5,9,13,17,21 * * *'   # every 4h: 07:00/11:00/15:00/19:00/23:00/03:00 IST
   workflow_dispatch:
     inputs:
       do_fetch:
@@ -142,11 +143,11 @@ jobs:
       # governs (saves are per-document, a timeout kill loses at most 1 doc).
       - name: T1 — extract concalls via Gemini (BACKFILL pool; runs until quota done)
         run: |
-          NOW=$(date -u +%s)
-          TARGET=$(date -u -d "02:55" +%s)
-          if [ "$TARGET" -le "$NOW" ]; then TARGET=$(date -u -d "tomorrow 02:55" +%s); fi
-          DEADLINE_MIN=$(( (TARGET - NOW) / 60 ))
-          echo "Extract deadline: $DEADLINE_MIN min (ends by 08:25 IST)"
+          # Catch-up mode: fixed 200-min extraction cap so each 4h slot releases
+          # the _extract.lock well before the next slot (and Phase 2 live slots
+          # are starved for at most one cycle on collision).
+          DEADLINE_MIN=200
+          echo "Extract deadline: $DEADLINE_MIN min (4h slot cadence)"
           python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
