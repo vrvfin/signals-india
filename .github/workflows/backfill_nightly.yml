@@ -32,10 +32,15 @@ name: backfill-nightly
 #   Fetch is idempotent — already-queued docs are skipped.
 #   Priority: portfolio ~56 → conviction ~498 → market-cap tail.
 
+# 5 slots/night (user 2026-06-12): fetch only what the same night can extract,
+# drain immediately each slot — no PDF lies around. Concurrency queues overlaps.
 on:
   schedule:
-    - cron: '30 17 * * *'   # Run 1 — 23:00 IST: fetch + extract (timeout-bound)
-    - cron: '15 23 * * *'   # Run 2 — 04:45 IST: extract only (deadline 08:25 IST)
+    - cron: '30 17 * * *'   # Slot 1 — 23:00 IST: fetch + extract
+    - cron: '30 19 * * *'   # Slot 2 — 01:00 IST: fetch + extract
+    - cron: '30 21 * * *'   # Slot 3 — 03:00 IST: fetch + extract
+    - cron: '30 23 * * *'   # Slot 4 — 05:00 IST: fetch + extract
+    - cron: '0 1 * * *'     # Slot 5 — 06:30 IST: fetch + extract (deadline 08:25)
   workflow_dispatch:
     inputs:
       do_fetch:
@@ -43,8 +48,8 @@ on:
         type: boolean
         default: false
       max_fetch:
-        description: "Companies to fetch (default 110 = ~440 PDFs ≈ one night's extract window)"
-        default: "110"
+        description: "Companies to fetch (default 80/slot x 5 slots = 400/night)"
+        default: "80"
       do_t2_full:
         description: "T2: full 3-statement scrape (not just today's reporters)"
         type: boolean
@@ -121,14 +126,13 @@ jobs:
       # so no PDF waits unprocessed past the 2-day retention. Run 2 (early morning,
       # UTC hour >= 20) skips fetch — its short window only drains the queue.
       # NEVER pass 0 — always cap to stay within 2-day storage policy.
+      # Every slot fetches a SMALL slice and extracts it immediately — sized so
+      # each slot's pull is digested within the slot (user 2026-06-12: no PDF
+      # lies around; hard 2-day retention has no pending exemption any more).
       - name: T1 — fetch concalls from Screener/BSE (next N companies)
         if: ${{ github.event_name == 'schedule' || github.event.inputs.do_fetch == 'true' }}
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%H)" -ge 20 ]; then
-            echo "Run 2 (early-morning slot) — skipping fetch, extract-only."
-            exit 0
-          fi
-          MAX=${{ github.event.inputs.max_fetch || '110' }}
+          MAX=${{ github.event.inputs.max_fetch || '80' }}
           python scripts/run_backfill.py --max-companies "$MAX" --quarters 4
 
       # ── T1 EXTRACT (every run — drain queue until quota/deadline) ───────────

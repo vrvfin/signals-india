@@ -7,6 +7,11 @@ company_repo/<ISIN>/documents/ folder. Once a document has been summarised the
 raw PDF is no longer needed — the company page, per-doc summaries, and the
 structured indexes hold the lasting value.
 
+HARD RETENTION (user rule 2026-06-12): age > RETAIN_DAYS deletes the PDF
+REGARDLESS of queue status — no pending exemption. Queue rows whose PDF was
+deleted are marked status="expired" (under the shared _extract.lock) so they
+never become zombies. Re-fetch re-queues a fresh copy if ever needed.
+
 NEVER touches: _daily/ digest .md files, company_page.md/.docx,
                doc_summaries/ (the per-doc summary sidecars), deep_report.*,
                summaries, _index/*.
@@ -108,33 +113,40 @@ def list_children(drive, parent_id, only_folders=False):
     return out
 
 
-def load_pending_pdf_ids(drive, repo_id) -> set[str] | None:
-    """drive_file_ids of processing_queue rows still 'pending'.
-
-    These PDFs have NOT been processed yet — the 2-day retention clock starts
-    at processing, so they must survive cleanup regardless of age (otherwise
-    the queue row becomes a zombie: pending forever with its PDF gone).
-    Returns None if the queue cannot be read — caller must then ABORT the
-    deletion pass (fail-safe: losing a night of cleanup is recoverable,
-    deleting unprocessed PDFs is not).
-    """
+def mark_expired_rows(drive, repo_id, deleted_ids: set[str]) -> None:
+    """Pending queue rows whose PDF was just deleted -> status='expired'.
+    Shared-parquet write — taken under the same _extract.lock the extractors
+    use (CLAUDE.md global rule #4). Fail-soft: a missed marking only means the
+    extractor logs that row as Skipped (download fail) until the next pass."""
+    if not deleted_ids:
+        return
     index_id = find_subfolder(drive, repo_id, "_index")
     if not index_id:
-        return set()
-    fid = next((f["id"] for f in list_children(drive, index_id)
-                if f["name"] == "processing_queue.parquet"), None)
-    if not fid:
-        return set()
+        return
     try:
-        import io
-        import pandas as pd
-        raw = drive.files().get_media(fileId=fid).execute()
-        q = pd.read_parquet(io.BytesIO(raw))
-        pending = q[q["status"].astype(str) == "pending"]
-        return set(pending["drive_file_id"].dropna().astype(str)) - {""}
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _extractor_base import (acquire_lock, release_lock,
+                                     load_parquet, save_parquet)
+        if not acquire_lock(drive, index_id, "_extract.lock", "cleanup"):
+            log("  queue busy (_extract.lock) — expired-marking deferred to next run.")
+            return
+        try:
+            q = load_parquet(drive, index_id, "processing_queue.parquet", [])
+            if q.empty or "drive_file_id" not in q.columns:
+                return
+            hit = (q["status"].astype(str).eq("pending")
+                   & q["drive_file_id"].astype(str).isin(deleted_ids))
+            if hit.any():
+                q.loc[hit, "status"] = "expired"
+                save_parquet(drive, index_id, "processing_queue.parquet", q)
+                log(f"  queue: {int(hit.sum())} pending row(s) marked expired "
+                    f"(PDF removed by retention).")
+        finally:
+            release_lock(drive, index_id, "_extract.lock")
     except Exception as e:
-        log(f"  ERROR reading processing_queue.parquet: {str(e)[:100]}")
-        return None
+        log(f"  expired-marking failed ({str(e)[:100]}) — rows stay pending "
+            f"(extractor will log them as Skipped).")
 
 
 def hours_old(modified_time_iso: str) -> float:
@@ -166,20 +178,14 @@ def main() -> None:
         print("company_repo/ does not exist yet — nothing to clean.")
         return
 
-    # PDFs still pending in the queue are exempt — not yet processed, so the
-    # retention clock hasn't started for them. Fail-safe: abort if unreadable.
-    pending_ids = load_pending_pdf_ids(drive, repo_id)
-    if pending_ids is None:
-        print("ABORT: queue unreadable — skipping deletion pass entirely "
-              "(fail-safe: never delete PDFs that might still be pending).")
-        return
-    log(f"Pending-queue PDFs exempt from deletion: {len(pending_ids)}")
-
+    # HARD RETENTION (user 2026-06-12): age alone decides — no pending
+    # exemption. Rows whose PDF dies are marked 'expired' afterwards.
     company_folders = [f for f in list_children(drive, repo_id, only_folders=True)
                        if f["name"] not in ("_index", "_daily")]
     log(f"Scanning {len(company_folders)} company folders...")
 
     scanned = deleted = kept = errors = 0
+    deleted_ids: set[str] = set()
     for cf in company_folders:
         docs_id = find_subfolder(drive, cf["id"], "documents")
         if not docs_id:
@@ -195,21 +201,22 @@ def main() -> None:
             if age_h <= cutoff_h:
                 kept += 1
                 continue
-            if f["id"] in pending_ids:
-                kept += 1   # still pending in queue — retention clock not started
-                continue
             if args.dry_run:
                 log(f"  would delete: {cf['name']}/documents/{f['name']} "
                     f"({age_h/24:.0f}d old)")
                 deleted += 1
                 continue
             try:
-                # move to trash (parmanetly, frees quota)
+                # permanent delete (frees quota immediately)
                 drive.files().delete(fileId=f["id"]).execute()
                 deleted += 1
+                deleted_ids.add(f["id"])
             except Exception as e:
                 errors += 1
                 log(f"  ERROR deleting {cf['name']}/{f['name']}: {str(e)[:100]}")
+
+    if not args.dry_run:
+        mark_expired_rows(drive, repo_id, deleted_ids)
 
     print("-" * 56)
     print(f"Raw docs scanned : {scanned}")
