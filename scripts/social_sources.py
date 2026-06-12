@@ -35,12 +35,43 @@ MIN_SCORE = 50.0       # OR a high post score counts as "top contributor"
 _THROTTLE_S = 0.8
 _last = 0.0
 
-# Curated blog RSS feeds (Indian fundamental-investing writers). Extend freely.
+# Built-in fallback feeds — the LIVE list is company_repo/_index/blog_feeds.csv
+# on Drive (name,url,enabled), managed via scripts/blog_feeds.py / add_blog.bat
+# or seeded below. _load_feeds() merges Drive over these.
 BLOG_FEEDS = [
     ("Dr Vijay Malik", "https://www.drvijaymalik.com/feed/"),
     ("Safal Niveshak", "https://www.safalniveshak.com/feed/"),
     ("AlphaIdeas", "https://alphaideas.in/feed/"),
 ]
+
+_feeds_loaded: list[tuple[str, str]] | None = None
+
+
+def _load_feeds() -> list[tuple[str, str]]:
+    """Drive blog_feeds.csv (enabled rows) merged over the built-ins."""
+    global _feeds_loaded
+    if _feeds_loaded is not None:
+        return _feeds_loaded
+    feeds = dict(BLOG_FEEDS)
+    try:
+        import io as _io
+        import pandas as pd
+        from _extractor_base import (get_drive, get_or_create_subfolder,
+                                     find_file, download_bytes)
+        drive = get_drive()
+        root = os.environ["GDRIVE_FOLDER_ID"]
+        idx = get_or_create_subfolder(
+            drive, get_or_create_subfolder(drive, root, "company_repo"), "_index")
+        fid = find_file(drive, idx, "blog_feeds.csv")
+        if fid:
+            df = pd.read_csv(_io.BytesIO(download_bytes(drive, fid)))
+            for _, r in df.iterrows():
+                if str(r.get("enabled", "1")).strip().lower() in ("1", "true", "yes"):
+                    feeds[str(r["name"]).strip()] = str(r["url"]).strip()
+    except Exception as e:
+        _log(f"  blog_feeds.csv not loaded ({str(e)[:50]}) — built-ins only")
+    _feeds_loaded = list(feeds.items())
+    return _feeds_loaded
 
 # Curated X/Twitter handles (used ONLY when X_BEARER_TOKEN is set).
 X_HANDLES = ["unseenvalue", "safalniveshak", "drvijaymalik", "Vivek_Investor",
@@ -167,7 +198,7 @@ def blog_items(company_name: str, days: int = 21) -> list[dict]:
     key = name.split()[0]
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     out = []
-    for label, url in BLOG_FEEDS:
+    for label, url in _load_feeds():
         for it in _feed_items(label, url):
             blob = (it["title"] + " " + it["text"]).lower()
             if key in blob and (not it["date"] or it["date"] >= cutoff):

@@ -10,9 +10,12 @@ name: pead
 # USER RULE 2026-06-12: ALL daily mails START at 19:00 IST. This cron anchors
 # the evening batch — pead mails first, then t4_nightly chains off completion
 # (fraud scan, catalyst, AR digest, PF digest follow in sequence).
+# PRIMARY trigger: cron-job.org POSTs a workflow_dispatch at 19:00 IST sharp.
+# The GitHub cron below is only a LATE FALLBACK (21:30 IST) — the guard job
+# skips it when today's batch already ran, so no duplicate mails.
 on:
   schedule:
-    - cron: "30 13 * * *"        # 13:30 UTC = 19:00 IST (GitHub drifts late only)
+    - cron: "0 16 * * *"         # fallback only: 16:00 UTC = 21:30 IST
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +23,33 @@ concurrency:
   cancel-in-progress: false      # never two refresh passes at once (parquet writes)
 
 jobs:
+  guard:
+    # once per day: scheduled fallback skips if today already succeeded
+    # (workflow_dispatch — cron-job.org or manual — always runs)
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.chk.outputs.go }}
+    steps:
+      - id: chk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          today=$(date -u +%Y-%m-%d)
+          n=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            --get --data-urlencode "status=success" \
+            --data-urlencode "created=>=${today}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/pead.yml/runs" \
+            | grep -c '"run_started_at"' || true)
+          echo "successful runs today: $n"
+          [ "$n" -gt 0 ] && echo "go=false" >> "$GITHUB_OUTPUT" \
+                         || echo "go=true" >> "$GITHUB_OUTPUT"
+
   pead:
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
