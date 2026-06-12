@@ -31,15 +31,17 @@ GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", GMAIL_USER)
 
 SETTINGS_NAME = "mail_settings.json"
+# ALL mails arrive in ONE evening batch from 19:00 IST (user rule 2026-06-12):
+# pead fires at 19:00, t4_nightly chains off its completion.
 MAIL_KEYS = {                      # key -> human label (app.py shows these)
-    "pead_guidance":   "Results last 24h vs guidance (daily 20:00 IST)",
-    "pead_tomorrow":   "Results tomorrow calendar (daily 20:00 IST)",
-    "fraud_scan":      "Fraud scan findings (nightly 21:30 IST)",
-    "catalyst":        "Catalyst notes digest (nightly 21:30 IST)",
-    "guidance_digest": "Concall guidance table + 🚀 >30% flags, last 24h (daily ~20:00 IST)",
-    "ops_digest":      "Ops digest: runs pass/fail + freshness + samples (daily 08:30 IST)",
-    "ar_focus":        "AR digest: focus/defocus lists from fresh annual reports (per 4h slot)",
-    "pf_digest":       "PF daily digest: filings/research/flags/docs/community per holding",
+    "pead_guidance":   "Results last 24h vs guidance",
+    "pead_tomorrow":   "Results tomorrow calendar",
+    "fraud_scan":      "Fraud scan findings",
+    "catalyst":        "Catalyst notes digest",
+    "guidance_digest": "Concall guidance table + 🚀 >30% flags (last 24h)",
+    "ops_digest":      "Ops digest: runs pass/fail + freshness + samples",
+    "ar_focus":        "AR digest: focus/defocus lists (PDF attached)",
+    "pf_digest":       "PF daily digest: filings/research/flags/docs/community",
 }
 
 

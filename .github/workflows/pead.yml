@@ -7,9 +7,12 @@ name: pead
 # t4_nightly chains off this workflow's completion (workflow_run) — guaranteed
 # ordering, no second cron to drift.
 
+# USER RULE 2026-06-12: ALL daily mails START at 19:00 IST. This cron anchors
+# the evening batch — pead mails first, then t4_nightly chains off completion
+# (fraud scan, catalyst, AR digest, PF digest follow in sequence).
 on:
   schedule:
-    - cron: "45 13 * * *"        # 13:45 UTC = 19:15 IST; drift lands ~20:00 IST
+    - cron: "30 13 * * *"        # 13:30 UTC = 19:00 IST (GitHub drifts late only)
   workflow_dispatch:
 
 concurrency:

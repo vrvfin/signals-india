@@ -1,11 +1,12 @@
 name: ops_mail
 
-# Morning ops digest — did everything run, is the data fresh, sample rows from
-# every build, open review flags. 08:30 IST = after backfill_nightly finishes.
+# Ops digest — did everything run, is the data fresh, sample rows from every
+# build, open review flags. USER RULE 2026-06-12: all mails arrive in the
+# 19:00 IST evening batch.
 
 on:
   schedule:
-    - cron: "0 3 * * *"            # 03:00 UTC = 08:30 IST, daily
+    - cron: "30 13 * * *"          # 13:30 UTC = 19:00 IST, daily
   workflow_dispatch: {}
 
 permissions:

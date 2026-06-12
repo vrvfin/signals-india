@@ -215,6 +215,9 @@ def main() -> None:
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--dry-run", action="store_true",
                     help="List today's ARs; no Gemini, no writes.")
+    ap.add_argument("--email", action="store_true",
+                    help="Send the digest mail. OFF in the 4h backfill slots; "
+                         "the 19:00 IST t4_nightly batch passes it once a day.")
     ap.add_argument("--range-from", type=str, default=None, metavar="YYYY-MM-DD",
                     help="With --range-to: range-wise focus-list pull, then exit.")
     ap.add_argument("--range-to", type=str, default=None, metavar="YYYY-MM-DD")
@@ -332,6 +335,9 @@ def main() -> None:
             log(f"deep_dive_queue: +{len(adds)} FOCUS name(s) enqueued")
 
     # ---- mail: body = FOCUS quick summaries with the WHY; full digest PDF attached ----
+    if not args.email:
+        log("no --email — digest/judge/enqueue done, mail left to the 19:00 batch.")
+        return
     if not load_mail_settings(drive, index_id).get("ar_focus", True):
         log("ar_focus mail toggled OFF — skipped.")
         return

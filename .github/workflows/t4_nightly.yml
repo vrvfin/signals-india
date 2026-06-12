@@ -99,6 +99,11 @@ jobs:
           --limit "${{ github.event.inputs.catalyst_limit || '30' }}" --email
         continue-on-error: true
 
+      - name: AR digest mail (one per day, 19:00 batch — slots write, this mails)
+        if: always()
+        run: python scripts/daily_ar_summary.py --email
+        continue-on-error: true
+
       - name: PF daily digest mail (filings/research/flags/community per holding)
         if: always()
         run: python scripts/run_pf_digest.py
