@@ -59,6 +59,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -475,10 +476,21 @@ def gemini_verify_hits(pool, company: str, symbol: str,
 
 
 def _fetch_listing_titles(url: str, label: str) -> list[str]:
-    """Anchor/title texts from a regulator's orders listing page. Fail-soft []."""
+    """Anchor/title texts from a regulator's orders listing page. Fail-soft [].
+    One retry after 5s — NFRA refuses CI connections intermittently (seen
+    2026-06-11; same call succeeded 2026-06-10)."""
+    r = None
+    for attempt in (1, 2):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html"},
+                             timeout=25)
+            break
+        except Exception as e:
+            if attempt == 2:
+                log(f"  {label}: fetch failed twice ({str(e)[:80]}) — skipping")
+                return []
+            time.sleep(5)
     try:
-        r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html"},
-                         timeout=25)
         if r.status_code != 200:
             log(f"  {label}: HTTP {r.status_code} — skipping")
             return []
@@ -504,15 +516,21 @@ def _fetch_sebi_rss_titles() -> list[str]:
             log(f"  SEBI-RSS: HTTP {r.status_code} — skipping")
             return []
         import xml.etree.ElementTree as ET
-        out = []
-        for el in ET.fromstring(r.content).iter("title"):
+        out, total = [], 0
+        for el in ET.fromstring(r.content).iter():
+            # match any namespaced/plain <title>; feeds vary
+            if not str(el.tag).lower().endswith("title"):
+                continue
             t = re.sub(r"\s+", " ", el.text or "").strip()
+            if len(t) < 15:
+                continue
+            total += 1
             tl = t.lower()
-            if (len(t) >= 15
-                    and any(k in tl for k in SEBI_RSS_ORDER_TERMS)
+            if (any(k in tl for k in SEBI_RSS_ORDER_TERMS)
                     and not any(neg in tl for neg in NEWS_NEGATIVE_TERMS)):
                 out.append(t)
-        log(f"  SEBI-RSS: {len(out)} order-like feed titles fetched")
+        log(f"  SEBI-RSS: {len(out)} order-like of {total} feed titles "
+            f"(sample: {out[0][:60] if out else '-'})")
         return out
     except Exception as e:
         log(f"  SEBI-RSS: fetch failed ({str(e)[:80]}) — skipping")
