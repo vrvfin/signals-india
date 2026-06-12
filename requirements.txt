@@ -16,8 +16,12 @@ plotly==5.24.0
 xlrd==2.0.1
 beautifulsoup4==4.12.3
 lxml==5.3.0
-# IMPORTANT: keep pandas < 3.0. pandas 3.0 wheels are built against the numpy 2.x
-# ABI; with numpy<2.0.0 below that mismatch SEGFAULTs Streamlit Cloud on import.
-numpy<2.0.0
-pandas>=2.2.3,<3.0
-pyarrow>=18.0.0,<19.0.0
+# IMPORTANT (segfault history): Streamlit Cloud SEGFAULTS on ABI mismatches in
+# the numpy/pandas/pyarrow triangle. EXACT pins only — loose ranges let pip
+# drift to a wheel built against a different numpy ABI (the 2026-06-12 crash
+# followed the >=18 pyarrow range). Known-good set:
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+# 💬 Ask page (chat over Drive data) — lite Gemini calls from the app.
+google-genai>=1.0,<2

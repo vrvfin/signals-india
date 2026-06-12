@@ -99,6 +99,7 @@ jobs:
           GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
           GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -109,6 +110,17 @@ jobs:
             echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
             echo "GEMINI_API_KEY=$GEMINI_API_KEY"
           } > .env
+          # Backfill keys as BACKUP for Phase 2 (user 2026-06-12): appended as
+          # numbered GEMINI_API_KEY_9xx so load_api_keys() picks them up AFTER
+          # the primary pool. Blob may be bare keys or KEY=VALUE lines.
+          i=900
+          printf '%s\n' "$BACKFILL_GEMINI_KEY" | while IFS= read -r line; do
+            line="${line##*=}"
+            line=$(printf '%s' "$line" | tr -d '\r' | xargs)
+            [ -z "$line" ] && continue
+            i=$((i+1))
+            echo "GEMINI_API_KEY_$i=$line" >> .env
+          done
 
       - name: Ingest company docs
         if: steps.fresh.outputs.skip != 'true'

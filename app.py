@@ -3237,6 +3237,95 @@ _BAND_COLORS = {"RED": "#e74c3c", "ALERT": "#e67e22", "WATCH": "#f39c12"}
 _TREND_ARROW = {"UP": "▲", "DOWN": "▼", "FLAT": "—", "NEW": "★"}
 
 
+def page_ask():
+    st.title("💬 Ask")
+    st.caption("Chat over **everything on Drive** about one company — concall/AR "
+               "summaries, scorecard, fraud tracker, guidance vs actuals, "
+               "catalysts, community. Answers cite their source; missing data "
+               "is said plainly. (Local fallback: `scripts\\ask.bat` — works "
+               "even when this app is down.)")
+    token = st.text_input("Company (symbol / ISIN / name)", key="ask_co").strip()
+    if not token:
+        return
+
+    # resolve
+    uni = load_csv(["company_repo", "_index", "company_universe.csv"])
+    if uni.empty:
+        st.error("universe not loadable")
+        return
+    sym_col = "nse_symbol" if "nse_symbol" in uni.columns else "symbol"
+    t = token.upper()
+    hit = uni[(uni[sym_col].astype(str).str.upper() == t)
+              | (uni["isin"].astype(str).str.upper() == t)
+              | (uni["name"].astype(str).str.upper().str.contains(t, na=False))]
+    if hit.empty:
+        st.warning(f"'{token}' not found in the universe.")
+        return
+    r0 = hit.iloc[0]
+    isin, sym, name = str(r0["isin"]), str(r0[sym_col]).upper(), str(r0["name"])
+    st.markdown(f"**{sym}** · {name}")
+
+    # context: assembled once per company per session (app's cached loaders)
+    if st.session_state.get("ask_sym") != sym:
+        with st.spinner("Assembling everything on Drive…"):
+            parts = []
+            page = find_company_page(isin) or find_company_page(sym) or ""
+            if page:
+                parts.append("## COMPANY PAGE\n" + page[-50_000:])
+            for label, df, col in (
+                    ("SCORECARD", load_scorecard(), "symbol"),
+                    ("FRAUD TRACKER",
+                     load_parquet(["company_repo", "_index",
+                                   "fraud_tracker.parquet"]), "symbol"),
+                    ("CATALYSTS", load_catalyst_index(), "symbol"),
+                    ("GUIDANCE", load_guidance_tracker(), "symbol")):
+                try:
+                    if not df.empty and col in df.columns:
+                        rows = df[df[col].astype(str).str.upper() == sym].tail(8)
+                        if not rows.empty:
+                            parts.append(f"## {label}\n"
+                                         + rows.to_csv(index=False)[:6000])
+                except Exception:
+                    pass
+            st.session_state["ask_ctx"] = ("\n\n".join(parts)
+                                           or "DATA_MISSING (no coverage yet)")
+            st.session_state["ask_sym"] = sym
+            st.session_state["ask_hist"] = []
+
+    for u, a in st.session_state.get("ask_hist", []):
+        st.chat_message("user").write(u)
+        st.chat_message("assistant").write(a)
+
+    q = st.chat_input(f"Ask about {sym}…")
+    if not q:
+        return
+    st.chat_message("user").write(q)
+    try:
+        import sys as _sys
+        _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+        if _sp not in _sys.path:
+            _sys.path.insert(0, _sp)
+        from ask_company import SYSTEM, answer, build_pool
+        if "ask_pool" not in st.session_state:
+            st.session_state["ask_pool"] = build_pool()
+        base = SYSTEM.format(company=name, symbol=sym,
+                             context=st.session_state["ask_ctx"])
+        with st.spinner("Thinking…"):
+            a = answer(st.session_state["ask_pool"], base,
+                       st.session_state["ask_hist"], q)
+        st.chat_message("assistant").write(a)
+        st.session_state["ask_hist"].append((q, a))
+    except SystemExit:
+        st.error("No Gemini keys configured — add BACKFILL_GEMINI_KEY (or "
+                 "DAILY_GEMINI_KEY / GEMINI_API_KEY) to Streamlit secrets. "
+                 "Local alternative: scripts\\ask.bat")
+    except ImportError as e:
+        st.error(f"Chat library not installed in this deployment ({e}). "
+                 "Local alternative: scripts\\ask.bat")
+    except Exception as e:
+        st.error(f"Chat failed: {str(e)[:150]}")
+
+
 def page_fraud_tracker():
     st.title("🕵️ Fraud Tracker")
     st.caption(
@@ -3695,6 +3784,7 @@ def main():
         "Graphs",
         "Scorecard",
         "Fraud Tracker",
+        "Ask 💬",
         "Stock Detail",
         "Strategy Docs",
     ])
@@ -3729,6 +3819,8 @@ def main():
         _safe_render(page_scorecard)
     elif page == "Fraud Tracker":
         _safe_render(page_fraud_tracker)
+    elif page == "Ask 💬":
+        _safe_render(page_ask)
     elif page == "Stock Detail":
         _safe_render(page_stock_detail)
     elif page == "Strategy Docs":
