@@ -77,70 +77,9 @@ def log(msg):
 #  synthetic fixtures dropped under <local-dir>/ in the Drive layout.  #
 # ------------------------------------------------------------------ #
 
-class Store:
-    """Read/write the Drive layout, or a local mirror dir when local=True.
+from _t4_store import Store
 
-    Drive mode delegates entirely to the shared _extractor_base helpers
-    (get_drive / get_or_create_subfolder / find_file / download_bytes /
-    upload_bytes) — no raw Drive API calls here (CLAUDE.md global rule #4).
-    Local mode joins path_parts under local_dir so the whole pipeline can be
-    exercised offline with synthetic fixtures laid out in the same folders."""
 
-    def __init__(self, local: bool, local_dir: Path | None):
-        self.local = local
-        self.local_dir = local_dir
-        self.drive = None
-        if not local:
-            self.drive = get_drive()
-            self.root = os.environ["GDRIVE_FOLDER_ID"]
-
-    def _folder(self, parts):
-        fid = self.root
-        for p in parts:
-            fid = get_or_create_subfolder(self.drive, fid, p)
-        return fid
-
-    def read_parquet(self, path_parts) -> "pd.DataFrame | None":
-        *folder, name = path_parts
-        if self.local:
-            fp = self.local_dir.joinpath(*path_parts)
-            return pd.read_parquet(fp) if fp.exists() else None
-        fid = find_file(self.drive, self._folder(folder), name)
-        if not fid:
-            return None
-        return pd.read_parquet(io.BytesIO(download_bytes(self.drive, fid)))
-
-    def read_csv(self, path_parts) -> "pd.DataFrame | None":
-        *folder, name = path_parts
-        if self.local:
-            fp = self.local_dir.joinpath(*path_parts)
-            return pd.read_csv(fp) if fp.exists() else None
-        fid = find_file(self.drive, self._folder(folder), name)
-        if not fid:
-            return None
-        return pd.read_csv(io.BytesIO(download_bytes(self.drive, fid)))
-
-    def write_df(self, path_parts, df: pd.DataFrame):
-        *folder, name = path_parts
-        if self.local:
-            fp = self.local_dir.joinpath(*path_parts)
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            if name.endswith(".csv"):
-                df.to_csv(fp, index=False)
-            else:
-                df.to_parquet(fp, index=False)
-            return
-        if name.endswith(".csv"):
-            data = df.to_csv(index=False).encode("utf-8")
-            mime = "text/csv"
-        else:
-            buf = io.BytesIO()
-            df.to_parquet(buf, index=False)
-            data = buf.getvalue()
-            mime = "application/octet-stream"
-        folder_id = self._folder(folder)
-        existing = find_file(self.drive, folder_id, name)
-        upload_bytes(self.drive, folder_id, name, data, mime, existing_id=existing)
 
 
 # ------------------------------------------------------------------ #

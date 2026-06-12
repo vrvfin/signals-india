@@ -2,13 +2,15 @@ name: t4_nightly
 
 # Phase 3 T4 + T5 — nightly scorecard refresh + catalyst notes.
 # Chain: investigative fraud (lists + rolling news + SEBI/NFRA) -> valuation ->
-# financial fraud rules -> 8-factor scorecard -> catalyst notes (Gemini lite).
-# 21:30 IST = after PEAD (20:00) so fresh results feed the scorecard, and before
-# backfill_nightly (23:30) so the two never contend for Drive parquets.
+# financial fraud rules -> 8-factor scorecard -> fraud tracker -> catalysts.
+# Triggered by pead COMPLETING (workflow_run, fires on success AND failure) —
+# guaranteed to run after fresh results land, immune to cron drift, and still
+# well before backfill_nightly (23:30 IST) Drive contention.
 
 on:
-  schedule:
-    - cron: "0 16 * * *"           # 16:00 UTC = 21:30 IST, daily
+  workflow_run:
+    workflows: ["pead"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       catalyst_limit:

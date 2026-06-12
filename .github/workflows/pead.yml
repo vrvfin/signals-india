@@ -2,11 +2,14 @@ name: pead
 
 # Phase 3 / T2.5 — daily earnings refresh + PEAD (guidance-vs-actual) + 2 emails.
 # Runs on CLOUD data only (Screener company pages, NSE calendar, Drive parquets),
-# NO Gemini. 20:00 IST = after market close + Screener's result-update lag.
+# NO Gemini. Target ~20:00 IST (after close + Screener lag). GitHub cron drifts
+# LATE only (observed +3h), so schedule 19:15 IST and let drift land ~20:00.
+# t4_nightly chains off this workflow's completion (workflow_run) — guaranteed
+# ordering, no second cron to drift.
 
 on:
   schedule:
-    - cron: "30 14 * * *"        # 14:30 UTC = 20:00 IST, daily
+    - cron: "45 13 * * *"        # 13:45 UTC = 19:15 IST; drift lands ~20:00 IST
   workflow_dispatch:
 
 concurrency:
