@@ -117,15 +117,21 @@ def mark_expired_rows(drive, repo_id, deleted_ids: set[str]) -> None:
     if not index_id:
         return
     try:
+        import io
         import sys
+        import pandas as pd
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from _extractor_base import (acquire_lock, release_lock,
-                                     load_parquet, save_parquet)
+        from _extractor_base import (acquire_lock, release_lock, find_file,
+                                     download_bytes, save_parquet)
         if not acquire_lock(drive, index_id, "_extract.lock", "cleanup"):
             log("  queue busy (_extract.lock) — expired-marking deferred to next run.")
             return
         try:
-            q = load_parquet(drive, index_id, "processing_queue.parquet", [])
+            # FULL frame read (load_parquet would subset columns and the save
+            # below would then truncate the queue schema).
+            qfid = find_file(drive, index_id, "processing_queue.parquet")
+            q = (pd.read_parquet(io.BytesIO(download_bytes(drive, qfid)))
+                 if qfid else pd.DataFrame())
             if q.empty or "drive_file_id" not in q.columns:
                 return
             hit = (q["status"].astype(str).eq("pending")

@@ -38,10 +38,17 @@ VISIBLE REPORT STRUCTURE
    • Working Capital Expansion: Reconcile inventory days and receivable days. Flag aging cycles stretching beyond 6 months or growing faster than revenue.
    • Capitalization Deficiencies: Check for aggressive accumulation of Capital Work-in-Progress (CWIP) relative to tangible net worth or delays in asset operationalization.
    • Tax vs. Financial Variance: Reconcile income tax paid and interest expenses shown on the Income Statement against the Cash Flow Statement.
+   • Accounting Policy Changes: flag ANY change in accounting method, policy, estimates or revenue-recognition vs the prior year, with its stated P&L/BS impact.
 
 5. GOVERNANCE & RELATED-PARTY TRANSACTIONS (RPT)
    • Tabulate the total volume, commercial terms, and nature of all transactions with related group entities or promoter-owned firms.
    • Itemize promoter pledging levels, Key Managerial Personnel (KMP) churn, independent director meeting attendance rates, and any change in independent auditors or critical Emphasis of Matter (EoM) clauses.
+
+5B. MANAGEMENT OUTLOOK & EXPANSION (Chairman's/MD letter + MD&A)
+   • Letter tone: classify the Chairman's/MD's letter as POSITIVE / NEUTRAL / CAUTIOUS, supported by 1-2 short verbatim quotes (cited).
+   • Forward guidance: itemize every explicit forward-looking number (growth %, margin, order book, target year) management commits to.
+   • Capacity & capex pipeline: tabulate announced capacity additions / new plants / expansions — what, how much (units or ₹), commissioning timeline.
+   • Industry dynamics: bullet the tailwinds/headwinds management cites for its industry (demand, policy, pricing, imports) — mark each [COMFORT] or [WARNING].
 
 6. FORENSIC FINANCIAL RISK SCORECARD (MANDATORY WEIGHTED MATRIX)
    Provide a markdown table tracking these exact risk dimensions and weights:

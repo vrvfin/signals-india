@@ -3576,6 +3576,7 @@ _MAIL_TOGGLES = [
     ("catalyst",        "💡 Catalyst notes (21:30)"),
     ("guidance_digest", "🎯 Guidance table + 🚀 flags (20:00)"),
     ("ops_digest",      "🩺 Ops digest (08:30)"),
+    ("ar_focus",        "📚 AR focus/defocus digest"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"
 

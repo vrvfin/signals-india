@@ -151,6 +151,16 @@ jobs:
           python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
+      # ── T8 — fresh Annual Reports: summarise ALL (not just PF), then judge ──
+      # max-age guard keeps quota off stale legacy rows; BACKFILL pool (D1).
+      - name: T8 — extract fresh ARs (all companies, BACKFILL pool)
+        run: >
+          python scripts/extract_annual_report.py --all-companies
+          --key-prefix BACKFILL_GEMINI_KEY --max-age-hours 48 || true
+
+      - name: T8 — daily AR digest + focus/defocus lists
+        run: python scripts/daily_ar_summary.py || true
+
       # ── T2 FULL SCRAPE (manual only — initial setup or quarterly refresh) ────
       - name: T2 — full 3-statement scrape (all companies)
         if: ${{ github.event.inputs.do_t2_full == 'true' }}

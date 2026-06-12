@@ -226,6 +226,16 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    # T8 flags (2026-06-12) — defaults leave Phase 2 live behaviour identical.
+    parser.add_argument("--all-companies", action="store_true",
+                        help="T8: skip the portfolio filter — process every "
+                             "pending AR (use with --max-age-hours).")
+    parser.add_argument("--key-prefix", type=str, default=None,
+                        help="T8: load keys from this env prefix (e.g. "
+                             "BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
+    parser.add_argument("--max-age-hours", type=float, default=None,
+                        help="T8: only rows discovered within N hours (guards "
+                             "against draining quota on stale legacy rows).")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -233,11 +243,19 @@ def main() -> None:
 
     drive = get_drive()
 
-    api_keys = load_api_keys()
-    if not api_keys:
-        print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
-        sys.exit(1)
-    log(f"Loaded {len(api_keys)} Gemini API key(s)")
+    if args.key_prefix:
+        from gemini_pool import load_keys
+        api_keys = load_keys(os.environ, prefix=args.key_prefix)
+        if not api_keys:
+            print(f"ERROR: no {args.key_prefix}* keys found in env")
+            sys.exit(1)
+    else:
+        api_keys = load_api_keys()
+        if not api_keys:
+            print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
+            sys.exit(1)
+    log(f"Loaded {len(api_keys)} Gemini API key(s)"
+        + (f" [{args.key_prefix}]" if args.key_prefix else ""))
 
     gemini = GeminiKeyPool(api_keys, GEMINI_MODEL)
 
@@ -256,13 +274,28 @@ def main() -> None:
     pending_idx = queue.index[pending_mask].tolist()
     log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending {DOC_TYPE}")
 
-    # Portfolio filter: skip non-portfolio companies (rows stay pending for future runs)
-    portfolio_isins = load_portfolio_isins(drive, folder_id)
-    if portfolio_isins:
+    # T8: optional freshness window (discovered_at within N hours).
+    if args.max_age_hours and "discovered_at" in queue.columns:
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(hours=args.max_age_hours)) \
+            .isoformat(timespec="seconds")
         before = len(pending_idx)
         pending_idx = [i for i in pending_idx
-                       if str(queue.loc[i, "isin"]).strip() in portfolio_isins]
-        log(f"  After portfolio filter: {len(pending_idx)}/{before} to process")
+                       if str(queue.loc[i, "discovered_at"]) >= cutoff]
+        log(f"  After {args.max_age_hours:.0f}h freshness filter: "
+            f"{len(pending_idx)}/{before} to process")
+
+    # Portfolio filter: skip non-portfolio companies (rows stay pending for
+    # future runs). T8 --all-companies bypasses (every fresh AR gets judged).
+    if args.all_companies:
+        log("  --all-companies: portfolio filter bypassed (T8)")
+    else:
+        portfolio_isins = load_portfolio_isins(drive, folder_id)
+        if portfolio_isins:
+            before = len(pending_idx)
+            pending_idx = [i for i in pending_idx
+                           if str(queue.loc[i, "isin"]).strip() in portfolio_isins]
+            log(f"  After portfolio filter: {len(pending_idx)}/{before} to process")
 
     if args.limit:
         pending_idx = pending_idx[: args.limit]
