@@ -3543,8 +3543,7 @@ _MAIL_TOGGLES = [
     ("pead_tomorrow",   "📅 Results tomorrow (20:00)"),
     ("fraud_scan",      "🚨 Fraud scan findings (21:30)"),
     ("catalyst",        "💡 Catalyst notes (21:30)"),
-    ("growth_guidance", "🚀 High-growth guidance (20:00)"),
-    ("guidance_digest", "🎯 Concall guidance table (20:00)"),
+    ("guidance_digest", "🎯 Guidance table + 🚀 flags (20:00)"),
     ("ops_digest",      "🩺 Ops digest (08:30)"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"

@@ -117,7 +117,11 @@ def build_rows(g: pd.DataFrame) -> list[dict]:
     return rows
 
 
-def build_html(rows: list[dict], since: datetime) -> str:
+HIGH_GROWTH_PCT = 30.0   # 🚀 marker threshold (user rule 2026-06-11)
+
+
+def build_html(rows: list[dict], since: datetime,
+               gf1_extras: list[dict] | None = None) -> str:
     td = ("padding:6px 10px;border:1px solid #ddd;font-size:13px;"
           "font-family:Arial,sans-serif;")
     th = td + "background:#34495e;color:#fff;text-align:left;"
@@ -128,6 +132,7 @@ def build_html(rows: list[dict], since: datetime) -> str:
         f"Cell colour: <span style='background:{GREEN}'>&gt;50%</span> · "
         f"<span style='background:{ORANGE}'>&gt;20%</span> · "
         f"<span style='background:{YELLOW}'>&gt;0%</span>. "
+        f"🚀 = guides &gt;{HIGH_GROWTH_PCT:.0f}% growth. "
         f"Sorted by best guidance in the row.</p>",
         "<table style='border-collapse:collapse'>",
         "<tr>" + "".join(
@@ -136,8 +141,9 @@ def build_html(rows: list[dict], since: datetime) -> str:
         ) + "</tr>",
     ]
     for i, r in enumerate(rows, 1):
+        rocket = "🚀 " if r["row_max"] > HIGH_GROWTH_PCT else ""
         tds = [f"<td style='{td}'>{i}</td>",
-               f"<td style='{td}'><b>{r['symbol']}</b> · {r['company_name']}</td>",
+               f"<td style='{td}'>{rocket}<b>{r['symbol']}</b> · {r['company_name']}</td>",
                f"<td style='{td}'>{r['quarter']}</td>"]
         for m in METRICS:
             c = r["cells"].get(m)
@@ -145,6 +151,22 @@ def build_html(rows: list[dict], since: datetime) -> str:
             tds.append(f"<td style='{td}{bg}'>{c['disp'] if c else ''}</td>")
         out.append("<tr>" + "".join(tds) + "</tr>")
     out.append("</table>")
+    if gf1_extras:
+        out.append(
+            f"<p style='font-family:Arial,sans-serif;font-size:13px'><b>🚀 GF1-only "
+            f"high growth</b> — forward statements &gt;{HIGH_GROWTH_PCT:.0f}% the "
+            f"structured table missed:</p><table style='border-collapse:collapse'>"
+            f"<tr><th style='{th}'>Company</th><th style='{th}'>Max %</th>"
+            f"<th style='{th}'>Statement</th></tr>")
+        for f in gf1_extras[:15]:
+            t0 = f["triggers"][0] if f["triggers"] else {}
+            out.append(
+                f"<tr><td style='{td}'><b>{f['symbol']}</b> · "
+                f"{f['company_name'][:30]}</td>"
+                f"<td style='{td}'><b>{f['max_pct']:.0f}%</b></td>"
+                f"<td style='{td}'>{t0.get('metric', '')}: "
+                f"<i>{str(t0.get('statement', ''))[:160]}</i></td></tr>")
+        out.append("</table>")
     return "\n".join(out)
 
 
@@ -183,12 +205,32 @@ def main() -> None:
 
     g = g[g["metric"].isin(METRICS)]
     rows = build_rows(g)
-    if not rows:
+
+    # 🚀 GF1 supplement (merged mail, user 2026-06-12): high-growth forward
+    # statements the Table_A parser missed. Import inside the function —
+    # run_growth_guidance_mail imports _to_pct from THIS module at top level.
+    gf1_extras: list[dict] = []
+    try:
+        from run_growth_guidance_mail import find_high_growth
+        gf1 = load_parquet(drive, index_id, "gf1_guidance_statements.parquet",
+                           ["isin", "symbol", "company_name", "quarter",
+                            "metric_type", "numeric_value", "range_val",
+                            "timeframe", "exact_statement", "processed_at",
+                            "source_doc_id"])
+        flags = find_high_growth(gf1, queue, int(args.hours), HIGH_GROWTH_PCT)
+        in_table = {r["symbol"] for r in rows}
+        gf1_extras = [f for f in flags if f["symbol"] not in in_table]
+    except Exception as e:
+        log(f"GF1 supplement failed ({str(e)[:60]}) — table only.")
+
+    if not rows and not gf1_extras:
         log("No companies with quantified guidance in window — no email.")
         return
 
-    html = build_html(rows, since)
-    subject = f"🎯 Concall guidance — last {args.hours:.0f}h ({len(rows)} cos)"
+    n_rocket = sum(1 for r in rows if r["row_max"] > HIGH_GROWTH_PCT) + len(gf1_extras)
+    html = build_html(rows, since, gf1_extras)
+    subject = (f"🎯 Concall guidance — last {args.hours:.0f}h ({len(rows)} cos"
+               + (f", 🚀{n_rocket} high-growth" if n_rocket else "") + ")")
 
     if args.dry_run:
         for i, r in enumerate(rows, 1):

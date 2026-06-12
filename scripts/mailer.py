@@ -36,10 +36,15 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "pead_tomorrow":   "Results tomorrow calendar (daily 20:00 IST)",
     "fraud_scan":      "Fraud scan findings (nightly 21:30 IST)",
     "catalyst":        "Catalyst notes digest (nightly 21:30 IST)",
-    "growth_guidance": "High-growth guidance >30% from fresh concalls (daily 20:00 IST)",
-    "guidance_digest": "Concall guidance table, last 24h (daily 20:00 IST)",
+    "guidance_digest": "Concall guidance table + 🚀 >30% flags, last 24h (daily ~20:00 IST)",
     "ops_digest":      "Ops digest: runs pass/fail + freshness + samples (daily 08:30 IST)",
 }
+
+
+def esc(s, n=120) -> str:
+    """HTML-escape + truncate — the one escape helper every mail builder uses."""
+    import html
+    return html.escape(str(s)[:n])
 
 
 def default_mail_settings() -> dict:

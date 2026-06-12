@@ -73,16 +73,10 @@ jobs:
       - name: Send daily emails (today's match + tomorrow's calendar)
         run: python scripts/run_pead_daily.py --days-ahead 1
 
-      # Third daily email — concall guidance table (last 24h, live Phase 2 only).
-      # Skips itself when no company gave quantified guidance in the window.
-      - name: Send guidance digest (last 24h)
+      # Third daily email — concall guidance table (last 24h, live Phase 2 only)
+      # MERGED with the high-growth flag (user 2026-06-12): 🚀 rows >30% + a
+      # GF1-only supplement section. Skips itself when nothing is in window.
+      - name: Send guidance digest + high-growth flags (last 24h)
         if: always()    # an earlier email failure must not block this one
         run: python scripts/guidance_digest_email.py
-        continue-on-error: true
-
-      # Fourth daily email — high-growth flag: GF1 max % > 30 (margin/utilization
-      # excluded), fresh Phase 2 concalls only. Skips itself when nothing crosses.
-      - name: Send high-growth guidance mail (>30%, last 24h)
-        if: always()
-        run: python scripts/run_growth_guidance_mail.py
         continue-on-error: true

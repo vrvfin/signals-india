@@ -176,8 +176,11 @@ def merge_flags(*flag_lists: list[dict]) -> list[dict]:
     return out
 
 
+from mailer import esc as _esc_base
+
+
 def _esc(s, n=160) -> str:
-    return html_mod.escape(str(s)[:n])
+    return _esc_base(s, n)
 
 
 def _mail_html(flagged: list[dict], hours: int, min_growth: float) -> str:

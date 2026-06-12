@@ -110,8 +110,11 @@ point. If the headlines do not show a clear catalyst, say so honestly (TYPE=unkn
 """
 
 
+from mailer import esc as _esc_base
+
+
 def _esc(s, n=120) -> str:
-    return html_mod.escape(str(s)[:n])
+    return _esc_base(s, n)
 
 
 def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,

@@ -58,8 +58,11 @@ FRESHNESS = [
 ]
 
 
+from mailer import esc as _esc_base
+
+
 def _esc(s, n=140) -> str:
-    return html_mod.escape(str(s)[:n])
+    return _esc_base(s, n)
 
 
 def _read(drive, root, path_parts):
