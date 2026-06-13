@@ -34,14 +34,17 @@ jobs:
 
       - name: Write credentials
         env:
-          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GDRIVE_FOLDER_ID:                ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON:         ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
         run: |
           mkdir -p _sec
-          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON"        > _sec/tk.json
           {
             echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
             echo "GDRIVE_OAUTH_TOKEN_JSON=$GDRIVE_OAUTH_TOKEN_JSON"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/cs.json"
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
           } > .env
 
