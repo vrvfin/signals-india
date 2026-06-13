@@ -2,13 +2,13 @@ name: Universe Refresh
 
 # Rebuilds universe/master_list.csv and company_repo/_index/company_universe.csv
 # from NSE + BSE scrip APIs, then does the full 2y BSE-only OHLCV backfill.
-# Runs every 4 hours + on manual dispatch. The full backfill of ~2,635 BSE-only
-# names takes ~2.5h; concurrency (below) queues a new trigger behind any run
-# still in progress so they never overlap. Public repo => Actions minutes free.
+# Runs weekly (Sunday 03:00 IST) + on manual dispatch. The full backfill of
+# ~2,635 BSE-only names takes ~2.5h; concurrency (below) queues a new trigger
+# behind any run still in progress so they never overlap.
 
 on:
   schedule:
-    - cron: "0 */4 * * *"    # every 4 hours
+    - cron: "30 21 * * 0"    # 21:30 UTC Sunday = 03:00 IST Monday
   workflow_dispatch:          # manual trigger anytime
 
 # Serialize: if a run is still going, the next trigger WAITS (does not overlap
