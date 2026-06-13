@@ -505,21 +505,37 @@ def load_api_keys() -> list[str]:
 # ------------------------------------------------------------------ #
 
 def acquire_lock(drive, index_id: str, lock_name: str, owner: str,
-                 max_age_min: int = 180) -> bool:
-    fid = find_file(drive, index_id, lock_name)
-    if fid:
+                 max_age_min: int = 180, grace_sec: int = 8) -> bool:
+    """Claim the shared lock; return False if another process holds it.
+
+    A genuinely-held lock persists; a just-released one disappears once Drive's
+    file-list index settles. So when we see a FRESH foreign lock we pause once for
+    `grace_sec` and re-check before yielding — that absorbs the hand-off lag when a
+    previous sequential step (e.g. extract_concall) released the lock moments ago,
+    without weakening mutual exclusion against a truly concurrent holder (which is
+    still there after the grace). Uncontended acquires (no lock file) pay nothing."""
+    fid = None
+    for attempt in (1, 2):
+        fid = find_file(drive, index_id, lock_name)
+        if not fid:
+            break                                   # free — acquire below
         try:
             content = download_bytes(drive, fid).decode("utf-8", errors="replace")
             ts_str = content.split("|", 2)[1] if "|" in content else ""
             ts = datetime.fromisoformat(ts_str) if ts_str else None
             age_min = ((datetime.now() - ts).total_seconds() / 60.0) if ts else 1e9
             if age_min < max_age_min:
+                if attempt == 1 and grace_sec > 0:
+                    time.sleep(grace_sec)
+                    continue                         # re-check: may have been released
                 log(f"  LOCK {lock_name} held by '{content.split('|')[0]}' "
                     f"({age_min:.0f} min) — exiting cleanly.")
                 return False
             log(f"  LOCK {lock_name} stale ({age_min:.0f} min) — stealing.")
+            break
         except Exception as e:
             log(f"  LOCK {lock_name} read failed ({str(e)[:60]}) — overwriting.")
+            break
     payload = f"{owner}|{datetime.now().isoformat(timespec='seconds')}".encode("utf-8")
     upload_bytes(drive, index_id, lock_name, payload, "text/plain", existing_id=fid)
     return True

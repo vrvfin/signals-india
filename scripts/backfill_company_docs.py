@@ -153,6 +153,41 @@ def _date_from_text(text: str, doc_type: str, run_date: dt.date) -> str:
     return run_date.isoformat()
 
 
+def _fy_quarter_label(iso_date: str) -> str:
+    """Approx Indian-FY (Apr–Mar) quarter a concall/results/presentation announced
+    on `iso_date` most likely REPORTS — i.e. the quarter that just ended. Coarse:
+    used only for the coverage view + dedup grain. Concall supersede uses Gemini's
+    parsed quarter, not this label."""
+    d = pd.to_datetime(str(iso_date)[:10], errors="coerce")
+    if pd.isna(d):
+        return ""
+    m, y = d.month, d.year
+    if m in (4, 5, 6):       q, fy = 4, y       # reports Jan–Mar (FY ending Mar y)
+    elif m in (7, 8, 9):     q, fy = 1, y + 1
+    elif m in (10, 11, 12):  q, fy = 2, y + 1
+    else:                    q, fy = 3, y       # Jan–Mar -> reports Oct–Dec, FY end Mar y
+    return f"Q{q}FY{fy % 100:02d}"
+
+
+def _period_for(doc_type: str, announcement_date: str) -> str:
+    """Natural-grain period label for a document (T12 queue `period` column)."""
+    if doc_type == "annual_report":
+        m = re.search(r"(19|20)\d{2}", str(announcement_date))
+        return f"FY{int(m.group(0)) % 100:02d}" if m else ""
+    if doc_type == "rating":
+        return str(announcement_date)[:10]      # ratings are dated events
+    return _fy_quarter_label(announcement_date)  # concall / results / presentation
+
+
+def _concall_date_from_div(text: str, run_date: dt.date) -> str:
+    """Concall date on the company page lives in the <li>'s leading date <div>
+    ('Apr 2026'), NOT in the <a> link text. Parse it to the 1st of that month."""
+    d = pd.to_datetime(str(text).strip(), errors="coerce")
+    if pd.notna(d):
+        return d.date().replace(day=1).isoformat()
+    return run_date.isoformat()
+
+
 def parse_company_documents(html: str, run_date: dt.date,
                             want_types: set[str]) -> list[dict]:
     """Parse the #documents section into a list of document dicts."""
@@ -167,6 +202,31 @@ def parse_company_documents(html: str, run_date: dt.date,
                         None)
         if not doc_type or doc_type not in want_types:
             continue
+
+        if doc_type == "concall":
+            # Each <li> is one call (one month); date is in the leading <div>, the
+            # <a> links (Transcript/PPT/REC) carry no date. Iterate per <li> so each
+            # link inherits the correct month — without this every concall fell back
+            # to run_date and the date window/dedup collapsed (T12 fix).
+            for li in sub.find_all("li"):
+                date_div = li.find("div")
+                ann = _concall_date_from_div(
+                    date_div.get_text(" ", strip=True) if date_div else "", run_date)
+                for a in li.select("a[href]"):
+                    href = (a.get("href") or "").strip()
+                    text = a.get_text(" ", strip=True)
+                    if not href or text.lower() == "all" or "corp-announc" in href:
+                        continue
+                    out.append({
+                        "doc_id":   _doc_id(href),
+                        "doc_type": "concall",
+                        "title":    text,
+                        "announcement_date": ann,
+                        "pdf_url":  href,
+                        "is_zip":   href.lower().endswith(".zip"),
+                    })
+            continue
+
         for a in sub.select("a[href]"):
             href = (a.get("href") or "").strip()
             text = a.get_text(" ", strip=True)
@@ -228,8 +288,13 @@ def resolve_company(token: str, symbol: str, isin: str,
 # --------------------------------------------------------------------------- #
 def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
              max_docs: int = 0, dry_run: bool = False,
-             drive=None, repo_id=None, index_id=None) -> dict:
-    """Fetch full doc history for one company, queue NEW docs. Returns counts."""
+             drive=None, repo_id=None, index_id=None,
+             since: str | None = None) -> dict:
+    """Fetch full doc history for one company, queue NEW docs. Returns counts.
+
+    `since` (ISO date, T12): drop documents older than this date BEFORE the
+    `max_docs` cap, so a deep request ("10 years") is not truncated to newest-N.
+    Default None → byte-for-byte identical to the pre-T12 behaviour."""
     want_types = want_types or set(SUBSECTION_TYPES.values())
     run_date = dt.date.today()
 
@@ -248,10 +313,14 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
 
     docs = parse_company_documents(html, run_date, want_types)
     docs.sort(key=lambda d: d["announcement_date"], reverse=True)
+    if since:
+        _floor = str(since)[:10]
+        docs = [d for d in docs if str(d["announcement_date"])[:10] >= _floor]
     if max_docs:
         docs = docs[:max_docs]
     log(f"  parsed {len(docs)} document(s) for {symbol} "
-        f"({', '.join(sorted(want_types))})")
+        f"({', '.join(sorted(want_types))}"
+        f"{', since ' + str(since)[:10] if since else ''})")
 
     key = isin if isin else symbol
     counts = {"found": len(docs), "new": 0, "downloaded": 0,
@@ -331,6 +400,8 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
             "discovered_at": dt.datetime.now().isoformat(timespec="seconds"),
             "processed_at": "",
             "source": "backfill",      # enqueue origin -> backfill extractor only
+            "period": _period_for(d["doc_type"], d["announcement_date"]),  # T12
+            "content_sha256": "",      # T12 reserved (Stage C)
         })
         counts["new"] += 1
         time.sleep(0.4)             # polite to BSE/CRISIL
