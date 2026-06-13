@@ -147,6 +147,9 @@ def main():
         print("universe/master_list.csv not found.")
         return
     universe = download_csv(drive, master_id)
+    # NSE-only (uses .NS suffix); BSE-only market cap is a later layer.
+    if "exchange" in universe.columns:
+        universe = universe[universe["exchange"].astype(str) == "NSE"]
     symbols = universe["symbol"].astype(str).tolist()
     if args.limit:
         symbols = symbols[:args.limit]
