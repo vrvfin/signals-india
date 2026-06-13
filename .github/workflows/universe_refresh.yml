@@ -1,15 +1,18 @@
 name: Universe Refresh
 
 # Rebuilds universe/master_list.csv and company_repo/_index/company_universe.csv
-# from NSE + BSE scrip APIs. Runs weekly (Sunday 03:00 IST) and on manual dispatch.
-# This keeps the company resolution table (ISIN, NSE symbol, BSE code, name) fresh
-# so deep-dive resolve and all downstream scripts always have current data.
+# from NSE + BSE scrip APIs, then does the full 2y BSE-only OHLCV backfill.
+# Runs every 4 hours + on manual dispatch. The full backfill of ~2,635 BSE-only
+# names takes ~2.5h; concurrency (below) queues a new trigger behind any run
+# still in progress so they never overlap. Public repo => Actions minutes free.
 
 on:
   schedule:
-    - cron: "30 21 * * 0"    # 21:30 UTC Sunday = 03:00 IST Monday
+    - cron: "0 */4 * * *"    # every 4 hours
   workflow_dispatch:          # manual trigger anytime
 
+# Serialize: if a run is still going, the next trigger WAITS (does not overlap
+# or cancel). One finishes, the next in queue starts.
 concurrency:
   group: universe-refresh
   cancel-in-progress: false
@@ -17,7 +20,9 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 350 min — just under GitHub-hosted runners' hard 360-min (6h) per-job cap.
+    # The ~2.5h backfill fits comfortably; the old 30-min cap killed it mid-run.
+    timeout-minutes: 350
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
