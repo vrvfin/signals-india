@@ -3237,93 +3237,110 @@ _BAND_COLORS = {"RED": "#e74c3c", "ALERT": "#e67e22", "WATCH": "#f39c12"}
 _TREND_ARROW = {"UP": "▲", "DOWN": "▼", "FLAT": "—", "NEW": "★"}
 
 
+def _ask_assemble_ctx(isin, sym):
+    """Per-company context from the app's cached loaders (no Gemini)."""
+    parts = []
+    page = find_company_page(isin) or find_company_page(sym) or ""
+    if page:
+        parts.append("## COMPANY PAGE\n" + page[-50_000:])
+    for label, df, col in (
+            ("SCORECARD", load_scorecard(), "symbol"),
+            ("FRAUD TRACKER",
+             load_parquet(["company_repo", "_index", "fraud_tracker.parquet"]),
+             "symbol"),
+            ("CATALYSTS", load_catalyst_index(), "symbol"),
+            ("GUIDANCE", load_guidance_tracker(), "symbol")):
+        try:
+            if not df.empty and col in df.columns:
+                rows = df[df[col].astype(str).str.upper() == sym].tail(8)
+                if not rows.empty:
+                    parts.append(f"## {label}\n" + rows.to_csv(index=False)[:6000])
+        except Exception:
+            pass
+    return "\n\n".join(parts) or "DATA_MISSING (no coverage yet)"
+
+
 def page_ask():
     st.title("💬 Ask")
-    st.caption("Chat over **everything on Drive** about one company — concall/AR "
-               "summaries, scorecard, fraud tracker, guidance vs actuals, "
-               "catalysts, community. Answers cite their source; missing data "
-               "is said plainly. (Local fallback: `scripts\\ask.bat` — works "
-               "even when this app is down.)")
-    token = st.text_input("Company (symbol / ISIN / name)", key="ask_co").strip()
-    if not token:
-        return
+    st.caption("Just type a question and **mention the company** — "
+               "*\"how is anondita doing?\"*, *\"what did TCS guide and are they "
+               "credible?\"*. Answers come from everything on Drive (concall/AR "
+               "summaries, scorecard, fraud tracker, guidance, catalysts, "
+               "community) and cite their source. Mention a different company "
+               "any time to switch. (Local fallback that never goes down: "
+               "`scripts\\ask.bat`.)")
 
-    # resolve
+    import sys as _sys
+    _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+    if _sp not in _sys.path:
+        _sys.path.insert(0, _sp)
+
     uni = load_csv(["company_repo", "_index", "company_universe.csv"])
     if uni.empty:
-        st.error("universe not loadable")
+        st.error("Universe not loadable.")
         return
-    sym_col = "nse_symbol" if "nse_symbol" in uni.columns else "symbol"
-    t = token.upper()
-    hit = uni[(uni[sym_col].astype(str).str.upper() == t)
-              | (uni["isin"].astype(str).str.upper() == t)
-              | (uni["name"].astype(str).str.upper().str.contains(t, na=False))]
-    if hit.empty:
-        st.warning(f"'{token}' not found in the universe.")
-        return
-    r0 = hit.iloc[0]
-    isin, sym, name = str(r0["isin"]), str(r0[sym_col]).upper(), str(r0["name"])
-    st.markdown(f"**{sym}** · {name}")
 
-    # context: assembled once per company per session (app's cached loaders)
-    if st.session_state.get("ask_sym") != sym:
-        with st.spinner("Assembling everything on Drive…"):
-            parts = []
-            page = find_company_page(isin) or find_company_page(sym) or ""
-            if page:
-                parts.append("## COMPANY PAGE\n" + page[-50_000:])
-            for label, df, col in (
-                    ("SCORECARD", load_scorecard(), "symbol"),
-                    ("FRAUD TRACKER",
-                     load_parquet(["company_repo", "_index",
-                                   "fraud_tracker.parquet"]), "symbol"),
-                    ("CATALYSTS", load_catalyst_index(), "symbol"),
-                    ("GUIDANCE", load_guidance_tracker(), "symbol")):
-                try:
-                    if not df.empty and col in df.columns:
-                        rows = df[df[col].astype(str).str.upper() == sym].tail(8)
-                        if not rows.empty:
-                            parts.append(f"## {label}\n"
-                                         + rows.to_csv(index=False)[:6000])
-                except Exception:
-                    pass
-            st.session_state["ask_ctx"] = ("\n\n".join(parts)
-                                           or "DATA_MISSING (no coverage yet)")
-            st.session_state["ask_sym"] = sym
-            st.session_state["ask_hist"] = []
-
+    cur = st.session_state.get("ask_sym")
+    if cur:
+        st.markdown(f"**Talking about: {cur} · "
+                    f"{st.session_state.get('ask_name', '')}**")
     for u, a in st.session_state.get("ask_hist", []):
         st.chat_message("user").write(u)
         st.chat_message("assistant").write(a)
 
-    q = st.chat_input(f"Ask about {sym}…")
-    if not q:
+    msg = st.chat_input("Ask about a company…")
+    if not msg:
         return
-    st.chat_message("user").write(q)
+    st.chat_message("user").write(msg)
+
     try:
-        import sys as _sys
-        _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
-        if _sp not in _sys.path:
-            _sys.path.insert(0, _sp)
-        from ask_company import SYSTEM, answer, build_pool
+        from ask_company import resolve, SYSTEM, answer, build_pool
+    except ImportError as e:
+        st.chat_message("assistant").write(
+            f"Chat library not installed in this deployment ({e}). "
+            "Use `scripts\\ask.bat` locally.")
+        return
+
+    # (re)lock the company whenever the message names a different one
+    hit = resolve(None, None, msg, uni)
+    if hit and hit[1] != cur:
+        isin, sym, name = hit
+        with st.spinner(f"Loading everything on Drive for {sym}…"):
+            st.session_state["ask_ctx"] = _ask_assemble_ctx(isin, sym)
+        st.session_state["ask_sym"] = sym
+        st.session_state["ask_name"] = name
+        st.session_state["ask_hist"] = []
+        cur = sym
+    if not cur:
+        st.chat_message("assistant").write(
+            "Which company? Mention its name or symbol — e.g. "
+            "*\"how is Anondita doing?\"*")
+        return
+
+    # message was only the company name → context loaded, invite a question
+    if hit and msg.strip().upper() in (cur, st.session_state["ask_name"].upper()):
+        st.chat_message("assistant").write(
+            f"Loaded everything on Drive for **{cur}** "
+            f"({st.session_state['ask_name']}). What would you like to know?")
+        return
+
+    try:
         if "ask_pool" not in st.session_state:
             st.session_state["ask_pool"] = build_pool()
-        base = SYSTEM.format(company=name, symbol=sym,
+        base = SYSTEM.format(company=st.session_state["ask_name"], symbol=cur,
                              context=st.session_state["ask_ctx"])
         with st.spinner("Thinking…"):
             a = answer(st.session_state["ask_pool"], base,
-                       st.session_state["ask_hist"], q)
+                       st.session_state["ask_hist"], msg)
         st.chat_message("assistant").write(a)
-        st.session_state["ask_hist"].append((q, a))
+        st.session_state["ask_hist"].append((msg, a))
     except SystemExit:
-        st.error("No Gemini keys configured — add BACKFILL_GEMINI_KEY (or "
-                 "DAILY_GEMINI_KEY / GEMINI_API_KEY) to Streamlit secrets. "
-                 "Local alternative: scripts\\ask.bat")
-    except ImportError as e:
-        st.error(f"Chat library not installed in this deployment ({e}). "
-                 "Local alternative: scripts\\ask.bat")
+        st.chat_message("assistant").write(
+            "No Gemini keys configured — add `BACKFILL_GEMINI_KEY_1` (or "
+            "`DAILY_GEMINI_KEY_1` / `GEMINI_API_KEY`) to this app's Streamlit "
+            "secrets, then reboot. Local alternative: `scripts\\ask.bat`.")
     except Exception as e:
-        st.error(f"Chat failed: {str(e)[:150]}")
+        st.chat_message("assistant").write(f"Chat failed: {str(e)[:160]}")
 
 
 def page_fraud_tracker():

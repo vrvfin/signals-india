@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -58,23 +59,74 @@ actuals, catalysts, community posts). Rules:
 === END CONTEXT ==="""
 
 
-def resolve(drive, root, token: str) -> tuple[str, str, str] | None:
-    """token (symbol/ISIN/name fragment) -> (isin, symbol, name)."""
+# Generic words that must not, on their own, match a company name.
+_NAME_STOP = {"LIMITED", "LTD", "INDIA", "INDIAN", "INDUSTRIES", "COMPANY", "CO",
+              "CORP", "CORPORATION", "PVT", "PRIVATE", "ENTERPRISES", "GROUP",
+              "PRODUCTS", "MEDICARE", "PHARMA", "TECHNOLOGIES", "TECH",
+              "SERVICES", "FINANCE", "MOTORS", "STEEL", "POWER", "ENERGY"}
+# Question words to ignore when scanning free text for a company.
+_QUESTION_STOP = {"TELL", "ABOUT", "HOW", "WHAT", "WHY", "WHEN", "IS", "ARE",
+                  "THE", "ME", "GOING", "DOING", "WITH", "AND", "FOR", "OF",
+                  "ON", "IN", "TO", "A", "AN", "DOES", "DID", "HAS", "HAVE",
+                  "THIS", "THAT", "ANY", "GIVE", "SHOW", "LATEST", "UPDATE",
+                  "STATUS", "COMPANY", "STOCK", "SHARE", "PRICE", "NEWS"}
+
+
+def _load_universe(drive, root):
     repo = get_or_create_subfolder(drive, root, "company_repo")
     idx = get_or_create_subfolder(drive, repo, "_index")
     fid = find_file(drive, idx, "company_universe.csv")
-    if not fid:
+    return pd.read_csv(io.BytesIO(download_bytes(drive, fid))) if fid else None
+
+
+def resolve(drive, root, token: str, uni=None) -> tuple[str, str, str] | None:
+    """Find the company a natural-language string is ABOUT.
+    Tries, in order: exact symbol/ISIN; a symbol appearing as a word in the
+    text; a distinctive company-name word appearing in the text (longest wins).
+    So 'tell me about anondita how is it going?' -> ANONDITA."""
+    if uni is None:
+        uni = _load_universe(drive, root)
+    if uni is None or uni.empty:
         return None
-    uni = pd.read_csv(io.BytesIO(download_bytes(drive, fid)))
-    t = token.strip().upper()
     sym_col = "nse_symbol" if "nse_symbol" in uni.columns else "symbol"
-    for cond in (uni[sym_col].astype(str).str.upper() == t,
-                 uni["isin"].astype(str).str.upper() == t,
-                 uni["name"].astype(str).str.upper().str.contains(t, na=False)):
+    raw = token.strip()
+    up = raw.upper()
+
+    def _ret(r):
+        return (str(r["isin"]), str(r[sym_col]).upper(), str(r["name"]))
+
+    # 1. exact symbol / ISIN
+    for cond in (uni[sym_col].astype(str).str.upper() == up,
+                 uni["isin"].astype(str).str.upper() == up):
         hit = uni[cond]
         if not hit.empty:
-            r = hit.iloc[0]
-            return (str(r["isin"]), str(r[sym_col]).upper(), str(r["name"]))
+            return _ret(hit.iloc[0])
+
+    # 2. whole-name substring (short inputs like "anondita medicare")
+    if 4 <= len(up) <= 40:
+        hit = uni[uni["name"].astype(str).str.upper().str.contains(
+            up, na=False, regex=False)]
+        if not hit.empty:
+            return _ret(hit.iloc[0])
+
+    # 3. scan free text for a symbol token or a distinctive name word
+    words = {w for w in re.findall(r"[A-Z0-9&]{3,}", up)
+             if w not in _QUESTION_STOP}
+    if not words:
+        return None
+    syms = {str(s).upper(): i for i, s in uni[sym_col].items()}
+    for w in words:
+        if w in syms:                       # a symbol mentioned in the sentence
+            return _ret(uni.loc[syms[w]])
+    best = None                             # longest distinctive name-word match
+    for i, nm in uni["name"].items():
+        for nw in re.findall(r"[A-Z0-9&]{4,}", str(nm).upper()):
+            if nw in _NAME_STOP:
+                continue
+            if nw in words and (best is None or len(nw) > best[0]):
+                best = (len(nw), i)
+    if best:
+        return _ret(uni.loc[best[1]])
     return None
 
 
@@ -143,36 +195,54 @@ def answer(pool, context_prompt: str, history: list[tuple[str, str]],
 
 
 def main() -> None:
-    token = " ".join(sys.argv[1:]).strip()
-    if not token:
-        token = input("Company (symbol / ISIN / name): ").strip()
     drive = get_drive()
     root = os.environ["GDRIVE_FOLDER_ID"]
-    hit = resolve(drive, root, token)
-    if not hit:
-        print(f"'{token}' not found in the universe.")
-        return
-    isin, sym, name = hit
-    print(f"Assembling everything on Drive for {sym} ({name}) ...")
-    ctx = assemble(drive, root, isin, sym, name)
-    print(f"  context: {len(ctx):,} chars. Pool: BACKFILL->DAILY->GEMINI.")
-    pool = build_pool()
-    base = SYSTEM.format(company=name, symbol=sym, context=ctx)
+    uni = _load_universe(drive, root)
+    first = " ".join(sys.argv[1:]).strip()
+    if not first:
+        first = input("Ask about a company (mention its name, e.g. "
+                      "'how is anondita doing?'): ").strip()
+
+    pool = None
+    sym = name = isin = None
+    base = ""
     history: list[tuple[str, str]] = []
-    print("Ask away (blank line or 'exit' to quit).\n")
+    pending = first                       # the first line may already be a question
+
     while True:
-        try:
-            q = input(f"[{sym}] you> ").strip()
-        except (EOFError, KeyboardInterrupt):
+        if pending is None:
+            try:
+                pending = input(f"[{sym or '?'}] you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+        msg, pending = pending, None
+        if not msg or msg.lower() in ("exit", "quit"):
             break
-        if not q or q.lower() in ("exit", "quit"):
-            break
+
+        # (re)lock the company whenever the message names a different one
+        hit = resolve(drive, root, msg, uni)
+        if hit and hit[1] != sym:
+            isin, sym, name = hit
+            print(f"\n→ {sym} ({name}) — assembling Drive context…")
+            ctx = assemble(drive, root, isin, sym, name)
+            print(f"  {len(ctx):,} chars loaded.\n")
+            base = SYSTEM.format(company=name, symbol=sym, context=ctx)
+            history = []
+        if not sym:
+            print("  Which company? Mention its name or symbol.\n")
+            continue
+
+        # if the message was only the company name, wait for the actual question
+        if msg.strip().upper() in (sym, name.upper()):
+            continue
+        if pool is None:
+            pool = build_pool()
         try:
-            a = answer(pool, base, history, q)
+            a = answer(pool, base, history, msg)
         except Exception as e:
             print(f"  (call failed: {str(e)[:100]})")
             continue
-        history.append((q, a))
+        history.append((msg, a))
         print("\n" + a.encode("ascii", "replace").decode() + "\n")
 
 
