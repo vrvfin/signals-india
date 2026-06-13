@@ -1038,6 +1038,35 @@ def phase3_block(svc, root, isin, symbol) -> str:
             parts.append("CLASSIFICATION & PEERS: " + blk.replace("\n", " "))
     except Exception:
         pass
+    # FACT row (mcap / valuation / price moves / growth) + peer medians
+    facts = _by_co(f"{P}/company_facts.parquet")
+    if not facts.empty:
+        r = facts.iloc[0]
+        def _g(k):
+            v = r.get(k)
+            if v is None or (isinstance(v, float) and v != v):
+                return "?"
+            return round(v, 1) if isinstance(v, float) else v
+        parts.append(
+            f"MARKET & FINANCIALS (latest): mcap={_g('mcap_cr')} cr | "
+            f"P/E={_g('pe')} | P/B={_g('pb')} | price ret 3m/6m/12m="
+            f"{_g('ret_3m_pct')}/{_g('ret_6m_pct')}/{_g('ret_12m_pct')}% | "
+            f"latest {_g('latest_q')}: rev={_g('rev_q')} (YoY {_g('rev_q_yoy')}%, "
+            f"QoQ {_g('rev_q_qoq')}%), PAT={_g('pat_q')} (YoY {_g('pat_q_yoy')}%), "
+            f"EPS={_g('eps_q')} (YoY {_g('eps_q_yoy')}%) | TTM rev/PAT/EPS="
+            f"{_g('rev_ttm')}/{_g('pat_ttm')}/{_g('eps_ttm')}")
+        pg = str(r.get("peer_group", "")).strip()
+        if pg:
+            pa = _read_parquet(svc, f"{P}/peer_aggregates.parquet", root)
+            if not pa.empty:
+                m = pa[(pa["level"] == "peer_group") & (pa["group"] == pg)]
+                if not m.empty:
+                    a = m.iloc[0]
+                    parts.append(
+                        f"PEER MEDIANS ({pg}, n={int(a['n'])}): "
+                        f"P/E={a.get('pe_median')} | 12m ret={a.get('ret_12m_pct_median')}% "
+                        f"| rev YoY={a.get('rev_q_yoy_median')}% | "
+                        f"PAT YoY={a.get('pat_q_yoy_median')}% — compare vs the company above")
     sc = _by_co(f"{P}/company_scorecard.parquet")
     if not sc.empty:
         r = sc.iloc[0]
