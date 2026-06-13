@@ -177,7 +177,14 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               # Phase 3 T1: enqueue origin — "live" or "backfill". Each extractor
               # drains ONLY its own rows so backfill never lands in the daily digest
               # or burns the main key pool. Blank/absent => treated as "live".
-              "source"]
+              "source",
+              # T12: natural-grain period label of the doc ("Q2FY25" concall/
+              # results/presentation, "FY24" annual_report, ISO date rating).
+              # Stamped at fetch time; used by the coverage view + supersede grain.
+              "period",
+              # T12 (reserved for Stage C): sha256 of the document bytes where
+              # available — cross-phase content identity. Blank until populated.
+              "content_sha256"]
 
 
 def load_queue(drive, index_id) -> pd.DataFrame:

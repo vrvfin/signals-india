@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import io
 import os
@@ -38,7 +39,13 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
+# T12: shared _extract.lock so this Stage-A ingester's queue write can never race a
+# backfill fetch's queue write (both rewrite processing_queue.parquet wholesale).
+from _extractor_base import acquire_lock, release_lock
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+_LOCK_NAME = "_extract.lock"
+_LOCK_MAX_AGE_MIN = 360
 
 # ============================================================
 # CONFIG — Screener announcement user-filter feeds.
@@ -256,7 +263,14 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               # so each extractor only drains its own rows (live -> daily digest +
               # main key pool; backfill -> daily_backfill digest + BACKFILL pool).
               # A blank/absent value is treated as "live" (legacy rows).
-              "source"]
+              "source",
+              # T12: natural-grain period label of the doc ("Q2FY25" concall/
+              # results/presentation, "FY24" annual_report, ISO date rating).
+              # Stamped at fetch time; used by the coverage view + supersede grain.
+              "period",
+              # T12 (reserved for Stage C): sha256 of the document bytes where
+              # available — cross-phase content identity. Blank until populated.
+              "content_sha256"]
 
 
 def load_queue(drive, index_id) -> pd.DataFrame:
@@ -321,6 +335,15 @@ def main() -> None:
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
+
+    # T12 Phase-2 safety: serialize the queue write via the global _extract.lock.
+    # On contention exit cleanly — the next scheduled run re-ingests (the feeds are
+    # a 2-day lookback, so a skipped slot loses nothing).
+    if not acquire_lock(drive, index_id, _LOCK_NAME, "ingest",
+                        max_age_min=_LOCK_MAX_AGE_MIN):
+        log("Another extraction/fetch holds _extract.lock — exiting cleanly.")
+        return
+    atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 
     queue = load_queue(drive, index_id)
     # Dedup key: (doc_id, announcement_date) — not just doc_id.

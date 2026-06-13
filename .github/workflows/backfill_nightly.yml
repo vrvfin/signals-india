@@ -130,11 +130,16 @@ jobs:
       # Every slot fetches a SMALL slice and extracts it immediately — sized so
       # each slot's pull is digested within the slot (user 2026-06-12: no PDF
       # lies around; hard 2-day retention has no pending exemption any more).
-      - name: T1 — fetch concalls from Screener/BSE (next N companies)
+      # T12: cursor-free, coverage-driven. No --start. --max-companies is the FETCH
+      # budget (covered companies self-skip via backfill_coverage.parquet, so each
+      # slot walks forward into the tail naturally). --quarters 8 = last ~2 years of
+      # concalls. AR is enabled later by adding a `--types annual_report --years N`
+      # step once concall reaches ~100% of the concall-bearing universe.
+      - name: T1 — fetch concalls from Screener/BSE (cursor-free walk)
         if: ${{ github.event_name == 'schedule' || github.event.inputs.do_fetch == 'true' }}
         run: |
           MAX=${{ github.event.inputs.max_fetch || '80' }}
-          python scripts/run_backfill.py --max-companies "$MAX" --quarters 4
+          python scripts/run_backfill.py --types concall --quarters 8 --max-companies "$MAX"
 
       # ── T1 EXTRACT (every run — drain queue until quota/deadline) ───────────
       # Deadline: minutes until 02:55 UTC (08:25 IST), so the early-morning run

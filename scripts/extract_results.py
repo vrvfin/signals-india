@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import re
 import sys
@@ -38,7 +39,14 @@ from _extractor_base import (
     extract_md_tables, clean_val, try_float, identify_metric,
     append_company_page, append_day_page,
     load_portfolio_isins,
+    acquire_lock, release_lock,
 )
+
+# T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
+# company_page.md / parquets, so a Phase-2 live run and a backfill run can never
+# write them concurrently.
+_LOCK_NAME = "_extract.lock"
+_LOCK_MAX_AGE_MIN = 360
 
 # ---- Config ----
 DOC_TYPE        = "results"
@@ -201,6 +209,15 @@ def main() -> None:
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id  = get_or_create_subfolder(drive, repo_id,   "_index")
+
+    # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
+    # On contention exit cleanly — the next run resumes (rows stay pending).
+    if not args.dry_run:
+        if not acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
+                            max_age_min=_LOCK_MAX_AGE_MIN):
+            log("  Another extraction/fetch holds _extract.lock — exiting cleanly.")
+            sys.exit(0)
+        atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 
     queue = load_queue(drive, index_id)
     pending_mask = (queue["status"] == "pending") & (queue["doc_type"] == DOC_TYPE)
