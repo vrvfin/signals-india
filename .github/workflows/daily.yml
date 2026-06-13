@@ -72,16 +72,9 @@ jobs:
         run: python scripts/build_universe.py
         continue-on-error: true
 
-      - name: Ingest OHLCV (incremental, NSE)
+      - name: Ingest OHLCV (incremental)
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_ohlcv.py
-        continue-on-error: true
-
-      # BSE-only OHLCV — incremental (1mo upsert, same as NSE) into data/ohlcv/
-      # so compute_features below covers the full NSE+BSE master_list daily.
-      - name: Ingest OHLCV (incremental, BSE-only)
-        if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/fetch_bse_only_ohlcv.py --promote
         continue-on-error: true
 
       - name: Ingest indices + macro

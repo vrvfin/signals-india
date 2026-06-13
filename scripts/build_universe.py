@@ -1,23 +1,14 @@
 """
-Stage 2a — Build the master equity universe (NSE + BSE-only).
+Stage 2a — Build the master NSE equity universe.
 
 Output (in your Google Drive `signals-india` folder):
     universe/master_list.csv             — current universe (overwritten each run)
     universe/history/master_list_YYYY-MM-DD.csv — daily snapshot
 
-UNIFIED (2026-06-13): master_list = NSE mainboard (EQUITY_L) + BSE-EXCLUSIVE
-names appended from company_repo/_index/company_universe.csv (dual-listed names
-stay NSE-primary — they already have an NSE symbol so they are not re-added).
-Every row gains:
-    exchange    NSE | BSE
-    yf_ticker   <symbol>.NS  for NSE  /  <bse_code>.BO  for BSE-only
-`symbol` is the storage key (= NSE symbol, or bse_symbol/BSE<code> for BSE-only)
-so it matches the OHLCV parquet filename. NSE rows are UNCHANGED (additive).
-OHLCV for NSE comes from ingest_ohlcv.py; for BSE-only from
-fetch_bse_only_ohlcv.py --promote. compute_features iterates this unified list.
-
 Run from project root, inside the `signals-india` conda env:
     python scripts/build_universe.py
+
+BSE coverage is intentionally not in this script — added in 2a.2 once NSE flow is verified.
 """
 
 from __future__ import annotations
@@ -92,62 +83,8 @@ def fetch_nse_equity_list() -> pd.DataFrame:
     df = df[df["series"].isin(KEEP_SERIES)].copy()
     log(f"Series filter: {before} → {len(df)} symbols "
         f"(kept {sorted(KEEP_SERIES)})")
-    df["yf_ticker"] = df["symbol"].astype(str).str.strip() + ".NS"
-    cols = ["symbol", "exchange", "name", "isin", "series", "listing_date",
-            "yf_ticker"]
+    cols = ["symbol", "exchange", "name", "isin", "series", "listing_date"]
     return df[cols].reset_index(drop=True)
-
-
-def _bse_storage_key(bse_symbol: str, bse_code: str) -> str:
-    """MUST match fetch_bse_only_ohlcv._storage_key so the parquet filename
-    lines up with the master_list symbol."""
-    s = str(bse_symbol).strip()
-    if s and s.lower() != "nan":
-        return s.upper()
-    return f"BSE{str(bse_code).strip()}"
-
-
-def fetch_bse_only_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFrame:
-    """BSE-EXCLUSIVE rows (have bse_code, no NSE symbol, ISIN not already on
-    the NSE list) from company_universe.csv, shaped for master_list."""
-    cols = ["symbol", "exchange", "name", "isin", "series", "listing_date",
-            "yf_ticker"]
-    try:
-        repo = get_or_create_subfolder(drive, folder_id, "company_repo")
-        idx = get_or_create_subfolder(drive, repo, "_index")
-        q = (f"name='company_universe.csv' and '{idx}' in parents "
-             f"and trashed=false")
-        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
-        if not files:
-            log("  company_universe.csv not found — BSE-only names skipped.")
-            return pd.DataFrame(columns=cols)
-        raw = drive.files().get_media(fileId=files[0]["id"]).execute()
-        uni = pd.read_csv(io.BytesIO(raw)).fillna("")
-    except Exception as e:
-        log(f"  BSE-only fetch failed ({str(e)[:80]}) — skipped.")
-        return pd.DataFrame(columns=cols)
-    nse_sym = uni["nse_symbol"].astype(str).str.strip()
-    code = uni["bse_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-    isin = uni["isin"].astype(str).str.strip()
-    mask = (nse_sym.isin(["", "nan"]) & ~code.isin(["", "nan"])
-            & ~isin.isin(nse_isins))
-    bse = uni[mask].copy()
-    if bse.empty:
-        return pd.DataFrame(columns=cols)
-    bse["bse_code"] = code[mask].values
-    out = pd.DataFrame({
-        "symbol": [_bse_storage_key(s, c) for s, c in
-                   zip(bse.get("bse_symbol", ""), bse["bse_code"])],
-        "exchange": "BSE",
-        "name": bse["name"].astype(str).str.strip(),
-        "isin": bse["isin"].astype(str).str.strip(),
-        "series": "",
-        "listing_date": "",
-        "yf_ticker": bse["bse_code"].astype(str) + ".BO",
-    })
-    out = out[out["symbol"].astype(str).str.len() > 0].drop_duplicates("symbol")
-    log(f"  BSE-only appended: {len(out)}")
-    return out[cols].reset_index(drop=True)
 
 
 def get_or_create_subfolder(drive, parent_id: str, name: str) -> str:
@@ -176,25 +113,18 @@ def upload_csv(drive, df: pd.DataFrame, folder_id: str, filename: str) -> str:
 
 
 def main() -> None:
-    print("Stage 2a — Build universe (NSE + BSE-only)")
+    print("Stage 2a — Build universe (NSE)")
     print("-" * 50)
     df = fetch_nse_equity_list()
     log(f"NSE symbols ready: {len(df)}")
+    print("\nSeries breakdown:")
+    print(df["series"].value_counts().to_string())
+    print("\nFirst 5 rows:")
+    print(df.head().to_string(index=False))
+    print()
 
     drive = get_drive_service()
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
-
-    nse_isins = set(df["isin"].astype(str).str.strip())
-    bse = fetch_bse_only_rows(drive, folder_id, nse_isins)
-    if not bse.empty:
-        df = pd.concat([df, bse], ignore_index=True)
-    log(f"Unified universe: {len(df)} "
-        f"(NSE {int((df['exchange'] == 'NSE').sum())} + "
-        f"BSE-only {int((df['exchange'] == 'BSE').sum())})")
-    print("\nFirst 3 rows:")
-    print(df.head(3).to_string(index=False))
-    print()
-
     universe_id = get_or_create_subfolder(drive, folder_id, "universe")
     history_id = get_or_create_subfolder(drive, universe_id, "history")
 
@@ -205,7 +135,7 @@ def main() -> None:
     log(f"Uploaded universe/history/master_list_{today}.csv")
 
     print("-" * 50)
-    print(f"Done. {len(df)} symbols in master_list.csv.")
+    print(f"Done. {len(df)} NSE symbols in master_list.csv.")
 
 
 if __name__ == "__main__":

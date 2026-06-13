@@ -45,19 +45,5 @@ jobs:
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
           } > .env
 
-      - name: Build universe (NSE+BSE full master)
+      - name: Build universe
         run: python scripts/build_company_universe.py
-
-      # Refresh the unified master_list (NSE + BSE-only, exchange + yf_ticker)
-      # so the daily Phase-1 picks up new listings.
-      - name: Rebuild unified master_list
-        run: python scripts/build_universe.py
-        continue-on-error: true
-
-      # BSE-only OHLCV — WEEKLY BACKFILL (full 2y) so newly-listed BSE names get
-      # full history (12m returns). daily.yml then keeps them fresh with the
-      # cheap 1mo incremental upsert (same pattern as NSE).
-      - name: Backfill BSE-only OHLCV (full 2y, promote)
-        run: >
-          python scripts/fetch_bse_only_ohlcv.py --promote --backfill
-          --min-rows 120 || true
