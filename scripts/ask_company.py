@@ -142,6 +142,13 @@ def assemble(drive, root, isin: str, sym: str, name: str) -> str:
             parts.append("## COMPANY PAGE (all summarised documents)\n"
                          + page[-MAX_PAGE_CHARS:])
     try:
+        import build_classification as bcl
+        blk = bcl.classification_block(drive, root, isin, sym)
+        if blk != "DATA_MISSING":
+            parts.append("## CLASSIFICATION & PEERS\n" + blk)
+    except Exception:
+        pass
+    try:
         import company_deep_report as cdr
         parts.append("## QUANT SNAPSHOT (nightly pipelines)\n"
                      + cdr.phase3_block(drive, root, isin, sym))

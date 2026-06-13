@@ -1031,6 +1031,13 @@ def phase3_block(svc, root, isin, symbol) -> str:
 
     P = "company_repo/_index"
     parts = []
+    try:
+        import build_classification as bcl
+        blk = bcl.classification_block(svc, root, isin, sym)
+        if blk != "DATA_MISSING":
+            parts.append("CLASSIFICATION & PEERS: " + blk.replace("\n", " "))
+    except Exception:
+        pass
     sc = _by_co(f"{P}/company_scorecard.parquet")
     if not sc.empty:
         r = sc.iloc[0]
