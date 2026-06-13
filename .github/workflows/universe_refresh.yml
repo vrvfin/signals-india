@@ -2,13 +2,15 @@ name: Universe Refresh
 
 # Rebuilds universe/master_list.csv and company_repo/_index/company_universe.csv
 # from NSE + BSE scrip APIs, then does the full 2y BSE-only OHLCV backfill.
-# Runs once daily (03:00 IST) + on manual dispatch. The full backfill of
-# ~2,635 BSE-only names takes ~2.5h; concurrency (below) queues a new trigger
-# behind any run still in progress so they never overlap.
+# Runs weekly (Sunday 03:00 IST) + on manual dispatch — same cadence as the
+# original NSE universe refresh. The full backfill of ~2,635 BSE-only names
+# takes ~2.5h; concurrency (below) queues a new trigger behind any run still
+# in progress so they never overlap. The daily Phase-1 (daily.yml, Mon-Fri
+# 16:00 IST) keeps BSE prices fresh via the cheap 1mo incremental in between.
 
 on:
   schedule:
-    - cron: "30 21 * * *"    # 21:30 UTC daily = 03:00 IST
+    - cron: "30 21 * * 0"    # 21:30 UTC Sunday = 03:00 IST Monday
   workflow_dispatch:          # manual trigger anytime
 
 # Serialize: if a run is still going, the next trigger WAITS (does not overlap
