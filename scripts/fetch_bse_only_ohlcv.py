@@ -91,6 +91,27 @@ def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
     return f[keep].dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
 
+def _merge_existing(drive, folder_id: str, key: str,
+                    new_df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Upsert new rows into the existing <key>.parquet (incremental, like
+    ingest_ohlcv.merge_and_upload) — preserves history so a short --period
+    fetch doesn't wipe it. Returns (merged_df, existing_file_id)."""
+    fid = find_file(drive, folder_id, f"{key}.parquet")
+    if not fid:
+        return new_df, None
+    try:
+        old = pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
+        old["date"] = pd.to_datetime(old["date"])
+        new_df = new_df.copy()
+        new_df["date"] = pd.to_datetime(new_df["date"])
+        merged = (pd.concat([old, new_df], ignore_index=True)
+                  .drop_duplicates(subset=["date"], keep="last")
+                  .sort_values("date").reset_index(drop=True))
+        return merged, fid
+    except Exception:
+        return new_df, fid
+
+
 def _fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
     """ticker(<code>.BO) -> normalized frame. Mirrors ingest_ohlcv batch logic."""
     if not tickers:
@@ -127,7 +148,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="Pilot: first N names.")
     ap.add_argument("--batch", type=int, default=40)
-    ap.add_argument("--period", type=str, default="1y")
+    ap.add_argument("--period", type=str, default=None,
+                    help="yfinance period (default: 1mo incremental, 2y if --backfill).")
+    ap.add_argument("--backfill", action="store_true",
+                    help="Full 2y history (initial seed); else 1mo incremental upsert.")
     ap.add_argument("--promote", action="store_true",
                     help="Copy validated parquets into the LIVE data/ohlcv/ "
                          "(run only after reviewing coverage).")
@@ -135,6 +159,7 @@ def main() -> None:
                     help="Min rows to count as usable / to promote.")
     args = ap.parse_args()
 
+    period = args.period or ("2y" if args.backfill else "1mo")
     drive = get_drive()
     bse = _bse_only(drive)
     if bse.empty:
@@ -142,7 +167,8 @@ def main() -> None:
         return
     if args.limit:
         bse = bse.head(args.limit)
-    log(f"BSE-only names to fetch: {len(bse)}  (period={args.period}, "
+    log(f"BSE-only names to fetch: {len(bse)}  (period={period}, "
+        f"{'BACKFILL' if args.backfill else 'incremental'}, "
         f"mode={'PROMOTE' if args.promote else 'TEST'})")
 
     bse_fid = _folder(drive, OHLCV_BSE)
@@ -156,7 +182,7 @@ def main() -> None:
     cov, ok, nodata, promoted = [], 0, 0, 0
     for i in range(0, len(tickers), args.batch):
         chunk = tickers[i:i + args.batch]
-        fetched = _fetch_batch(chunk, args.period)
+        fetched = _fetch_batch(chunk, period)
         for tk in chunk:
             r = tk_to_row[tk]
             key = _storage_key(r)
@@ -170,20 +196,25 @@ def main() -> None:
                             "first_date": "", "last_date": ""})
                 nodata += 1
                 continue
-            data = frame.to_parquet(index=False)
-            upload_bytes(drive, bse_fid, f"{key}.parquet", data,
-                         "application/octet-stream",
-                         existing_id=find_file(drive, bse_fid, f"{key}.parquet"))
-            if args.promote and len(frame) >= args.min_rows:
-                upload_bytes(drive, live_fid, f"{key}.parquet", data,
-                             "application/octet-stream",
-                             existing_id=find_file(drive, live_fid, f"{key}.parquet"))
+            # incremental upsert into the test parquet (preserves history)
+            merged, ex_bse = _merge_existing(drive, bse_fid, key, frame)
+            upload_bytes(drive, bse_fid, f"{key}.parquet",
+                         merged.to_parquet(index=False),
+                         "application/octet-stream", existing_id=ex_bse)
+            total = len(merged)
+            if args.promote and total >= args.min_rows:
+                # merge against the LIVE parquet too, then write back
+                lmerged, ex_live = _merge_existing(drive, live_fid, key, frame)
+                upload_bytes(drive, live_fid, f"{key}.parquet",
+                             lmerged.to_parquet(index=False),
+                             "application/octet-stream", existing_id=ex_live)
+                total = len(lmerged)
                 promoted += 1
             cov.append({**base,
-                        "status": "ok" if len(frame) >= args.min_rows else "thin",
-                        "rows": len(frame),
-                        "first_date": str(frame["date"].min())[:10],
-                        "last_date": str(frame["date"].max())[:10]})
+                        "status": "ok" if total >= args.min_rows else "thin",
+                        "rows": total,
+                        "first_date": str(merged["date"].min())[:10],
+                        "last_date": str(merged["date"].max())[:10]})
             ok += 1
         log(f"  {min(i + args.batch, len(tickers))}/{len(tickers)} "
             f"(ok={ok} no_data={nodata})")

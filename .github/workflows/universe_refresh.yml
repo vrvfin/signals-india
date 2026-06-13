@@ -54,10 +54,10 @@ jobs:
         run: python scripts/build_universe.py
         continue-on-error: true
 
-      # BSE-only OHLCV -> data/ohlcv/ (weekly; BSE-only are slow-moving micro
-      # names). NSE OHLCV stays daily via daily.yml. --period 2y so 12m returns
-      # compute. TODO: make incremental for a daily cadence later.
-      - name: Fetch BSE-only OHLCV (promote into live pipeline)
+      # BSE-only OHLCV — WEEKLY BACKFILL (full 2y) so newly-listed BSE names get
+      # full history (12m returns). daily.yml then keeps them fresh with the
+      # cheap 1mo incremental upsert (same pattern as NSE).
+      - name: Backfill BSE-only OHLCV (full 2y, promote)
         run: >
-          python scripts/fetch_bse_only_ohlcv.py --promote --period 2y
+          python scripts/fetch_bse_only_ohlcv.py --promote --backfill
           --min-rows 120 || true
