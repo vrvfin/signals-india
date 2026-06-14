@@ -54,8 +54,8 @@ on:
         type: boolean
         default: false
       max_fetch:
-        description: "Companies to fetch (default 80/slot x 5 slots = 400/night)"
-        default: "80"
+        description: "Companies to fetch per slot (scheduled default: 40; 6 slots/day = ~240/day)"
+        default: "40"
       do_t2_full:
         description: "T2: full 3-statement scrape (not just today's reporters)"
         type: boolean
