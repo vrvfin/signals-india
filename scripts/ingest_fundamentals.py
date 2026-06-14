@@ -217,6 +217,14 @@ def main():
             log(f"  [{i}/{len(work)}] ok={len(rows)} fail={fail_count} "
                 f"rate {rate:.2f}/s | ETA {eta:.1f}m")
 
+        # Checkpoint: flush summary.parquet periodically so a truncated run (cookie
+        # expiry, runner hiccup, local restart) still persists partial progress
+        # instead of losing everything — summary is otherwise only written at the end.
+        if i % 500 == 0 and rows and not args.dry_run:
+            upload_parquet(drive, fund_id, "summary.parquet", pd.DataFrame(rows),
+                           find_file(drive, fund_id, "summary.parquet"))
+            log(f"  [checkpoint] summary.parquet flushed ({len(rows)} rows)")
+
     if rows and not args.dry_run:
         summary_df = pd.DataFrame(rows)
         upload_parquet(drive, fund_id, "summary.parquet", summary_df,
