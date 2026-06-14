@@ -67,7 +67,10 @@ jobs:
       # BSE-only OHLCV — WEEKLY BACKFILL (full 2y) so newly-listed BSE names get
       # full history (12m returns). daily.yml then keeps them fresh with the
       # cheap 1mo incremental upsert (same pattern as NSE).
+      # --skip-complete: names already complete in live data/ohlcv/ are skipped,
+      # so this weekly job only pulls 2y for NEW listings (after the initial seed
+      # it goes from ~1.5h to minutes).
       - name: Backfill BSE-only OHLCV (full 2y, promote)
         run: >
           python scripts/fetch_bse_only_ohlcv.py --promote --backfill
-          --min-rows 120 || true
+          --skip-complete --min-rows 120 || true

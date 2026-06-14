@@ -182,6 +182,9 @@ def main() -> None:
     ap.add_argument("--live-only", action="store_true",
                     help="Daily/BAU path: write ONLY the live data/ohlcv/ folder "
                          "(skip the data/ohlcv_bse/ staging copy). Halves Drive I/O.")
+    ap.add_argument("--skip-complete", action="store_true",
+                    help="Backfill: skip names that already have a live parquet "
+                         "(complete) — only (re)fetch new/thin/no-data names.")
     args = ap.parse_args()
 
     period = args.period or ("2y" if args.backfill else "1mo")
@@ -202,6 +205,20 @@ def main() -> None:
     # Pre-list each folder ONCE so the loop never calls find_file per name.
     live_index = _list_folder(drive, live_fid) if live_fid else {}
     bse_index = _list_folder(drive, bse_fid) if write_stage else {}
+
+    # --skip-complete: a name with a live parquet already passed the >= min-rows
+    # promote gate, so its 2y history is complete — skip re-fetching it. Only new
+    # listings + previously thin/no-data names remain. (Daily incremental keeps
+    # the complete ones fresh.) Needs the live index, so requires --promote.
+    if args.backfill and args.skip_complete and live_fid:
+        before = len(bse)
+        keep = ~bse.apply(lambda r: f"{_storage_key(r)}.parquet" in live_index, axis=1)
+        bse = bse[keep].reset_index(drop=True)
+        log(f"skip-complete: skipped {before - len(bse)} names already complete "
+            f"in live; {len(bse)} new/incomplete to fetch")
+        if bse.empty:
+            log("Nothing new to backfill — all names already complete.")
+            return
 
     # ticker -> row mapping
     rows = bse.to_dict("records")
