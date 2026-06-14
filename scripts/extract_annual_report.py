@@ -42,7 +42,7 @@ from _extractor_base import (
     extract_md_tables, clean_val, try_float, identify_metric,
     append_company_page, append_day_page,
     load_portfolio_isins,
-    acquire_lock, release_lock,
+    acquire_lock, release_lock, phase2_beacon_fresh,
 )
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
@@ -276,12 +276,18 @@ def main() -> None:
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id  = get_or_create_subfolder(drive, repo_id,   "_index")
 
-    # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
-    # On contention exit cleanly — the next run resumes (rows stay pending).
+    # T12 lock + priority: --all-companies is the backfill (T8) path → yield to
+    # Phase 2; the PF path is Phase 2 itself → wait up to 15 min for the lock.
+    _is_backfill = args.all_companies
     if not args.dry_run:
-        if not acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
-                            max_age_min=_LOCK_MAX_AGE_MIN):
-            log("  Another extraction/fetch holds _extract.lock — exiting cleanly.")
+        if _is_backfill:
+            got = acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
+                               max_age_min=_LOCK_MAX_AGE_MIN, defer_to_phase2=True)
+        else:
+            got = acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
+                               max_age_min=_LOCK_MAX_AGE_MIN, wait_min=15)
+        if not got:
+            log("  Lock unavailable (yielded to Phase 2 / timed out) — exiting cleanly.")
             sys.exit(0)
         atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 
@@ -319,6 +325,11 @@ def main() -> None:
     counts = {"processed": 0, "error": 0, "skipped": 0}
 
     for queue_idx in pending_idx:
+        # Priority yield: a backfill run steps aside the moment Phase 2 wants the
+        # lock — finishes the current doc loop iteration boundary and exits cleanly.
+        if _is_backfill and not args.dry_run and phase2_beacon_fresh(drive, index_id):
+            log("  Phase 2 became active — yielding lock, exiting cleanly.")
+            break
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
         log(f"Processing: {label}")

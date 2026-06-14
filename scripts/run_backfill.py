@@ -363,9 +363,10 @@ def main() -> None:
     # On contention exit cleanly — the next slot retries (cursor-free: no progress
     # lost). Released on process exit via atexit.
     if not args.dry_run and not args.no_lock:
+        # Backfill is low priority: yield immediately if Phase 2 is active.
         if not acquire_lock(drive, index_id, _LOCK_NAME, "run_backfill",
-                            max_age_min=_LOCK_MAX_AGE_MIN):
-            log("Another extraction/fetch holds _extract.lock — exiting cleanly.")
+                            max_age_min=_LOCK_MAX_AGE_MIN, defer_to_phase2=True):
+            log("Phase 2 active or lock held — exiting cleanly.")
             sys.exit(0)
         atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 

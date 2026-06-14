@@ -213,9 +213,11 @@ def main() -> None:
     # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
     # On contention exit cleanly — the next run resumes (rows stay pending).
     if not args.dry_run:
+        # Phase-2 priority: wait up to 15 min for the lock (backfill yields to us
+        # within ~one document) instead of skipping the slot on contention.
         if not acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
-                            max_age_min=_LOCK_MAX_AGE_MIN):
-            log("  Another extraction/fetch holds _extract.lock — exiting cleanly.")
+                            max_age_min=_LOCK_MAX_AGE_MIN, wait_min=15):
+            log("  Lock unavailable after wait — exiting cleanly.")
             sys.exit(0)
         atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 

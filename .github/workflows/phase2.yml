@@ -123,6 +123,14 @@ jobs:
             echo "GEMINI_API_KEY_$i=$line" >> .env
           done
 
+      # ── Phase-2 priority beacon (T12) ───────────────────────────────────
+      # Raise it before any processing so a concurrently-running backfill steps
+      # aside from the shared _extract.lock for this whole job; cleared at the end.
+      - name: Raise Phase 2 priority beacon
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/phase2_beacon.py set
+        continue-on-error: true
+
       - name: Ingest company docs
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_company_docs.py
@@ -166,4 +174,13 @@ jobs:
       - name: Write Phase 2 status
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/write_phase2_status.py
+        continue-on-error: true
+
+      # ── Lower the Phase-2 priority beacon (T12) ─────────────────────────
+      # always() so the beacon is cleared even if a step above failed — but not
+      # on a skipped run (it never raised the beacon). Without this it would go
+      # stale on its own in ~20 min; clearing it lets backfill resume immediately.
+      - name: Lower Phase 2 priority beacon
+        if: always() && steps.fresh.outputs.skip != 'true'
+        run: python scripts/phase2_beacon.py clear
         continue-on-error: true

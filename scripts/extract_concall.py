@@ -55,7 +55,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
                          load_keys)
-from _extractor_base import P1_MODELS   # lite chain — backfill-only fallback
+from _extractor_base import (P1_MODELS,   # lite chain — backfill-only fallback
+                             acquire_lock, release_lock, phase2_beacon_fresh)
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -229,37 +230,20 @@ LOCK_MAX_AGE_MIN = 360   # 6h — long enough for a big backfill night run
 
 
 def acquire_extract_lock(drive, index_id, mode: str) -> bool:
-    """Try to claim the extractor lock. Returns True on success.
-
-    A fresh lock owned by another run blocks acquisition; a lock older than
-    LOCK_MAX_AGE_MIN is considered stale and stolen."""
-    fid = find_file(drive, index_id, _LOCK_NAME)
-    if fid:
-        try:
-            content = download_bytes(drive, fid).decode("utf-8", errors="replace")
-            ts_str = content.split("|", 2)[1] if "|" in content else ""
-            ts = datetime.fromisoformat(ts_str) if ts_str else None
-            age_min = ((datetime.now() - ts).total_seconds() / 60.0) if ts else 1e9
-            if age_min < LOCK_MAX_AGE_MIN:
-                log(f"  LOCK held by '{content.split('|')[0]}' "
-                    f"({age_min:.0f} min old) — another extraction is running. "
-                    f"Exiting cleanly; will resume next run.")
-                return False
-            log(f"  LOCK is stale ({age_min:.0f} min) — stealing it.")
-        except Exception as e:
-            log(f"  LOCK read failed ({str(e)[:60]}) — overwriting.")
-    payload = f"{mode}|{datetime.now().isoformat(timespec='seconds')}".encode("utf-8")
-    upload_bytes(drive, index_id, _LOCK_NAME, payload, "text/plain", existing_id=fid)
-    return True
+    """Claim the extractor lock with Phase-2 priority (T12). Delegates to the
+    shared _extractor_base.acquire_lock:
+      • mode='live'     (Phase 2)  → wait up to 15 min for the lock;
+      • mode='backfill' (backfill) → yield immediately if Phase 2 is active.
+    Stale locks (> LOCK_MAX_AGE_MIN) are auto-stolen as before."""
+    if mode == "backfill":
+        return acquire_lock(drive, index_id, _LOCK_NAME, mode,
+                            max_age_min=LOCK_MAX_AGE_MIN, defer_to_phase2=True)
+    return acquire_lock(drive, index_id, _LOCK_NAME, mode,
+                        max_age_min=LOCK_MAX_AGE_MIN, wait_min=15)
 
 
 def release_extract_lock(drive, index_id) -> None:
-    try:
-        fid = find_file(drive, index_id, _LOCK_NAME)
-        if fid:
-            drive.files().delete(fileId=fid).execute()
-    except Exception as e:
-        log(f"  LOCK release failed ({str(e)[:60]}) — will be auto-stolen later.")
+    release_lock(drive, index_id, _LOCK_NAME)
 
 
 # ------------------------------------------------------------------ #
@@ -1614,6 +1598,12 @@ def main() -> None:
     run_time = datetime.now().strftime("%H:%M IST")
 
     for queue_idx in pending_idx:
+        # Priority yield (T12): a backfill run steps aside the moment Phase 2 wants
+        # the lock — between documents, so Phase 2 acquires within ~one doc (~75 s).
+        if args.backfill and not args.dry_run and not args.no_lock \
+                and phase2_beacon_fresh(drive, index_id):
+            log("  Phase 2 became active — yielding lock, exiting cleanly.")
+            break
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
         log(f"Processing: {label}")

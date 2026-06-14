@@ -504,38 +504,104 @@ def load_api_keys() -> list[str]:
 #  max_age_min (crashed run). Acquire returns True on success.        #
 # ------------------------------------------------------------------ #
 
+# ------------------------------------------------------------------ #
+#  PHASE-2 PRIORITY BEACON                                            #
+#  Phase 2 (high priority) drops this marker while it wants the lock; #
+#  backfill (low priority) sees it and steps aside — at acquire time  #
+#  AND between documents — so Phase 2 always wins within ~one doc.    #
+# ------------------------------------------------------------------ #
+_PHASE2_BEACON = "_phase2_active"
+PHASE2_BEACON_MAX_AGE_MIN = 20   # stale (crashed Phase 2) after this → ignored
+
+
+def set_phase2_beacon(drive, index_id: str) -> None:
+    """Announce 'Phase 2 wants the lock'. Idempotent; refreshes the timestamp."""
+    try:
+        fid = find_file(drive, index_id, _PHASE2_BEACON)
+        payload = datetime.now().isoformat(timespec="seconds").encode("utf-8")
+        upload_bytes(drive, index_id, _PHASE2_BEACON, payload, "text/plain",
+                     existing_id=fid)
+    except Exception as e:
+        log(f"  BEACON set failed ({str(e)[:60]}) — continuing.")
+
+
+def clear_phase2_beacon(drive, index_id: str) -> None:
+    try:
+        fid = find_file(drive, index_id, _PHASE2_BEACON)
+        if fid:
+            drive.files().delete(fileId=fid).execute()
+    except Exception as e:
+        log(f"  BEACON clear failed ({str(e)[:60]}) — will go stale on its own.")
+
+
+def phase2_beacon_fresh(drive, index_id: str,
+                        max_age_min: int = PHASE2_BEACON_MAX_AGE_MIN) -> bool:
+    """True if Phase 2 has a fresh active beacon (so backfill should step aside)."""
+    try:
+        fid = find_file(drive, index_id, _PHASE2_BEACON)
+        if not fid:
+            return False
+        ts_str = download_bytes(drive, fid).decode("utf-8", errors="replace").strip()
+        ts = datetime.fromisoformat(ts_str) if ts_str else None
+        if not ts:
+            return False
+        return (datetime.now() - ts).total_seconds() / 60.0 < max_age_min
+    except Exception:
+        return False                                 # fail-open: don't block backfill
+
+
 def acquire_lock(drive, index_id: str, lock_name: str, owner: str,
-                 max_age_min: int = 180, grace_sec: int = 8) -> bool:
+                 max_age_min: int = 180, grace_sec: int = 8,
+                 wait_min: float = 0.0, defer_to_phase2: bool = False) -> bool:
     """Claim the shared lock; return False if another process holds it.
 
+    Priority coordination (T12):
+      • defer_to_phase2 (backfill callers): if Phase 2 has a fresh beacon, yield the
+        lock immediately so Phase 2 can take it.
+      • wait_min > 0 (Phase 2 callers): announce the beacon and POLL for the lock up
+        to wait_min minutes before giving up — backfill yields within ~one document,
+        so Phase 2 normally acquires in well under 2 min; wait_min is just the cap.
+
     A genuinely-held lock persists; a just-released one disappears once Drive's
-    file-list index settles. So when we see a FRESH foreign lock we pause once for
-    `grace_sec` and re-check before yielding — that absorbs the hand-off lag when a
-    previous sequential step (e.g. extract_concall) released the lock moments ago,
-    without weakening mutual exclusion against a truly concurrent holder (which is
-    still there after the grace). Uncontended acquires (no lock file) pay nothing."""
+    file-list index settles, so a fresh foreign lock is re-checked after a short nap
+    before yielding (absorbs sequential hand-off lag). Uncontended acquires pay
+    nothing."""
+    if defer_to_phase2 and phase2_beacon_fresh(drive, index_id):
+        log(f"  Phase 2 active — '{owner}' yields {lock_name}, exiting cleanly.")
+        return False
+    if wait_min > 0:
+        set_phase2_beacon(drive, index_id)           # backfill, step aside
+
+    deadline = time.time() + max(wait_min * 60.0, float(grace_sec))
     fid = None
-    for attempt in (1, 2):
+    while True:
         fid = find_file(drive, index_id, lock_name)
         if not fid:
-            break                                   # free — acquire below
+            break                                    # free — acquire below
         try:
             content = download_bytes(drive, fid).decode("utf-8", errors="replace")
             ts_str = content.split("|", 2)[1] if "|" in content else ""
             ts = datetime.fromisoformat(ts_str) if ts_str else None
             age_min = ((datetime.now() - ts).total_seconds() / 60.0) if ts else 1e9
-            if age_min < max_age_min:
-                if attempt == 1 and grace_sec > 0:
-                    time.sleep(grace_sec)
-                    continue                         # re-check: may have been released
-                log(f"  LOCK {lock_name} held by '{content.split('|')[0]}' "
-                    f"({age_min:.0f} min) — exiting cleanly.")
-                return False
-            log(f"  LOCK {lock_name} stale ({age_min:.0f} min) — stealing.")
-            break
         except Exception as e:
             log(f"  LOCK {lock_name} read failed ({str(e)[:60]}) — overwriting.")
             break
+        if age_min >= max_age_min:
+            log(f"  LOCK {lock_name} stale ({age_min:.0f} min) — stealing.")
+            break
+        now = time.time()
+        if now < deadline:
+            if wait_min > 0:
+                set_phase2_beacon(drive, index_id)   # keep announcing while we wait
+                log(f"  LOCK {lock_name} held by '{content.split('|')[0]}' "
+                    f"({age_min:.0f} min) — Phase 2 waiting…")
+                time.sleep(min(30.0, max(1.0, deadline - now)))
+            else:
+                time.sleep(min(float(grace_sec), max(0.5, deadline - now)))
+            continue                                 # re-check
+        log(f"  LOCK {lock_name} held by '{content.split('|')[0]}' "
+            f"({age_min:.0f} min) — exiting cleanly.")
+        return False
     payload = f"{owner}|{datetime.now().isoformat(timespec='seconds')}".encode("utf-8")
     upload_bytes(drive, index_id, lock_name, payload, "text/plain", existing_id=fid)
     return True

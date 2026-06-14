@@ -339,9 +339,11 @@ def main() -> None:
     # T12 Phase-2 safety: serialize the queue write via the global _extract.lock.
     # On contention exit cleanly — the next scheduled run re-ingests (the feeds are
     # a 2-day lookback, so a skipped slot loses nothing).
+    # Phase-2 priority: wait up to 15 min for the lock (backfill yields to us
+    # within ~one document) instead of skipping the ingest on contention.
     if not acquire_lock(drive, index_id, _LOCK_NAME, "ingest",
-                        max_age_min=_LOCK_MAX_AGE_MIN):
-        log("Another extraction/fetch holds _extract.lock — exiting cleanly.")
+                        max_age_min=_LOCK_MAX_AGE_MIN, wait_min=15):
+        log("Lock unavailable after wait — exiting cleanly.")
         return
     atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 
