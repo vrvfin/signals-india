@@ -317,6 +317,12 @@ def main() -> None:
     ap.add_argument("--max-companies", type=int, default=0,
                     help="Cap companies actually FETCHED this run (0 = no cap). "
                          "Covered companies self-skip and do NOT count against it.")
+    ap.add_argument("--target-pending", type=int, default=0,
+                    help="Fill-to-target throttle (0 = off). Per doc_type: if the "
+                         "queue already holds >= this many pending backfill docs, "
+                         "skip fetching that type; otherwise fetch only enough to "
+                         "reach the target. Keeps fetch paced to extract capacity "
+                         "so PDFs never age out before summarising.")
     ap.add_argument("--refetch-days", type=int, default=30,
                     help="Skip a covered company's page if fetched within this many "
                          "days (default 30). New quarters are caught by the live feed.")
@@ -392,9 +398,16 @@ def main() -> None:
     # dry-run). This is what makes the walk cursor-free: covered (company,doc_type)
     # pairs self-skip, so each run spends its --max-companies budget on the tail.
     cov_index: dict = {}
+    pending_by_type: dict = {}        # doc_type -> count of pending backfill rows
     try:
-        cov_index = coverage_lookup(build_coverage(load_queue(drive, index_id)))
+        _q = load_queue(drive, index_id)
+        cov_index = coverage_lookup(build_coverage(_q))
         log(f"Coverage view: {len(cov_index)} (company,doc_type) pairs known.")
+        if not _q.empty and args.target_pending:
+            _src = _q["source"].astype(str).str.strip().str.lower()
+            _pend = _q[(_q["status"].astype(str) == "pending") & _src.eq("backfill")]
+            pending_by_type = (_pend["doc_type"].astype(str)
+                               .value_counts().to_dict())
     except Exception as _e:
         log(f"  WARNING: could not build coverage view ({str(_e)[:80]}) — "
             f"treating all as uncovered.")
@@ -415,10 +428,26 @@ def main() -> None:
             break
         floor = _since_for(doc_type, args)
         log(f"=== {doc_type}: since-floor {floor or '(all history)'} ===")
+        # Fill-to-target throttle: don't fetch past what extraction can drain.
+        budget_docs = None
+        if args.target_pending and not force_explicit:
+            cur_pending = int(pending_by_type.get(doc_type, 0))
+            if cur_pending >= args.target_pending:
+                log(f"  {doc_type}: {cur_pending} pending >= target-pending "
+                    f"{args.target_pending} — skip fetch (extractor drains instead).")
+                continue
+            budget_docs = args.target_pending - cur_pending
+            log(f"  {doc_type}: {cur_pending} pending; fetch up to ~{budget_docs} "
+                f"more docs to reach target {args.target_pending}.")
+        added_docs = 0
         for co in companies:
             if cap and fetched >= cap:
                 log(f"  reached --max-companies={cap} — stopping walk.")
                 stop = True
+                break
+            if budget_docs is not None and added_docs >= budget_docs:
+                log(f"  {doc_type}: reached target-pending (+{added_docs} docs) "
+                    f"— stop fetching this type.")
                 break
             sym, isin, name = co["symbol"], co["isin"], co["name"]
             key = isin if isin else sym
@@ -446,6 +475,7 @@ def main() -> None:
             totals["fetched"] += 1
             for k in ("found", "new", "downloaded", "dup", "download_fail"):
                 totals[k] += int(counts.get(k, 0))
+            added_docs += int(counts.get("new", 0))   # fill-to-target accounting
             if args.sleep:
                 time.sleep(args.sleep)
 

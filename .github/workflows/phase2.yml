@@ -2,18 +2,18 @@ name: Phase 2 — Company Intelligence
 
 # ── Seasonal run strategy ──────────────────────────────────────────────────
 #
-# India Q-end results seasons (heavy concall upload periods):
-#   Q3 FY:  17 Jan – 28 Feb   |  Q4 FY: 17 Apr – 30 May (60-day season)
-#   Q1 FY:  17 Jul – 30 Aug   |  Q2 FY: 17 Oct – 30 Nov
+# India Q-end results seasons (heavy concall upload periods) — see seasons.py:
+#   Q3 FY:  15 Jan – 1 Mar    |  Q4 FY: 15 Apr – 14 Jun (60-day annual season)
+#   Q1 FY:  15 Jul – 29 Aug   |  Q2 FY: 15 Oct – 29 Nov
 #
 # This file carries the PEAK schedule (maximum slots).
 # pipeline_skip_check.py reads today's date and suppresses extra runs in
-# off-season, leaving only 3 runs/day near IST 08:00 / 14:00 / 20:00.
+# off-season, leaving only 3 runs/day near IST 09:00 / 14:00 / 20:00.
 #
 # Effective run counts (skip_check enforced):
-#   Peak weekday  : 6 daytime (08/11/14/17/20/22 IST) + overnight 03:00 = 7/day
-#   Peak Saturday : 5 daytime (08/11:30/14/16:30/20 IST) + overnight     = 6/day
-#   Peak Sunday   : 3 daytime (08/14/20 IST)                              = 3/day
+#   Peak weekday  : every 2h 10:00–22:00 IST (10/12/14/16/18/20/22)      = 7/day
+#   Peak Saturday : light (11:30 / 16:30 IST + base 09/14/20)            = ~5/day
+#   Peak Sunday   : 3 daytime (09/14/20 IST)                             = 3/day
 #   Off-season    : 3/day on ALL day types (skip_check window filter)
 #
 # Three-layer reliability (see InfraFix 3 in Concall_Extractor.txt):
@@ -33,9 +33,10 @@ on:
     # First slot moved 08:00 → 09:00 (2026-06-10) so backfill owns 23:00–08:30 IST.
     - cron: '30 3,8,14 * * *'
 
-    # ── Weekday peak extras (Mon–Fri) ──
-    # Adds IST 11:00 / 17:00 / 22:00  (UTC 05:30 / 11:30 / 16:30)
-    - cron: '30 5,11,16 * * 1-5'
+    # ── Weekday peak: every 2h 10:00–22:00 IST (Mon–Fri) ──
+    # IST 10/12/14/16/18/20/22  (UTC 04:30/06:30/08:30/10:30/12:30/14:30/16:30)
+    # In off-season skip_check collapses these back to the 09/14/20 windows.
+    - cron: '30 4,6,8,10,12,14,16 * * 1-5'
 
     # ── Saturday peak extras ──
     # Adds IST 11:30 / 16:30  (UTC 06:00 / 11:00)

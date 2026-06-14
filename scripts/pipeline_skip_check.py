@@ -8,14 +8,14 @@ status from Drive and decides whether the run should proceed or be skipped.
 │  PHASE 2 SEASONAL RUN STRATEGY                                          │
 │                                                                         │
 │  India Q-end results seasons (peak = more runs per day):                │
-│    Q3 FY:  17 Jan – 28 Feb   (quarter ended Dec)                        │
-│    Q4 FY:  17 Apr – 30 May   (quarter ended Mar; 60-day season)         │
-│    Q1 FY:  17 Jul – 30 Aug   (quarter ended Jun)                        │
-│    Q2 FY:  17 Oct – 30 Nov   (quarter ended Sep)                        │
+│    Q3 FY:  15 Jan – 1 Mar    (quarter ended Dec)                        │
+│    Q4 FY:  15 Apr – 14 Jun   (quarter ended Mar; 60-day annual season)  │
+│    Q1 FY:  15 Jul – 29 Aug   (quarter ended Jun)                        │
+│    Q2 FY:  15 Oct – 29 Nov   (quarter ended Sep)                        │
 │                                                                         │
 │  Peak season:                                                           │
-│    phase2.yml runs 6–7×/day weekdays, 5–6× Sat, 3× Sun.               │
-│    skip threshold = 45 min (process as fast as the queue allows)        │
+│    phase2.yml runs every 2h 10:00–22:00 IST weekdays (7/day),          │
+│    lighter Sat, 3× Sun. skip threshold = 45 min (drain as fast as able) │
 │                                                                         │
 │  Off-season:                                                            │
 │    Runs are suppressed to 3/day for ALL day types.                      │
@@ -55,19 +55,20 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+# Single source of truth for the earnings-season windows (shared with the
+# backfill gate). Imported by name so this file's internal calls keep working.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from seasons import PEAK_SEASONS, is_peak_season as _is_peak_season  # noqa: E402
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # ── Seasonal configuration ────────────────────────────────────────────────────
 
-# India quarterly results seasons: (start_month, start_day, end_month, end_day)
-# All within a single calendar year (none cross Dec→Jan boundary).
-PEAK_SEASONS = [
-    (1, 17, 2, 28),    # Q3 FY: 17 Jan – 28 Feb  (dec quarter)
-    (4, 17, 5, 30),    # Q4 FY: 17 Apr – 30 May  (mar quarter; 60-day annual)
-    (7, 17, 8, 30),    # Q1 FY: 17 Jul – 30 Aug  (jun quarter)
-    (10, 17, 11, 30),  # Q2 FY: 17 Oct – 30 Nov  (sep quarter)
-]
+# India quarterly results seasons now live in seasons.py (imported above):
+#   15 Jan–1 Mar · 15 Apr–14 Jun · 15 Jul–29 Aug · 15 Oct–29 Nov
+# (PEAK_SEASONS / _is_peak_season are imported at the top of this file.)
 
 # Off-season: only allow runs within ±WINDOW_RADIUS_MIN of these IST hours
 # First slot 8 → 9 (2026-06-10): backfill owns 23:00–08:30 IST overnight.
@@ -147,16 +148,7 @@ def age_minutes(iso_ts: str) -> float:
 
 
 # ── seasonal helpers ──────────────────────────────────────────────────────────
-
-def _is_peak_season(ist_now: datetime) -> bool:
-    """Return True if ist_now falls within any India results season."""
-    m, d = ist_now.month, ist_now.day
-    for sm, sd, em, ed in PEAK_SEASONS:
-        after_start = (m > sm) or (m == sm and d >= sd)
-        before_end  = (m < em) or (m == em and d <= ed)
-        if after_start and before_end:
-            return True
-    return False
+# _is_peak_season is imported from seasons.py (single source of truth).
 
 
 def _in_offseason_window(ist_now: datetime) -> bool:
