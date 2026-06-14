@@ -126,6 +126,8 @@ def main():
                         help="Seconds between screener requests (default 1.0)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip symbols already in per_symbol/")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Fetch + log only; no Drive write.")
     args = parser.parse_args()
 
     print("Stage 11a — Fundamentals ingestion")
@@ -140,25 +142,42 @@ def main():
     universe_id = get_or_create_subfolder(drive, folder_id, "universe")
     master_id = find_file(drive, universe_id, "master_list.csv")
     universe = download_csv(drive, master_id)
-    symbols = universe["symbol"].astype(str).tolist()
     if args.limit:
-        symbols = symbols[:args.limit]
+        universe = universe.head(args.limit)
+
+    # Screener resolution token per row: NSE names resolve by their NSE symbol;
+    # BSE-only names resolve by bse_code (Screener serves /company/<bse_code>/).
+    # The bse_code is the yf_ticker minus the ".BO" suffix. Storage key stays
+    # `symbol` so summary/per_symbol filenames match master_list (NSE unchanged).
+    def _token(row) -> str:
+        if str(row.get("exchange", "NSE")) == "BSE":
+            yt = str(row.get("yf_ticker", ""))
+            if yt.endswith(".BO"):
+                return yt[:-3]
+        return str(row["symbol"])
+
+    work = [(str(r["symbol"]), _token(r)) for _, r in universe.iterrows()]
 
     fund_id = get_or_create_subfolder(drive, folder_id, "fundamentals")
     per_sym_id = get_or_create_subfolder(drive, fund_id, "per_symbol")
     existing = list_files_in_folder(drive, per_sym_id)
+    # Gap-2: full P&L / balance-sheet / cash-flow statements (long format),
+    # one parquet per company under fundamentals/statements/.
+    stmt_sym_id = get_or_create_subfolder(drive, fund_id, "statements")
+    existing_stmt = list_files_in_folder(drive, stmt_sym_id)
 
     if args.resume:
-        symbols = [s for s in symbols if f"{s}.parquet" not in existing]
-        log(f"Resume mode: {len(symbols)} symbols left after skipping {len(existing)} done.")
-    log(f"Symbols to fetch: {len(symbols)}")
+        work = [(s, t) for (s, t) in work if f"{s}.parquet" not in existing]
+        log(f"Resume mode: {len(work)} symbols left after skipping {len(existing)} done.")
+    log(f"Symbols to fetch: {len(work)} (full universe NSE+BSE)")
 
     rows = []
+    stmt_total = 0
     t_start = time.time()
     fail_count = 0
-    for i, sym in enumerate(symbols, 1):
+    for i, (sym, token) in enumerate(work, 1):
         try:
-            soup = client.fetch_company(sym)
+            soup = client.fetch_company(token)
         except CookieExpiredError:
             log("Stopping run — cookie expired. Refresh instructions printed above.")
             return
@@ -175,10 +194,18 @@ def main():
             summary = client.extract_summary(sym, soup)
             summary["fetched_at"] = datetime.now().isoformat()
             rows.append(summary)
-            # Per-symbol parquet (for cache + future detail panels)
-            sym_df = pd.DataFrame([summary])
-            upload_parquet(drive, per_sym_id, f"{sym}.parquet", sym_df,
-                           existing.get(f"{sym}.parquet"))
+            # Gap-2: full statements (long format), one parquet per company.
+            stmts = client.extract_statements(sym, soup)
+            stmt_total += len(stmts)
+            if not args.dry_run:
+                sym_df = pd.DataFrame([summary])
+                upload_parquet(drive, per_sym_id, f"{sym}.parquet", sym_df,
+                               existing.get(f"{sym}.parquet"))
+                if stmts:
+                    stmt_df = pd.DataFrame(stmts)
+                    stmt_df["fetched_at"] = summary["fetched_at"]
+                    upload_parquet(drive, stmt_sym_id, f"{sym}.parquet", stmt_df,
+                                   existing_stmt.get(f"{sym}.parquet"))
         except Exception as e:
             log(f"  {sym}: parse error — {str(e)[:80]}")
             fail_count += 1
@@ -186,16 +213,20 @@ def main():
         if i % 25 == 0:
             elapsed = time.time() - t_start
             rate = i / elapsed
-            eta = (len(symbols) - i) / rate / 60
-            log(f"  [{i}/{len(symbols)}] ok={len(rows)} fail={fail_count} "
+            eta = (len(work) - i) / rate / 60
+            log(f"  [{i}/{len(work)}] ok={len(rows)} fail={fail_count} "
                 f"rate {rate:.2f}/s | ETA {eta:.1f}m")
 
-    if rows:
+    if rows and not args.dry_run:
         summary_df = pd.DataFrame(rows)
         upload_parquet(drive, fund_id, "summary.parquet", summary_df,
                        find_file(drive, fund_id, "summary.parquet"))
         log(f"Wrote fundamentals/summary.parquet ({len(summary_df)} rows)")
-    log(f"Done. ok={len(rows)} fail={fail_count} elapsed={(time.time()-t_start)/60:.1f}m")
+    elif rows:
+        log(f"[dry-run] would write fundamentals/summary.parquet ({len(rows)} rows) "
+            f"+ statements ({stmt_total} rows across statements/) — no write")
+    log(f"Done. ok={len(rows)} statements={stmt_total} fail={fail_count} "
+        f"elapsed={(time.time()-t_start)/60:.1f}m")
 
 
 if __name__ == "__main__":

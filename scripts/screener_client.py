@@ -166,6 +166,33 @@ class ScreenerClient:
             out[key] = sub
         return out
 
+    # statement section_id -> normalized statement name
+    STATEMENT_SECTIONS = {
+        "quarters": "quarterly_pl",
+        "profit-loss": "annual_pl",
+        "balance-sheet": "balance_sheet",
+        "cash-flow": "cash_flow",
+    }
+
+    def extract_statements(self, symbol: str, soup: BeautifulSoup) -> list[dict]:
+        """Long-format rows of the full financial statements (quarterly P&L,
+        annual P&L, balance sheet, cash flow). One row per (statement, line_item,
+        period). Gap-2: gives multi-period statement history, not just ratios."""
+        out = []
+        for section_id, stmt in self.STATEMENT_SECTIONS.items():
+            tbl = self.parse_table_section(soup, section_id)
+            headers = tbl["headers"]
+            for line_item, values in tbl["rows"].items():
+                for period, value in zip(headers, values):
+                    out.append({
+                        "symbol": symbol,
+                        "statement": stmt,
+                        "line_item": line_item,
+                        "period": period,
+                        "value": value,
+                    })
+        return out
+
     def extract_summary(self, symbol: str, soup: BeautifulSoup) -> dict:
         """One-row summary with key numbers used by CANSLIM + PEAD."""
         top = self.parse_top_ratios(soup)
