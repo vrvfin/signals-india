@@ -1,0 +1,72 @@
+name: Fundamentals Refresh
+
+# Full-universe (NSE + BSE) fundamentals + market cap + statement history via
+# Screener. Decoupled from daily.yml because the whole-universe Screener pull
+# plus per-company statement parquets takes a few hours — too heavy for the
+# daily 180-min budget. Runs weekly (Monday early IST) + manual dispatch.
+# Writes fundamentals/summary.parquet, fundamentals/per_symbol/, and
+# fundamentals/statements/, plus universe/market_cap.csv. Downstream strategies
+# (CANSLIM, PEAD) in daily.yml read the summary this job keeps fresh.
+
+on:
+  schedule:
+    - cron: "0 1 * * 1"     # 01:00 UTC Monday = 06:30 IST Monday
+  workflow_dispatch:
+
+# Serialize: a new trigger waits for any run still in progress.
+concurrency:
+  group: fundamentals-refresh
+  cancel-in-progress: false
+
+jobs:
+  fundamentals:
+    runs-on: ubuntu-latest
+    # No explicit timeout — defaults to the GitHub-hosted runner 6h cap, ample
+    # for the ~3-4h full-universe Screener pull + statement parquets.
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-fund-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-fund-
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install "yfinance>=1.3.0"
+
+      - name: Write credentials from secrets
+        env:
+          GDRIVE_FOLDER_ID:                ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON:         ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          SCREENER_SESSION_COOKIE:         ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON"        > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/cs.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+          } > .env
+
+      # Full universe (NSE symbol + BSE bse_code). Writes summary + per_symbol +
+      # statements. SCREENER_SESSION_COOKIE is read from .env by the script.
+      - name: Fundamentals (full universe + statements)
+        env:
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: python scripts/ingest_fundamentals.py
+        continue-on-error: true
+
+      - name: Enrich market cap (NSE via yfinance)
+        run: python scripts/enrich_market_cap.py
+        continue-on-error: true

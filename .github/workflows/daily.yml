@@ -136,19 +136,11 @@ jobs:
         run: python scripts/strategy_volume.py
         continue-on-error: true
 
-      # ---- Fundamentals (Monday only) + fundamentals-dependent strategies ----
-      - name: Fundamentals (weekly)
-        if: steps.fresh.outputs.skip != 'true' && github.event.schedule == '30 10 * * 1'
-        env:
-          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
-        run: python scripts/ingest_fundamentals.py
-        continue-on-error: true
-
-      - name: Enrich market cap (weekly)
-        if: steps.fresh.outputs.skip != 'true' && github.event.schedule == '30 10 * * 1'
-        run: python scripts/enrich_market_cap.py
-        continue-on-error: true
-
+      # ---- Fundamentals-dependent strategies ----
+      # Fundamentals + market cap ingestion moved to its own weekly workflow
+      # (fundamentals.yml): the full-universe Screener pull + statement history
+      # takes hours and no longer fits the daily 180-min budget. The strategies
+      # below read the summary.parquet that fundamentals.yml keeps fresh.
       - name: Strategy - CANSLIM
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_canslim.py
