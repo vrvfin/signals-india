@@ -2,8 +2,9 @@ name: Daily Pipeline Execution
 
 on:
   schedule:
-    - cron: '30 10 * * 1'    # Monday 16:00 IST — weekly run, includes fundamentals
-    - cron: '30 10 * * 2-5'  # Tue-Fri 16:00 IST — daily run
+    - cron: '30 10 * * 1-5'  # Mon-Fri 16:00 IST — daily run (OHLCV, features,
+                             # strategies, aggregate). Fundamentals/market-cap run
+                             # separately in fundamentals.yml (weekly, Mon).
     # UTC 10:30 is pre-US-business-hours (off-peak GitHub), so runner queue wait
     # is ~15-30 min → data consistently ready by IST 17:00-17:30.
   workflow_dispatch:          # manual trigger from GitHub UI
