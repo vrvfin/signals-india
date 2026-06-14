@@ -240,6 +240,15 @@ def main():
         print("ERROR: universe/master_list.csv missing. Run build_universe.py first.")
         sys.exit(1)
     universe_df = download_csv(drive, universe_files["master_list.csv"])
+    # NSE-only here (uses the .NS Yahoo suffix). BSE-only rows in the unified
+    # master_list are fetched by fetch_bse_only_ohlcv.py (.BO) — skip them so
+    # we don't waste calls on <NSE-suffix> tickers that don't exist.
+    if "exchange" in universe_df.columns:
+        before = len(universe_df)
+        universe_df = universe_df[universe_df["exchange"].astype(str) == "NSE"]
+        if before != len(universe_df):
+            log(f"NSE filter: {len(universe_df)}/{before} rows (BSE-only handled "
+                f"by fetch_bse_only_ohlcv.py)")
     symbols = universe_df["symbol"].astype(str).tolist()
     if args.pilot:
         symbols = symbols[:args.limit]

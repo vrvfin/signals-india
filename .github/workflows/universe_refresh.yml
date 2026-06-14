@@ -1,15 +1,20 @@
 name: Universe Refresh
 
 # Rebuilds universe/master_list.csv and company_repo/_index/company_universe.csv
-# from NSE + BSE scrip APIs. Runs weekly (Sunday 03:00 IST) and on manual dispatch.
-# This keeps the company resolution table (ISIN, NSE symbol, BSE code, name) fresh
-# so deep-dive resolve and all downstream scripts always have current data.
+# from NSE + BSE scrip APIs, then does the full 2y BSE-only OHLCV backfill.
+# Runs weekly (Sunday 03:00 IST) + on manual dispatch — same cadence as the
+# original NSE universe refresh. The full backfill of ~2,635 BSE-only names
+# takes ~2.5h; concurrency (below) queues a new trigger behind any run still
+# in progress so they never overlap. The daily Phase-1 (daily.yml, Mon-Fri
+# 16:00 IST) keeps BSE prices fresh via the cheap 1mo incremental in between.
 
 on:
   schedule:
     - cron: "30 21 * * 0"    # 21:30 UTC Sunday = 03:00 IST Monday
   workflow_dispatch:          # manual trigger anytime
 
+# Serialize: if a run is still going, the next trigger WAITS (does not overlap
+# or cancel). One finishes, the next in queue starts.
 concurrency:
   group: universe-refresh
   cancel-in-progress: false
@@ -17,7 +22,9 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # No explicit timeout — defaults to GitHub-hosted runners' 6h (360-min) per-job
+    # hard cap, which is plenty for the ~2.5h backfill. (The old 30-min cap killed
+    # it mid-run.)
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -34,16 +41,33 @@ jobs:
 
       - name: Write credentials
         env:
-          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GDRIVE_FOLDER_ID:                ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON:         ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
         run: |
           mkdir -p _sec
-          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON"        > _sec/tk.json
           {
             echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
             echo "GDRIVE_OAUTH_TOKEN_JSON=$GDRIVE_OAUTH_TOKEN_JSON"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/cs.json"
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
           } > .env
 
-      - name: Build universe
+      - name: Build universe (NSE+BSE full master)
         run: python scripts/build_company_universe.py
+
+      # Refresh the unified master_list (NSE + BSE-only, exchange + yf_ticker)
+      # so the daily Phase-1 picks up new listings.
+      - name: Rebuild unified master_list
+        run: python scripts/build_universe.py
+        continue-on-error: true
+
+      # BSE-only OHLCV — WEEKLY BACKFILL (full 2y) so newly-listed BSE names get
+      # full history (12m returns). daily.yml then keeps them fresh with the
+      # cheap 1mo incremental upsert (same pattern as NSE).
+      - name: Backfill BSE-only OHLCV (full 2y, promote)
+        run: >
+          python scripts/fetch_bse_only_ohlcv.py --promote --backfill
+          --min-rows 120 || true
