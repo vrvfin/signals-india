@@ -40,11 +40,16 @@ from _extractor_base import load_parquet, save_parquet
 COVERAGE_FILE = "backfill_coverage.parquet"
 COVERAGE_COLS = [
     "key", "doc_type",
-    "n_found", "n_done", "n_pending", "n_superseded",
+    "n_found", "n_done", "n_pending", "n_superseded", "n_expired",
     "covered_earliest_date", "covered_latest_date",
     "covered_earliest_period", "covered_latest_period",
     "last_fetched_at",
 ]
+
+# Statuses that do NOT count as "covered": the doc was fetched but its PDF aged
+# out (expired) or never downloaded (download_failed). Excluded from the covered
+# date window so the company is re-fetched to recover them.
+_NOT_COVERED = {"expired", "download_failed"}
 
 
 def _row_key(r) -> str:
@@ -78,7 +83,10 @@ def build_coverage(queue: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     for (key, doc_type), g in df.groupby(["_key", "doc_type"], sort=False):
         st = g["status"].astype(str)
-        g_dated = g[g["_ann"].notna()].sort_values("_ann")
+        # Covered window = only rows that actually hold (or will hold) content;
+        # expired / download_failed are excluded so they look "missing" and refetch.
+        real = g[~st.isin(_NOT_COVERED)]
+        g_dated = real[real["_ann"].notna()].sort_values("_ann")
         earliest = g_dated.iloc[0] if not g_dated.empty else None
         latest = g_dated.iloc[-1] if not g_dated.empty else None
         rows.append({
@@ -88,6 +96,7 @@ def build_coverage(queue: pd.DataFrame) -> pd.DataFrame:
             "n_done": int((st == "done").sum()),
             "n_pending": int((st == "pending").sum()),
             "n_superseded": int((st == "superseded").sum()),
+            "n_expired": int(st.isin(_NOT_COVERED).sum()),
             "covered_earliest_date": (earliest["_ann"].date().isoformat()
                                       if earliest is not None else ""),
             "covered_latest_date": (latest["_ann"].date().isoformat()

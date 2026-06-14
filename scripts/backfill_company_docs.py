@@ -345,8 +345,10 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
     def _month_key(comp_key, ann): return f"{comp_key}__{str(ann)[:7]}"
     known_concall_month: set[str] = set()
     if not queue.empty:
-        failed_mask = queue["status"].astype(str) == "download_failed"
-        queue = queue[~failed_mask].reset_index(drop=True)
+        # Retry rows whose PDF never landed (download_failed) OR aged out before
+        # extraction (expired): drop them so the doc re-downloads + re-queues.
+        retry_mask = queue["status"].astype(str).isin(["download_failed", "expired"])
+        queue = queue[~retry_mask].reset_index(drop=True)
         known = set(_key(queue)) if not queue.empty else set()
         if not queue.empty:
             cc = queue[queue["doc_type"].astype(str) == "concall"]

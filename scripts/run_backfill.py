@@ -271,6 +271,14 @@ def _needs_fetch(cov_row: dict | None, since_floor: str | None,
     if not cov_row:
         return True, "never-fetched"             # no coverage row yet
 
+    # Recover docs that were fetched but aged out before extraction (expired) or
+    # never downloaded (download_failed) — re-fetch to re-queue them.
+    try:
+        if int(cov_row.get("n_expired") or 0) > 0:
+            return True, "has-expired"
+    except (TypeError, ValueError):
+        pass
+
     # Deeper-window: requested floor reaches meaningfully older than our oldest doc.
     cov_earliest = str(cov_row.get("covered_earliest_date") or "")
     if since_floor and cov_earliest:
