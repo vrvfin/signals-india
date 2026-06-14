@@ -91,12 +91,34 @@ def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
     return f[keep].dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
 
-def _merge_existing(drive, folder_id: str, key: str,
-                    new_df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+def _list_folder(drive, folder_id: str) -> dict:
+    """{filename: file_id} for a folder via ONE paginated query, so the loop can
+    skip the per-name find_file Drive query (mirrors ingest_ohlcv.list_files)."""
+    out, token = {}, None
+    while True:
+        resp = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id, name)", pageSize=1000,
+            pageToken=token).execute()
+        for f in resp.get("files", []):
+            out[f["name"]] = f["id"]
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return out
+
+
+def _merge_existing(drive, folder_id: str, key: str, new_df: pd.DataFrame,
+                    existing_id: str | None = None,
+                    do_lookup: bool = True) -> tuple[pd.DataFrame, str | None]:
     """Upsert new rows into the existing <key>.parquet (incremental, like
     ingest_ohlcv.merge_and_upload) — preserves history so a short --period
-    fetch doesn't wipe it. Returns (merged_df, existing_file_id)."""
-    fid = find_file(drive, folder_id, f"{key}.parquet")
+    fetch doesn't wipe it. Returns (merged_df, existing_file_id).
+    Pass existing_id from a pre-listed folder index with do_lookup=False to skip
+    the per-name find_file query."""
+    fid = existing_id
+    if fid is None and do_lookup:
+        fid = find_file(drive, folder_id, f"{key}.parquet")
     if not fid:
         return new_df, None
     try:
@@ -157,6 +179,9 @@ def main() -> None:
                          "(run only after reviewing coverage).")
     ap.add_argument("--min-rows", type=int, default=120,
                     help="Min rows to count as usable / to promote.")
+    ap.add_argument("--live-only", action="store_true",
+                    help="Daily/BAU path: write ONLY the live data/ohlcv/ folder "
+                         "(skip the data/ohlcv_bse/ staging copy). Halves Drive I/O.")
     args = ap.parse_args()
 
     period = args.period or ("2y" if args.backfill else "1mo")
@@ -171,8 +196,12 @@ def main() -> None:
         f"{'BACKFILL' if args.backfill else 'incremental'}, "
         f"mode={'PROMOTE' if args.promote else 'TEST'})")
 
-    bse_fid = _folder(drive, OHLCV_BSE)
+    write_stage = not args.live_only        # staging copy (skipped on daily path)
+    bse_fid = _folder(drive, OHLCV_BSE)      # still used for the coverage CSV
     live_fid = _folder(drive, OHLCV_LIVE) if args.promote else None
+    # Pre-list each folder ONCE so the loop never calls find_file per name.
+    live_index = _list_folder(drive, live_fid) if live_fid else {}
+    bse_index = _list_folder(drive, bse_fid) if write_stage else {}
 
     # ticker -> row mapping
     rows = bse.to_dict("records")
@@ -196,25 +225,34 @@ def main() -> None:
                             "first_date": "", "last_date": ""})
                 nodata += 1
                 continue
-            # incremental upsert into the test parquet (preserves history)
-            merged, ex_bse = _merge_existing(drive, bse_fid, key, frame)
-            upload_bytes(drive, bse_fid, f"{key}.parquet",
-                         merged.to_parquet(index=False),
-                         "application/octet-stream", existing_id=ex_bse)
-            total = len(merged)
-            if args.promote and total >= args.min_rows:
-                # merge against the LIVE parquet too, then write back
-                lmerged, ex_live = _merge_existing(drive, live_fid, key, frame)
-                upload_bytes(drive, live_fid, f"{key}.parquet",
-                             lmerged.to_parquet(index=False),
-                             "application/octet-stream", existing_id=ex_live)
-                total = len(lmerged)
-                promoted += 1
+            total, last_df = 0, frame
+            # Staging copy (data/ohlcv_bse/): kept by the weekly backfill; the
+            # daily --live-only path skips it entirely.
+            if write_stage:
+                merged, ex_bse = _merge_existing(
+                    drive, bse_fid, key, frame,
+                    existing_id=bse_index.get(f"{key}.parquet"), do_lookup=False)
+                upload_bytes(drive, bse_fid, f"{key}.parquet",
+                             merged.to_parquet(index=False),
+                             "application/octet-stream", existing_id=ex_bse)
+                total, last_df = len(merged), merged
+            # Live write (data/ohlcv/), gated on enough history so we never push a
+            # thin (<min-rows) series into the pipeline.
+            if args.promote and live_fid:
+                lmerged, ex_live = _merge_existing(
+                    drive, live_fid, key, frame,
+                    existing_id=live_index.get(f"{key}.parquet"), do_lookup=False)
+                if len(lmerged) >= args.min_rows:
+                    upload_bytes(drive, live_fid, f"{key}.parquet",
+                                 lmerged.to_parquet(index=False),
+                                 "application/octet-stream", existing_id=ex_live)
+                    promoted += 1
+                total, last_df = len(lmerged), lmerged
             cov.append({**base,
                         "status": "ok" if total >= args.min_rows else "thin",
                         "rows": total,
-                        "first_date": str(merged["date"].min())[:10],
-                        "last_date": str(merged["date"].max())[:10]})
+                        "first_date": str(last_df["date"].min())[:10],
+                        "last_date": str(last_df["date"].max())[:10]})
             ok += 1
         log(f"  {min(i + args.batch, len(tickers))}/{len(tickers)} "
             f"(ok={ok} no_data={nodata})")

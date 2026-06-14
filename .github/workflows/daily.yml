@@ -79,9 +79,11 @@ jobs:
 
       # BSE-only OHLCV — incremental (1mo upsert, same as NSE) into data/ohlcv/
       # so compute_features below covers the full NSE+BSE master_list daily.
+      # --live-only: write ONLY the live folder (skip the staging copy) and the
+      # folder is pre-listed once — keeps the daily BSE step ~NSE-fast (~20m vs ~2h).
       - name: Ingest OHLCV (incremental, BSE-only)
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/fetch_bse_only_ohlcv.py --promote
+        run: python scripts/fetch_bse_only_ohlcv.py --promote --live-only
         continue-on-error: true
 
       - name: Ingest indices + macro
