@@ -1618,8 +1618,20 @@ def main() -> None:
     # thread-safe); only the ~75 s Gemini call truly overlaps. The context caches
     # (_gf1/_qfacts/_results) are loaded once and only READ here, so concurrent
     # reads in workers are safe.
-    eff_workers = 1 if args.dry_run else max(1, args.workers)
+    # --workers is honoured even under --dry-run so the parallel path can be
+    # smoke-tested safely: dry-run makes real Gemini calls + Drive reads but writes
+    # nothing, so it can run alongside a live backfill without touching shared files.
+    eff_workers = max(1, args.workers)
     _drive_lock = threading.Lock()
+
+    def _safe_save_queue():
+        """Persist the queue, but never let a Drive blip crash the run — used on
+        the error/fatal paths where a failed save must not abort everything."""
+        try:
+            save_queue(drive, index_id, queue)
+        except Exception as exc:                       # noqa: BLE001
+            log(f"  WARN: queue save failed ({str(exc)[:80]}) — will retry next write")
+
     if eff_workers > 1:
         log(f"Parallel extract: {eff_workers} workers "
             f"(download+Gemini fan-out; writes stay serial, in order).")
@@ -1708,10 +1720,14 @@ def main() -> None:
             continue
         if res["kind"] == "fatal":
             # Deterministic failure for THIS document (bad PDF, blocked, 400).
+            # Transient connection errors are now retried inside the pool, so this
+            # really is per-doc. Skip the queue write in dry-run; guard it so a
+            # Drive blip marks the doc but never crashes the whole run.
             log(f"  FATAL (this doc): {res['exc']}")
-            queue.loc[queue_idx, "status"] = "error"
-            queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
+            if not args.dry_run:
+                queue.loc[queue_idx, "status"] = "error"
+                queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
+                _safe_save_queue()
             counts["error"] += 1
             continue
 
@@ -1905,11 +1921,12 @@ def main() -> None:
         except Exception as exc:
             # Quota (AllBucketsExhausted) and per-doc fatal are now handled in the
             # consume preamble above; this catches errors in the serial WRITE path
-            # (parse / parquet / md) only.
+            # (parse / parquet / md) only. Guarded save so a Drive blip here marks
+            # the row but doesn't abort the run.
             log(f"  ERROR (post-processing): {str(exc)[:120]}")
             queue.loc[queue_idx, "status"] = "error"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
+            _safe_save_queue()
             counts["error"] += 1
 
     # CSV snapshots (once per run, after all processing)

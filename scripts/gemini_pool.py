@@ -88,6 +88,17 @@ def classify_error(exc: Exception) -> tuple[str, float]:
     # generic 429 with no dimension: treat as a transient minute-class throttle
     if "429" in s or "RESOURCE_EXHAUSTED" in s or "Resource has been exhausted" in s:
         return PERMIN, _retry_delay(s, default=45.0)
+    # connection-level failures (server hangup, reset, read timeout, network blip)
+    # are TRANSIENT — retry on another bucket, never burn the row as a fatal error.
+    # Seen live: "Server disconnected without sending a response" / WinError 10053.
+    _low = s.lower()
+    if any(t in s for t in ("Server disconnected", "RemoteDisconnected",
+                            "ConnectionAborted", "ConnectionReset", "10053", "10054")) \
+            or any(t in _low for t in ("connection aborted", "connection reset",
+                                       "connection error", "timed out", "timeout",
+                                       "read timed out", "temporarily unavailable",
+                                       "500 internal", "502", "504")):
+        return OVERLOAD, _retry_delay(s, default=8.0)
     return FATAL, 0.0
 
 
@@ -138,6 +149,7 @@ class BucketPool:
         stage_deadline_s: float | None = None,  # optional wall-clock cap; None = no cap
         inter_call_s: float = 6.0,    # min gap between successful calls (RPM hygiene)
         overload_backoff_s: float = 8.0,
+        call_timeout_s: float = 180.0,  # hard per-call HTTP timeout (no infinite hangs)
         logger=print,
     ):
         # NOTE: there is deliberately NO wall-clock cap by default. Termination is
@@ -153,6 +165,11 @@ class BucketPool:
         self.overload_budget = overload_budget
         self.inter_call_s = inter_call_s
         self.overload_backoff_s = overload_backoff_s
+        # google-genai HttpOptions.timeout is in MILLISECONDS. A hard ceiling so a
+        # stalled connection raises (transient -> retried) instead of hanging the
+        # whole run. Critical under --workers: one stuck call would otherwise block
+        # consumption of every completed result behind it (head-of-line stall).
+        self._call_timeout_ms = int(call_timeout_s * 1000)
         self._log = logger
         self._last_call_ts = 0.0
         # Guards all mutable bucket/pool state so K worker threads can share one
@@ -178,7 +195,10 @@ class BucketPool:
         # RLock-guarded: safe to call while already holding self._lock.
         with self._lock:
             if key_idx not in self._clients:
-                self._clients[key_idx] = genai.Client(api_key=self.keys[key_idx - 1])
+                self._clients[key_idx] = genai.Client(
+                    api_key=self.keys[key_idx - 1],
+                    http_options=genai_types.HttpOptions(timeout=self._call_timeout_ms),
+                )
             return self._clients[key_idx]
 
     # -- bucket selection --
