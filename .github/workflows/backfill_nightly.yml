@@ -175,7 +175,10 @@ jobs:
         run: |
           DEADLINE_MIN=${{ steps.sched.outputs.deadline_min }}
           echo "Extract deadline: $DEADLINE_MIN min (from seasonal gate)"
-          python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
+          # --workers 8 (T12 #1): fan the download+Gemini call across 8 threads so
+          # extraction is quota-bound, not 75s/doc runtime-bound. Writes stay serial.
+          # Phase 2's own extract_concall call keeps the default --workers 1.
+          python scripts/extract_concall.py --backfill --workers 8 --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
       # ── T8 — fresh Annual Reports: summarise ALL (not just PF), then judge ──
