@@ -14,12 +14,12 @@ on:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    # Universe doubled to ~5,029 (NSE+BSE): NSE OHLCV (~71m) + BSE OHLCV (~62m) +
-    # features (~42m) = ~175m of ingest before strategies even start, so the old
-    # 180-min cap killed the run mid-strategy (signals/aggregate never produced).
-    # 330m fits today's runtime with headroom and stays under the 360-min runner cap.
-    # Durable fix is faster OHLCV ingest (pre-list Drive folder), not just raising this.
-    timeout-minutes: 330
+    # No explicit timeout — defaults to GitHub-hosted runners' 6h (360-min) hard cap,
+    # same as universe_refresh.yml. The 180-min cap killed the run mid-strategy once
+    # the universe doubled to ~5,029 (NSE+BSE); rather than chase a number, we let it
+    # run as long as it needs. Ingest is now bounded-parallel (--workers 8 in
+    # ingest_ohlcv / fetch_bse_only_ohlcv / compute_features), so a normal day is
+    # ~30-40m anyway; the 6h ceiling is just a safety net.
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # Node.js 20 deprecated Jun 2 2026
     steps:
