@@ -93,10 +93,12 @@ def classify_error(exc: Exception) -> tuple[str, float]:
     # Seen live: "Server disconnected without sending a response" / WinError 10053.
     _low = s.lower()
     if any(t in s for t in ("Server disconnected", "RemoteDisconnected",
-                            "ConnectionAborted", "ConnectionReset", "10053", "10054")) \
+                            "ConnectionAborted", "ConnectionReset", "10053", "10054",
+                            "499", "CANCELLED")) \
             or any(t in _low for t in ("connection aborted", "connection reset",
                                        "connection error", "timed out", "timeout",
                                        "read timed out", "temporarily unavailable",
+                                       "operation was cancelled", "cancelled",
                                        "500 internal", "502", "504")):
         return OVERLOAD, _retry_delay(s, default=8.0)
     return FATAL, 0.0
