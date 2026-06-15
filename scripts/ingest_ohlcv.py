@@ -21,7 +21,9 @@ import argparse
 import io
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -61,6 +63,21 @@ def get_drive_service():
             creds = flow.run_local_server(port=0)
         tk_path.write_text(creds.to_json())
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+# Per-thread Drive client. googleapiclient's underlying http transport is NOT
+# thread-safe, so each worker thread builds (and caches) its own service from the
+# same on-disk creds. The main thread builds the first service (refreshing the
+# token file once) before any worker starts, so workers only ever READ a valid token.
+_tl = threading.local()
+
+
+def _thread_drive():
+    d = getattr(_tl, "drive", None)
+    if d is None:
+        d = get_drive_service()
+        _tl.drive = d
+    return d
 
 
 def get_or_create_subfolder(drive, parent_id, name):
@@ -221,6 +238,12 @@ def main():
                         help="yfinance period (default: 1mo incremental, 10y if --backfill)")
     parser.add_argument("--backfill", action="store_true",
                         help="Force period=10y for full history")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel Drive merge/upload workers (default 8). "
+                             "Each iteration touches its OWN <sym>.parquet — no "
+                             "shared-file writes — so threading is data-safe; "
+                             "bounded to respect Drive API rate limits. Use 1 for "
+                             "the original serial path.")
     args = parser.parse_args()
 
     period = args.period
@@ -265,27 +288,41 @@ def main():
                for i in range(0, len(symbols), args.batch_size)]
     log(f"Batches: {len(batches)} of size up to {args.batch_size}")
 
+    workers = max(1, args.workers)
+    log(f"Drive merge/upload workers: {workers}"
+        + ("  (serial)" if workers == 1 else "  (parallel, per-thread Drive client)"))
+
+    def _process(sym: str) -> dict:
+        # Each worker uses its OWN Drive client (thread-local); serial path reuses
+        # the main one. existing_files is read-only here (.get) so sharing it is safe.
+        d = drive if workers == 1 else _thread_drive()
+        try:
+            return merge_and_upload(d, ohlcv_folder_id, sym, fetched[sym], existing_files)
+        except Exception as e:
+            return {"symbol": sym, "status": "upload_error", "detail": str(e)[:120]}
+
     results: list[dict] = []
     t_start = time.time()
+    pool = None if workers == 1 else ThreadPoolExecutor(max_workers=workers)
     for b_idx, batch in enumerate(batches, 1):
         b_start = time.time()
         fetched = fetch_ohlcv_batch(batch, period=period)
-        not_returned = [s for s in batch if s not in fetched]
+        to_process = [s for s in batch if s in fetched]
 
-        # Process each fetched symbol
+        # Parallelize the per-symbol download→merge→upload (the Drive-I/O cost).
+        # yfinance fetch above stays serial (it's already batched and cheap).
+        if pool is None:
+            for sym in to_process:
+                results.append(_process(sym))
+        else:
+            futs = {pool.submit(_process, s): s for s in to_process}
+            for f in as_completed(futs):
+                results.append(f.result())
+        # Names Yahoo didn't return at all
         for sym in batch:
-            if sym in fetched:
-                try:
-                    r = merge_and_upload(drive, ohlcv_folder_id, sym,
-                                         fetched[sym], existing_files)
-                except Exception as e:
-                    r = {"symbol": sym, "status": "upload_error",
-                         "detail": str(e)[:120]}
-            else:
-                r = {"symbol": sym, "status": "no_data_returned",
-                     "rows_added": 0,
-                     "total_rows": 0}
-            results.append(r)
+            if sym not in fetched:
+                results.append({"symbol": sym, "status": "no_data_returned",
+                                "rows_added": 0, "total_rows": 0})
 
         elapsed = time.time() - t_start
         done = b_idx * args.batch_size
@@ -299,6 +336,9 @@ def main():
         # Keep a small safety pause between bulk downloads
         if b_idx < len(batches):
             time.sleep(1)
+
+    if pool is not None:
+        pool.shutdown(wait=True)
 
     summary = pd.DataFrame(results)
     print()

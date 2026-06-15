@@ -27,7 +27,9 @@ import argparse
 import io
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +44,19 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, upload_bytes, log)
+
+# Per-thread Drive client (googleapiclient http transport isn't thread-safe).
+# Main thread builds the first service before workers start, so workers only
+# ever read a valid token.
+_tl = threading.local()
+
+
+def _thread_drive(main_drive):
+    d = getattr(_tl, "drive", None)
+    if d is None:
+        d = get_drive()
+        _tl.drive = d
+    return d
 
 OHLCV_LIVE = "data/ohlcv"          # the live NSE folder — only --promote writes here
 OHLCV_BSE = "data/ohlcv_bse"       # test folder — safe
@@ -185,6 +200,11 @@ def main() -> None:
     ap.add_argument("--skip-complete", action="store_true",
                     help="Backfill: skip names that already have a live parquet "
                          "(complete) — only (re)fetch new/thin/no-data names.")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="Parallel merge/upload workers (default 8). Each name "
+                         "writes its OWN <key>.parquet (no shared-file writes), so "
+                         "threading is data-safe; bounded for Drive API limits. "
+                         "Use 1 for the serial path.")
     args = ap.parse_args()
 
     period = args.period or ("2y" if args.backfill else "1mo")
@@ -225,55 +245,77 @@ def main() -> None:
     tk_to_row = {f"{r['bse_code']}.BO": r for r in rows}
     tickers = list(tk_to_row.keys())
 
+    workers = max(1, args.workers)
+    log(f"merge/upload workers: {workers}"
+        + ("  (serial)" if workers == 1 else "  (parallel, per-thread Drive client)"))
+
+    def _process(tk: str, frame) -> dict:
+        """Merge + upload one ticker's parquet(s). Returns a coverage row with a
+        '_promoted' flag. Each call writes its OWN <key>.parquet — no shared file."""
+        d = drive if workers == 1 else _thread_drive(drive)
+        r = tk_to_row[tk]
+        key = _storage_key(r)
+        base = {"isin": r.get("isin", ""), "bse_code": r["bse_code"],
+                "bse_symbol": r.get("bse_symbol", ""), "name": r.get("name", ""),
+                "yf_ticker": tk, "storage_key": key,
+                "fetched_at": datetime.now().isoformat(timespec="seconds")}
+        if frame is None or frame.empty:
+            return {**base, "status": "no_data", "rows": 0,
+                    "first_date": "", "last_date": "", "_promoted": False}
+        total, last_df, promoted_flag = 0, frame, False
+        if write_stage:
+            merged, ex_bse = _merge_existing(
+                d, bse_fid, key, frame,
+                existing_id=bse_index.get(f"{key}.parquet"), do_lookup=False)
+            upload_bytes(d, bse_fid, f"{key}.parquet",
+                         merged.to_parquet(index=False),
+                         "application/octet-stream", existing_id=ex_bse)
+            total, last_df = len(merged), merged
+        if args.promote and live_fid:
+            lmerged, ex_live = _merge_existing(
+                d, live_fid, key, frame,
+                existing_id=live_index.get(f"{key}.parquet"), do_lookup=False)
+            if len(lmerged) >= args.min_rows:
+                upload_bytes(d, live_fid, f"{key}.parquet",
+                             lmerged.to_parquet(index=False),
+                             "application/octet-stream", existing_id=ex_live)
+                promoted_flag = True
+            total, last_df = len(lmerged), lmerged
+        return {**base,
+                "status": "ok" if total >= args.min_rows else "thin",
+                "rows": total,
+                "first_date": str(last_df["date"].min())[:10],
+                "last_date": str(last_df["date"].max())[:10],
+                "_promoted": promoted_flag}
+
     cov, ok, nodata, promoted = [], 0, 0, 0
+
+    def _tally(res: dict) -> None:
+        nonlocal ok, nodata, promoted
+        if res.pop("_promoted", False):
+            promoted += 1
+        if res["status"] == "no_data":
+            nodata += 1
+        else:
+            ok += 1
+        cov.append(res)
+
+    pool = None if workers == 1 else ThreadPoolExecutor(max_workers=workers)
     for i in range(0, len(tickers), args.batch):
         chunk = tickers[i:i + args.batch]
         fetched = _fetch_batch(chunk, period)
-        for tk in chunk:
-            r = tk_to_row[tk]
-            key = _storage_key(r)
-            frame = fetched.get(tk)
-            base = {"isin": r.get("isin", ""), "bse_code": r["bse_code"],
-                    "bse_symbol": r.get("bse_symbol", ""), "name": r.get("name", ""),
-                    "yf_ticker": tk, "storage_key": key,
-                    "fetched_at": datetime.now().isoformat(timespec="seconds")}
-            if frame is None or frame.empty:
-                cov.append({**base, "status": "no_data", "rows": 0,
-                            "first_date": "", "last_date": ""})
-                nodata += 1
-                continue
-            total, last_df = 0, frame
-            # Staging copy (data/ohlcv_bse/): kept by the weekly backfill; the
-            # daily --live-only path skips it entirely.
-            if write_stage:
-                merged, ex_bse = _merge_existing(
-                    drive, bse_fid, key, frame,
-                    existing_id=bse_index.get(f"{key}.parquet"), do_lookup=False)
-                upload_bytes(drive, bse_fid, f"{key}.parquet",
-                             merged.to_parquet(index=False),
-                             "application/octet-stream", existing_id=ex_bse)
-                total, last_df = len(merged), merged
-            # Live write (data/ohlcv/), gated on enough history so we never push a
-            # thin (<min-rows) series into the pipeline.
-            if args.promote and live_fid:
-                lmerged, ex_live = _merge_existing(
-                    drive, live_fid, key, frame,
-                    existing_id=live_index.get(f"{key}.parquet"), do_lookup=False)
-                if len(lmerged) >= args.min_rows:
-                    upload_bytes(drive, live_fid, f"{key}.parquet",
-                                 lmerged.to_parquet(index=False),
-                                 "application/octet-stream", existing_id=ex_live)
-                    promoted += 1
-                total, last_df = len(lmerged), lmerged
-            cov.append({**base,
-                        "status": "ok" if total >= args.min_rows else "thin",
-                        "rows": total,
-                        "first_date": str(last_df["date"].min())[:10],
-                        "last_date": str(last_df["date"].max())[:10]})
-            ok += 1
+        if pool is None:
+            for tk in chunk:
+                _tally(_process(tk, fetched.get(tk)))
+        else:
+            futs = [pool.submit(_process, tk, fetched.get(tk)) for tk in chunk]
+            for f in as_completed(futs):
+                _tally(f.result())
         log(f"  {min(i + args.batch, len(tickers))}/{len(tickers)} "
             f"(ok={ok} no_data={nodata})")
         time.sleep(0.5)
+    if pool is not None:
+        pool.shutdown(wait=True)
 
     cov_df = pd.DataFrame(cov, columns=COV_COLS)
     upload_bytes(drive, bse_fid, COVERAGE_NAME,

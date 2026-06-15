@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +47,20 @@ def log(msg: str) -> None:
 
 
 # ---------- Drive helpers ----------
+
+# Per-thread Drive client (googleapiclient http transport isn't thread-safe).
+# The main thread builds the first service (refreshing the token once) before any
+# worker starts, so workers only ever read a valid token.
+_tl = threading.local()
+
+
+def _thread_drive():
+    d = getattr(_tl, "drive", None)
+    if d is None:
+        d = get_drive_service()
+        _tl.drive = d
+    return d
+
 
 def get_drive_service():
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -256,6 +272,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None,
                         help="Process only first N symbols (debug)")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel OHLCV-download workers (default 8). Reads are "
+                             "independent per symbol and results are collected in the "
+                             "main thread, so threading is data-safe; bounded for Drive "
+                             "API limits. Use 1 for the original serial path.")
     args = parser.parse_args()
 
     print("Stage 3 — Feature engine")
@@ -290,26 +311,46 @@ def main() -> None:
         log("WARNING: NIFTY_500.parquet not found — rs_vs_nifty500 columns will be skipped")
 
     # Compute per symbol
-    rows: list[dict] = []
-    missing: list[str] = []
-    t_start = time.time()
-    for i, sym in enumerate(symbols, 1):
-        fname = f"{sym}.parquet"
-        if fname not in ohlcv_files:
-            missing.append(sym)
-            continue
+    workers = max(1, args.workers)
+    present = [s for s in symbols if f"{s}.parquet" in ohlcv_files]
+    missing: list[str] = [s for s in symbols if f"{s}.parquet" not in ohlcv_files]
+    log(f"OHLCV present: {len(present)} | missing parquet: {len(missing)} | "
+        f"workers: {workers}")
+
+    def _one(sym: str):
+        # Download (per-thread Drive client) + compute (pure pandas, thread-safe).
+        d = drive if workers == 1 else _thread_drive()
         try:
-            df = download_parquet(drive, ohlcv_files[fname])
-            r = compute_features_one(sym, df)
-            if r is not None:
-                rows.append(r)
+            df = download_parquet(d, ohlcv_files[f"{sym}.parquet"])
+            return sym, compute_features_one(sym, df), None
         except Exception as e:
-            missing.append(f"{sym}({str(e)[:60]})")
-        if i % 100 == 0:
+            return sym, None, str(e)[:60]
+
+    rows: list[dict] = []
+    t_start = time.time()
+    done = 0
+
+    def _collect(res):
+        nonlocal done
+        sym, r, err = res
+        if err is not None:
+            missing.append(f"{sym}({err})")
+        elif r is not None:
+            rows.append(r)
+        done += 1
+        if done % 200 == 0:
             elapsed = time.time() - t_start
-            rate = i / elapsed
-            eta = (len(symbols) - i) / rate / 60
-            log(f"  [{i}/{len(symbols)}] rate {rate:.1f}/s | ETA {eta:.1f}m")
+            rate = done / elapsed if elapsed else 0
+            eta = (len(present) - done) / rate / 60 if rate else 0
+            log(f"  [{done}/{len(present)}] rate {rate:.1f}/s | ETA {eta:.1f}m")
+
+    if workers == 1:
+        for sym in present:
+            _collect(_one(sym))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for res in as_completed([pool.submit(_one, s) for s in present]):
+                _collect(res.result())
 
     feat_df = pd.DataFrame(rows)
     log(f"Computed features for {len(feat_df)} symbols. Missing: {len(missing)}")
