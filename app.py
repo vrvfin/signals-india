@@ -582,15 +582,29 @@ def _drive_call(fn, attempts=4):
                 pass
             time.sleep(1.5 * (i + 1))
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _resolve_path_folder(path_parts: tuple):
+    """Resolve a chain of subfolder names to the final folder ID, cached so
+    repeated loads from the same folder don't re-traverse Drive every call.
+    Returns the folder ID, or None if any segment is missing. Empty path → root."""
+    def _do():
+        drive = drive_service()
+        parent = os.environ["GDRIVE_FOLDER_ID"]
+        for part in path_parts:
+            parent = _find_subfolder(drive, parent, part)
+            if not parent:
+                return None
+        return parent
+    return _drive_call(_do)
+
+
 @st.cache_data(ttl=300, show_spinner=False, max_entries=16)
 def load_csv(path_parts):
     def _do():
         drive = drive_service()
-        parent = os.environ["GDRIVE_FOLDER_ID"]
-        for part in path_parts[:-1]:
-            parent = _find_subfolder(drive, parent, part)
-            if not parent:
-                return pd.DataFrame()
+        parent = _resolve_path_folder(tuple(path_parts[:-1]))
+        if not parent:
+            return pd.DataFrame()
         files = _list_folder(drive, parent)
         fid = files.get(path_parts[-1])
         if not fid:
@@ -603,11 +617,9 @@ def load_csv(path_parts):
 def load_parquet(path_parts):
     def _do():
         drive = drive_service()
-        parent = os.environ["GDRIVE_FOLDER_ID"]
-        for part in path_parts[:-1]:
-            parent = _find_subfolder(drive, parent, part)
-            if not parent:
-                return pd.DataFrame()
+        parent = _resolve_path_folder(tuple(path_parts[:-1]))
+        if not parent:
+            return pd.DataFrame()
         files = _list_folder(drive, parent)
         fid = files.get(path_parts[-1])
         if not fid:
@@ -1936,12 +1948,17 @@ def page_stock_detail():
     feat_row = features[features["symbol"] == symbol]
     if not feat_row.empty:
         r = feat_row.iloc[0]
+        def _fmt(val, fmt, fallback="—"):
+            try:
+                return format(float(val), fmt) if pd.notna(val) else fallback
+            except (TypeError, ValueError):
+                return fallback
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Close", f"₹{r['close']:.2f}")
-        c2.metric("3M return", f"{r['return_3m_pct']:.1f}%")
-        c3.metric("RS rank (3M)", f"{r['rs_rank_3m']:.0f}")
-        c4.metric("Dist from 52w high", f"{r['dist_from_52w_high_pct']:.1f}%")
-        c5.metric("ADR%(20)", f"{r['adr_pct_20']:.2f}%")
+        c1.metric("Close",              f"₹{_fmt(r.get('close'), ',.2f')}")
+        c2.metric("3M return",          f"{_fmt(r.get('return_3m_pct'), '.1f')}%")
+        c3.metric("RS rank (3M)",       f"{_fmt(r.get('rs_rank_3m'), '.0f')}")
+        c4.metric("Dist from 52w high", f"{_fmt(r.get('dist_from_52w_high_pct'), '.1f')}%")
+        c5.metric("ADR%(20)",           f"{_fmt(r.get('adr_pct_20'), '.2f')}%")
 
     # T4 — conviction scorecard badge
     _sc_badge = _scorecard_badge(symbol, load_scorecard())
@@ -1971,8 +1988,11 @@ def page_stock_detail():
     if not n500.empty:
         merged = ohlcv.merge(n500[["date", "close"]].rename(columns={"close": "n500"}),
                              on="date", how="left")
-        rs_series = (merged["close"] / merged["close"].iloc[0]) / \
-                    (merged["n500"] / merged["n500"].iloc[0]) * 100
+        if not merged.empty:
+            p0_close = float(merged["close"].iloc[0]) if pd.notna(merged["close"].iloc[0]) else 0.0
+            p0_n500  = float(merged["n500"].iloc[0])  if pd.notna(merged["n500"].iloc[0])  else 0.0
+            if p0_close and p0_n500:
+                rs_series = (merged["close"] / p0_close) / (merged["n500"] / p0_n500) * 100
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
                         row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03,
@@ -2022,8 +2042,10 @@ def page_stock_detail():
         for _, sig in sym_sigs.iterrows():
             strat = sig.get("strategy", "")
             doc = STRATEGY_DOCS.get(strat, {})
+            _sc = sig.get('score')
+            _sc_str = f"{_sc:.1f}" if pd.notna(_sc) else "—"
             with st.expander(f"{doc.get('title', strat)} — **{sig.get('zone_type')}** "
-                             f"(score {sig.get('score'):.1f})"):
+                             f"(score {_sc_str})"):
                 st.markdown(f"**Intent:** {doc.get('intent', '(no doc)')}")
                 if doc.get("rules"):
                     st.markdown("**Rules used:**")
@@ -2164,7 +2186,7 @@ def page_graphs():
     c3, c4, c5, c6 = st.columns(4)
     with c3:
         min_strats = st.number_input("Min strategies", min_value=1,
-                                     max_value=10, value=1, step=1)
+                                     max_value=10, value=2, step=1)
     with c4:
         tf = st.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()), index=2)
     with c5:
@@ -2265,8 +2287,9 @@ def page_graphs():
             f"for 300+ stocks). Subsequent visits use the 30-min cache — instant.",
             icon="ℹ️",
         )
-        # ohlcv_map_sort already populated above for return-based sorts; otherwise load now
-        if "ohlcv_map_sort" not in dir():
+        # ohlcv_map_sort populated above when sort needed returns; load now if not
+        _sort_loaded = sort_key in ("default", "ret_1m", "ret_3m", "ret_6m")
+        if not _sort_loaded:
             prog = st.progress(0, text="Loading OHLCV from Drive (one batch call)…")
             ohlcv_map_sort = load_ohlcv_bulk(sym_list)
             prog.progress(100, text="Done — rendering charts…")
@@ -2281,13 +2304,34 @@ def page_graphs():
         scorecard_df = load_scorecard()          # T4 conviction scores (empty until built)
         catalyst_df  = load_catalyst_index()     # T5 latest note + what-to-track
 
-        def _catalyst_line(sym: str, cat_df) -> str:
+        # Pre-group each table by symbol ONCE. The render loop below visits every
+        # matching stock; without this, each per-symbol lookup was a full-table
+        # scan → O(stocks × rows). Dict lookups make it O(rows) total. Output is
+        # identical — same rows, same order within each symbol's group.
+        _EMPTY = pd.DataFrame()
+
+        def _group_exact(df):
+            if df is None or df.empty or "symbol" not in df.columns:
+                return {}
+            return {k: g for k, g in df.groupby("symbol", sort=False)}
+
+        def _group_upper(df):
+            if df is None or df.empty or "symbol" not in df.columns:
+                return {}
+            keys = df["symbol"].astype(str).str.upper()
+            return {k: g for k, g in df.groupby(keys, sort=False)}
+
+        sel_by_sym       = _group_exact(sel)
+        results_by_sym   = _group_exact(results_df)
+        guidance_by_sym  = _group_exact(guidance_df)
+        catalyst_by_sym  = _group_upper(catalyst_df)
+        scorecard_by_sym = _group_upper(scorecard_df)
+
+        def _catalyst_line(sym: str) -> str:
             """💡 headline · 👁 what-to-track for the latest catalyst note."""
             try:
-                if cat_df is None or cat_df.empty or "symbol" not in cat_df.columns:
-                    return ""
-                rows = cat_df[cat_df["symbol"].astype(str).str.upper() == sym.upper()]
-                if rows.empty:
+                rows = catalyst_by_sym.get(sym.upper())
+                if rows is None or rows.empty:
                     return ""
                 r = rows.sort_values("as_of").iloc[-1]
                 head = str(r.get("headline", "")).strip()
@@ -2306,10 +2350,8 @@ def page_graphs():
             parts = []
 
             # ── Results: latest Sales + Net Profit row for this symbol ────────
-            if (not results_df.empty
-                    and "symbol" in results_df.columns
-                    and "metric" in results_df.columns):
-                sym_res = results_df[results_df["symbol"] == sym]
+            sym_res = results_by_sym.get(sym)
+            if sym_res is not None and "metric" in sym_res.columns:
                 for metric_kw, label in [
                     ("sales|revenue|income from operations", "Sales"),
                     ("net profit|pat|profit after tax",      "PAT"),
@@ -2334,11 +2376,10 @@ def page_graphs():
                         parts.append(f"{qtr_tag}{label}: {sub}")
 
             # ── Guidance: active revenue/PAT/EPS rows ─────────────────────────
-            if (not guidance_df.empty
-                    and "symbol" in guidance_df.columns
-                    and "metric" in guidance_df.columns
-                    and "horizon_fy" in guidance_df.columns):
-                sym_g = guidance_df[guidance_df["symbol"] == sym]
+            sym_g = guidance_by_sym.get(sym)
+            if (sym_g is not None
+                    and "metric" in sym_g.columns
+                    and "horizon_fy" in sym_g.columns):
                 sym_g = sym_g[sym_g["horizon_fy"].apply(_guidance_is_active)]
                 sym_g = sym_g[
                     sym_g["metric"].astype(str).str.lower()
@@ -2384,12 +2425,13 @@ def page_graphs():
 
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
-            sym_sigs = sel[sel["symbol"] == sym]
+            sym_sigs = sel_by_sym.get(sym, _EMPTY)
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
             with st.container():
                 # Line 1 — strategy chips + T4 conviction badge
-                line1_html = _strat_chips(sym_sigs) + _scorecard_badge(sym, scorecard_df)
+                line1_html = _strat_chips(sym_sigs) + _scorecard_badge(
+                    sym, scorecard_by_sym.get(sym.upper(), _EMPTY))
                 if line1_html:
                     st.markdown(line1_html, unsafe_allow_html=True)
 
@@ -2403,7 +2445,7 @@ def page_graphs():
                     )
 
                 # Line 3 — latest catalyst (why moving) + what to track (T5)
-                cat_line = _catalyst_line(sym, catalyst_df)
+                cat_line = _catalyst_line(sym)
                 if cat_line:
                     st.markdown(
                         f'<div style="font-size:11px;color:#555;'
@@ -2473,9 +2515,14 @@ def page_graphs():
     with st.spinner(f"Loading {len(page_syms)} charts from Drive…"):
         ohlcv_map = load_ohlcv_bulk(page_syms)
 
+    # Pre-group this page's signal rows by symbol once (same pattern as Quick Scan).
+    page_sel = sel[sel["symbol"].isin(page_syms)]
+    sel_by_sym = ({k: g for k, g in page_sel.groupby("symbol", sort=False)}
+                  if not page_sel.empty else {})
+
     for _, crow in conv.iloc[page * per_page:(page + 1) * per_page].iterrows():
         sym      = crow["symbol"]
-        sym_sigs = sel[sel["symbol"] == sym]
+        sym_sigs = sel_by_sym.get(sym, pd.DataFrame())
         st.markdown(f"### {sym}  ·  {int(crow['n_strategies'])} strategies")
         chips = []
         for _, sg in sym_sigs.iterrows():
