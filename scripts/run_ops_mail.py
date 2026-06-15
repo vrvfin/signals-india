@@ -151,51 +151,106 @@ def freshness_html(drive, root) -> tuple[str, int]:
 
 # ---------------- section 2b: coverage ----------------
 
+_BUCKET_ORDER = ["today", "yesterday", "<=5d", "<=1mo", ">1mo", "no data"]
+
+
+def _freshness_table(df: pd.DataFrame, group_col: str, group_label: str) -> str:
+    """Crosstab of last-bar-age buckets per group (exchange / segment)."""
+    piv = pd.crosstab(df[group_col].fillna("(none)"), df["bucket"])
+    for b in _BUCKET_ORDER:
+        if b not in piv.columns:
+            piv[b] = 0
+    piv = piv[_BUCKET_ORDER]
+    piv["total"] = piv.sum(axis=1)
+    head = ("<tr><th>" + group_label + "</th>"
+            + "".join(f"<th>{b}</th>" for b in _BUCKET_ORDER)
+            + "<th>total</th></tr>")
+    body = []
+    for g, r in piv.sort_values("total", ascending=False).iterrows():
+        tds = "".join(f"<td align=right>{int(r[b]):,}</td>" for b in _BUCKET_ORDER)
+        body.append(f"<tr><td>{_esc(g, 16)}</td>{tds}"
+                    f"<td align=right><b>{int(r['total']):,}</b></td></tr>")
+    return ("<table border=1 cellpadding=4 cellspacing=0>"
+            + head + "".join(body) + "</table>")
+
+
 def coverage_html(drive, root) -> tuple[str, int]:
-    """Stock coverage: total universe | how many are current to the latest market
-    bar (data pulled this cycle) | how many are missing. Reads master_list (the
-    set Phase 1 iterates) + features/latest.parquet (one row per featured stock,
-    with the latest bar date). Returns (html, n_bad)."""
+    """Stock coverage + freshness, bifurcated by exchange and market-cap segment.
+    Per-company 'last data date' = features/latest.parquet date (its latest bar);
+    names with no features row = 'no data'. Returns (html, n_bad)."""
     ml = _read(drive, root, ["universe", "master_list.csv"])
     feat = _read(drive, root, ["features", "latest.parquet"])
+    sc = _read(drive, root, ["company_repo", "_index", "company_scorecard.parquet"])
     total = len(ml) if ml is not None else 0
     if feat is None or feat.empty or "date" not in feat.columns or total == 0:
         return ("<p>❌ Coverage: master_list or features/latest.parquet "
                 "missing — cannot compute.</p>", 1)
 
-    featured = feat["symbol"].nunique() if "symbol" in feat.columns else len(feat)
-    d = pd.to_datetime(feat["date"], errors="coerce")
-    latest_bar = d.max()
-    current = int((d == latest_bar).sum())          # data pulled this cycle
-    missing = max(0, total - featured)
-    cur_pct_feat = (100.0 * current / featured) if featured else 0.0
+    ml = ml[["symbol", "exchange"]].copy()
+    ml["symbol"] = ml["symbol"].astype(str).str.upper()
+    f = feat[["symbol", "date"]].copy()
+    f["symbol"] = f["symbol"].astype(str).str.upper()
+    df = ml.merge(f, on="symbol", how="left")
+    if sc is not None and not sc.empty and "mcap_segment" in sc.columns:
+        s = sc[["symbol", "mcap_segment"]].copy()
+        s["symbol"] = s["symbol"].astype(str).str.upper()
+        df = df.merge(s, on="symbol", how="left")
+    else:
+        df["mcap_segment"] = None
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    today = pd.Timestamp(datetime.now().date())
+    latest_bar = df["date"].max()
+    age = (today - df["date"]).dt.days
+
+    def _bucket(a, has):
+        if not has:
+            return "no data"
+        if a <= 0:
+            return "today"
+        if a <= 1:
+            return "yesterday"
+        if a <= 5:
+            return "<=5d"
+        if a <= 30:
+            return "<=1mo"
+        return ">1mo"
+
+    df["bucket"] = [_bucket(a, pd.notna(d)) for a, d in zip(age, df["date"])]
+    df["seg"] = df["mcap_segment"].where(
+        df["mcap_segment"].isin(["Largecap", "Midcap", "Smallcap", "Microcap"]),
+        "Unknown/BSE")
+
+    featured = int((df["bucket"] != "no data").sum())
+    current = int((df["bucket"] == "today").sum())
+    missing = int((df["bucket"] == "no data").sum())
 
     def pct(x):
         return f"{(100.0 * x / total):.1f}%" if total else "n/a"
 
-    # Informational icon on the fresh-share row (BSE/illiquid names legitimately
-    # lag a day, so a low share is not by itself a failure).
-    icon = "✅" if cur_pct_feat >= 90 else ("⚠️" if cur_pct_feat >= 60 else "❌")
-    # Hard red (forces the digest 🔴) only on a genuine break: nothing pulled this
-    # cycle, or featured coverage collapsed below half the universe.
+    # Hard red only on a genuine break: nothing current at all, or coverage
+    # collapsed below half the universe. (BSE/.BO names legitimately lag a few
+    # days, so a low overall 'today' share is expected, not an alarm.)
     n_bad = 1 if (current == 0 or featured < 0.5 * total) else 0
 
-    html = (
+    summary = (
         "<table border=1 cellpadding=4 cellspacing=0>"
         "<tr><th>Metric</th><th>Count</th><th>% of total</th></tr>"
-        f"<tr><td>Total stocks (master_list)</td>"
-        f"<td align=right>{total:,}</td><td>100%</td></tr>"
-        f"<tr><td>With data (featured / OHLCV)</td>"
-        f"<td align=right>{featured:,}</td><td>{pct(featured)}</td></tr>"
-        f"<tr><td>{icon} Data pulled this cycle "
-        f"(current to {str(latest_bar)[:10]})</td>"
+        f"<tr><td>Total stocks (master_list)</td><td align=right>{total:,}</td><td>100%</td></tr>"
+        f"<tr><td>With data (featured)</td><td align=right>{featured:,}</td><td>{pct(featured)}</td></tr>"
+        f"<tr><td>Current to latest bar ({str(latest_bar)[:10]})</td>"
         f"<td align=right>{current:,}</td><td>{pct(current)}</td></tr>"
-        f"<tr><td>Missing (no data)</td>"
-        f"<td align=right>{missing:,}</td><td>{pct(missing)}</td></tr>"
-        "</table>"
-        f"<p style='font-size:11px;color:#999'>Fresh share of covered set: "
-        f"{cur_pct_feat:.0f}% current to the latest market bar "
-        f"({str(latest_bar)[:10]}).</p>")
+        f"<tr><td>Missing (no data)</td><td align=right>{missing:,}</td><td>{pct(missing)}</td></tr>"
+        "</table>")
+
+    html = (summary
+            + "<p style='margin:6px 0 2px'><b>Last-data freshness by exchange:</b></p>"
+            + _freshness_table(df, "exchange", "exchange")
+            + "<p style='margin:6px 0 2px'><b>by market-cap segment:</b></p>"
+            + _freshness_table(df, "seg", "segment")
+            + "<p style='font-size:11px;color:#999'>Per-company 'last data' = latest "
+              "bar in features/latest. BSE/.BO names typically lag a few days "
+              "(Yahoo feed delay) — expected, not a failure.</p>")
     return html, n_bad
 
 
