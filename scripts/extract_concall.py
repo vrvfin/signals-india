@@ -37,11 +37,14 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import collections
 import io
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 
@@ -1477,7 +1480,15 @@ def main() -> None:
                              "morning run to end before Phase 2's first window.")
     parser.add_argument("--check-keys", action="store_true",
                         help="Print the selected key-pool size and exit (no Gemini, no Drive).")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel Gemini calls (T12 #1). Default 1 = the "
+                             "original sequential path (Phase 2 live keeps this). "
+                             ">1 fans the PDF download + Gemini call across N worker "
+                             "threads while ALL shared-file writes stay single-"
+                             "threaded and in queue order. Use 8 for backfill.")
     args = parser.parse_args()
+    if args.workers < 1:
+        args.workers = 1
 
     # Backfill defaults to the dedicated key pool unless an explicit prefix is given.
     key_prefix = args.key_prefix or ("BACKFILL_GEMINI_KEY" if args.backfill
@@ -1597,44 +1608,123 @@ def main() -> None:
     # by run (Run 1 / Run 2 / …) so the user can see what each scheduled slot added.
     run_time = datetime.now().strftime("%H:%M IST")
 
-    for queue_idx in pending_idx:
+    # ── T12 #1: parallel fetch (download + Gemini), strictly serial writes ──────
+    # eff_workers worker threads each run the SLOW part (download PDF + Gemini
+    # call) for one document; the main thread consumes their results IN QUEUE
+    # ORDER and does every shared-file write (parquets, company_page.md, queue)
+    # single-threaded — so parallelism never touches shared state. Default
+    # eff_workers=1 = the original sequential path (Phase 2 live keeps it).
+    # Drive downloads are serialized by _drive_lock (the Drive client is not
+    # thread-safe); only the ~75 s Gemini call truly overlaps. The context caches
+    # (_gf1/_qfacts/_results) are loaded once and only READ here, so concurrent
+    # reads in workers are safe.
+    eff_workers = 1 if args.dry_run else max(1, args.workers)
+    _drive_lock = threading.Lock()
+    if eff_workers > 1:
+        log(f"Parallel extract: {eff_workers} workers "
+            f"(download+Gemini fan-out; writes stay serial, in order).")
+
+    def _gemini_call(q_idx):
+        """Worker body. Returns a result dict; never raises (quota/fatal/skip are
+        encoded as 'kind'). Performs NO shared-file writes."""
+        r = queue.loc[q_idx]
+        fid = str(r.get("drive_file_id") or "").strip()
+        if not fid:
+            return {"idx": q_idx, "kind": "skip_nofid"}
+        try:
+            with _drive_lock:
+                pdf_bytes = download_bytes(drive, fid)
+        except Exception as exc:                       # noqa: BLE001
+            return {"idx": q_idx, "kind": "download_fail", "exc": str(exc)[:80]}
+        hist = _build_historical_context(_gf1_cache, _qfacts_cache, _results_cache, r)
+        eff_prompt = prompt + "\n\n" + hist if hist else prompt
+        try:
+            md, model = gemini.call_pdf(pdf_bytes, eff_prompt)
+        except AllBucketsExhausted as exc:
+            return {"idx": q_idx, "kind": "exhausted", "exc": str(exc)}
+        except FatalCallError as exc:
+            return {"idx": q_idx, "kind": "fatal", "exc": str(exc)[:120]}
+        return {"idx": q_idx, "kind": "ok", "md": md, "model": model,
+                "hist": hist, "pdf_len": len(pdf_bytes)}
+
+    def _results():
+        """Yield _gemini_call results in pending_idx order. eff_workers>1 keeps a
+        sliding window of N concurrent calls so order (oldest->newest per company)
+        is preserved while N Gemini calls overlap."""
+        if eff_workers <= 1:
+            for q_idx in pending_idx:
+                yield _gemini_call(q_idx)
+            return
+        ex = ThreadPoolExecutor(max_workers=eff_workers)
+        try:
+            win = collections.deque()
+            it = iter(pending_idx)
+            for _ in range(eff_workers):
+                try:
+                    win.append(ex.submit(_gemini_call, next(it)))
+                except StopIteration:
+                    break
+            while win:
+                fut = win.popleft()
+                try:
+                    win.append(ex.submit(_gemini_call, next(it)))
+                except StopIteration:
+                    pass
+                yield fut.result()
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    for res in _results():
+        queue_idx = res["idx"]
         # Priority yield (T12): a backfill run steps aside the moment Phase 2 wants
-        # the lock — between documents, so Phase 2 acquires within ~one doc (~75 s).
+        # the lock — checked between writes, so Phase 2 acquires within ~one window
+        # of in-flight docs. In-flight Gemini results are dropped (rows stay pending).
         if args.backfill and not args.dry_run and not args.no_lock \
                 and phase2_beacon_fresh(drive, index_id):
             log("  Phase 2 became active — yielding lock, exiting cleanly.")
             break
+
+        if res["kind"] == "exhausted":
+            # Transient/quota: every remaining row faces the same dead buckets,
+            # so stop now. Rows stay 'pending' and resume next run.
+            counts["deferred"] = (len(pending_idx) - counts["processed"]
+                                  - counts["error"] - counts["skipped"]
+                                  - counts["skipped_dup"] - counts.get("superseded", 0))
+            log(f"Stopping: {res['exc']}. {counts['deferred']} concall(s) deferred — "
+                f"resume after next free bucket / reset (~13:30 IST).")
+            break
+
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
         log(f"Processing: {label}")
 
-        drive_fid = str(row.get("drive_file_id") or "").strip()
-        if not drive_fid:
+        if res["kind"] == "skip_nofid":
             log("  SKIP: no drive_file_id in queue row")
             counts["skipped"] += 1
             continue
-
-        # Download PDF outside the main try so a transient Drive error doesn't
-        # get misclassified as a permanent row 'error'.
-        try:
-            pdf_bytes = download_bytes(drive, drive_fid)
-            log(f"  PDF: {len(pdf_bytes):,} bytes")
-        except Exception as exc:
-            log(f"  Drive download failed ({str(exc)[:80]}) — leaving pending")
+        if res["kind"] == "download_fail":
+            log(f"  Drive download failed ({res['exc']}) — leaving pending")
             counts["skipped"] += 1
             continue
+        if res["kind"] == "fatal":
+            # Deterministic failure for THIS document (bad PDF, blocked, 400).
+            log(f"  FATAL (this doc): {res['exc']}")
+            queue.loc[queue_idx, "status"] = "error"
+            queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_queue(drive, index_id, queue)
+            counts["error"] += 1
+            continue
+
+        # kind == "ok": run the serial write block (main thread only).
+        markdown_text = res["md"]
+        model_used = res["model"]
+        _hist = res["hist"]
+        log(f"  PDF: {res['pdf_len']:,} bytes")
+        if _hist:
+            log(f"  GF_TRACK: injecting {len(_hist):,}-char historical context")
+        log(f"  Gemini response: {len(markdown_text):,} chars [{model_used}]")
 
         try:
-            # Build historical context for GF_TRACK (returns None if no prior history)
-            _hist = _build_historical_context(_gf1_cache, _qfacts_cache, _results_cache, row)
-            effective_prompt = prompt + "\n\n" + _hist if _hist else prompt
-            if _hist:
-                log(f"  GF_TRACK: injecting {len(_hist):,}-char historical context")
-
-            # Generate via the bucket pool (best model first; bounded fallback).
-            markdown_text, model_used = gemini.call_pdf(pdf_bytes, effective_prompt)
-            log(f"  Gemini response: {len(markdown_text):,} chars [{model_used}]")
-
             if args.dry_run:
                 print(f"\n{'='*60}\nDRY RUN — {row.get('symbol')}\n"
                       f"{markdown_text[:800]}\n{'='*60}\n")
@@ -1812,24 +1902,10 @@ def main() -> None:
             counts["processed"] += 1
             log(f"  Done: {row.get('symbol')}")
 
-        except AllBucketsExhausted as exc:
-            # Transient/quota: every remaining row faces the same dead buckets,
-            # so stop now. Row stays 'pending' (untouched) and resumes next run.
-            counts["deferred"] = len(pending_idx) - counts["processed"] \
-                - counts["error"] - counts["skipped"]
-            log(f"Stopping: {exc}. {counts['deferred']} concall(s) deferred — "
-                f"resume after next free bucket / reset (~13:30 IST).")
-            break
-
-        except FatalCallError as exc:
-            # Deterministic failure for THIS document (bad PDF, blocked, 400).
-            log(f"  FATAL (this doc): {str(exc)[:120]}")
-            queue.loc[queue_idx, "status"] = "error"
-            queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
-            counts["error"] += 1
-
         except Exception as exc:
+            # Quota (AllBucketsExhausted) and per-doc fatal are now handled in the
+            # consume preamble above; this catches errors in the serial WRITE path
+            # (parse / parquet / md) only.
             log(f"  ERROR (post-processing): {str(exc)[:120]}")
             queue.loc[queue_idx, "status"] = "error"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")

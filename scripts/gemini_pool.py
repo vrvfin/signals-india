@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import base64
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -116,6 +117,8 @@ class _Bucket:
     overload_used: int = 0       # 503s consumed
     ok: int = 0
     fail: int = 0
+    in_flight: bool = False      # a worker is mid-call on this bucket (parallel mode)
+    last_call_ts: float = 0.0    # epoch of this bucket's last successful call (RPM pace)
 
     @property
     def label(self) -> str:
@@ -152,6 +155,13 @@ class BucketPool:
         self.overload_backoff_s = overload_backoff_s
         self._log = logger
         self._last_call_ts = 0.0
+        # Guards all mutable bucket/pool state so K worker threads can share one
+        # pool (T12 #1). RLock: _client() may be called while the lock is held.
+        # The slow generate_content() network call happens OUTSIDE this lock, so
+        # workers genuinely run in parallel; only selection + bookkeeping is
+        # serialized. In the default single-worker path the lock is uncontended,
+        # so behaviour is identical to the original sequential engine.
+        self._lock = threading.RLock()
         self._started = time.time()
         self._deadline = (self._started + stage_deadline_s
                           if stage_deadline_s else None)
@@ -165,16 +175,23 @@ class BucketPool:
 
     # -- client cache --
     def _client(self, key_idx: int) -> genai.Client:
-        if key_idx not in self._clients:
-            self._clients[key_idx] = genai.Client(api_key=self.keys[key_idx - 1])
-        return self._clients[key_idx]
+        # RLock-guarded: safe to call while already holding self._lock.
+        with self._lock:
+            if key_idx not in self._clients:
+                self._clients[key_idx] = genai.Client(api_key=self.keys[key_idx - 1])
+            return self._clients[key_idx]
 
     # -- bucket selection --
     def _live(self, b: _Bucket, now: float) -> bool:
-        return b.state == ALIVE and b.not_before <= now
+        # A bucket already serving a worker (in_flight) is not selectable, so two
+        # workers never hammer the same (key, model) inside its RPM window.
+        return b.state == ALIVE and not b.in_flight and b.not_before <= now
 
     def _any_nonterminal(self) -> bool:
         return any(b.state == ALIVE for b in self.buckets)
+
+    def _any_in_flight(self) -> bool:
+        return any(b.in_flight for b in self.buckets)
 
     def _next_bucket(self, now: float) -> _Bucket | None:
         """Lowest (model_rank, key_idx) bucket that is live right now."""
@@ -208,50 +225,82 @@ class BucketPool:
         return self._run([genai_types.Part.from_text(text=prompt)])
 
     def _run(self, parts) -> tuple[str, str]:
-        # pace successful-call cadence (RPM hygiene)
-        gap = time.time() - self._last_call_ts
-        if self._last_call_ts and gap < self.inter_call_s:
-            time.sleep(self.inter_call_s - gap)
-
+        # Thread-safe call engine. Selection + bookkeeping run under self._lock;
+        # the slow generate_content() network call runs OUTSIDE the lock so K
+        # workers overlap. RPM hygiene is now per-bucket (last_call_ts) instead of
+        # one global gate — correct under parallelism and equivalent for one
+        # worker (a single thread rotates buckets and rarely re-hits one inside
+        # inter_call_s anyway).
         while True:
-            now = time.time()
-            if self._deadline is not None and now >= self._deadline:
-                raise AllBucketsExhausted("stage wall-clock ceiling reached")
+            b = None
+            client = None
+            nap = 0.0
+            with self._lock:
+                now = time.time()
+                if self._deadline is not None and now >= self._deadline:
+                    raise AllBucketsExhausted("stage wall-clock ceiling reached")
 
-            b = self._next_bucket(now)
+                b = self._next_bucket(now)
+                if b is not None:
+                    # per-bucket RPM pace: leave inter_call_s between this bucket's
+                    # own successful calls.
+                    gap = now - b.last_call_ts
+                    if b.last_call_ts and gap < self.inter_call_s:
+                        b.not_before = max(b.not_before,
+                                           b.last_call_ts + self.inter_call_s)
+                        b = None            # cooling — fall through to wait/retry
+                    else:
+                        b.in_flight = True
+                        client = self._client(b.key_idx)
+
+                if b is None:
+                    # nothing selectable now — wait for the soonest wakeup, unless
+                    # an in-flight worker may free/refresh a bucket first.
+                    wake = self._earliest_wakeup(now)
+                    if wake is None or (self._deadline is not None and wake >= self._deadline):
+                        if not self._any_in_flight():
+                            raise AllBucketsExhausted(self._state_summary())
+                        nap = 0.25          # let an in-flight call complete
+                    else:
+                        nap = max(0.0, wake - now)
+                        if self._any_in_flight():
+                            nap = min(nap, 0.5)   # re-check completions promptly
+
+            # ---- outside the lock ----
             if b is None:
-                # nothing live now — can anything wake (before the deadline, if set)?
-                wake = self._earliest_wakeup(now)
-                if wake is None or (self._deadline is not None and wake >= self._deadline):
-                    raise AllBucketsExhausted(self._state_summary())
-                nap = max(0.0, wake - now)
-                self._log(f"  all buckets cooling — waiting {nap:.0f}s for next free bucket")
-                time.sleep(nap)
+                if nap > 0:
+                    time.sleep(nap)
                 continue
 
+            self._log(f"  calling {b.label} ...")
             try:
-                self._log(f"  calling {b.label} ...")
-                resp = self._client(b.key_idx).models.generate_content(
+                resp = client.models.generate_content(
                     model=b.model,
                     contents=parts,
                     config=genai_types.GenerateContentConfig(temperature=0.1),
                 )
                 text = resp.text
-                if not text:
-                    # empty/blocked response is deterministic for this doc
-                    raise FatalCallError(f"empty response from {b.label}")
-                b.ok += 1
-                self._last_call_ts = time.time()
-                return text, b.model
-            except FatalCallError:
-                raise
             except Exception as exc:
-                b.fail += 1
-                kind, retry_after = classify_error(exc)
-                self._apply_failure(b, kind, retry_after, exc)
+                with self._lock:
+                    b.in_flight = False
+                    b.fail += 1
+                    kind, retry_after = classify_error(exc)
+                    self._apply_failure(b, kind, retry_after, exc)
                 if kind == FATAL:
                     raise FatalCallError(str(exc)[:300])
-                # else loop: pick the next live bucket (instant for perday/permin)
+                continue   # loop: pick the next live bucket
+            if not text:
+                # empty/blocked response is deterministic for this doc
+                with self._lock:
+                    b.in_flight = False
+                    b.fail += 1
+                raise FatalCallError(f"empty response from {b.label}")
+            with self._lock:
+                b.in_flight = False
+                b.ok += 1
+                b.last_call_ts = time.time()
+                self._last_call_ts = b.last_call_ts
+            return text, b.model
 
     def _apply_failure(self, b: _Bucket, kind: str, retry_after: float, exc: Exception):
         now = time.time()
