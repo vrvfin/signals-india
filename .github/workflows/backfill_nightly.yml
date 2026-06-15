@@ -54,8 +54,8 @@ on:
         type: boolean
         default: false
       max_fetch:
-        description: "Companies to fetch per slot (scheduled default: 40; 6 slots/day = ~240/day)"
-        default: "40"
+        description: "Companies to fetch per slot (scheduled default: 150; queue capped at --target-pending)"
+        default: "150"
       do_t2_full:
         description: "T2: full 3-statement scrape (not just today's reporters)"
         type: boolean
@@ -152,15 +152,19 @@ jobs:
       # slot walks forward into the tail naturally). --quarters 8 = last ~2 years of
       # concalls. AR is enabled later by adding a `--types annual_report --years N`
       # step once concall reaches ~100% of the concall-bearing universe.
-      # --target-pending 200 = fill-to-target throttle: only top the queue up to
-      # ~200 pending concall docs (≈ what one night drains), so PDFs never age out
-      # before summarising. --max-companies caps companies fetched per slot.
+      # --target-pending 300 = fill-to-target throttle: top the queue up to ~300
+      # pending concall docs (≈ measured extract ceiling ~300-600/quota-day, well
+      # within the 2-day PDF retention), so extract is never starved AND PDFs never
+      # age out before summarising. --max-companies 150 caps companies fetched per
+      # slot; the walk stops early if the queue hits target-pending first, so the
+      # depth cap — not the company cap — is the real safety limit against
+      # over-fetching the deep tail (uncovered companies yield up to 8 concalls each).
       - name: T1 — fetch concalls from Screener/BSE (cursor-free walk)
         if: ${{ steps.sched.outputs.skip != 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
         run: |
-          MAX=${{ github.event.inputs.max_fetch || '40' }}
+          MAX=${{ github.event.inputs.max_fetch || '150' }}
           python scripts/run_backfill.py --types concall --quarters 8 \
-            --max-companies "$MAX" --target-pending 200
+            --max-companies "$MAX" --target-pending 300
 
       # ── T1 EXTRACT (every run — drain queue until quota/deadline) ───────────
       # Deadline comes from the seasonal gate: 200 min normally, but the peak

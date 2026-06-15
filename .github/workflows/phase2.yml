@@ -184,3 +184,27 @@ jobs:
         if: always() && steps.fresh.outputs.skip != 'true'
         run: python scripts/phase2_beacon.py clear
         continue-on-error: true
+
+      # ── Chain backfill into the idle gap (T12) ──────────────────────────
+      # Phase 2 just finished and cleared its beacon. Fire a backfill run NOW so
+      # the lock is used in the window before the NEXT Phase 2 raises the beacon
+      # again — backfill self-paces off Phase 2 instead of guessing with crons.
+      # Phase 2 stays strictly priority: the next Phase 2 raises the beacon and
+      # this backfill yields within ~75s.
+      # Uses repository_dispatch (NOT workflow_dispatch) so the seasonal gate
+      # still applies (peak-season daytime self-skips) AND the fetch step runs.
+      # Requires ACTIONS_PAT (workflow scope); safe no-op if the secret is unset.
+      # Runs even on a skipped Phase 2 slot so idle gaps are still filled.
+      - name: Chain backfill into the idle gap
+        if: always()
+        run: |
+          if [ -n "$GH_TOKEN" ]; then
+            gh api "repos/${{ github.repository }}/dispatches" \
+              -f event_type=trigger-backfill \
+              && echo "Backfill chained (trigger-backfill dispatched)." \
+              || echo "Backfill chain dispatch failed (scheduled crons still cover it)."
+          else
+            echo "ACTIONS_PAT not set — backfill chain skipped."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
