@@ -26,9 +26,12 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 import io
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -65,6 +68,18 @@ def get_drive():
             creds = flow.run_local_server(port=0)
         tk_path.write_text(creds.to_json())
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+# Per-thread Drive client (googleapiclient http transport isn't thread-safe).
+_tl = threading.local()
+
+
+def _thread_drive():
+    d = getattr(_tl, "drive", None)
+    if d is None:
+        d = get_drive()
+        _tl.drive = d
+    return d
 
 
 def get_or_create_subfolder(drive, parent_id, name):
@@ -179,6 +194,14 @@ def detect_pead(symbol, ohlcv, qtr_end_dt, today_dt):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workers", type=int, default=8,
+                    help="Parallel OHLCV-download workers (default 8). Reads are "
+                         "independent per symbol, results collected in the main "
+                         "thread — data-safe; bounded for Drive API limits. Use 1 "
+                         "for the serial path.")
+    args = ap.parse_args()
+
     print("Stage 11c — PEAD signals")
     print("-" * 50)
     drive = get_drive()
@@ -199,23 +222,39 @@ def main():
 
     today_dt = pd.Timestamp(datetime.now().date())
 
-    rows = []
-    for i, r in fund.iterrows():
+    # Cheap pre-filter (no Drive I/O): only names with a quarter-end in the last
+    # 90 days AND an OHLCV parquet on Drive. The download (the cost) happens only
+    # for these, parallelized below.
+    work = []
+    for _, r in fund.iterrows():
         sym = r["symbol"]
         qtr_end = parse_quarter_label(r.get("latest_quarter_label"))
-        if qtr_end is None:
-            continue
-        # Only look at recent quarters — last 90 days
-        if (today_dt - qtr_end).days > 90:
+        if qtr_end is None or (today_dt - qtr_end).days > 90:
             continue
         fid = ohlcv_files.get(f"{sym}.parquet")
-        if not fid:
-            continue
+        if fid:
+            work.append((sym, qtr_end, fid))
+
+    workers = max(1, args.workers)
+    log(f"PEAD candidates (recent quarter + OHLCV): {len(work)} | workers: {workers}")
+
+    def _scan(item):
+        sym, qtr_end, fid = item
+        d = drive if workers == 1 else _thread_drive()
         try:
-            ohlcv = download_parquet(drive, fid)
-            pead = detect_pead(sym, ohlcv, qtr_end, today_dt)
+            ohlcv = download_parquet(d, fid)
+            return sym, qtr_end, detect_pead(sym, ohlcv, qtr_end, today_dt)
         except Exception:
-            continue
+            return sym, qtr_end, None
+
+    if workers == 1:
+        scanned = [_scan(it) for it in work]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            scanned = [f.result() for f in as_completed([pool.submit(_scan, it) for it in work])]
+
+    rows = []
+    for sym, qtr_end, pead in scanned:
         if pead is None:
             continue
 
@@ -249,8 +288,6 @@ def main():
                        f"{pead['earnings_vol_mult']:.1f}× vol; "
                        f"{days}d into drift, {pead['drift_pct']:+.1f}% since"),
         })
-        if i % 100 == 0:
-            log(f"  scanned {i} fundamentals, {len(rows)} setups so far")
 
     sig_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
     log(f"PEAD signals: {len(sig_df)}")

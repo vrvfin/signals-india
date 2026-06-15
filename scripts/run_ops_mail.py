@@ -149,6 +149,56 @@ def freshness_html(drive, root) -> tuple[str, int]:
             + "".join(rows) + "</table>", n_bad)
 
 
+# ---------------- section 2b: coverage ----------------
+
+def coverage_html(drive, root) -> tuple[str, int]:
+    """Stock coverage: total universe | how many are current to the latest market
+    bar (data pulled this cycle) | how many are missing. Reads master_list (the
+    set Phase 1 iterates) + features/latest.parquet (one row per featured stock,
+    with the latest bar date). Returns (html, n_bad)."""
+    ml = _read(drive, root, ["universe", "master_list.csv"])
+    feat = _read(drive, root, ["features", "latest.parquet"])
+    total = len(ml) if ml is not None else 0
+    if feat is None or feat.empty or "date" not in feat.columns or total == 0:
+        return ("<p>❌ Coverage: master_list or features/latest.parquet "
+                "missing — cannot compute.</p>", 1)
+
+    featured = feat["symbol"].nunique() if "symbol" in feat.columns else len(feat)
+    d = pd.to_datetime(feat["date"], errors="coerce")
+    latest_bar = d.max()
+    current = int((d == latest_bar).sum())          # data pulled this cycle
+    missing = max(0, total - featured)
+    cur_pct_feat = (100.0 * current / featured) if featured else 0.0
+
+    def pct(x):
+        return f"{(100.0 * x / total):.1f}%" if total else "n/a"
+
+    # Informational icon on the fresh-share row (BSE/illiquid names legitimately
+    # lag a day, so a low share is not by itself a failure).
+    icon = "✅" if cur_pct_feat >= 90 else ("⚠️" if cur_pct_feat >= 60 else "❌")
+    # Hard red (forces the digest 🔴) only on a genuine break: nothing pulled this
+    # cycle, or featured coverage collapsed below half the universe.
+    n_bad = 1 if (current == 0 or featured < 0.5 * total) else 0
+
+    html = (
+        "<table border=1 cellpadding=4 cellspacing=0>"
+        "<tr><th>Metric</th><th>Count</th><th>% of total</th></tr>"
+        f"<tr><td>Total stocks (master_list)</td>"
+        f"<td align=right>{total:,}</td><td>100%</td></tr>"
+        f"<tr><td>With data (featured / OHLCV)</td>"
+        f"<td align=right>{featured:,}</td><td>{pct(featured)}</td></tr>"
+        f"<tr><td>{icon} Data pulled this cycle "
+        f"(current to {str(latest_bar)[:10]})</td>"
+        f"<td align=right>{current:,}</td><td>{pct(current)}</td></tr>"
+        f"<tr><td>Missing (no data)</td>"
+        f"<td align=right>{missing:,}</td><td>{pct(missing)}</td></tr>"
+        "</table>"
+        f"<p style='font-size:11px;color:#999'>Fresh share of covered set: "
+        f"{cur_pct_feat:.0f}% current to the latest market bar "
+        f"({str(latest_bar)[:10]}).</p>")
+    return html, n_bad
+
+
 # ---------------- section 3: samples ----------------
 
 def _tbl(df: pd.DataFrame, cols: list[str], fmt: dict | None = None) -> str:
@@ -236,16 +286,19 @@ def main() -> None:
 
     wf_html, ok, failed = workflow_runs_html()
     fresh_html, n_bad = freshness_html(drive, root)
+    cov_html, n_cov_bad = coverage_html(drive, root)
     body = (f"<h3>Workflow runs (last 26h)</h3>{wf_html}"
+            f"<h3>Stock coverage</h3>{cov_html}"
             f"<h3>Data freshness</h3>{fresh_html}"
             f"<h3>Samples</h3>{samples_html(drive, root)}"
             f"{flags_html(drive, root)}"
             f"<p style='font-size:11px;color:#999'>Toggle this mail in the app "
             f"sidebar (📧 Email toggles) or toggle_mail.bat.</p>")
-    status = "🔴" if (failed or n_bad) else "🟢"
+    status = "🔴" if (failed or n_bad or n_cov_bad) else "🟢"
     subject = (f"{status} Ops digest — {ok} ok / {failed} failed / "
-               f"{n_bad} stale — {date.today()}")
-    log(f"ops digest: {ok} ok, {failed} failed, {n_bad} stale datasets")
+               f"{n_bad} stale / coverage {'⚠️' if n_cov_bad else 'ok'} — {date.today()}")
+    log(f"ops digest: {ok} ok, {failed} failed, {n_bad} stale, "
+        f"coverage_bad={n_cov_bad}")
 
     if args.dry_run:
         prev = os.path.join(os.path.dirname(_SCRIPTS_DIR), "ops_digest_preview.html")

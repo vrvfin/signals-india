@@ -318,9 +318,21 @@ def main() -> None:
         pool.shutdown(wait=True)
 
     cov_df = pd.DataFrame(cov, columns=COV_COLS)
-    upload_bytes(drive, bse_fid, COVERAGE_NAME,
-                 cov_df.to_csv(index=False).encode("utf-8"), "text/csv",
-                 existing_id=find_file(drive, bse_fid, COVERAGE_NAME))
+    # The long parallel phase can leave the main-thread Drive socket stale
+    # (SSLEOFError surfaced on this final write). Rebuild the client before the
+    # coverage upload, with one retry. The per-symbol parquets are already written
+    # in the loop above, so a coverage-CSV failure never affects price data.
+    for attempt in (1, 2):
+        try:
+            drive = get_drive()
+            upload_bytes(drive, bse_fid, COVERAGE_NAME,
+                         cov_df.to_csv(index=False).encode("utf-8"), "text/csv",
+                         existing_id=find_file(drive, bse_fid, COVERAGE_NAME))
+            break
+        except Exception as e:
+            log(f"  coverage upload attempt {attempt} failed: {str(e)[:90]}")
+            if attempt == 2:
+                log("  WARNING: _coverage.csv not refreshed (price parquets unaffected).")
 
     usable = int((cov_df["status"] == "ok").sum())
     thin = int((cov_df["status"] == "thin").sum())
