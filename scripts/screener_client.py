@@ -86,8 +86,28 @@ class ScreenerClient:
             _print_cookie_expired_banner()
             raise CookieExpiredError(f"HTTP {r.status_code} while fetching {symbol}")
 
+    def _has_live_ratios(self, soup: BeautifulSoup) -> bool:
+        """True if the top-ratios strip carries real data. Small BSE companies with
+        no consolidated accounts return a valid HTTP-200 page where EVERY ratio
+        number is blank — Current Price is the reliable tell (every live company
+        has one), so an empty Current Price means this variant is an empty stub."""
+        ul = soup.find("ul", id="top-ratios")
+        if not ul:
+            return False
+        for li in ul.find_all("li"):
+            name_el = li.find("span", class_="name")
+            if not name_el or "current price" not in name_el.get_text(strip=True).lower():
+                continue
+            num_el = li.find("span", class_="number")
+            return bool(num_el and num_el.get_text(strip=True))
+        return False
+
     def fetch_company(self, symbol: str) -> BeautifulSoup | None:
-        """Return the parsed HTML of a company page. Tries consolidated then standalone."""
+        """Return the parsed HTML of a company page. Prefers consolidated (group
+        accounts) but falls through to standalone when consolidated is an empty
+        stub — many small BSE names have no consolidated financials and Screener
+        serves a 200 page with every ratio blank (see _has_live_ratios)."""
+        fallback = None
         for variant in ("consolidated/", ""):
             url = f"{BASE_URL}/company/{symbol}/{variant}"
             self._wait()
@@ -99,8 +119,11 @@ class ScreenerClient:
                 continue
             self._check_auth(r, symbol)
             if r.status_code == 200 and "company" in r.url.lower():
-                return BeautifulSoup(r.text, "lxml")
-        return None
+                soup = BeautifulSoup(r.text, "lxml")
+                if self._has_live_ratios(soup):
+                    return soup
+                fallback = fallback or soup   # empty stub — keep only as last resort
+        return fallback
 
     # ---------- Parsers ----------
 
