@@ -254,6 +254,62 @@ def coverage_html(drive, root) -> tuple[str, int]:
     return html, n_bad
 
 
+# ---------------- section 2c: market-cap freshness + coverage ----------------
+
+def mcap_health_html(drive, root) -> tuple[str, int]:
+    """Market-cap source health: is the data fresh and how complete is
+    market_cap_cr. Both enrich steps in fundamentals.yml are continue-on-error,
+    so a missed weekly run or a Screener-cookie expiry mid-run can leave mcap
+    stale while CI still shows green — this catches that. Returns (html, n_bad)."""
+    rows, n_bad = [], 0
+    now = datetime.now()
+
+    def _row(label, df, ts_col):
+        nonlocal n_bad
+        if df is None or df.empty or "market_cap_cr" not in df.columns:
+            n_bad += 1
+            return (f"<tr><td>❌ {_esc(label, 44)}</td><td>missing</td>"
+                    f"<td>-</td><td>-</td></tr>")
+        total = len(df)
+        mc = pd.to_numeric(df["market_cap_cr"], errors="coerce")
+        have = int(mc.notna().sum())
+        nan_pct = 100 * (total - have) / total if total else 100
+        # Freshness — weekly job, so measured in DAYS
+        if ts_col is None:
+            fresh_icon, age_txt = "", "—"
+        elif ts_col in df.columns and pd.notna(
+                pd.to_datetime(df[ts_col], errors="coerce").max()):
+            latest = pd.to_datetime(df[ts_col], errors="coerce").max()
+            days = (now - latest.to_pydatetime().replace(tzinfo=None)).total_seconds() / 86400
+            fresh_icon = "✅" if days < 9 else ("⚠️" if days < 16 else "❌")
+            age_txt = f"{days:.0f}d ago"
+            n_bad += fresh_icon == "❌"
+        else:
+            fresh_icon, age_txt = "⚠️", "no timestamp"
+        # Coverage — NaN-rate of market_cap_cr
+        cov_icon = "✅" if nan_pct < 10 else ("⚠️" if nan_pct < 25 else "❌")
+        n_bad += cov_icon == "❌"
+        return (f"<tr><td>{_esc(label, 44)}</td>"
+                f"<td>{fresh_icon} {age_txt}</td>"
+                f"<td align=right>{have:,}/{total:,}</td>"
+                f"<td>{cov_icon} {nan_pct:.0f}% NaN</td></tr>")
+
+    rows.append(_row("Screener (summary.parquet, NSE+BSE)",
+                     _read(drive, root, ["fundamentals", "summary.parquet"]), "fetched_at"))
+    rows.append(_row("yfinance (market_cap.csv, NSE)",
+                     _read(drive, root, ["universe", "market_cap.csv"]), None))
+
+    html = ("<table border=1 cellpadding=4 cellspacing=0>"
+            "<tr><th>Market-cap source</th><th>Freshness</th>"
+            "<th>Have/Total</th><th>Coverage</th></tr>"
+            + "".join(rows) + "</table>"
+            "<p style='font-size:11px;color:#999'>Refreshed weekly by "
+            "fundamentals.yml (Mon 06:30 IST). Stale (❌ &gt;16d) = a weekly run "
+            "was missed or the Screener cookie expired mid-run — both enrich steps "
+            "are continue-on-error, so CI can show green while mcap silently ages.</p>")
+    return html, n_bad
+
+
 # ---------------- section 3: samples ----------------
 
 def _tbl(df: pd.DataFrame, cols: list[str], fmt: dict | None = None) -> str:
@@ -342,18 +398,21 @@ def main() -> None:
     wf_html, ok, failed = workflow_runs_html()
     fresh_html, n_bad = freshness_html(drive, root)
     cov_html, n_cov_bad = coverage_html(drive, root)
+    mcap_html, n_mcap_bad = mcap_health_html(drive, root)
     body = (f"<h3>Workflow runs (last 26h)</h3>{wf_html}"
             f"<h3>Stock coverage</h3>{cov_html}"
+            f"<h3>Market-cap freshness</h3>{mcap_html}"
             f"<h3>Data freshness</h3>{fresh_html}"
             f"<h3>Samples</h3>{samples_html(drive, root)}"
             f"{flags_html(drive, root)}"
             f"<p style='font-size:11px;color:#999'>Toggle this mail in the app "
             f"sidebar (📧 Email toggles) or toggle_mail.bat.</p>")
-    status = "🔴" if (failed or n_bad or n_cov_bad) else "🟢"
+    status = "🔴" if (failed or n_bad or n_cov_bad or n_mcap_bad) else "🟢"
     subject = (f"{status} Ops digest — {ok} ok / {failed} failed / "
-               f"{n_bad} stale / coverage {'⚠️' if n_cov_bad else 'ok'} — {date.today()}")
+               f"{n_bad} stale / coverage {'⚠️' if n_cov_bad else 'ok'} / "
+               f"mcap {'⚠️' if n_mcap_bad else 'ok'} — {date.today()}")
     log(f"ops digest: {ok} ok, {failed} failed, {n_bad} stale, "
-        f"coverage_bad={n_cov_bad}")
+        f"coverage_bad={n_cov_bad}, mcap_bad={n_mcap_bad}")
 
     if args.dry_run:
         prev = os.path.join(os.path.dirname(_SCRIPTS_DIR), "ops_digest_preview.html")
