@@ -41,7 +41,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # T12: shared _extract.lock so this Stage-A ingester's queue write can never race a
 # backfill fetch's queue write (both rewrite processing_queue.parquet wholesale).
-from _extractor_base import acquire_lock, release_lock
+from _extractor_base import acquire_lock, release_lock, load_portfolio_isins
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 _LOCK_NAME = "_extract.lock"
@@ -359,12 +359,20 @@ def main() -> None:
     else:
         known_keys = set()
     sym2isin = load_symbol_isin_map(drive, index_id)
-    log(f"Queue has {len(queue)} existing rows · universe map: {len(sym2isin)} symbols")
+    # T12: extract_results/rating/presentation/annual_report process PORTFOLIO
+    # companies only; extract_concall processes ALL companies. So we ingest those
+    # four types for portfolio names only — downloading a non-PF copy just creates
+    # a PDF no extractor drains, which cleanup deletes in 2 days, leaving an orphaned
+    # 'pending' row. Concall is always ingested (whole universe). Fail-safe: if the
+    # portfolio list can't be loaded we ingest everything (old behaviour).
+    portfolio_isins = load_portfolio_isins(drive, folder_id) or set()
+    log(f"Queue has {len(queue)} existing rows · universe map: {len(sym2isin)} symbols "
+        f"· portfolio: {len(portfolio_isins)} ISINs (non-concall ingested PF-only)")
 
     session = screener_session()
     new_rows = []
     counts = {"seen": 0, "new": 0, "downloaded": 0, "skipped_old": 0,
-              "dup": 0, "download_fail": 0, "ingest_error": 0}
+              "dup": 0, "download_fail": 0, "ingest_error": 0, "skipped_nonpf": 0}
 
     for feed_name, cfg in feeds.items():
         src = cfg.get("path") or f"filter {cfg.get('filter_id')}"
@@ -394,6 +402,16 @@ def main() -> None:
 
                 isin = sym2isin.get(a["symbol"], "")
                 key = isin if isin else a["symbol"]
+
+                # T12: PF-only ingest for non-concall types (see note above). Concall
+                # is always ingested. Skipped non-PF rows are never queued, so no
+                # orphan is created; if the company joins the portfolio later, the
+                # 2-day feed lookback re-surfaces its recent docs.
+                if (a["doc_type"] != "concall" and portfolio_isins
+                        and isin not in portfolio_isins):
+                    counts["skipped_nonpf"] += 1
+                    continue
+
                 counts["new"] += 1
 
                 # Per-document isolation: a failed download/upload for ONE doc
@@ -449,6 +467,7 @@ def main() -> None:
     print(f"Announcements seen     : {counts['seen']}")
     print(f"Already in queue (dup) : {counts['dup']}")
     print(f"Outside lookback window: {counts['skipped_old']}")
+    print(f"Non-PF (non-concall)   : {counts['skipped_nonpf']}  (skipped — extractor is PF-only)")
     print(f"New documents queued   : {counts['new']}")
     print(f"  PDFs downloaded      : {counts['downloaded']}")
     print(f"  download failures    : {counts['download_fail']}")
