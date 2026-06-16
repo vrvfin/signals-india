@@ -2205,6 +2205,13 @@ def page_graphs():
             per_page = int(st.number_input("Charts/page", min_value=2,
                                            max_value=20, value=6, step=2))
 
+    min_turnover_cr = st.number_input(
+        "Min avg ₹ turnover (cr/day, 20d) — 0 = off", min_value=0.0,
+        max_value=500.0, value=1.0, step=1.0,
+        help="Liquidity floor: avg daily shares×price over 20 days, in ₹ crores. "
+             "Drops illiquid names (~45% of signals are sub-₹1cr/day). "
+             "Stocks with no volume data are dropped when the floor is on. 0 disables.")
+
     # ── Filter signals ────────────────────────────────────────────────────────
     sel = signals[signals["strategy_group"].isin(chosen)]
     if zones:
@@ -2222,6 +2229,30 @@ def page_graphs():
 
     best = sel.groupby("symbol")["score"].max().reset_index(name="best_score")
     conv = conv.merge(best, on="symbol", how="left")
+
+    # ── Liquidity floor (avg ₹ turnover, 20d) ─────────────────────────────────
+    # Prefers the avg_turnover_20d_cr feature (added in compute_features.py); until
+    # Phase 1 re-runs and writes it, falls back to vol_20d_avg × close on the fly.
+    if min_turnover_cr > 0:
+        feats = load_parquet(["features", "latest.parquet"])
+        if not feats.empty and "symbol" in feats.columns:
+            if "avg_turnover_20d_cr" in feats.columns:
+                turn = pd.to_numeric(feats["avg_turnover_20d_cr"], errors="coerce")
+            elif {"vol_20d_avg", "close"} <= set(feats.columns):
+                turn = (pd.to_numeric(feats["vol_20d_avg"], errors="coerce")
+                        * pd.to_numeric(feats["close"], errors="coerce")) / 1e7
+            else:
+                turn = pd.Series(float("nan"), index=feats.index)
+            tmap = dict(zip(feats["symbol"].astype(str), turn))
+            before = len(conv)
+            keep = conv["symbol"].astype(str).map(tmap).fillna(-1.0) >= min_turnover_cr
+            conv = conv[keep]
+            st.caption(f"Liquidity floor ≥ ₹{min_turnover_cr:.0f}cr/day turnover — "
+                       f"{len(conv)} of {before} stocks pass "
+                       f"(no-data names dropped).")
+            if conv.empty:
+                st.info("No stock passes the liquidity floor. Lower it.")
+                return
 
     # ── Sort ──────────────────────────────────────────────────────────────────
     SORT_OPTIONS = {

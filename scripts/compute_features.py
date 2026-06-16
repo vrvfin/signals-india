@@ -224,6 +224,11 @@ def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
     last5_avg = volume.tail(5).mean()
     last20_avg = volume.tail(20).mean()
     feat["vol_dryup_flag"] = bool(last5_avg < 0.8 * last20_avg) if last20_avg else False
+    # Avg daily ₹ turnover over 20d, in crores (shares x price). Liquidity proxy —
+    # far more discriminating than raw share volume for filtering tradeability.
+    turnover20 = (volume * close).rolling(20).mean()
+    feat["avg_turnover_20d_cr"] = (turnover20.iloc[-1] / 1e7
+                                   if pd.notna(turnover20.iloc[-1]) else np.nan)
 
     # Trend flags
     feat["above_50sma"]  = bool(close.iloc[-1] > smas[50].iloc[-1]) if pd.notna(smas[50].iloc[-1]) else False
