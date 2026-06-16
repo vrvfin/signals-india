@@ -83,13 +83,15 @@ jobs:
         run: python scripts/ingest_ohlcv.py
         continue-on-error: true
 
-      # BSE-only OHLCV — incremental (1mo upsert, same as NSE) into data/ohlcv/
-      # so compute_features below covers the full NSE+BSE master_list daily.
-      # --live-only: write ONLY the live folder (skip the staging copy) and the
-      # folder is pre-listed once — keeps the daily BSE step ~NSE-fast (~20m vs ~2h).
-      - name: Ingest OHLCV (incremental, BSE-only)
+      # BSE-only EOD — DAILY incremental via the BSE API (api.bseindia.com).
+      # Replaces the Yahoo `.BO` feed, which left BSE-only names ~3-5 days stale
+      # (only ~2 of 2,635 current). The API returns the latest completed session
+      # for ~92% of names (tested) and is faster (~5.5m vs ~14m). Appends one bar
+      # per scrip into data/ohlcv/ (dedup-merge). Full 2y history is still seeded
+      # by fetch_bse_only_ohlcv.py --backfill in universe_refresh.yml (weekly).
+      - name: Ingest OHLCV (incremental, BSE-only via BSE API)
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/fetch_bse_only_ohlcv.py --promote --live-only
+        run: python scripts/fetch_bse_eod_api.py --workers 8
         continue-on-error: true
 
       - name: Ingest indices + macro
