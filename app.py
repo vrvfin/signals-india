@@ -2190,10 +2190,14 @@ def page_graphs():
     with c4:
         tf = st.selectbox("Timeframe", list(TIMEFRAME_DAYS.keys()), index=2)
     with c5:
-        view_mode = st.radio("View mode", ["Quick Scan", "Detailed"],
-                             horizontal=True,
-                             help="Quick Scan: 3-column line charts, scroll all at once. "
-                                  "Detailed: full candlestick with volume, paginated.")
+        view = st.radio(
+            "View",
+            ["NSE · top 200", "NSE · next 150", "BSE-only · top 150", "Detailed"],
+            help="NSE views = stocks listed on NSE (may also trade on BSE). "
+                 "BSE-only = stocks not on NSE. Each view renders ONE bounded slice "
+                 "so Cloud memory stays safe (real tabs would render all at once and "
+                 "crash). Detailed = paginated candlesticks over the full filtered set.")
+    view_mode = "Detailed" if view == "Detailed" else "Quick Scan"
     with c6:
         if view_mode == "Quick Scan":
             normalize = st.toggle("Normalise (% from start)",
@@ -2254,21 +2258,38 @@ def page_graphs():
                 st.info("No stock passes the liquidity floor. Lower it.")
                 return
 
-    # ── Hard memory cap (Quick Scan) ──────────────────────────────────────────
-    # Quick Scan bulk-loads every symbol's OHLCV AND renders a Plotly figure each.
-    # Hundreds of these blow Streamlit Cloud's ~1GB ceiling → native heap crash
-    # (segfault / malloc corruption). Cap the set BEFORE the OHLCV bulk-load so
-    # both the download and the render stay bounded. Pre-rank by best_score so the
-    # cap keeps the strongest names; tighten filters to surface the rest.
-    QUICK_SCAN_CAP = 120
-    if view_mode == "Quick Scan" and len(conv) > QUICK_SCAN_CAP:
-        n_before_cap = len(conv)
-        conv = (conv.sort_values("best_score", ascending=False)
-                    .head(QUICK_SCAN_CAP).reset_index(drop=True))
-        st.warning(
-            f"⚠️ Showing the top **{QUICK_SCAN_CAP}** by score (of {n_before_cap}) to "
-            f"stay within Streamlit Cloud's memory limit. Tighten filters — more "
-            f"strategies, higher ₹ turnover, or fewer zones — to surface the rest.")
+    # ── Exchange split + bounded slice (memory-safe segments) ─────────────────
+    # Each Quick-Scan view renders ONE slice so the OHLCV bulk-load and the Plotly
+    # render stay bounded (hundreds of figures blow Cloud's ~1GB → native crash).
+    # Slice membership uses a CHEAP pre-rank (n_strategies, then score) so we don't
+    # have to load every symbol's OHLCV just to rank — n_strategies is the default
+    # sort's primary key, so this is faithful; the chosen sort then reorders the
+    # slice for display below.
+    NSE_TOP, NSE_NEXT, BSE_TOP = 200, 150, 150
+    if view_mode == "Quick Scan":
+        uni = load_csv(["universe", "master_list.csv"])
+        exch = {}
+        if not uni.empty and {"symbol", "exchange"} <= set(uni.columns):
+            exch = dict(zip(uni["symbol"].astype(str), uni["exchange"].astype(str)))
+        conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
+        conv = conv.sort_values(["n_strategies", "best_score"],
+                                ascending=[False, False]).reset_index(drop=True)
+        nse = conv[conv["_exch"] != "BSE"].reset_index(drop=True)   # NSE-listed
+        bse = conv[conv["_exch"] == "BSE"].reset_index(drop=True)   # BSE-only
+        if view == "NSE · top 200":
+            conv = nse.head(NSE_TOP)
+            st.caption(f"NSE-listed · top {len(conv)} of {len(nse)}.")
+        elif view == "NSE · next 150":
+            conv = nse.iloc[NSE_TOP:NSE_TOP + NSE_NEXT]
+            st.caption(f"NSE-listed · rank {NSE_TOP + 1}–{NSE_TOP + len(conv)} "
+                       f"of {len(nse)}.")
+        else:  # "BSE-only · top 150"
+            conv = bse.head(BSE_TOP)
+            st.caption(f"BSE-only · top {len(conv)} of {len(bse)}.")
+        conv = conv.reset_index(drop=True)
+        if conv.empty:
+            st.info("No stocks in this segment for the current filters.")
+            return
 
     # ── Sort ──────────────────────────────────────────────────────────────────
     SORT_OPTIONS = {
@@ -2659,6 +2680,11 @@ def _read_portfolio_table(raw_bytes: bytes, filename: str):
     }
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
     df["isin"] = df["isin"].astype(str).str.strip()
+    # Screener-only columns are optional — a broker export may omit them. Default
+    # so downstream (rating stars, display, sort) never KeyErrors.
+    for _opt in ("screener_rating", "screener_name", "screener_last_price"):
+        if _opt not in df.columns:
+            df[_opt] = pd.NA
     return df
 
 
