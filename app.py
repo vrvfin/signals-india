@@ -2192,11 +2192,12 @@ def page_graphs():
     with c5:
         view = st.radio(
             "View",
-            ["NSE · top 200", "NSE · next 150", "BSE-only · top 150", "Detailed"],
+            ["NSE · 1–100", "NSE · 101–200", "NSE · 201–300", "NSE · 301–400",
+             "BSE-only · top 100", "Detailed"],
             help="NSE views = stocks listed on NSE (may also trade on BSE). "
-                 "BSE-only = stocks not on NSE. Each view renders ONE bounded slice "
-                 "so Cloud memory stays safe (real tabs would render all at once and "
-                 "crash). Detailed = paginated candlesticks over the full filtered set.")
+                 "BSE-only = stocks not on NSE. Each view renders ONE slice of ≤100 "
+                 "charts so Cloud memory stays safe (real tabs would render all at "
+                 "once and crash). Detailed = paginated candlesticks over the full set.")
     view_mode = "Detailed" if view == "Detailed" else "Quick Scan"
     with c6:
         if view_mode == "Quick Scan":
@@ -2265,7 +2266,15 @@ def page_graphs():
     # have to load every symbol's OHLCV just to rank — n_strategies is the default
     # sort's primary key, so this is faithful; the chosen sort then reorders the
     # slice for display below.
-    NSE_TOP, NSE_NEXT, BSE_TOP = 200, 150, 150
+    # view -> (which exchange set, slice start, slice end). Each slice is ≤100,
+    # comfortably under the ~120-chart memory ceiling proven safe on Cloud.
+    SEG = {
+        "NSE · 1–100":        ("nse",   0, 100),
+        "NSE · 101–200":      ("nse", 100, 200),
+        "NSE · 201–300":      ("nse", 200, 300),
+        "NSE · 301–400":      ("nse", 300, 400),
+        "BSE-only · top 100": ("bse",   0, 100),
+    }
     if view_mode == "Quick Scan":
         uni = load_csv(["universe", "master_list.csv"])
         exch = {}
@@ -2276,17 +2285,11 @@ def page_graphs():
                                 ascending=[False, False]).reset_index(drop=True)
         nse = conv[conv["_exch"] != "BSE"].reset_index(drop=True)   # NSE-listed
         bse = conv[conv["_exch"] == "BSE"].reset_index(drop=True)   # BSE-only
-        if view == "NSE · top 200":
-            conv = nse.head(NSE_TOP)
-            st.caption(f"NSE-listed · top {len(conv)} of {len(nse)}.")
-        elif view == "NSE · next 150":
-            conv = nse.iloc[NSE_TOP:NSE_TOP + NSE_NEXT]
-            st.caption(f"NSE-listed · rank {NSE_TOP + 1}–{NSE_TOP + len(conv)} "
-                       f"of {len(nse)}.")
-        else:  # "BSE-only · top 150"
-            conv = bse.head(BSE_TOP)
-            st.caption(f"BSE-only · top {len(conv)} of {len(bse)}.")
-        conv = conv.reset_index(drop=True)
+        which, lo, hi = SEG[view]
+        src = nse if which == "nse" else bse
+        conv = src.iloc[lo:hi].reset_index(drop=True)
+        label = "NSE-listed" if which == "nse" else "BSE-only"
+        st.caption(f"{label} · rank {lo + 1}–{lo + len(conv)} of {len(src)}.")
         if conv.empty:
             st.info("No stocks in this segment for the current filters.")
             return
