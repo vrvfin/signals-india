@@ -70,9 +70,15 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 # Quality-only chain. Disjoint from P1_MODELS (lite) so P1 extraction can never
 # consume concall's premium buckets. 3 models × 6 keys = 18 daily buckets.
 CONCALL_MODELS = [
-    "gemini-3.5-flash",        # best free-tier quality
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",        # 20/day measured
+    # 2026-06-16 HOTFIX: gemini-3.5-flash REMOVED — Google now returns
+    # "503 UNAVAILABLE" for it on EVERY key (verified live; it worked until ~06-14).
+    # As the rank-0 model it was tried first on every doc, so each doc wasted
+    # ~30-50 min burning all 10 keys on the dead model (each 503 ~50s in CI) before
+    # failing over -> throughput collapsed to ~54 docs/day. Lead with the
+    # currently-working models instead. Re-add gemini-3.5-flash as the FIRST entry
+    # if/when it recovers (it was the best-quality option).
+    "gemini-3-flash-preview",  # WORKING (verified 06-16, ~3.5s) — best available
+    "gemini-2.5-flash",        # WORKING (verified 06-16, ~1.0s)
 ]
 
 # Minimum seconds to sleep between consecutive successful Gemini calls (RPM hygiene).
