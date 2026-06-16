@@ -175,10 +175,13 @@ jobs:
         run: |
           DEADLINE_MIN=${{ steps.sched.outputs.deadline_min }}
           echo "Extract deadline: $DEADLINE_MIN min (from seasonal gate)"
-          # --workers 8 (T12 #1): fan the download+Gemini call across 8 threads so
-          # extraction is quota-bound, not 75s/doc runtime-bound. Writes stay serial.
-          # Phase 2's own extract_concall call keeps the default --workers 1.
-          python scripts/extract_concall.py --backfill --workers 8 --deadline-min "$DEADLINE_MIN" || true
+          # HOTFIX 2026-06-16: reverted to sequential (--workers 1). The parallel
+          # path (T12 #1, --workers 8) SEGFAULTS in CI (core dumped after ~1 doc) —
+          # 3/6 recent runs crashed, processing ~0 docs/24h. Root cause: a C-ext
+          # (genai/grpc or pyarrow) is not thread-safe under concurrent calls in the
+          # CI image. Sequential is the proven path; re-enable parallel only after
+          # the segfault is fixed + re-validated in CI.
+          python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
       # ── T8 — fresh Annual Reports: summarise ALL (not just PF), then judge ──
