@@ -91,7 +91,7 @@ jobs:
       # by fetch_bse_only_ohlcv.py --backfill in universe_refresh.yml (weekly).
       - name: Ingest OHLCV (incremental, BSE-only via BSE API)
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/fetch_bse_eod_api.py --workers 8
+        run: python scripts/fetch_bse_eod_api.py --workers 16
         continue-on-error: true
 
       - name: Ingest indices + macro

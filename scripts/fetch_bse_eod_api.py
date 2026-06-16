@@ -57,7 +57,9 @@ HDR_URL = ("https://api.bseindia.com/BseIndiaAPI/api/getScripHeaderData/w"
            "?Debtflag=&scripcode={code}&seriesid=")
 TRD_URL = "https://api.bseindia.com/BseIndiaAPI/api/StockTrading/w?flag=&scripcode={code}"
 
-# Per-thread requests.Session (Session is not safe to share across threads).
+# Per-thread requests.Session AND Drive client (neither is safe to share across
+# threads). The main thread builds the first Drive client before workers start so
+# workers only ever read a valid token.
 _tl = threading.local()
 
 
@@ -68,6 +70,14 @@ def _session() -> requests.Session:
         s.headers.update(API_HDR)
         _tl.s = s
     return s
+
+
+def _thread_drive():
+    d = getattr(_tl, "drive", None)
+    if d is None:
+        d = get_drive()
+        _tl.drive = d
+    return d
 
 
 def _folder(drive, parts: str) -> str:
@@ -229,25 +239,29 @@ def main() -> None:
     live_index = {} if args.dry_run else _list_folder(drive, live_fid)
     rows = bse.to_dict("records")
 
+    # Worker: fetch the bar AND (live) append it — both parallelized. Each name
+    # writes its OWN <key>.parquet via a thread-local Drive client, so there are
+    # no shared-file writes; the per-name download+upload is the real cost and is
+    # what must run in parallel (the dry-run skips it, hence it looked fast).
+    def _process(row) -> dict:
+        res = fetch_bar(row, args.max_stale_days)
+        if not args.dry_run and res["status"] in ("ok", "no_volume"):
+            try:
+                _merge_append(_thread_drive(), live_fid, res["key"], res["bar"],
+                              live_index.get(f"{res['key']}.parquet"))
+                res["appended"] = True
+            except Exception as e:
+                res["status"] = "error"
+                res["err"] = str(e)[:80]
+        return res
+
     results: list[dict] = []
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(fetch_bar, r, args.max_stale_days) for r in rows]
+        futs = [pool.submit(_process, r) for r in rows]
         for f in as_completed(futs):
             results.append(f.result())
-
-    # Append the good bars (skip dry-run).
-    appended = 0
-    if not args.dry_run:
-        for res in results:
-            if res["status"] in ("ok", "no_volume"):
-                try:
-                    _merge_append(drive, live_fid, res["key"], res["bar"],
-                                  live_index.get(f"{res['key']}.parquet"))
-                    appended += 1
-                except Exception as e:
-                    res["status"] = "error"
-                    res["err"] = str(e)[:80]
+    appended = sum(1 for r in results if r.get("appended"))
 
     # Coverage summary.
     cov = pd.DataFrame([{k: v for k, v in r.items() if k != "bar"} for r in results])
