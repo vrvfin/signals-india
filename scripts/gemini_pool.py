@@ -246,7 +246,7 @@ class BucketPool:
         A per-KEY condition (PerDay/PerMinute/auth) does NOT condemn the model — only
         a model-level outage, confirmed on up to `max_keys_per_model` different keys,
         drops it. Cheap: ~1 call per live model. Returns the dropped model names."""
-        cfg = genai_types.GenerateContentConfig(temperature=0, max_output_tokens=4)
+        cfg = genai_types.GenerateContentConfig(temperature=0, max_output_tokens=8)
         part = [genai_types.Part.from_text(text="ping")]
         dropped: list[str] = []
         for mi, model in enumerate(list(self.models)):
@@ -254,11 +254,14 @@ class BucketPool:
             for kj in range(min(max_keys_per_model, len(self.keys))):
                 key_idx = ((mi * max_keys_per_model + kj) % len(self.keys)) + 1
                 try:
-                    r = self._client(key_idx).models.generate_content(
+                    # A non-exception response == the model is up. Do NOT inspect
+                    # r.text: a tiny max_output_tokens can finish as MAX_TOKENS with
+                    # empty text on a perfectly healthy model (this false-dropped
+                    # live models before).
+                    self._client(key_idx).models.generate_content(
                         model=model, contents=part, config=cfg)
-                    alive = r.text is not None
-                    if alive:
-                        break
+                    alive = True
+                    break
                 except Exception as exc:                       # noqa: BLE001
                     kind, _ = classify_error(exc)
                     s = str(exc).lower()
