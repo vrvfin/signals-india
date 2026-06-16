@@ -2254,6 +2254,22 @@ def page_graphs():
                 st.info("No stock passes the liquidity floor. Lower it.")
                 return
 
+    # ── Hard memory cap (Quick Scan) ──────────────────────────────────────────
+    # Quick Scan bulk-loads every symbol's OHLCV AND renders a Plotly figure each.
+    # Hundreds of these blow Streamlit Cloud's ~1GB ceiling → native heap crash
+    # (segfault / malloc corruption). Cap the set BEFORE the OHLCV bulk-load so
+    # both the download and the render stay bounded. Pre-rank by best_score so the
+    # cap keeps the strongest names; tighten filters to surface the rest.
+    QUICK_SCAN_CAP = 120
+    if view_mode == "Quick Scan" and len(conv) > QUICK_SCAN_CAP:
+        n_before_cap = len(conv)
+        conv = (conv.sort_values("best_score", ascending=False)
+                    .head(QUICK_SCAN_CAP).reset_index(drop=True))
+        st.warning(
+            f"⚠️ Showing the top **{QUICK_SCAN_CAP}** by score (of {n_before_cap}) to "
+            f"stay within Streamlit Cloud's memory limit. Tighten filters — more "
+            f"strategies, higher ₹ turnover, or fewer zones — to surface the rest.")
+
     # ── Sort ──────────────────────────────────────────────────────────────────
     SORT_OPTIONS = {
         "Strategies ↓  →  1M ret ↓  →  3M ret ↓  (default)": "default",
