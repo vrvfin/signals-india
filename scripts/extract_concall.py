@@ -69,16 +69,17 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 # All confirmed to have a free tier as of 2026-06 (pro-tier models do NOT).
 # Quality-only chain. Disjoint from P1_MODELS (lite) so P1 extraction can never
 # consume concall's premium buckets. 3 models × 6 keys = 18 daily buckets.
+# Best-first quality chain. STEP A (BucketPool.probe_models, run once at startup)
+# pings each model and DROPS any that are unresponsive (503/UNAVAILABLE) for the
+# whole run — so a document never wastes time failing over a dead model, and the
+# list self-heals automatically when a model recovers (no hardcoded removals).
+# (Context: 2026-06-16 gemini-3.5-flash started returning 503 on every key; as the
+# rank-0 model it was tried first on every doc and collapsed throughput to ~54/day.
+# Step A now drops it dynamically while it's down and restores it when it's back.)
 CONCALL_MODELS = [
-    # 2026-06-16 HOTFIX: gemini-3.5-flash REMOVED — Google now returns
-    # "503 UNAVAILABLE" for it on EVERY key (verified live; it worked until ~06-14).
-    # As the rank-0 model it was tried first on every doc, so each doc wasted
-    # ~30-50 min burning all 10 keys on the dead model (each 503 ~50s in CI) before
-    # failing over -> throughput collapsed to ~54 docs/day. Lead with the
-    # currently-working models instead. Re-add gemini-3.5-flash as the FIRST entry
-    # if/when it recovers (it was the best-quality option).
-    "gemini-3-flash-preview",  # WORKING (verified 06-16, ~3.5s) — best available
-    "gemini-2.5-flash",        # WORKING (verified 06-16, ~1.0s)
+    "gemini-3.5-flash",        # best quality (auto-dropped this run if it 503s)
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
 ]
 
 # Minimum seconds to sleep between consecutive successful Gemini calls (RPM hygiene).
@@ -1530,12 +1531,18 @@ def main() -> None:
         + ("  [BACKFILL MODE]" if args.backfill else ""))
     gemini = BucketPool(api_keys, pool_models,
                         inter_call_s=INTER_CALL_SLEEP, logger=log,
+                        overload_budget=3,   # flash models flap: give a bucket 3
+                                             # 503-strikes (fast-fail ~2s each) before
+                                             # parking, so a brief flap doesn't lose it
                         stage_deadline_s=(args.deadline_min * 60
                                           if args.deadline_min else None))
     if args.deadline_min:
         log(f"Wall-clock cap: {args.deadline_min:.0f} min — exits cleanly after.")
     log(f"Loaded {len(api_keys)} key(s) × {len(pool_models)} model(s) "
         f"= {len(api_keys) * len(pool_models)} buckets")
+    # STEP A — drop any model that is unresponsive right now (503/404) so no document
+    # wastes time failing over a dead model; self-heals when the model recovers.
+    gemini.probe_models()
 
     # Load prompt
     prompt_path = Path(__file__).resolve().parent / "concall_prompt.txt"

@@ -197,9 +197,16 @@ class BucketPool:
         # RLock-guarded: safe to call while already holding self._lock.
         with self._lock:
             if key_idx not in self._clients:
+                # attempts=1 -> the SDK does NOT retry 503/overload internally; it
+                # surfaces in ~1-2s so OUR engine does the failover fast (was ~50s
+                # of hidden SDK retries inside the timeout, which crippled throughput
+                # when a model flapped). timeout still caps a genuinely hung call.
                 self._clients[key_idx] = genai.Client(
                     api_key=self.keys[key_idx - 1],
-                    http_options=genai_types.HttpOptions(timeout=self._call_timeout_ms),
+                    http_options=genai_types.HttpOptions(
+                        timeout=self._call_timeout_ms,
+                        retry_options=genai_types.HttpRetryOptions(attempts=1),
+                    ),
                 )
             return self._clients[key_idx]
 
@@ -230,6 +237,51 @@ class BucketPool:
         return min(future) if future else None
 
     # -- public API --
+    def probe_models(self, *, max_keys_per_model: int = 2) -> list[str]:
+        """STEP A — pre-flight model health check. Ping each model once and DROP
+        (for this run) any that is unresponsive — 503/UNAVAILABLE or not-found — so
+        no document later wastes time failing over a dead model, and the chain
+        self-heals when a model recovers (no hardcoded removals).
+
+        A per-KEY condition (PerDay/PerMinute/auth) does NOT condemn the model — only
+        a model-level outage, confirmed on up to `max_keys_per_model` different keys,
+        drops it. Cheap: ~1 call per live model. Returns the dropped model names."""
+        cfg = genai_types.GenerateContentConfig(temperature=0, max_output_tokens=4)
+        part = [genai_types.Part.from_text(text="ping")]
+        dropped: list[str] = []
+        for mi, model in enumerate(list(self.models)):
+            alive = False
+            for kj in range(min(max_keys_per_model, len(self.keys))):
+                key_idx = ((mi * max_keys_per_model + kj) % len(self.keys)) + 1
+                try:
+                    r = self._client(key_idx).models.generate_content(
+                        model=model, contents=part, config=cfg)
+                    alive = r.text is not None
+                    if alive:
+                        break
+                except Exception as exc:                       # noqa: BLE001
+                    kind, _ = classify_error(exc)
+                    s = str(exc).lower()
+                    model_down = (kind == OVERLOAD) or "404" in s \
+                        or "not found" in s or "not supported" in s
+                    if not model_down:
+                        alive = True   # per-key quota/auth/transient — model is fine
+                        break
+                    # model-level error -> try the next key to confirm it's really down
+            if not alive:
+                dropped.append(model)
+        if dropped:
+            with self._lock:
+                self.models = [m for m in self.models if m not in dropped]
+                self.buckets = [b for b in self.buckets if b.model not in dropped]
+            for m in dropped:
+                self._log(f"  STEP A: model '{m}' unresponsive (503/404) — DROPPED for this run")
+        self._log(f"  STEP A model health: {len(self.models)} live model(s) {self.models}"
+                  + (f" · dropped {dropped}" if dropped else ""))
+        if not self.models:
+            self._log("  STEP A WARNING: every model failed the probe — nothing live!")
+        return dropped
+
     def call_pdf(self, pdf_bytes: bytes, prompt: str) -> tuple[str, str]:
         """Run prompt over the PDF. Returns (response_text, model_used).
 
