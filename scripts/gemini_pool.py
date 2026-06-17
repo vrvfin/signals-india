@@ -152,6 +152,8 @@ class BucketPool:
         inter_call_s: float = 6.0,    # min gap between successful calls (RPM hygiene)
         overload_backoff_s: float = 8.0,
         call_timeout_s: float = 180.0,  # hard per-call HTTP timeout (no infinite hangs)
+        model_overload_keys: int = 3,   # 503 on this many DISTINCT keys -> drop the
+                                        # whole model for the run (circuit breaker)
         logger=print,
     ):
         # NOTE: there is deliberately NO wall-clock cap by default. Termination is
@@ -167,6 +169,11 @@ class BucketPool:
         self.overload_budget = overload_budget
         self.inter_call_s = inter_call_s
         self.overload_backoff_s = overload_backoff_s
+        self.model_overload_keys = model_overload_keys
+        # Distinct key indices that have hit 503 per model (circuit-breaker signal).
+        # A tiny "ping" probe can pass while real PDF calls 503 (model overloaded for
+        # the actual workload), so this is driven by REAL calls, not the probe.
+        self._model_503_keys: dict[str, set] = {}
         # google-genai HttpOptions.timeout is in MILLISECONDS. A hard ceiling so a
         # stalled connection raises (transient -> retried) instead of hanging the
         # whole run. Critical under --workers: one stuck call would otherwise block
@@ -402,6 +409,21 @@ class BucketPool:
                 b.not_before = now + self.overload_backoff_s
                 self._log(f"  {b.label}: 503 overload — backoff {self.overload_backoff_s:.0f}s "
                           f"({b.overload_used}/{self.overload_budget})")
+            # MODEL CIRCUIT BREAKER — if this model has now 503'd on enough DISTINCT
+            # keys, it's overloaded for the real (PDF) workload regardless of what the
+            # ping-probe said: drop the ENTIRE model for this run and move on, instead
+            # of burning ~25s/503 across all 10 keys one-by-one.
+            ks = self._model_503_keys.setdefault(b.model, set())
+            ks.add(b.key_idx)
+            if len(ks) >= self.model_overload_keys:
+                killed = [bb for bb in self.buckets
+                          if bb.model == b.model and bb.state == ALIVE]
+                for bb in killed:
+                    bb.state = DEAD_RUN
+                if killed:
+                    self._log(f"  CIRCUIT-BREAK: model '{b.model}' 503'd on "
+                              f"{len(ks)} keys — dropping all {len(killed)} remaining "
+                              f"buckets for this run; failing over to next model.")
 
     # -- reporting --
     def _state_summary(self) -> str:
