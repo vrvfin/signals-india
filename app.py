@@ -3895,6 +3895,72 @@ def _render_fraud_checks(sym: str) -> None:
     st.markdown(" ".join(parts), unsafe_allow_html=True)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_screener_grades() -> pd.DataFrame:
+    """6-rule attractiveness grades (build_screener_grades.py)."""
+    return load_parquet(["company_repo", "_index", "screener_grades.parquet"])
+
+
+def page_screener():
+    import sys as _sys
+    _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+    if _sp not in _sys.path:
+        _sys.path.insert(0, _sp)
+    from gradation import GREEN_TIERS, TIER_COLOR
+
+    st.title("🟢 Attractiveness Screener")
+    st.caption("Six rules, color-graded. Green = Good/Great/Exceptional · amber = "
+               "Ok/Decent · red = Poor. Sorted by how many rules are green.")
+    df = load_screener_grades()
+    if df.empty:
+        st.info("`screener_grades.parquet` not found yet — runs nightly "
+                "(`build_screener_grades.py`).")
+        return
+
+    metrics = [("yoy", "YOY"), ("qoq", "QOQ"), ("guidance", "Guidance"),
+               ("val", "Valuation"), ("cfo", "CFO"), ("roe", "ROE")]
+    cols = st.columns(len(metrics))
+    for (key, lbl), c in zip(metrics, cols):
+        green = int(df[f"{key}_tier"].isin(GREEN_TIERS).sum())
+        c.metric(f"{lbl} 🟢", f"{green}", help=f"{lbl} Good-or-better")
+
+    c1, c2 = st.columns([1, 2])
+    min_g = c1.slider("Min green count", 0, 6, 3)
+    qtext = c2.text_input("Filter symbol / name", "")
+    view = df[df["green_count"] >= min_g]
+    if qtext:
+        m = (view["symbol"].astype(str).str.contains(qtext, case=False, na=False) |
+             view["company_name"].astype(str).str.contains(qtext, case=False, na=False))
+        view = view[m]
+    view = view.sort_values("green_count", ascending=False).head(300).reset_index(drop=True)
+    st.caption(f"Showing {len(view)} companies (green ≥ {min_g}).")
+
+    disp = pd.DataFrame({
+        "Symbol": view["symbol"], "Name": view["company_name"].astype(str).str[:26],
+        "🟢#": view["green_count"],
+        "YOY%": pd.to_numeric(view["yoy"], errors="coerce").round(0),
+        "QOQ%": pd.to_numeric(view["qoq"], errors="coerce").round(0),
+        "Guid%": pd.to_numeric(view["guidance"], errors="coerce").round(0),
+        "Val(PE)": pd.to_numeric(view["val_value"], errors="coerce").round(1),
+        "CFO(x)": pd.to_numeric(view["cfo_ratio"], errors="coerce").round(2),
+        "ROE%": pd.to_numeric(view["roe"], errors="coerce").round(0),
+    })
+    tier_of = {"YOY%": "yoy_tier", "QOQ%": "qoq_tier", "Guid%": "guidance_tier",
+               "Val(PE)": "val_tier", "CFO(x)": "cfo_tier", "ROE%": "roe_tier"}
+
+    def _style(_):
+        sty = pd.DataFrame("", index=disp.index, columns=disp.columns)
+        for dcol, tcol in tier_of.items():
+            colors = view[tcol].map(lambda t: f"background-color:{TIER_COLOR.get(t, '#eeeeee')}")
+            sty[dcol] = colors.values
+        return sty
+
+    st.dataframe(disp.style.apply(_style, axis=None), use_container_width=True,
+                 height=620, hide_index=True)
+    st.caption("Valuation = PE (v1; PB for finance / EV-EBITDA for asset-heavy coming). "
+               "Guidance shown only where management gave a number.")
+
+
 def _safe_render(page_fn):
     """Run a page function; show a recoverable error instead of crashing."""
     try:
@@ -4029,6 +4095,7 @@ def main():
         "Market Overview",
         "Market Trends",
         "Today's Signals",
+        "Screener 🟢",
         "Company Intel",
         "Mgmt Guidance",
         "Doc Viewer",
@@ -4055,6 +4122,8 @@ def main():
         _safe_render(page_market_trends)
     elif page == "Today's Signals":
         _safe_render(page_signals)
+    elif page == "Screener 🟢":
+        _safe_render(page_screener)
     elif page == "Company Intel":
         _safe_render(page_company_intel)
     elif page == "Mgmt Guidance":
