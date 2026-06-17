@@ -172,6 +172,20 @@ jobs:
         run: python scripts/market_state.py
         continue-on-error: true
 
+      # ---- BSE announcements -> LLM summary (independent of Phase 2) ----
+      # Runs after Aggregate signals (needs the fresh PF + n_strategies>=2 watchlist
+      # with the Rs1cr turnover floor). Pulls the day's market-wide BSE filings,
+      # summarises the new material ones (own ledger dedup), writes daily_update_summary
+      # + company_page sections. Uses FREE_POOL keys (default for new programs).
+      - name: BSE announcement summaries
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/ingest_announcements.py
+        continue-on-error: true
+        env:
+          FREE_POOL:            ${{ secrets.FREE_POOL }}
+          BACKFILL_GEMINI_KEY:  ${{ secrets.BACKFILL_GEMINI_KEY }}
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+
       # ---- Truth gate: the ONLY step allowed to fail the run ----
       - name: Health check (truth gate)
         if: steps.fresh.outputs.skip != 'true'

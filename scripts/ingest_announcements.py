@@ -203,13 +203,15 @@ def _download_pdf(attachment: str) -> bytes | None:
 
 
 def _build_pool():
-    """Lite-model cascade, BACKFILL keys FIRST then GEMINI (user 2026-06-17)."""
-    keys = load_keys(os.environ, prefix="BACKFILL_GEMINI_KEY")
-    keys += [k for k in load_keys(os.environ, prefix="GEMINI_API_KEY") if k not in keys]
+    """Lite-model cascade. FREE_POOL is the default pool for new programs
+    (user 2026-06-17); BACKFILL -> GEMINI kept as fallback."""
+    keys = load_keys(os.environ, prefix="FREE_POOL")
+    for pref in ("BACKFILL_GEMINI_KEY", "GEMINI_API_KEY"):
+        keys += [k for k in load_keys(os.environ, prefix=pref) if k not in keys]
     if not keys:
-        log("No Gemini keys (BACKFILL/GEMINI) — cannot summarise.")
+        log("No Gemini keys (FREE_POOL/BACKFILL/GEMINI) — cannot summarise.")
         return None
-    log(f"Gemini pool: {len(keys)} keys (BACKFILL then GEMINI) x lite models")
+    log(f"Gemini pool: {len(keys)} keys (FREE_POOL then BACKFILL/GEMINI) x lite models")
     return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"],
                       inter_call_s=0.5, logger=log, overload_budget=3)
 
@@ -293,9 +295,9 @@ def main() -> None:
         log("\n(DRY-RUN — no writes/Gemini.)")
         return
 
+    new = [k for k in new if k["attachment"]]      # need a PDF to summarise
     if args.limit and args.limit > 0:
         new = new[:args.limit]
-    new = [k for k in new if k["attachment"]]      # need a PDF to summarise
     if not new:
         log("No new PDF-bearing announcements — nothing to summarise.")
         return
