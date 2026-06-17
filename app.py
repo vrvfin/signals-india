@@ -2250,10 +2250,11 @@ def page_graphs():
     with c5:
         view = st.radio(
             "View",
-            ["NSE · 1–100", "NSE · 101–200", "NSE · 201–300", "NSE · 301–400",
-             "BSE-only · top 100", "Detailed"],
+            ["NSE · 1–60", "NSE · 61–120", "NSE · 121–180", "NSE · 181–240",
+             "NSE · 241–300", "NSE · 301–360",
+             "BSE-only · 1–60", "BSE-only · 61–120", "Detailed"],
             help="NSE views = stocks listed on NSE (may also trade on BSE). "
-                 "BSE-only = stocks not on NSE. Each view renders ONE slice of ≤100 "
+                 "BSE-only = stocks not on NSE. Each view renders ONE slice of ≤60 "
                  "charts so Cloud memory stays safe (real tabs would render all at "
                  "once and crash). Detailed = paginated candlesticks over the full set.")
     view_mode = "Detailed" if view == "Detailed" else "Quick Scan"
@@ -2324,14 +2325,17 @@ def page_graphs():
     # have to load every symbol's OHLCV just to rank — n_strategies is the default
     # sort's primary key, so this is faithful; the chosen sort then reorders the
     # slice for display below.
-    # view -> (which exchange set, slice start, slice end). Each slice is ≤100,
-    # comfortably under the ~120-chart memory ceiling proven safe on Cloud.
+    # view -> (which exchange set, slice start, slice end). Each slice is ≤60 —
+    # 100-chart slices were still OOM-segfaulting Cloud, so dropped to 60.
     SEG = {
-        "NSE · 1–100":        ("nse",   0, 100),
-        "NSE · 101–200":      ("nse", 100, 200),
-        "NSE · 201–300":      ("nse", 200, 300),
-        "NSE · 301–400":      ("nse", 300, 400),
-        "BSE-only · top 100": ("bse",   0, 100),
+        "NSE · 1–60":        ("nse",   0,  60),
+        "NSE · 61–120":      ("nse",  60, 120),
+        "NSE · 121–180":     ("nse", 120, 180),
+        "NSE · 181–240":     ("nse", 180, 240),
+        "NSE · 241–300":     ("nse", 240, 300),
+        "NSE · 301–360":     ("nse", 300, 360),
+        "BSE-only · 1–60":   ("bse",   0,  60),
+        "BSE-only · 61–120": ("bse",  60, 120),
     }
     if view_mode == "Quick Scan":
         uni = load_csv(["universe", "master_list.csv"])
