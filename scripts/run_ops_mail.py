@@ -151,7 +151,10 @@ def freshness_html(drive, root) -> tuple[str, int]:
 
 # ---------------- section 2b: coverage ----------------
 
-_BUCKET_ORDER = ["today", "yesterday", "<=5d", "<=1mo", ">1mo", "no data"]
+# Buckets are measured relative to the LATEST available market bar (not calendar
+# today) — so the morning before a run, or over a weekend, does not show everything
+# as "stale". "current" = as fresh as the freshest session we have.
+_BUCKET_ORDER = ["current", "1 back", "<=5 back", "<=1mo", ">1mo", "no data"]
 
 
 def _freshness_table(df: pd.DataFrame, group_col: str, group_label: str) -> str:
@@ -201,17 +204,19 @@ def coverage_html(drive, root) -> tuple[str, int]:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     today = pd.Timestamp(datetime.now().date())
     latest_bar = df["date"].max()
-    age = (today - df["date"]).dt.days
+    # Age is measured against the LATEST AVAILABLE bar, not calendar today, so the
+    # morning before the daily run (or a weekend) doesn't read as 0% / all-stale.
+    age = (latest_bar - df["date"]).dt.days
 
     def _bucket(a, has):
         if not has:
             return "no data"
         if a <= 0:
-            return "today"
+            return "current"
         if a <= 1:
-            return "yesterday"
+            return "1 back"
         if a <= 5:
-            return "<=5d"
+            return "<=5 back"
         if a <= 30:
             return "<=1mo"
         return ">1mo"
@@ -222,23 +227,30 @@ def coverage_html(drive, root) -> tuple[str, int]:
         "Unknown/BSE")
 
     featured = int((df["bucket"] != "no data").sum())
-    current = int((df["bucket"] == "today").sum())
+    current = int((df["date"] == latest_bar).sum())   # current to the latest session
     missing = int((df["bucket"] == "no data").sum())
+
+    # Is the data itself stale? (pipeline stopped producing fresh bars). Weekends
+    # mean the latest session can be 2-3 calendar days old, so allow up to 5.
+    latest_bar_age = (today - latest_bar).days if pd.notna(latest_bar) else 999
 
     def pct(x):
         return f"{(100.0 * x / total):.1f}%" if total else "n/a"
 
-    # Hard red only on a genuine break: nothing current at all, or coverage
-    # collapsed below half the universe. (BSE/.BO names legitimately lag a few
-    # days, so a low overall 'today' share is expected, not an alarm.)
-    n_bad = 1 if (current == 0 or featured < 0.5 * total) else 0
+    # Hard red only on a GENUINE break: the freshest bar we have is itself stale
+    # (daily run not producing), or coverage collapsed below half the universe.
+    # NOT on calendar-today==0, which is normal every morning pre-run.
+    n_bad = 1 if (latest_bar_age > 5 or featured < 0.5 * total) else 0
+    fresh_icon = "✅" if latest_bar_age <= 5 else "❌"
 
     summary = (
         "<table border=1 cellpadding=4 cellspacing=0>"
         "<tr><th>Metric</th><th>Count</th><th>% of total</th></tr>"
         f"<tr><td>Total stocks (master_list)</td><td align=right>{total:,}</td><td>100%</td></tr>"
         f"<tr><td>With data (featured)</td><td align=right>{featured:,}</td><td>{pct(featured)}</td></tr>"
-        f"<tr><td>Current to latest bar ({str(latest_bar)[:10]})</td>"
+        f"<tr><td>{fresh_icon} Latest bar {str(latest_bar)[:10]} "
+        f"({latest_bar_age}d old)</td><td colspan=2>data freshness</td></tr>"
+        f"<tr><td>Current to that bar</td>"
         f"<td align=right>{current:,}</td><td>{pct(current)}</td></tr>"
         f"<tr><td>Missing (no data)</td><td align=right>{missing:,}</td><td>{pct(missing)}</td></tr>"
         "</table>")
