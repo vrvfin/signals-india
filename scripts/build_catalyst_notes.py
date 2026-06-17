@@ -48,6 +48,8 @@ DATA_MISSING = "DATA_MISSING"
 CATALYST_COLS = [
     "isin", "symbol", "as_of", "headline", "catalyst_type", "tags",
     "what_to_track",          # 2026-06-12: concrete monitorables (user ask)
+    "note_text",              # 2026-06-17: note body inline, so the app can diff
+                              # today's note vs the prior as_of without fetching md
     "md_path", "n_sources", "computed_at",
 ]
 
@@ -403,6 +405,11 @@ def main():
             "isin": isin, "symbol": sym, "as_of": as_of,
             "headline": headline, "catalyst_type": ctype, "tags": tags,
             "what_to_track": track,
+            # Inline note body (headline + what-to-track + narrative) so the app can
+            # diff today vs the prior as_of cheaply — no per-render md fetch.
+            "note_text": (f"{headline}\n\n"
+                          + (f"What to track: {track}\n\n" if track else "")
+                          + (body or "")).strip(),
             "md_path": md_path, "n_sources": len(items) + len(filings),
             "computed_at": datetime.now().isoformat(timespec="seconds"),
         })

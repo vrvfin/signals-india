@@ -897,6 +897,61 @@ def load_catalyst_index() -> pd.DataFrame:
     return load_parquet(["company_repo", "_index", "catalyst_index.parquet"])
 
 
+def _catalyst_text(row) -> str:
+    """Best available note text for diffing: full note_text if present, else fall
+    back to headline + what-to-track (older rows have no note_text)."""
+    t = str(row.get("note_text", "") or "").strip()
+    if t and t.lower() != "nan":
+        return t
+    parts = [str(row.get("headline", "") or "").strip()]
+    wt = str(row.get("what_to_track", "") or "").strip()
+    if wt and wt.lower() != "nan":
+        parts.append("What to track: " + wt)
+    return "\n".join(p for p in parts if p)
+
+
+def _catalyst_diff_html(today_txt: str, prev_txt):
+    """(html, changed) — today's note with new/changed sentences highlighted green
+    vs the previous note. changed=False means the text is 100% identical."""
+    import difflib
+    import html as _h
+    import re as _re
+    esc = lambda s: _h.escape(s)
+    split = lambda s: [x.strip() for x in _re.split(r"(?<=[.!?])\s+|\n+", s.strip()) if x.strip()]
+    if not prev_txt:
+        return esc(today_txt).replace("\n", "<br>"), True   # first note — no baseline
+    a, b = split(prev_txt), split(today_txt)
+    if a == b:
+        return esc(today_txt).replace("\n", "<br>"), False  # 100% identical
+    out = []
+    for op, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if op == "delete":
+            continue                                        # focus on today's text
+        seg = " ".join(b[j1:j2])
+        if op == "equal":
+            out.append(esc(seg))
+        else:                                               # insert / replace = new
+            out.append(f'<mark style="background:#d4f8d4;padding:0 2px;'
+                       f'border-radius:3px">{esc(seg)}</mark>')
+    return " ".join(out), True
+
+
+def _freshness_badge(as_of, label: str = "updated") -> str:
+    """Colored age pill for a date: green <=2d, amber <=7d, red older, grey unknown."""
+    import datetime as _dt
+    s = str(as_of or "").strip()[:10]
+    try:
+        age = (_dt.date.today() - _dt.date.fromisoformat(s)).days
+    except Exception:
+        return ('<span style="background:#aaa;color:#fff;padding:1px 7px;'
+                'border-radius:8px;font-size:11px">freshness unknown</span>')
+    color = "#27ae60" if age <= 2 else ("#f39c12" if age <= 7 else "#e74c3c")
+    when = "today" if age <= 0 else ("yesterday" if age == 1 else f"{age}d ago")
+    return (f'<span style="background:{color};color:#fff;padding:1px 7px;'
+            f'border-radius:8px;font-size:11px;font-weight:600">'
+            f'{label} {s} · {when}</span>')
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_quarterly_index() -> list[dict]:
     """List quarterly guidance .md files from company_repo/_quarterly/."""
@@ -3769,16 +3824,75 @@ a 90-composite company on a watchlist keeps its 90 but shows a low red Investiga
             + ".  Weights auto-renormalize — composite reflects available data only."
         )
 
-    # T5 — latest catalyst note for the drilled symbol
+    # T5 — catalyst note, diffed vs the previous note (new = green) + freshness pill
     cat = load_catalyst_index()
     if not cat.empty and "symbol" in cat.columns:
-        crows = cat[cat["symbol"].astype(str).str.upper() == drill_sym]
+        crows = cat[cat["symbol"].astype(str).str.upper() == drill_sym].sort_values("as_of")
         if not crows.empty:
-            cr = crows.sort_values("as_of").iloc[-1]
+            cur = crows.iloc[-1]
+            prev = crows.iloc[-2] if len(crows) >= 2 else None
+            prev_txt = _catalyst_text(prev) if prev is not None else None
+            diff_html, changed = _catalyst_diff_html(_catalyst_text(cur), prev_txt)
             st.markdown(
-                f"💡 **Latest catalyst** ({cr.get('as_of', '')}, "
-                f"{cr.get('catalyst_type', '')}): {cr.get('headline', '')}"
-            )
+                f"💡 **Catalyst** · {cur.get('catalyst_type', '')} &nbsp; "
+                + _freshness_badge(cur.get("as_of", "")), unsafe_allow_html=True)
+            if prev is not None and not changed:
+                st.success(f"🟰 No change since {str(prev.get('as_of',''))[:10]} "
+                           "— catalyst text identical.")
+            elif prev is not None:
+                st.caption("🟢 Highlighted = new / changed since the previous note.")
+            st.markdown(diff_html, unsafe_allow_html=True)
+
+    # Fraud / risk checks for the drilled symbol (T4/T7)
+    _render_fraud_checks(drill_sym)
+
+
+def _render_fraud_checks(sym: str) -> None:
+    """Fraud-tracker band + investigative grade + forensic flags, freshness-stamped."""
+    ft = load_parquet(["company_repo", "_index", "fraud_tracker.parquet"])
+    inv = load_parquet(["company_repo", "_index", "investigative_fraud.parquet"])
+    su = sym.upper()
+    frow = (ft[ft["symbol"].astype(str).str.upper() == su]
+            if not ft.empty and "symbol" in ft.columns else pd.DataFrame())
+    irow = (inv[inv["symbol"].astype(str).str.upper() == su]
+            if not inv.empty and "symbol" in inv.columns else pd.DataFrame())
+    if frow.empty and irow.empty:
+        st.markdown("🛡️ **Fraud checks:** no flags — untracked / clean "
+                    "(below the WATCH threshold).")
+        return
+    parts = ["🛡️ **Fraud / forensic checks**"]
+    if not frow.empty:
+        r = frow.iloc[-1]
+        band = str(r.get("band", "") or "—")
+        color = _BAND_COLORS.get(band, "#7f8c8d")
+        score = r.get("fraud_score")
+        trend = _TREND_ARROW.get(str(r.get("trend", "")), "")
+        parts.append(
+            f"&nbsp; <span style='background:{color};color:#fff;padding:1px 7px;"
+            f"border-radius:8px;font-size:11px;font-weight:600'>{band} "
+            f"{'' if pd.isna(score) else int(score)}</span> {trend} &nbsp; "
+            + _freshness_badge(str(r.get("last_changed_at", r.get("computed_at", "")))[:10],
+                               "checked"))
+        reason = str(r.get("reason", "") or "").strip()
+        if reason and reason.lower() != "nan":
+            parts.append(f"<br>**Why:** {reason}")
+    if not irow.empty:
+        r = irow.iloc[-1]
+        grade = r.get("investigative_grade")
+        greason = str(r.get("grade_reason", "") or "").strip()
+        flags = [f"{k.upper()}={r.get(k)}" for k in ("asm_level", "esm_level", "gsm_stage")
+                 if str(r.get(k, "")).strip() not in ("", "0", "none", "nan", "False")]
+        sebi = r.get("sebi_actions"); nfra = r.get("nfra_actions")
+        extra = []
+        if sebi and str(sebi) not in ("0", "nan"): extra.append(f"SEBI×{sebi}")
+        if nfra and str(nfra) not in ("0", "nan"): extra.append(f"NFRA×{nfra}")
+        line = f"<br>**Investigative:** grade {'' if pd.isna(grade) else int(grade)}/4"
+        if greason and greason.lower() not in ("nan", "clean"):
+            line += f" — {greason}"
+        if flags or extra:
+            line += " · " + ", ".join(flags + extra)
+        parts.append(line)
+    st.markdown(" ".join(parts), unsafe_allow_html=True)
 
 
 def _safe_render(page_fn):
