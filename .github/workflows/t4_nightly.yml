@@ -108,8 +108,20 @@ jobs:
         run: python scripts/build_valuation.py
         continue-on-error: true
 
+      # Full-universe forensic metrics from fundamentals/statements/ -> lifts
+      # financials_derived (and thus fraud_risk) from ~45 to the whole universe.
+      - name: Derive forensic metrics (full universe from statements)
+        run: python scripts/build_derived_from_statements.py --workers 12
+        continue-on-error: true
+
       - name: Financial fraud rules (T2 forensics)
         run: python scripts/build_fraud_risk.py
+        continue-on-error: true
+
+      # 6-rule attractiveness heatmap (YOY/QOQ/Guidance/Valuation/CFO/ROE) ->
+      # screener_grades.parquet, rendered on the app's "Screener" page.
+      - name: Screener grades (6-rule heatmap)
+        run: python scripts/build_screener_grades.py
         continue-on-error: true
 
       - name: 8-factor scorecard blend
