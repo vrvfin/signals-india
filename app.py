@@ -2556,19 +2556,94 @@ def page_graphs():
                 )
             return " ".join(chips)
 
+        # ── 6-rule grade strip + 6-quarter table (chart+table+grades+summary glance) ──
+        import sys as _sysg
+        _spg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+        if _spg not in _sysg.path:
+            _sysg.path.insert(0, _spg)
+        from gradation import TIER_COLOR as _TC
+        grades_by_sym = _group_upper(load_screener_grades())
+        # (tier_col, label, value_col, value_format)
+        _GTILES = [("yoy_tier", "YOY", "yoy", "{:.0f}%"),
+                   ("qoq_tier", "QOQ", "qoq", "{:.0f}%"),
+                   ("guidance_tier", "Guid", "guidance", "{:.0f}%"),
+                   ("val_tier", "Val", "val_value", "PE {:.0f}"),
+                   ("cfo_tier", "CFO", "cfo_ratio", "{:.1f}x"),
+                   ("roe_tier", "ROE", "roe", "{:.0f}%")]
+
+        def _grades_strip(sym: str) -> str:
+            g = grades_by_sym.get(sym.upper(), _EMPTY)
+            if g is None or g.empty:
+                return ""
+            r = g.iloc[-1]
+            tiles = []
+            for tcol, lbl, vcol, vfmt in _GTILES:
+                tier = str(r.get(tcol, "na"))
+                v = r.get(vcol)
+                try:
+                    vs = vfmt.format(float(v)) if v is not None and pd.notna(v) else "—"
+                except (TypeError, ValueError):
+                    vs = "—"
+                tiles.append(
+                    f'<span style="background:{_TC.get(tier, "#eee")};color:#111;'
+                    f'padding:1px 6px;border-radius:6px;font-size:11px;margin-right:3px;'
+                    f'display:inline-block">{lbl} {vs}</span>')
+            return "".join(tiles)
+
+        def _quarterly_html(sym: str) -> str:
+            sdf = load_parquet(["fundamentals", "statements", f"{sym}.parquet"])
+            if sdf.empty or "statement" not in sdf.columns:
+                return ""
+            q = sdf[sdf["statement"] == "quarterly_pl"]
+            if q.empty:
+                return ""
+            def ser(item):
+                sub = q[q["line_item"] == item]
+                return list(zip(sub["period"].astype(str),
+                                pd.to_numeric(sub["value"], errors="coerce")))
+            rowdefs = [("Sales", "Sales"), ("Profit", "Net Profit"), ("EPS", "EPS in Rs")]
+            periods = None
+            for _, it in rowdefs:
+                s = ser(it)
+                if s:
+                    periods = [p for p, _ in s][-6:]
+                    break
+            if not periods:
+                return ""
+            th = ("<tr><td style='font-size:10px'></td>"
+                  + "".join(f"<td style='font-size:10px;text-align:right;color:#888'>{p}</td>"
+                            for p in periods) + "</tr>")
+            body = ""
+            for lbl, it in rowdefs:
+                d = dict(ser(it))
+                cells = "".join(
+                    "<td style='font-size:10px;text-align:right'>"
+                    + ("—" if d.get(p) is None or pd.isna(d.get(p))
+                       else format(d.get(p), ',.0f')) + "</td>"
+                    for p in periods)
+                body += f"<tr><td style='font-size:10px'><b>{lbl}</b></td>{cells}</tr>"
+            return (f"<table style='border-collapse:collapse;width:100%;"
+                    f"margin:2px 0 4px 0'>{th}{body}</table>")
+
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
             sym_sigs = sel_by_sym.get(sym, _EMPTY)
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
             with st.container():
-                # Line 1 — strategy chips + T4 conviction badge
-                line1_html = _strat_chips(sym_sigs) + _scorecard_badge(
+                # Line 1 — 6-rule grade strip (green/amber) + conviction badge
+                # (strategy chips removed per user — grades give the glance instead)
+                line1_html = _grades_strip(sym) + " " + _scorecard_badge(
                     sym, scorecard_by_sym.get(sym.upper(), _EMPTY))
-                if line1_html:
+                if line1_html.strip():
                     st.markdown(line1_html, unsafe_allow_html=True)
 
-                # Line 2 — fundamentals (results YoY/QoQ + guidance)
+                # Line 2 — last-6-quarter table (Sales / Profit / EPS)
+                qhtml = _quarterly_html(sym)
+                if qhtml:
+                    st.markdown(qhtml, unsafe_allow_html=True)
+
+                # Line 3 — fundamentals growth (results YoY/QoQ + guidance)
                 fund = _fund_line(sym)
                 if fund:
                     st.markdown(
@@ -2577,7 +2652,7 @@ def page_graphs():
                         unsafe_allow_html=True,
                     )
 
-                # Line 3 — latest catalyst (why moving) + what to track (T5)
+                # Line 4 — LLM catalyst summary (why moving) + what to track
                 cat_line = _catalyst_line(sym)
                 if cat_line:
                     st.markdown(
