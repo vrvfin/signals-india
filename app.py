@@ -2020,6 +2020,9 @@ def page_stock_detail():
     if _sc_badge:
         st.markdown(_sc_badge, unsafe_allow_html=True)
 
+    # Last 6 quarters: Sales / Net Profit / EPS with latest-qtr YoY & QoQ + guidance
+    _render_quarterly_table(symbol)
+
     # T5 — latest catalyst note headline
     _cat = load_catalyst_index()
     if not _cat.empty and "symbol" in _cat.columns:
@@ -3893,6 +3896,87 @@ def _render_fraud_checks(sym: str) -> None:
             line += " · " + ", ".join(flags + extra)
         parts.append(line)
     st.markdown(" ".join(parts), unsafe_allow_html=True)
+
+
+def _render_quarterly_table(symbol: str) -> None:
+    """Last 6 quarters of Sales / Net Profit / EPS, with latest-quarter YoY & QoQ
+    and a management-guidance row, growth cells color-graded."""
+    import sys as _sys
+    _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+    if _sp not in _sys.path:
+        _sys.path.insert(0, _sp)
+    from gradation import grade_growth, TIER_COLOR
+
+    stmt = load_parquet(["fundamentals", "statements", f"{symbol}.parquet"])
+    if stmt.empty or "statement" not in stmt.columns:
+        return
+    q = stmt[stmt["statement"] == "quarterly_pl"]
+    if q.empty:
+        return
+
+    def _series(item):
+        sub = q[q["line_item"] == item]
+        per = sub["period"].astype(str).tolist()
+        val = pd.to_numeric(sub["value"], errors="coerce").tolist()
+        return per, val
+
+    rows_def = [("Sales", "Sales"), ("Net Profit", "Net Profit"), ("EPS", "EPS in Rs")]
+    periods = None
+    for _, item in rows_def:
+        p, _v = _series(item)
+        if p:
+            periods = p[-6:]
+            break
+    if not periods:
+        return
+
+    st.markdown("##### 📊 Last 6 quarters")
+    yoy_qoq = {}
+    table = {"Quarter": periods}
+    for label, item in rows_def:
+        p, v = _series(item)
+        d = dict(zip(p, v))
+        table[label] = [d.get(per) for per in periods]
+        full_v = v
+        yoy = (_pct_change(full_v[-1], full_v[-5]) if len(full_v) >= 5 else None)
+        qoq = (_pct_change(full_v[-1], full_v[-2]) if len(full_v) >= 2 else None)
+        yoy_qoq[label] = (yoy, qoq)
+    df = pd.DataFrame(table)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # YoY / QoQ summary for the latest quarter, color-graded
+    guid = load_guidance_tracker()
+    gtxt = ""
+    if not guid.empty and "symbol" in guid.columns:
+        gr = guid[guid["symbol"].astype(str).str.upper() == symbol]
+        gr = gr[pd.to_numeric(gr.get("cagr_pct"), errors="coerce").notna()]
+        if not gr.empty:
+            gv = pd.to_numeric(gr["cagr_pct"], errors="coerce").max()
+            gtxt = (f"<span style='background:{TIER_COLOR[grade_growth(gv)]};"
+                    f"padding:1px 7px;border-radius:8px'>Guidance ~{gv:.0f}%</span>")
+
+    def _chip(v):
+        if v is None:
+            return "<span style='color:#999'>—</span>"
+        return (f"<span style='background:{TIER_COLOR[grade_growth(v)]};"
+                f"padding:1px 7px;border-radius:8px'>{v:+.0f}%</span>")
+
+    cells = []
+    for label in ("Sales", "Net Profit", "EPS"):
+        yoy, qoq = yoy_qoq.get(label, (None, None))
+        cells.append(f"<b>{label}</b> &nbsp;YoY {_chip(yoy)} &nbsp;QoQ {_chip(qoq)}")
+    st.markdown("Latest quarter: &nbsp; " + " &nbsp;|&nbsp; ".join(cells)
+                + (f" &nbsp;|&nbsp; {gtxt}" if gtxt else ""), unsafe_allow_html=True)
+
+
+def _pct_change(a, b):
+    try:
+        a, b = float(a), float(b)
+        if b == 0 or pd.isna(a) or pd.isna(b):
+            return None
+        return (a - b) / abs(b) * 100.0
+    except (TypeError, ValueError):
+        return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
