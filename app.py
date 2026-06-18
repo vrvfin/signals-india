@@ -686,6 +686,37 @@ def load_ohlcv_bulk(symbols: tuple) -> dict:
     return _drive_call(_do)
 
 
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=3)
+def load_statements_bulk(symbols: tuple) -> dict:
+    """Download fundamentals/statements/<sym>.parquet for many symbols in ONE
+    Drive session. Folder is listed once; only the needed files are downloaded.
+    Mirrors load_ohlcv_bulk — avoids per-symbol path resolution + folder listing
+    on the main thread (that serial thrash froze the Graphs page for 60s+).
+    Returns {symbol: DataFrame}. Missing symbols map to empty DataFrame."""
+    def _do():
+        drive  = drive_service()
+        root   = os.environ["GDRIVE_FOLDER_ID"]
+        fund_id = _find_subfolder(drive, root, "fundamentals")
+        if not fund_id:
+            return {}
+        stmt_id = _find_subfolder(drive, fund_id, "statements")
+        if not stmt_id:
+            return {}
+        all_files = _list_folder(drive, stmt_id)   # one API call lists everything
+        result = {}
+        for sym in symbols:
+            fid = all_files.get(f"{sym}.parquet")
+            if not fid:
+                result[sym] = pd.DataFrame()
+                continue
+            try:
+                result[sym] = pd.read_parquet(io.BytesIO(_download_bytes(drive, fid)))
+            except Exception:
+                result[sym] = pd.DataFrame()
+        return result
+    return _drive_call(_do)
+
+
 # ---------- Company Intel helpers ----------
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2590,9 +2621,14 @@ def page_graphs():
                     f'display:inline-block">{lbl} {vs}</span>')
             return "".join(tiles)
 
+        # Pre-load statements for the WHOLE slice in one Drive session (was a
+        # per-symbol load_parquet inside the loop → 60 serial round-trips that
+        # froze the page 60s+ and segfaulted). Mirrors the OHLCV bulk loader.
+        stmts_by_sym = load_statements_bulk(tuple(conv["symbol"].tolist()))
+
         def _quarterly_html(sym: str) -> str:
-            sdf = load_parquet(["fundamentals", "statements", f"{sym}.parquet"])
-            if sdf.empty or "statement" not in sdf.columns:
+            sdf = stmts_by_sym.get(sym, _EMPTY)
+            if sdf is None or sdf.empty or "statement" not in sdf.columns:
                 return ""
             q = sdf[sdf["statement"] == "quarterly_pl"]
             if q.empty:
