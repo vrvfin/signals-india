@@ -21,6 +21,7 @@ import json
 import ssl
 import socket
 import time
+import gc
 
 st.set_page_config(page_title="Signals India", layout="wide",
                           initial_sidebar_state="expanded")
@@ -2723,7 +2724,7 @@ def page_graphs():
                         lbl2, vs = f"Guid·{short} 1Y", f"+{gv:.0f}%"
                     tiles.append(
                         f'<span style="background:{_TC.get(tier, "#eee")};color:#111;'
-                        f'padding:1px 6px;border-radius:6px;font-size:11px;margin-right:3px;'
+                        f'padding:1px 7px;border-radius:6px;font-size:12px;font-weight:600;margin-right:3px;'
                         f'display:inline-block">{lbl2} {vs}</span>')
                     continue
                 tier = str(r.get(tcol, "na"))
@@ -2734,7 +2735,7 @@ def page_graphs():
                     vs = "—"
                 tiles.append(
                     f'<span style="background:{_TC.get(tier, "#eee")};color:#111;'
-                    f'padding:1px 6px;border-radius:6px;font-size:11px;margin-right:3px;'
+                    f'padding:1px 7px;border-radius:6px;font-size:12px;font-weight:600;margin-right:3px;'
                     f'display:inline-block">{lbl} {vs}</span>')
             return "".join(tiles)
 
@@ -2783,26 +2784,34 @@ def page_graphs():
                 return ""
 
             def _pct_cell(cur, prev):
-                """+/- coloured % chip vs a reference value (None when n/a)."""
-                if cur is None or prev is None or pd.isna(cur) or pd.isna(prev) or prev == 0:
-                    return "<td style='font-size:10px;text-align:right;color:#bbb'>—</td>"
-                pct = (cur / prev - 1) * 100
-                col = "#27ae60" if pct >= 0 else "#e74c3c"
-                return (f"<td style='font-size:10px;text-align:right;color:{col}'>"
-                        f"{pct:+.0f}%</td>")
+                """+/- coloured % chip vs a reference value. Colour ALWAYS reflects
+                real direction (cur vs prev); the % is shown only when the base is
+                positive — a %-change off a negative base flips sign (a deepening
+                loss would look like +growth), so we show 'n/m' there instead."""
+                if cur is None or prev is None or pd.isna(cur) or pd.isna(prev):
+                    return "<td style='font-size:11px;text-align:right;color:#bbb'>—</td>"
+                improved = cur > prev                     # true direction
+                col = "#1a7a3a" if improved else "#c0392b"
+                if prev > 0:
+                    txt = f"{(cur / prev - 1) * 100:+.0f}%"
+                else:
+                    txt = ("▲" if improved else "▼") + " n/m"   # base ≤0 → % meaningless
+                return (f"<td style='font-size:11px;text-align:right;font-weight:700;"
+                        f"color:{col}'>{txt}</td>")
 
-            th = ("<tr><td style='font-size:10px'></td>"
-                  + "".join(f"<td style='font-size:10px;text-align:right;color:#888'>{_qtr_label(p)}</td>"
+            th = ("<tr><td style='font-size:11px'></td>"
+                  + "".join(f"<td style='font-size:11px;text-align:right;color:#666;"
+                            f"font-weight:600'>{_qtr_label(p)}</td>"
                             for p in periods)
-                  + "<td style='font-size:10px;text-align:right;color:#888;"
-                    "border-left:1px solid #ddd'>YoY</td>"
-                  + "<td style='font-size:10px;text-align:right;color:#888'>QoQ</td></tr>")
+                  + "<td style='font-size:11px;text-align:right;color:#666;font-weight:600;"
+                    "border-left:1px solid #ccc'>YoY</td>"
+                  + "<td style='font-size:11px;text-align:right;color:#666;font-weight:600'>QoQ</td></tr>")
             body = ""
             for lbl, it in rowdefs:
                 vals = ser(it)                       # chronological (period, value)
                 d = dict(vals)
                 cells = "".join(
-                    "<td style='font-size:10px;text-align:right'>"
+                    "<td style='font-size:11px;text-align:right;font-weight:600;color:#111'>"
                     + ("—" if d.get(p) is None or pd.isna(d.get(p))
                        else format(d.get(p), ',.0f')) + "</td>"
                     for p in periods)
@@ -2812,9 +2821,9 @@ def page_graphs():
                 yoy_ref = seq[-5] if len(seq) >= 5 else None
                 qoq_ref = seq[-2] if len(seq) >= 2 else None
                 yoy_c = _pct_cell(cur, yoy_ref).replace("text-align:right;",
-                                                        "text-align:right;border-left:1px solid #ddd;")
+                                                        "text-align:right;border-left:1px solid #ccc;")
                 qoq_c = _pct_cell(cur, qoq_ref)
-                body += (f"<tr><td style='font-size:10px'><b>{lbl}</b></td>"
+                body += (f"<tr><td style='font-size:11px;color:#333'><b>{lbl}</b></td>"
                          f"{cells}{yoy_c}{qoq_c}</tr>")
             return (f"<table style='border-collapse:collapse;width:100%;"
                     f"margin:2px 0 4px 0'>{th}{body}</table>")
@@ -2838,7 +2847,7 @@ def page_graphs():
                 return ""
             txt = f"₹{mc:,.0f} Cr" + (f" · {seg}" if seg else "")
             return (f'<span style="background:#eceff1;color:#333;padding:1px 7px;'
-                    f'border-radius:6px;font-size:11px;margin-right:4px">{txt}</span>')
+                    f'border-radius:6px;font-size:12px;font-weight:600;margin-right:4px">{txt}</span>')
 
         def _latest_qtr(sym):
             """Label of the most recent quarter in statements, e.g. 'Q4 FY25'."""
@@ -2953,8 +2962,8 @@ def page_graphs():
             if not hot:
                 return ""
             qtag = f'<span style="opacity:.85">{qlab} · </span>' if qlab else ""
-            return (f'<div style="background:#1a7a3a;color:#fff;padding:3px 9px;'
-                    f'border-radius:6px;font-size:12px;font-weight:600;margin:3px 0">'
+            return (f'<div style="background:#1a7a3a;color:#fff;padding:4px 10px;'
+                    f'border-radius:6px;font-size:13.5px;font-weight:700;margin:3px 0">'
                     f'🚀 {qtag}{" · ".join(hot)}</div>')
 
         def _gf1_blob(sym):
@@ -2965,9 +2974,8 @@ def page_graphs():
             #     Revenue" / "INR173 cr" / "15% growth") + a kind tag so margin vs
             #     growth vs absolute is never ambiguous.
             qlab, g = _guidance_latest(sym)
+            src_q = qlab                        # the concall quarter this guidance is from
             if g is not None and not g.empty:
-                if qlab:
-                    lines.append(f'<span style="color:#777">latest: {qlab}</span>')
                 _HLABEL = {"NEXT_QTR": "Nxt-Q", "1Y": "Yr", "2Y": "2Y", "3Y": "3Y", "3Y+": "3Y+"}
                 for m, sub in g.groupby(g["metric"].astype(str).str.title()):
                     if not m or m.lower() == "nan":
@@ -2990,13 +2998,16 @@ def page_graphs():
                             disp = t
                             if kind in ("growth", "margin") and re.fullmatch(r"[\d.\-– ]+", disp):
                                 disp = disp + "%"            # bare number -> rate
+                            disp = disp[:34] + ("…" if len(disp) > 34 else "")
                             tag = _HLABEL.get(h, "")
-                            bits.append((f"{tag} " if tag else "") + (disp[:34] + ("…" if len(disp) > 34 else "")))
+                            # value bold + dark so the NUMBER stands out at a glance
+                            bits.append((f'<span style="color:#888">{tag}</span> ' if tag else "")
+                                        + f'<b style="color:#0d2f5c">{disp}</b>')
                             break       # one value per horizon keeps it compact
                     if bits:
                         chip = (f'<span style="background:{kcol};color:#fff;border-radius:4px;'
-                                f'padding:0 4px;font-size:9px;margin-left:4px">{klab}</span>')
-                        lines.append(f"<b>{m}</b>{chip} " + " · ".join(bits[:4]))
+                                f'padding:0 5px;font-size:10px;margin-left:4px">{klab}</span>')
+                        lines.append(f'<b style="color:#1565c0">{m}</b>{chip} ' + " · ".join(bits[:4]))
                     if len(lines) >= 7:
                         break
 
@@ -3021,9 +3032,13 @@ def page_graphs():
             if not lines:
                 return ""
             body = "<br>".join(lines[:7])
+            src = (f'<span style="background:#1565c0;color:#fff;border-radius:4px;'
+                   f'padding:0 6px;font-size:10px;margin-left:6px">concall {src_q}</span>'
+                   if src_q else "")
             return (f'<div style="background:#eef6ff;border-left:3px solid #1565c0;'
-                    f'padding:4px 8px;font-size:11px;color:#333;margin:2px 0;'
-                    f'line-height:1.45">📋 <b>Guidance / outlook:</b><br>{body}</div>')
+                    f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;'
+                    f'line-height:1.55">📋 <b style="font-size:13px">Guidance / outlook</b>'
+                    f'{src}<br>{body}</div>')
 
         import datetime as _dtg
         _today_g = _dtg.date.today()
@@ -3049,9 +3064,10 @@ def page_graphs():
                 if s and s.lower() != "nan":
                     adate = str(row.get("ann_date", ""))[:10]
                     return (f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
-                            f'padding:4px 8px;font-size:11px;color:#333;margin:2px 0">'
-                            f'{_fresh_badge(adate)}🧠 <b>{adate} {row.get("category","")}:</b> '
-                            f'{s[:400]}</div>')
+                            f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;'
+                            f'line-height:1.55">'
+                            f'{_fresh_badge(adate)}🧠 <b style="color:#8a6d00">{adate} · '
+                            f'{row.get("category","")}:</b> {s[:400]}</div>')
             return _catalyst_line(sym)   # fall back to catalyst note
 
         for i, (_, crow) in enumerate(conv.iterrows()):
@@ -3105,6 +3121,10 @@ def page_graphs():
                 for blob in (_growth_blob(sym), _gf1_blob(sym), _llm_summary(sym)):
                     if blob:
                         st.markdown(blob, unsafe_allow_html=True)
+        # Release the slice's Plotly figures promptly — memory crept across
+        # successive slice navigations and segfaulted Cloud (~1GB) around the
+        # 5th slice. gc.collect() breaks the figure reference cycles each rerun.
+        gc.collect()
         return
 
     # ─────────────────────────────────────────────────────────────────────────
