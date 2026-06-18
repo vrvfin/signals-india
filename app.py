@@ -2773,6 +2773,32 @@ def page_graphs():
         # BAJAJCON 30% was a derived 3Y revenue row, real 1Y was 10–22%.)
         _HORIZON_ORDER = ["NEXT_QTR", "1Y", "2Y", "3Y", "3Y+"]
         _GROWTH_METRICS = ("revenue", "sales", "pat", "profit", "volume", "earnings")
+        # metrics whose bare "%" means a growth rate (vs a margin level)
+        _BARE_PCT_GROWTH = ("revenue", "sales", "volume")
+        _CUR_TOK = ("inr", "₹", "crore", " cr", "cr.", "cr ", "gigawatt",
+                    " gw", " mw", " ton", "capex", " bn", " mn")
+        # kind -> (chip label, chip colour)
+        _KIND_TAG = {"growth": ("growth", "#1a7a3a"), "margin": ("margin", "#8e6e00"),
+                     "absolute": ("abs", "#5a4bb3"), "qual": ("note", "#777")}
+
+        def _g_kind(metric, value):
+            """Classify a guidance row from its free-text value: growth rate vs
+            margin level vs absolute target vs qualitative note."""
+            m = str(metric).lower()
+            v = str(value).lower().strip()
+            if v in ("", "na", "nan", "n/a", "-"):
+                return "qual"
+            if "growth" in v or "yoy" in v or "cagr" in v:
+                return "growth"
+            if "margin" in v or "of revenue" in v or "of sales" in v or "bps" in v:
+                return "margin"
+            if any(c in v for c in _CUR_TOK):
+                return "absolute"
+            # a "%" OR a bare number/range ("15", "23-24", "9.5") -> a rate:
+            # growth for revenue/sales/volume, otherwise a margin/level.
+            if "%" in v or re.fullmatch(r"[\d.\-– ]+", v):
+                return "growth" if any(k in m for k in _BARE_PCT_GROWTH) else "margin"
+            return "qual"
 
         def _q_order(qs):
             m = re.match(r"\s*Q([1-4])\s*FY\s*0*(\d+)", str(qs), re.I)
@@ -2792,13 +2818,17 @@ def page_graphs():
             return qlab, g
 
         def _guid_1y(sym):
-            """[(metric, value)] explicit 1Y guidance, latest quarter, median per
-            metric (median tames duplicate/contradictory extractions)."""
+            """[(metric, growth_pct)] explicit 1Y GROWTH guidance, latest quarter,
+            median per metric. Only kind=='growth' rows feed this — a margin level
+            (e.g. 'EBITDA 23% of revenue') is NEVER shown as a growth number."""
             qlab, g = _guidance_latest(sym)
             if g is None:
                 return "", []
+            kinds = [_g_kind(mm, vv) for mm, vv in zip(g["metric"], g.get("value", ""))]
+            g = g.assign(_kind=kinds)
             g1 = g[g["horizon_fy"].astype(str).str.upper().eq("1Y")
-                   & g["guidance_type"].astype(str).str.lower().str.contains("explicit")]
+                   & g["guidance_type"].astype(str).str.lower().str.contains("explicit")
+                   & g["_kind"].eq("growth")]
             g1 = g1.dropna(subset=["_c"])
             out = []
             for m, sub in g1.groupby(g1["metric"].astype(str).str.title()):
@@ -2826,11 +2856,11 @@ def page_graphs():
                 v = pd.to_numeric(r.get(key), errors="coerce")
                 if pd.notna(v) and v > 30:
                     hot.append(f"{lbl} +{v:.0f}%")
-            # guidance: 1Y growth metrics >30% only (named + horizon-tagged)
+            # guidance: 1Y growth metrics >30% only (named + tagged as growth)
             _qg, _mets = _guid_1y(sym)
             for m, c in _mets:
                 if c > 30 and any(k in m.lower() for k in _GROWTH_METRICS):
-                    hot.append(f"Guid·{m} +{c:.0f}% (1Y)")
+                    hot.append(f"Guid·{m} +{c:.0f}% (1Y growth)")
             if not hot:
                 return ""
             qtag = f'<span style="opacity:.85">{qlab} · </span>' if qlab else ""
@@ -2841,30 +2871,44 @@ def page_graphs():
         def _gf1_blob(sym):
             lines = []
 
-            # (a) Quantified guidance — LATEST quarter, ALL horizons per metric
-            #     (NEXT_QTR -> 1Y -> long range), median across dup extractions.
+            # (a) Quantified guidance — LATEST quarter, ALL horizons per metric,
+            #     showing management's RAW value text (self-describing: "23-24% of
+            #     Revenue" / "INR173 cr" / "15% growth") + a kind tag so margin vs
+            #     growth vs absolute is never ambiguous.
             qlab, g = _guidance_latest(sym)
             if g is not None and not g.empty:
                 if qlab:
                     lines.append(f'<span style="color:#777">latest: {qlab}</span>')
+                _HLABEL = {"NEXT_QTR": "Nxt-Q", "1Y": "Yr", "2Y": "2Y", "3Y": "3Y", "3Y+": "3Y+"}
                 for m, sub in g.groupby(g["metric"].astype(str).str.title()):
                     if not m or m.lower() == "nan":
                         continue
-                    horizons = []
-                    for h in _HORIZON_ORDER:
-                        hs = sub[sub["horizon_fy"].astype(str).str.upper() == h]
-                        cs = hs["_c"].dropna()
-                        if len(cs):
-                            tag = "Yr" if h == "1Y" else h.replace("_", " ").title()
-                            horizons.append(f"{tag} {cs.median():+.0f}%")
-                    # any horizon that didn't match the known buckets
-                    if not horizons:
-                        cs = sub["_c"].dropna()
-                        if len(cs):
-                            horizons.append(f"{cs.median():+.0f}%")
-                    if horizons:
-                        lines.append(f"<b>{m}:</b> " + " · ".join(horizons))
-                    if len(lines) >= 6:
+                    # dominant kind across this metric's rows -> coloured chip
+                    ks = [_g_kind(m, vv) for vv in sub.get("value", [])]
+                    kind = max(set(ks), key=ks.count) if ks else "qual"
+                    klab, kcol = _KIND_TAG.get(kind, ("", "#777"))
+                    bits, seen_v = [], set()
+                    for h in _HORIZON_ORDER + ["__other__"]:
+                        if h == "__other__":
+                            hs = sub[~sub["horizon_fy"].astype(str).str.upper().isin(_HORIZON_ORDER)]
+                        else:
+                            hs = sub[sub["horizon_fy"].astype(str).str.upper() == h]
+                        for vv in hs.get("value", []):
+                            t = str(vv).strip()
+                            if not t or t.lower() in ("na", "nan", "n/a", "-") or t in seen_v:
+                                continue
+                            seen_v.add(t)
+                            disp = t
+                            if kind in ("growth", "margin") and re.fullmatch(r"[\d.\-– ]+", disp):
+                                disp = disp + "%"            # bare number -> rate
+                            tag = _HLABEL.get(h, "")
+                            bits.append((f"{tag} " if tag else "") + (disp[:34] + ("…" if len(disp) > 34 else "")))
+                            break       # one value per horizon keeps it compact
+                    if bits:
+                        chip = (f'<span style="background:{kcol};color:#fff;border-radius:4px;'
+                                f'padding:0 4px;font-size:9px;margin-left:4px">{klab}</span>')
+                        lines.append(f"<b>{m}</b>{chip} " + " · ".join(bits[:4]))
+                    if len(lines) >= 7:
                         break
 
             # (b) Raw forward-looking statements (GF1) — up to 3, tagged metric·timeframe.
