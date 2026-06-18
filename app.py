@@ -2281,11 +2281,12 @@ def page_graphs():
     with c5:
         view = st.radio(
             "View",
-            ["NSE · 1–60", "NSE · 61–120", "NSE · 121–180", "NSE · 181–240",
-             "NSE · 241–300", "NSE · 301–360",
-             "BSE-only · 1–60", "BSE-only · 61–120", "Detailed"],
+            ["NSE · 1–40", "NSE · 41–80", "NSE · 81–120", "NSE · 121–160",
+             "NSE · 161–200", "NSE · 201–240", "NSE · 241–280", "NSE · 281–320",
+             "NSE · 321–360",
+             "BSE-only · 1–40", "BSE-only · 41–80", "BSE-only · 81–120", "Detailed"],
             help="NSE views = stocks listed on NSE (may also trade on BSE). "
-                 "BSE-only = stocks not on NSE. Each view renders ONE slice of ≤60 "
+                 "BSE-only = stocks not on NSE. Each view renders ONE slice of ≤40 "
                  "charts so Cloud memory stays safe (real tabs would render all at "
                  "once and crash). Detailed = paginated candlesticks over the full set.")
     view_mode = "Detailed" if view == "Detailed" else "Quick Scan"
@@ -2356,17 +2357,23 @@ def page_graphs():
     # have to load every symbol's OHLCV just to rank — n_strategies is the default
     # sort's primary key, so this is faithful; the chosen sort then reorders the
     # slice for display below.
-    # view -> (which exchange set, slice start, slice end). Each slice is ≤60 —
-    # 100-chart slices were still OOM-segfaulting Cloud, so dropped to 60.
+    # view -> (which exchange set, slice start, slice end). Each slice is ≤40 —
+    # 60-chart slices OOM-segfaulted once the per-chart render got richer
+    # (480px chart + 6Q table + grade strip + blobs ≈ 2x memory per chart),
+    # so dropped 60 -> 40. (100 -> 60 earlier for the same reason.)
     SEG = {
-        "NSE · 1–60":        ("nse",   0,  60),
-        "NSE · 61–120":      ("nse",  60, 120),
-        "NSE · 121–180":     ("nse", 120, 180),
-        "NSE · 181–240":     ("nse", 180, 240),
-        "NSE · 241–300":     ("nse", 240, 300),
-        "NSE · 301–360":     ("nse", 300, 360),
-        "BSE-only · 1–60":   ("bse",   0,  60),
-        "BSE-only · 61–120": ("bse",  60, 120),
+        "NSE · 1–40":        ("nse",   0,  40),
+        "NSE · 41–80":       ("nse",  40,  80),
+        "NSE · 81–120":      ("nse",  80, 120),
+        "NSE · 121–160":     ("nse", 120, 160),
+        "NSE · 161–200":     ("nse", 160, 200),
+        "NSE · 201–240":     ("nse", 200, 240),
+        "NSE · 241–280":     ("nse", 240, 280),
+        "NSE · 281–320":     ("nse", 280, 320),
+        "NSE · 321–360":     ("nse", 320, 360),
+        "BSE-only · 1–40":   ("bse",   0,  40),
+        "BSE-only · 41–80":  ("bse",  40,  80),
+        "BSE-only · 81–120": ("bse",  80, 120),
     }
     if view_mode == "Quick Scan":
         uni = load_csv(["universe", "master_list.csv"])
