@@ -694,7 +694,7 @@ def load_all_strategy_signals():
 
 # ---------- Bulk OHLCV loader (traverses Drive path ONCE for N symbols) ----------
 
-@st.cache_data(ttl=1800, show_spinner=False, max_entries=3)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=1)
 def load_ohlcv_bulk(symbols: tuple) -> dict:
     """Download OHLCV for multiple symbols in a single Drive session.
     Folder lookups happen once; only the needed parquets are downloaded.
@@ -723,7 +723,7 @@ def load_ohlcv_bulk(symbols: tuple) -> dict:
     return _drive_call(_do)
 
 
-@st.cache_data(ttl=1800, show_spinner=False, max_entries=3)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=1)
 def load_statements_bulk(symbols: tuple) -> dict:
     """Download fundamentals/statements/<sym>.parquet for many symbols in ONE
     Drive session. Folder is listed once; only the needed files are downloaded.
@@ -3114,8 +3114,13 @@ def page_graphs():
                 else:
                     fig = build_quick_chart(sym, ohlcv, sym_sigs, tf_days,
                                             normalize=normalize)
+                    # POSITION key (not symbol): reuse qs_0..qs_N across slices so
+                    # Streamlit retains at most one slice's chart state. Symbol keys
+                    # accumulated every visited chart and corrupted the heap (~5th
+                    # slice). del the fig so it isn't held after render.
                     st.plotly_chart(fig, use_container_width=True,
-                                    key=f"qs_{sym}", config={"displayModeBar": False})
+                                    key=f"qs_{i}", config={"displayModeBar": False})
+                    del fig
 
                 # ── Below the chart: >30% growth highlight + GF1 guidance + LLM summary ──
                 for blob in (_growth_blob(sym), _gf1_blob(sym), _llm_summary(sym)):
