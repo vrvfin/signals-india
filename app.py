@@ -243,8 +243,8 @@ def build_quick_chart(symbol, ohlcv, signals_for_stock, timeframe_days,
                          marker_color=vol_colors, showlegend=False), row=2, col=1)
 
     fig.update_layout(
-        height=380,
-        title=dict(text=title_html, font=dict(size=12), x=0.02, y=0.97),
+        height=480,
+        title=dict(text=title_html, font=dict(size=13), x=0.02, y=0.97),
         margin=dict(l=4, r=55, t=52, b=4),   # r=55 leaves room for hline labels
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
@@ -2625,25 +2625,86 @@ def page_graphs():
             return (f"<table style='border-collapse:collapse;width:100%;"
                     f"margin:2px 0 4px 0'>{th}{body}</table>")
 
+        # mcap (market_cap.csv) · announcement LLM summary · GF1 guidance · >30% blob
+        _mc_df = load_csv(["universe", "market_cap.csv"])
+        mcap_by_sym = {}
+        if not _mc_df.empty and "symbol" in _mc_df.columns:
+            for _, r in _mc_df.iterrows():
+                mcap_by_sym[str(r["symbol"]).upper()] = (
+                    pd.to_numeric(r.get("market_cap_cr"), errors="coerce"),
+                    str(r.get("mcap_segment", "") or ""))
+        ann_by_sym = _group_upper(load_parquet(
+            ["company_repo", "_index", "announcement_ledger.parquet"]))
+        gf1_by_sym = _group_upper(load_parquet(
+            ["company_repo", "_index", "gf1_guidance_statements.parquet"]))
+
+        def _mcap_str(sym):
+            mc, seg = mcap_by_sym.get(sym.upper(), (None, ""))
+            if mc is None or pd.isna(mc):
+                return ""
+            txt = f"₹{mc:,.0f} Cr" + (f" · {seg}" if seg else "")
+            return (f'<span style="background:#eceff1;color:#333;padding:1px 7px;'
+                    f'border-radius:6px;font-size:11px;margin-right:4px">{txt}</span>')
+
+        def _growth_blob(sym):
+            g = grades_by_sym.get(sym.upper(), _EMPTY)
+            if g is None or g.empty:
+                return ""
+            r = g.iloc[-1]
+            hot = []
+            for key, lbl in (("yoy", "YoY"), ("qoq", "QoQ"), ("guidance", "Guidance")):
+                v = pd.to_numeric(r.get(key), errors="coerce")
+                if pd.notna(v) and v > 30:
+                    hot.append(f"{lbl} +{v:.0f}%")
+            if not hot:
+                return ""
+            return (f'<div style="background:#1a7a3a;color:#fff;padding:3px 9px;'
+                    f'border-radius:6px;font-size:12px;font-weight:600;margin:3px 0">'
+                    f'🚀 {" · ".join(hot)}</div>')
+
+        def _gf1_blob(sym):
+            g = gf1_by_sym.get(sym.upper(), _EMPTY)
+            if g is None or g.empty or "exact_statement" not in g.columns:
+                return ""
+            g2 = g.sort_values("processed_at") if "processed_at" in g.columns else g
+            stmt = str(g2.iloc[-1].get("exact_statement", "") or "").strip()
+            if not stmt or stmt.lower() == "nan":
+                return ""
+            return (f'<div style="background:#eef6ff;border-left:3px solid #1565c0;'
+                    f'padding:3px 8px;font-size:11px;color:#333;margin:2px 0">'
+                    f'📋 <b>Guidance:</b> {stmt[:240]}</div>')
+
+        def _llm_summary(sym):
+            a = ann_by_sym.get(sym.upper(), _EMPTY)
+            if a is not None and not a.empty and "summary" in a.columns:
+                a2 = a.sort_values("ann_date") if "ann_date" in a.columns else a
+                row = a2.iloc[-1]
+                s = str(row.get("summary", "") or "").strip()
+                if s and s.lower() != "nan":
+                    return (f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
+                            f'padding:4px 8px;font-size:11px;color:#333;margin:2px 0">'
+                            f'🧠 <b>{str(row.get("ann_date",""))[:10]} {row.get("category","")}:</b> '
+                            f'{s[:400]}</div>')
+            return _catalyst_line(sym)   # fall back to catalyst note
+
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
             sym_sigs = sel_by_sym.get(sym, _EMPTY)
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
             with st.container():
-                # Line 1 — 6-rule grade strip (green/amber) + conviction badge
-                # (strategy chips removed per user — grades give the glance instead)
-                line1_html = _grades_strip(sym) + " " + _scorecard_badge(
-                    sym, scorecard_by_sym.get(sym.upper(), _EMPTY))
+                # Header — mcap + 6-rule grade strip (green/amber) + conviction badge
+                line1_html = (_mcap_str(sym) + _grades_strip(sym) + " "
+                              + _scorecard_badge(sym, scorecard_by_sym.get(sym.upper(), _EMPTY)))
                 if line1_html.strip():
                     st.markdown(line1_html, unsafe_allow_html=True)
 
-                # Line 2 — last-6-quarter table (Sales / Profit / EPS)
+                # last-6-quarter table (Sales / Profit / EPS)
                 qhtml = _quarterly_html(sym)
                 if qhtml:
                     st.markdown(qhtml, unsafe_allow_html=True)
 
-                # Line 3 — fundamentals growth (results YoY/QoQ + guidance)
+                # fundamentals growth (results YoY/QoQ + guidance)
                 fund = _fund_line(sym)
                 if fund:
                     st.markdown(
@@ -2652,16 +2713,7 @@ def page_graphs():
                         unsafe_allow_html=True,
                     )
 
-                # Line 4 — LLM catalyst summary (why moving) + what to track
-                cat_line = _catalyst_line(sym)
-                if cat_line:
-                    st.markdown(
-                        f'<div style="font-size:11px;color:#555;'
-                        f'margin:1px 0 3px 0;line-height:1.4">{cat_line}</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                # Chart
+                # Chart (bigger)
                 if ohlcv.empty:
                     st.caption(f"{sym} — no OHLCV data")
                 else:
@@ -2669,6 +2721,11 @@ def page_graphs():
                                             normalize=normalize)
                     st.plotly_chart(fig, use_container_width=True,
                                     key=f"qs_{sym}", config={"displayModeBar": False})
+
+                # ── Below the chart: >30% growth highlight + GF1 guidance + LLM summary ──
+                for blob in (_growth_blob(sym), _gf1_blob(sym), _llm_summary(sym)):
+                    if blob:
+                        st.markdown(blob, unsafe_allow_html=True)
         return
 
     # ─────────────────────────────────────────────────────────────────────────
