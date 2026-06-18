@@ -2599,7 +2599,7 @@ def page_graphs():
         _spg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
         if _spg not in _sysg.path:
             _sysg.path.insert(0, _spg)
-        from gradation import TIER_COLOR as _TC
+        from gradation import TIER_COLOR as _TC, grade_growth as _grade_growth
         _grades_all = load_screener_grades()
         grades_by_sym = _group_upper(_grades_all)
         name_by_sym = {}
@@ -2621,6 +2621,22 @@ def page_graphs():
             r = g.iloc[-1]
             tiles = []
             for tcol, lbl, vcol, vfmt in _GTILES:
+                # Guidance tile is computed live from the 1Y-headline (same source
+                # as the blob + blue panel) — NOT screener_grades' max-cagr, which
+                # cherry-picked derived/long-range outliers.
+                if tcol == "guidance_tier":
+                    gm, gv, _gq = _guid_1y_headline(sym)
+                    if gv is None:
+                        tier, lbl2, vs = "na", "Guid 1Y", "—"
+                    else:
+                        tier = _grade_growth(gv)
+                        short = gm.split()[0][:4] if gm else "Guid"
+                        lbl2, vs = f"Guid·{short} 1Y", f"+{gv:.0f}%"
+                    tiles.append(
+                        f'<span style="background:{_TC.get(tier, "#eee")};color:#111;'
+                        f'padding:1px 6px;border-radius:6px;font-size:11px;margin-right:3px;'
+                        f'display:inline-block">{lbl2} {vs}</span>')
+                    continue
                 tier = str(r.get(tcol, "na"))
                 v = r.get(vcol)
                 try:
@@ -2749,27 +2765,55 @@ def page_graphs():
             per = list(sub["period"].astype(str))
             return _qtr_label(per[-1]) if per else ""
 
-        def _guidance_metrics(sym, hot_only=False):
-            """[(metric, cagr_pct)] from guidance_tracker. hot_only -> cagr>30."""
+        # ── Guidance: ONE selection feeding the green tile, the blob AND the blue
+        # panel so they can never disagree. Restrict to the company's LATEST
+        # quarter (freshest concall) and drop derived/long-range noise from the
+        # green headline; the blue panel keeps every horizon. (Old bug: green
+        # showed MAX cagr across all rows → picked derived/3Y+ outliers, e.g.
+        # BAJAJCON 30% was a derived 3Y revenue row, real 1Y was 10–22%.)
+        _HORIZON_ORDER = ["NEXT_QTR", "1Y", "2Y", "3Y", "3Y+"]
+        _GROWTH_METRICS = ("revenue", "sales", "pat", "profit", "volume", "earnings")
+
+        def _q_order(qs):
+            m = re.match(r"\s*Q([1-4])\s*FY\s*0*(\d+)", str(qs), re.I)
+            return int(m.group(2)) * 10 + int(m.group(1)) if m else -1
+
+        def _guidance_latest(sym):
+            """(quarter_label, df_of_latest_quarter_with_numeric_cagr) or ('', None)."""
             sym_g = guidance_by_sym.get(sym)
+            if sym_g is None or sym_g.empty or "metric" not in sym_g.columns:
+                return "", None
+            g = sym_g.copy()
+            g["_qo"] = g["quarter"].map(_q_order) if "quarter" in g.columns else -1
+            if g["_qo"].max() >= 0:
+                g = g[g["_qo"] == g["_qo"].max()]
+            qlab = str(g["quarter"].iloc[0]) if "quarter" in g.columns and len(g) else ""
+            g = g.assign(_c=pd.to_numeric(g.get("cagr_pct"), errors="coerce"))
+            return qlab, g
+
+        def _guid_1y(sym):
+            """[(metric, value)] explicit 1Y guidance, latest quarter, median per
+            metric (median tames duplicate/contradictory extractions)."""
+            qlab, g = _guidance_latest(sym)
+            if g is None:
+                return "", []
+            g1 = g[g["horizon_fy"].astype(str).str.upper().eq("1Y")
+                   & g["guidance_type"].astype(str).str.lower().str.contains("explicit")]
+            g1 = g1.dropna(subset=["_c"])
             out = []
-            if sym_g is None or "metric" not in sym_g.columns or "cagr_pct" not in sym_g.columns:
-                return out
-            for _, gr in sym_g.iterrows():
-                c = pd.to_numeric(gr.get("cagr_pct"), errors="coerce")
-                if pd.isna(c):
-                    continue
-                if hot_only and c <= 30:
-                    continue
-                m = str(gr.get("metric", "") or "").strip().title()
-                if m:
-                    out.append((m, float(c)))
-            # de-dupe metric, keep highest cagr
-            best = {}
-            for m, c in out:
-                if m not in best or c > best[m]:
-                    best[m] = c
-            return sorted(best.items(), key=lambda x: -x[1])
+            for m, sub in g1.groupby(g1["metric"].astype(str).str.title()):
+                out.append((m, float(sub["_c"].median())))
+            return qlab, sorted(out, key=lambda x: -x[1])
+
+        def _guid_1y_headline(sym):
+            """Single representative 1Y growth number (prefer Revenue), tier-able."""
+            qlab, mets = _guid_1y(sym)
+            if not mets:
+                return None, None, qlab
+            for m, v in mets:                       # prefer a genuine growth metric
+                if any(k in m.lower() for k in _GROWTH_METRICS):
+                    return m, v, qlab
+            return mets[0][0], mets[0][1], qlab     # else strongest 1Y metric
 
         def _growth_blob(sym):
             g = grades_by_sym.get(sym.upper(), _EMPTY)
@@ -2782,9 +2826,11 @@ def page_graphs():
                 v = pd.to_numeric(r.get(key), errors="coerce")
                 if pd.notna(v) and v > 30:
                     hot.append(f"{lbl} +{v:.0f}%")
-            # guidance: name the metric(s) growing >30%, not a bare number
-            for m, c in _guidance_metrics(sym, hot_only=True):
-                hot.append(f"Guid·{m} +{c:.0f}%")
+            # guidance: 1Y growth metrics >30% only (named + horizon-tagged)
+            _qg, _mets = _guid_1y(sym)
+            for m, c in _mets:
+                if c > 30 and any(k in m.lower() for k in _GROWTH_METRICS):
+                    hot.append(f"Guid·{m} +{c:.0f}% (1Y)")
             if not hot:
                 return ""
             qtag = f'<span style="opacity:.85">{qlab} · </span>' if qlab else ""
@@ -2795,29 +2841,30 @@ def page_graphs():
         def _gf1_blob(sym):
             lines = []
 
-            # (a) Quantified guidance from guidance_tracker — metric · value · horizon.
-            sym_g = guidance_by_sym.get(sym)
-            if sym_g is not None and "metric" in sym_g.columns:
-                seen_m = set()
-                for _, gr in sym_g.iterrows():
-                    m = str(gr.get("metric", "") or "").strip().title()
-                    if not m or m in seen_m:
+            # (a) Quantified guidance — LATEST quarter, ALL horizons per metric
+            #     (NEXT_QTR -> 1Y -> long range), median across dup extractions.
+            qlab, g = _guidance_latest(sym)
+            if g is not None and not g.empty:
+                if qlab:
+                    lines.append(f'<span style="color:#777">latest: {qlab}</span>')
+                for m, sub in g.groupby(g["metric"].astype(str).str.title()):
+                    if not m or m.lower() == "nan":
                         continue
-                    val = str(gr.get("value", "") or "").strip()
-                    unit = str(gr.get("unit", "") or "").strip()
-                    fy = str(gr.get("horizon_fy", "") or "").strip()
-                    cag = pd.to_numeric(gr.get("cagr_pct"), errors="coerce")
-                    bits = []
-                    if val and val.lower() != "nan":
-                        bits.append(f"{val}{(' ' + unit) if unit and unit.lower()!='nan' else ''}")
-                    if pd.notna(cag):
-                        bits.append(f"{cag:+.0f}%")
-                    if fy and fy.lower() != "nan":
-                        bits.append(fy)
-                    if bits:
-                        seen_m.add(m)
-                        lines.append(f"<b>{m}:</b> {' · '.join(bits)}")
-                    if len(seen_m) >= 4:
+                    horizons = []
+                    for h in _HORIZON_ORDER:
+                        hs = sub[sub["horizon_fy"].astype(str).str.upper() == h]
+                        cs = hs["_c"].dropna()
+                        if len(cs):
+                            tag = "Yr" if h == "1Y" else h.replace("_", " ").title()
+                            horizons.append(f"{tag} {cs.median():+.0f}%")
+                    # any horizon that didn't match the known buckets
+                    if not horizons:
+                        cs = sub["_c"].dropna()
+                        if len(cs):
+                            horizons.append(f"{cs.median():+.0f}%")
+                    if horizons:
+                        lines.append(f"<b>{m}:</b> " + " · ".join(horizons))
+                    if len(lines) >= 6:
                         break
 
             # (b) Raw forward-looking statements (GF1) — up to 3, tagged metric·timeframe.
