@@ -628,6 +628,42 @@ def load_parquet(path_parts):
     return _drive_call(_do)
 
 
+def _mcap_segment_label(v):
+    """Largecap/Midcap/Smallcap/Microcap from market cap in ₹cr (matches
+    enrich_market_cap.SEGMENT_THRESHOLDS)."""
+    if v is None or pd.isna(v):
+        return "Unknown"
+    return ("Largecap" if v >= 20000 else "Midcap" if v >= 5000
+            else "Smallcap" if v >= 500 else "Microcap")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_mcap() -> pd.DataFrame:
+    """Single source of truth for market cap → DataFrame[symbol, market_cap_cr,
+    mcap_segment]. Prefers fundamentals/summary.parquet (screener.in, weekly-
+    fresh, has fetched_at); falls back to universe/market_cap.csv (yfinance
+    .NS marketCap, stale/wrong for a minority of names) only for symbols the
+    screener scrape doesn't cover. Segment is recomputed from the chosen value."""
+    out = {}
+    mc = load_csv(["universe", "market_cap.csv"])              # yfinance fallback
+    if not mc.empty and "symbol" in mc.columns:
+        for _, r in mc.iterrows():
+            v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
+            out[str(r["symbol"]).upper()] = v
+    summ = load_parquet(["fundamentals", "summary.parquet"])   # screener (wins)
+    if not summ.empty and {"symbol", "market_cap_cr"} <= set(summ.columns):
+        for _, r in summ.iterrows():
+            v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
+            if pd.notna(v) and v > 0:
+                out[str(r["symbol"]).upper()] = v
+    if not out:
+        return pd.DataFrame(columns=["symbol", "market_cap_cr", "mcap_segment"])
+    df = pd.DataFrame({"symbol": list(out.keys()),
+                       "market_cap_cr": list(out.values())})
+    df["mcap_segment"] = df["market_cap_cr"].apply(_mcap_segment_label)
+    return df
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_all_strategy_signals():
     def _do():
@@ -1138,6 +1174,41 @@ def _gf4_quality_score(gf4_df: pd.DataFrame, symbol: str) -> int:
     return score
 
 
+def _quarter_ord(qs) -> int:
+    """'Q3 FY26' -> 2603 for chronological sort; -1 if unparseable."""
+    m = re.match(r"\s*Q([1-4])\s*FY\s*0*(\d+)", str(qs), re.I)
+    return int(m.group(2)) * 100 + int(m.group(1)) if m else -1
+
+
+def _guidance_history(gt: pd.DataFrame) -> dict:
+    """Per (symbol, metric, horizon_fy): (first_guided_q, last_reaffirmed_q,
+    value_changed_q). Dates are derived from the stable `quarter` field — NOT
+    processed_at, which resets when a concall is reprocessed. value_changed_q
+    is best-effort (latest quarter whose cagr differs from the prior quarter)."""
+    out: dict = {}
+    if gt.empty or "quarter" not in gt.columns:
+        return out
+    g = gt.copy()
+    g["_qo"] = g["quarter"].map(_quarter_ord)
+    g = g[g["_qo"] >= 0]
+    g["_c"] = pd.to_numeric(g.get("cagr_pct"), errors="coerce").round(1)
+    keys = [g["symbol"].astype(str), g["metric"].astype(str), g["horizon_fy"].astype(str)]
+    for (sym, met, hz), sub in g.groupby(keys):
+        sub = sub.sort_values("_qo")
+        quarters = sub["quarter"].tolist()
+        first_q, last_q = quarters[0], quarters[-1]
+        # value-changed: walk distinct quarters, note last quarter cagr changed
+        changed_q = ""
+        prev_v, prev_q = None, None
+        for q, v in zip(sub["quarter"], sub["_c"]):
+            if prev_v is not None and pd.notna(v) and v != prev_v:
+                changed_q = q
+            if pd.notna(v):
+                prev_v = v
+        out[(sym, met, hz)] = (first_q, last_q, changed_q)
+    return out
+
+
 def _guidance_is_active(horizon_fy) -> bool:
     """Return True if the horizon FY is the current FY or a future FY."""
     today = datetime.now()
@@ -1241,11 +1312,29 @@ def page_guidance():
                 if sel_type != "All":
                     gf = gf[gf["guidance_type"] == sel_type]
 
-                st.caption(f"{len(gf)} guidance rows")
+                # Derive first-guided / last-reaffirmed / value-changed quarters
+                # from the FULL table (all quarters), then attach to filtered rows.
+                hist = _guidance_history(gt)
+                if hist:
+                    triples = gf.apply(
+                        lambda r: hist.get((str(r.get("symbol")), str(r.get("metric")),
+                                            str(r.get("horizon_fy"))), ("", "", "")),
+                        axis=1)
+                    gf = gf.copy()
+                    gf["first_guided"] = [t[0] for t in triples]
+                    gf["last_reaffirmed"] = [t[1] for t in triples]
+                    gf["value_changed_q"] = [t[2] for t in triples]
+
+                st.caption(f"{len(gf)} guidance rows · "
+                           "‘first guided’ = earliest quarter this metric/horizon "
+                           "appeared; ‘last reaffirmed’ = latest; ‘value changed’ = "
+                           "latest quarter the number moved (best-effort, from quarter "
+                           "labels — not processed_at).")
                 show_cols = [c for c in [
                     "symbol", "company_name", "quarter", "metric",
                     "guidance_type", "horizon_fy", "value", "unit",
-                    "cagr_pct", "notes",
+                    "cagr_pct", "first_guided", "last_reaffirmed", "value_changed_q",
+                    "notes",
                 ] if c in gf.columns]
                 st.dataframe(_style_current_q(gf[show_cols], cur_q),
                              use_container_width=True, hide_index=True, height=400)
@@ -1861,7 +1950,7 @@ def page_market_overview():
     # Universe breadth with segment toggle
     st.subheader("Universe breadth")
 
-    mcap_df = load_csv(["universe", "market_cap.csv"])
+    mcap_df = load_mcap()
     has_mcap = (not mcap_df.empty) and ("mcap_segment" in mcap_df.columns)
     if has_mcap:
         segment_options = ["All", "Largecap", "Midcap", "Smallcap", "Microcap"]
@@ -2730,29 +2819,14 @@ def page_graphs():
             return (f"<table style='border-collapse:collapse;width:100%;"
                     f"margin:2px 0 4px 0'>{th}{body}</table>")
 
-        # mcap · announcement LLM summary · GF1 guidance · >30% blob
-        # Source PRIORITY: fundamentals/summary.parquet (screener.in, weekly-fresh,
-        # matches the Screener page) FIRST; universe/market_cap.csv (yfinance
-        # .NS marketCap, stale/wrong for a minority of names) only as fallback.
-        def _seg_label(v):
-            if v is None or pd.isna(v):
-                return ""
-            return ("Largecap" if v >= 20000 else "Midcap" if v >= 5000
-                    else "Smallcap" if v >= 500 else "Microcap")
-
-        _summ_df = load_parquet(["fundamentals", "summary.parquet"])
-        _mc_df = load_csv(["universe", "market_cap.csv"])
+        # mcap (single source = load_mcap: screener summary, yfinance fallback)
         mcap_by_sym = {}
-        # fallback first (yfinance), so screener values overwrite them
-        if not _mc_df.empty and "symbol" in _mc_df.columns:
+        _mc_df = load_mcap()
+        if not _mc_df.empty:
             for _, r in _mc_df.iterrows():
-                v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
-                mcap_by_sym[str(r["symbol"]).upper()] = (v, str(r.get("mcap_segment", "") or ""))
-        if not _summ_df.empty and {"symbol", "market_cap_cr"} <= set(_summ_df.columns):
-            for _, r in _summ_df.iterrows():
-                v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
-                if pd.notna(v) and v > 0:
-                    mcap_by_sym[str(r["symbol"]).upper()] = (v, _seg_label(v))
+                mcap_by_sym[str(r["symbol"]).upper()] = (
+                    pd.to_numeric(r.get("market_cap_cr"), errors="coerce"),
+                    str(r.get("mcap_segment", "") or ""))
         ann_by_sym = _group_upper(load_parquet(
             ["company_repo", "_index", "announcement_ledger.parquet"]))
         gf1_by_sym = _group_upper(load_parquet(
