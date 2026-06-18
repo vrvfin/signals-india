@@ -2600,10 +2600,15 @@ def page_graphs():
         if _spg not in _sysg.path:
             _sysg.path.insert(0, _spg)
         from gradation import TIER_COLOR as _TC
-        grades_by_sym = _group_upper(load_screener_grades())
+        _grades_all = load_screener_grades()
+        grades_by_sym = _group_upper(_grades_all)
+        name_by_sym = {}
+        if not _grades_all.empty and {"symbol", "company_name"} <= set(_grades_all.columns):
+            for _, r in _grades_all.iterrows():
+                name_by_sym[str(r["symbol"]).upper()] = str(r.get("company_name", "") or "").strip()
         # (tier_col, label, value_col, value_format)
-        _GTILES = [("yoy_tier", "YOY", "yoy", "{:.0f}%"),
-                   ("qoq_tier", "QOQ", "qoq", "{:.0f}%"),
+        _GTILES = [("yoy_tier", "PAT YoY", "yoy", "{:.0f}%"),
+                   ("qoq_tier", "PAT QoQ", "qoq", "{:.0f}%"),
                    ("guidance_tier", "Guid", "guidance", "{:.0f}%"),
                    ("val_tier", "Val", "val_value", "PE {:.0f}"),
                    ("cfo_tier", "CFO", "cfo_ratio", "{:.1f}x"),
@@ -2633,6 +2638,24 @@ def page_graphs():
         # froze the page 60s+ and segfaulted). Mirrors the OHLCV bulk loader.
         stmts_by_sym = load_statements_bulk(tuple(conv["symbol"].tolist()))
 
+        # Indian fiscal-quarter label: "Mar 2025" -> "Q4 FY25", "Jun 2024" -> "Q1 FY25".
+        _QMAP = {"mar": ("Q4", 0), "jun": ("Q1", 1), "sep": ("Q2", 1), "dec": ("Q3", 1)}
+
+        def _qtr_label(period: str) -> str:
+            p = str(period).strip()
+            toks = p.replace("-", " ").split()
+            if len(toks) >= 2:
+                mon = toks[0][:3].lower()
+                yr = "".join(c for c in toks[-1] if c.isdigit())
+                if mon in _QMAP and yr:
+                    q, bump = _QMAP[mon]
+                    try:
+                        fy = (int(yr[-2:]) if len(yr) <= 2 else int(yr) % 100) + bump
+                        return f"{q} FY{fy % 100:02d}"
+                    except ValueError:
+                        pass
+            return p   # fall back to raw period string if unparseable
+
         def _quarterly_html(sym: str) -> str:
             sdf = stmts_by_sym.get(sym, _EMPTY)
             if sdf is None or sdf.empty or "statement" not in sdf.columns:
@@ -2653,18 +2676,41 @@ def page_graphs():
                     break
             if not periods:
                 return ""
+
+            def _pct_cell(cur, prev):
+                """+/- coloured % chip vs a reference value (None when n/a)."""
+                if cur is None or prev is None or pd.isna(cur) or pd.isna(prev) or prev == 0:
+                    return "<td style='font-size:10px;text-align:right;color:#bbb'>—</td>"
+                pct = (cur / prev - 1) * 100
+                col = "#27ae60" if pct >= 0 else "#e74c3c"
+                return (f"<td style='font-size:10px;text-align:right;color:{col}'>"
+                        f"{pct:+.0f}%</td>")
+
             th = ("<tr><td style='font-size:10px'></td>"
-                  + "".join(f"<td style='font-size:10px;text-align:right;color:#888'>{p}</td>"
-                            for p in periods) + "</tr>")
+                  + "".join(f"<td style='font-size:10px;text-align:right;color:#888'>{_qtr_label(p)}</td>"
+                            for p in periods)
+                  + "<td style='font-size:10px;text-align:right;color:#888;"
+                    "border-left:1px solid #ddd'>YoY</td>"
+                  + "<td style='font-size:10px;text-align:right;color:#888'>QoQ</td></tr>")
             body = ""
             for lbl, it in rowdefs:
-                d = dict(ser(it))
+                vals = ser(it)                       # chronological (period, value)
+                d = dict(vals)
                 cells = "".join(
                     "<td style='font-size:10px;text-align:right'>"
                     + ("—" if d.get(p) is None or pd.isna(d.get(p))
                        else format(d.get(p), ',.0f')) + "</td>"
                     for p in periods)
-                body += f"<tr><td style='font-size:10px'><b>{lbl}</b></td>{cells}</tr>"
+                # YoY = latest vs 4 quarters back; QoQ = latest vs previous quarter
+                seq = [v for _, v in vals]
+                cur  = seq[-1] if seq else None
+                yoy_ref = seq[-5] if len(seq) >= 5 else None
+                qoq_ref = seq[-2] if len(seq) >= 2 else None
+                yoy_c = _pct_cell(cur, yoy_ref).replace("text-align:right;",
+                                                        "text-align:right;border-left:1px solid #ddd;")
+                qoq_c = _pct_cell(cur, qoq_ref)
+                body += (f"<tr><td style='font-size:10px'><b>{lbl}</b></td>"
+                         f"{cells}{yoy_c}{qoq_c}</tr>")
             return (f"<table style='border-collapse:collapse;width:100%;"
                     f"margin:2px 0 4px 0'>{th}{body}</table>")
 
@@ -2689,33 +2735,115 @@ def page_graphs():
             return (f'<span style="background:#eceff1;color:#333;padding:1px 7px;'
                     f'border-radius:6px;font-size:11px;margin-right:4px">{txt}</span>')
 
+        def _latest_qtr(sym):
+            """Label of the most recent quarter in statements, e.g. 'Q4 FY25'."""
+            sdf = stmts_by_sym.get(sym, _EMPTY)
+            if sdf is None or sdf.empty or "statement" not in sdf.columns:
+                return ""
+            q = sdf[sdf["statement"] == "quarterly_pl"]
+            if q.empty or "period" not in q.columns:
+                return ""
+            sub = q[q["line_item"] == "Net Profit"]
+            if sub.empty:
+                sub = q
+            per = list(sub["period"].astype(str))
+            return _qtr_label(per[-1]) if per else ""
+
+        def _guidance_metrics(sym, hot_only=False):
+            """[(metric, cagr_pct)] from guidance_tracker. hot_only -> cagr>30."""
+            sym_g = guidance_by_sym.get(sym)
+            out = []
+            if sym_g is None or "metric" not in sym_g.columns or "cagr_pct" not in sym_g.columns:
+                return out
+            for _, gr in sym_g.iterrows():
+                c = pd.to_numeric(gr.get("cagr_pct"), errors="coerce")
+                if pd.isna(c):
+                    continue
+                if hot_only and c <= 30:
+                    continue
+                m = str(gr.get("metric", "") or "").strip().title()
+                if m:
+                    out.append((m, float(c)))
+            # de-dupe metric, keep highest cagr
+            best = {}
+            for m, c in out:
+                if m not in best or c > best[m]:
+                    best[m] = c
+            return sorted(best.items(), key=lambda x: -x[1])
+
         def _growth_blob(sym):
             g = grades_by_sym.get(sym.upper(), _EMPTY)
             if g is None or g.empty:
                 return ""
             r = g.iloc[-1]
+            qlab = _latest_qtr(sym)
             hot = []
-            for key, lbl in (("yoy", "YoY"), ("qoq", "QoQ"), ("guidance", "Guidance")):
+            for key, lbl in (("yoy", "PAT YoY"), ("qoq", "PAT QoQ")):
                 v = pd.to_numeric(r.get(key), errors="coerce")
                 if pd.notna(v) and v > 30:
                     hot.append(f"{lbl} +{v:.0f}%")
+            # guidance: name the metric(s) growing >30%, not a bare number
+            for m, c in _guidance_metrics(sym, hot_only=True):
+                hot.append(f"Guid·{m} +{c:.0f}%")
             if not hot:
                 return ""
+            qtag = f'<span style="opacity:.85">{qlab} · </span>' if qlab else ""
             return (f'<div style="background:#1a7a3a;color:#fff;padding:3px 9px;'
                     f'border-radius:6px;font-size:12px;font-weight:600;margin:3px 0">'
-                    f'🚀 {" · ".join(hot)}</div>')
+                    f'🚀 {qtag}{" · ".join(hot)}</div>')
 
         def _gf1_blob(sym):
+            lines = []
+
+            # (a) Quantified guidance from guidance_tracker — metric · value · horizon.
+            sym_g = guidance_by_sym.get(sym)
+            if sym_g is not None and "metric" in sym_g.columns:
+                seen_m = set()
+                for _, gr in sym_g.iterrows():
+                    m = str(gr.get("metric", "") or "").strip().title()
+                    if not m or m in seen_m:
+                        continue
+                    val = str(gr.get("value", "") or "").strip()
+                    unit = str(gr.get("unit", "") or "").strip()
+                    fy = str(gr.get("horizon_fy", "") or "").strip()
+                    cag = pd.to_numeric(gr.get("cagr_pct"), errors="coerce")
+                    bits = []
+                    if val and val.lower() != "nan":
+                        bits.append(f"{val}{(' ' + unit) if unit and unit.lower()!='nan' else ''}")
+                    if pd.notna(cag):
+                        bits.append(f"{cag:+.0f}%")
+                    if fy and fy.lower() != "nan":
+                        bits.append(fy)
+                    if bits:
+                        seen_m.add(m)
+                        lines.append(f"<b>{m}:</b> {' · '.join(bits)}")
+                    if len(seen_m) >= 4:
+                        break
+
+            # (b) Raw forward-looking statements (GF1) — up to 3, tagged metric·timeframe.
             g = gf1_by_sym.get(sym.upper(), _EMPTY)
-            if g is None or g.empty or "exact_statement" not in g.columns:
+            if g is not None and not g.empty and "exact_statement" in g.columns:
+                g2 = g.sort_values("processed_at") if "processed_at" in g.columns else g
+                shown = 0
+                for _, gr in g2.iloc[::-1].iterrows():       # newest first
+                    stmt = str(gr.get("exact_statement", "") or "").strip()
+                    if not stmt or stmt.lower() == "nan":
+                        continue
+                    mt = str(gr.get("metric_type", "") or "").strip()
+                    tf = str(gr.get("timeframe", "") or "").strip()
+                    tag = " · ".join(t for t in (mt, tf) if t and t.lower() != "nan")
+                    tag_html = f'<i style="color:#1565c0">[{tag}]</i> ' if tag else ""
+                    lines.append(f"{tag_html}{stmt[:200]}")
+                    shown += 1
+                    if shown >= 3:
+                        break
+
+            if not lines:
                 return ""
-            g2 = g.sort_values("processed_at") if "processed_at" in g.columns else g
-            stmt = str(g2.iloc[-1].get("exact_statement", "") or "").strip()
-            if not stmt or stmt.lower() == "nan":
-                return ""
+            body = "<br>".join(lines[:7])
             return (f'<div style="background:#eef6ff;border-left:3px solid #1565c0;'
-                    f'padding:3px 8px;font-size:11px;color:#333;margin:2px 0">'
-                    f'📋 <b>Guidance:</b> {stmt[:240]}</div>')
+                    f'padding:4px 8px;font-size:11px;color:#333;margin:2px 0;'
+                    f'line-height:1.45">📋 <b>Guidance / outlook:</b><br>{body}</div>')
 
         import datetime as _dtg
         _today_g = _dtg.date.today()
@@ -2752,6 +2880,18 @@ def page_graphs():
             ohlcv    = ohlcv_map_sort.get(sym, pd.DataFrame())
 
             with st.container():
+                # Card title bar — clear company identity + separator from prev card
+                nm = name_by_sym.get(sym.upper(), "")
+                st.markdown(
+                    f'<div style="border-top:3px solid #1a3d6e;margin:14px 0 4px 0;'
+                    f'padding-top:4px"><span style="font-size:15px;font-weight:800;'
+                    f'color:#1a3d6e">{i + 1}. {sym}</span>'
+                    + (f'<span style="font-size:12px;color:#666;margin-left:8px">{nm}</span>'
+                       if nm else "")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+
                 # Header — mcap + 6-rule grade strip (green/amber) + conviction badge
                 line1_html = (_mcap_str(sym) + _grades_strip(sym) + " "
                               + _scorecard_badge(sym, scorecard_by_sym.get(sym.upper(), _EMPTY)))
