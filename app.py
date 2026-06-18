@@ -2674,6 +2674,21 @@ def page_graphs():
                     f'padding:3px 8px;font-size:11px;color:#333;margin:2px 0">'
                     f'📋 <b>Guidance:</b> {stmt[:240]}</div>')
 
+        import datetime as _dtg
+        _today_g = _dtg.date.today()
+
+        def _fresh_badge(date_str):
+            """🆕 NEW vs ↺ unchanged so you can tell at a glance whether to re-read."""
+            try:
+                age = (_today_g - _dtg.date.fromisoformat(str(date_str)[:10])).days
+            except Exception:
+                return ""
+            if age <= 1:
+                return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
+                        'border-radius:6px;font-size:10px;font-weight:700">🆕 NEW</span> ')
+            return (f'<span style="background:#9e9e9e;color:#fff;padding:1px 6px;'
+                    f'border-radius:6px;font-size:10px">↺ {age}d old · unchanged</span> ')
+
         def _llm_summary(sym):
             a = ann_by_sym.get(sym.upper(), _EMPTY)
             if a is not None and not a.empty and "summary" in a.columns:
@@ -2681,9 +2696,10 @@ def page_graphs():
                 row = a2.iloc[-1]
                 s = str(row.get("summary", "") or "").strip()
                 if s and s.lower() != "nan":
+                    adate = str(row.get("ann_date", ""))[:10]
                     return (f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
                             f'padding:4px 8px;font-size:11px;color:#333;margin:2px 0">'
-                            f'🧠 <b>{str(row.get("ann_date",""))[:10]} {row.get("category","")}:</b> '
+                            f'{_fresh_badge(adate)}🧠 <b>{adate} {row.get("category","")}:</b> '
                             f'{s[:400]}</div>')
             return _catalyst_line(sym)   # fall back to catalyst note
 
