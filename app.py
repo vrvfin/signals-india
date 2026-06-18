@@ -2730,14 +2730,29 @@ def page_graphs():
             return (f"<table style='border-collapse:collapse;width:100%;"
                     f"margin:2px 0 4px 0'>{th}{body}</table>")
 
-        # mcap (market_cap.csv) · announcement LLM summary · GF1 guidance · >30% blob
+        # mcap · announcement LLM summary · GF1 guidance · >30% blob
+        # Source PRIORITY: fundamentals/summary.parquet (screener.in, weekly-fresh,
+        # matches the Screener page) FIRST; universe/market_cap.csv (yfinance
+        # .NS marketCap, stale/wrong for a minority of names) only as fallback.
+        def _seg_label(v):
+            if v is None or pd.isna(v):
+                return ""
+            return ("Largecap" if v >= 20000 else "Midcap" if v >= 5000
+                    else "Smallcap" if v >= 500 else "Microcap")
+
+        _summ_df = load_parquet(["fundamentals", "summary.parquet"])
         _mc_df = load_csv(["universe", "market_cap.csv"])
         mcap_by_sym = {}
+        # fallback first (yfinance), so screener values overwrite them
         if not _mc_df.empty and "symbol" in _mc_df.columns:
             for _, r in _mc_df.iterrows():
-                mcap_by_sym[str(r["symbol"]).upper()] = (
-                    pd.to_numeric(r.get("market_cap_cr"), errors="coerce"),
-                    str(r.get("mcap_segment", "") or ""))
+                v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
+                mcap_by_sym[str(r["symbol"]).upper()] = (v, str(r.get("mcap_segment", "") or ""))
+        if not _summ_df.empty and {"symbol", "market_cap_cr"} <= set(_summ_df.columns):
+            for _, r in _summ_df.iterrows():
+                v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
+                if pd.notna(v) and v > 0:
+                    mcap_by_sym[str(r["symbol"]).upper()] = (v, _seg_label(v))
         ann_by_sym = _group_upper(load_parquet(
             ["company_repo", "_index", "announcement_ledger.parquet"]))
         gf1_by_sym = _group_upper(load_parquet(
