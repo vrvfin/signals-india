@@ -3070,6 +3070,99 @@ def page_graphs():
                             f'{row.get("category","")}:</b> {s[:400]}</div>')
             return _catalyst_line(sym)   # fall back to catalyst note
 
+        # ── One-click full HTML gallery (client-side charts → zero server-figure
+        #    memory; renders ALL ranked names in one downloadable file) ──────────
+        def _ohlc_arrays(odf, days):
+            if odf is None or odf.empty:
+                return [], []
+            d = odf.sort_values("date").tail(days)
+            candles, vols = [], []
+            for _, r in d.iterrows():
+                try:
+                    o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
+                except (TypeError, ValueError):
+                    continue
+                t = str(r["date"])[:10]
+                candles.append({"time": t, "open": o, "high": h, "low": l, "close": c})
+                v = pd.to_numeric(r.get("volume"), errors="coerce")
+                vols.append({"time": t, "value": float(v) if pd.notna(v) else 0,
+                             "color": "#26a69a" if c >= o else "#ef5350"})
+            return candles, vols
+
+        def _build_gallery_html(ranked: pd.DataFrame, omap: dict) -> str:
+            cards, data = [], {}
+            for j, (_, rr) in enumerate(ranked.iterrows()):
+                s = rr["symbol"]
+                nmj = name_by_sym.get(s.upper(), "")
+                meta = "".join(x for x in [
+                    f'<div class="hd">{j + 1}. <b>{s}</b>'
+                    + (f' <span class="nm">{nmj}</span>' if nmj else "") + "</div>",
+                    f'<div class="row">{_mcap_str(s)}{_grades_strip(s)}</div>',
+                    _quarterly_html(s), _growth_blob(s), _gf1_blob(s), _llm_summary(s),
+                ] if x)
+                c, v = _ohlc_arrays(omap.get(s, _EMPTY), tf_days)
+                data[str(j)] = {"c": c, "v": v}
+                cards.append(f'<div class="card">{meta}'
+                             f'<div class="chart" id="ch{j}"></div></div>')
+            payload = json.dumps(data, separators=(",", ":"))
+            tpl = """<!doctype html><html><head><meta charset="utf-8">
+<title>Signals gallery __DATE__</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;margin:0;padding:12px}
+ h1{font-size:16px;margin:6px 8px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:12px}
+ .card{background:#fff;border:1px solid #e3e7ee;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+ .hd{font-size:15px;font-weight:800;color:#1a3d6e;border-top:3px solid #1a3d6e;padding-top:4px;margin-bottom:3px}
+ .hd .nm{font-size:12px;font-weight:500;color:#666}
+ .row{margin:2px 0}
+ .chart{height:300px;margin-top:6px}
+ table{border-collapse:collapse;width:100%}
+</style></head><body>
+<h1>📊 Signals gallery — __N__ charts — __DATE__ (rendered in your browser)</h1>
+<div class="grid">__CARDS__</div>
+<script>
+const D=__PAYLOAD__;
+function mk(id){
+ const el=document.getElementById('ch'+id); if(!el||el.dataset.done)return; el.dataset.done=1;
+ const ch=LightweightCharts.createChart(el,{height:300,layout:{textColor:'#333',background:{color:'#fff'}},
+   rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},grid:{horzLines:{color:'#f2f2f2'},vertLines:{color:'#f7f7f7'}}});
+ const cs=ch.addCandlestickSeries(); cs.setData((D[id]||{}).c||[]);
+ const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});
+ vs.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}}); vs.setData((D[id]||{}).v||[]);
+ ch.timeScale().fitContent();
+}
+// lazy-init on scroll so 100s of charts stay snappy
+const io=new IntersectionObserver((es)=>{es.forEach(e=>{if(e.isIntersecting)mk(e.target.id.slice(2));});},{rootMargin:'300px'});
+document.querySelectorAll('.chart').forEach(el=>io.observe(el));
+</script></body></html>"""
+            return (tpl.replace("__PAYLOAD__", payload)
+                       .replace("__CARDS__", "".join(cards))
+                       .replace("__N__", str(len(cards)))
+                       .replace("__DATE__", datetime.now().strftime("%d %b %Y %H:%M")))
+
+        _ranked_all = pd.concat([nse, bse], ignore_index=True) if not bse.empty else nse
+        with st.expander(f"🖼 Generate full HTML gallery — all {len(_ranked_all)} "
+                         f"charts in one file (no crash, opens in your browser)"):
+            st.caption("Builds ONE self-contained .html where every chart is drawn "
+                       "client-side (TradingView lightweight-charts). Download and open "
+                       "it — all charts load at once, using your browser's memory, not "
+                       "Streamlit's. Charts are candlestick + volume; cards carry the "
+                       "same mcap / grades / 6Q / guidance / summary as below.")
+            if st.button("Build gallery .html", key="build_gallery"):
+                with st.spinner(f"Fetching data + assembling {len(_ranked_all)} charts…"):
+                    _omap = load_ohlcv_bulk(tuple(_ranked_all["symbol"].tolist()))
+                    _html = _build_gallery_html(_ranked_all, _omap)
+                # stash so the download button survives the rerun the click triggers
+                st.session_state["_gallery_html"] = _html.encode("utf-8")
+                st.session_state["_gallery_meta"] = (len(_ranked_all), len(_html) / 1e6)
+            if st.session_state.get("_gallery_html"):
+                n_g, mb_g = st.session_state.get("_gallery_meta", (0, 0.0))
+                st.download_button(f"⬇ Download gallery.html  ({n_g} charts · {mb_g:.1f} MB)",
+                                   data=st.session_state["_gallery_html"],
+                                   file_name=f"signals_gallery_{datetime.now():%d%b%y_%H%M}.html",
+                                   mime="text/html", key="dl_gallery")
+
         for i, (_, crow) in enumerate(conv.iterrows()):
             sym      = crow["symbol"]
             sym_sigs = sel_by_sym.get(sym, _EMPTY)
