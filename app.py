@@ -3111,7 +3111,9 @@ def page_graphs():
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;margin:0;padding:12px}
  h1{font-size:16px;margin:6px 8px}
- .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:12px}
+ .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+ @media(max-width:1200px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ @media(max-width:760px){.grid{grid-template-columns:1fr}}
  .card{background:#fff;border:1px solid #e3e7ee;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
  .hd{font-size:15px;font-weight:800;color:#1a3d6e;border-top:3px solid #1a3d6e;padding-top:4px;margin-bottom:3px}
  .hd .nm{font-size:12px;font-weight:500;color:#666}
