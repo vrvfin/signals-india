@@ -97,6 +97,7 @@ jobs:
           GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+          FREE_POOL:               ${{ secrets.FREE_POOL }}
           BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
           BACKFILL_GEMINI_KEY_1:   ${{ secrets.BACKFILL_GEMINI_KEY_1 }}
           BACKFILL_GEMINI_KEY_2:   ${{ secrets.BACKFILL_GEMINI_KEY_2 }}
@@ -116,6 +117,7 @@ jobs:
             echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
             # Secret may be a multi-line blob (KEY_N=value lines or bare keys):
             # flatten to one comma-joined line so dotenv keeps every key.
+            echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
             echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
             echo "BACKFILL_GEMINI_KEY_1=$BACKFILL_GEMINI_KEY_1"
             echo "BACKFILL_GEMINI_KEY_2=$BACKFILL_GEMINI_KEY_2"

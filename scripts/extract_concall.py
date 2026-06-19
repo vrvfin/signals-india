@@ -61,6 +61,20 @@ from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
 from _extractor_base import (P1_MODELS,   # lite chain — backfill-only fallback
                              acquire_lock, release_lock, phase2_beacon_fresh)
 
+
+def load_keys_multi(env, prefixes_csv: str) -> list[str]:
+    """Load keys across a comma-separated list of env prefixes, concatenated and
+    de-duped (first occurrence wins, order preserved). A single prefix behaves
+    exactly like load_keys(env, prefix=...), so Phase 2 (GEMINI_API_KEY) is
+    unchanged. Backfill uses 'FREE_POOL,BACKFILL_GEMINI_KEY' — a missing prefix
+    simply contributes nothing (graceful fallback to whatever IS present)."""
+    keys: list[str] = []
+    for p in (x.strip() for x in str(prefixes_csv).split(",") if x.strip()):
+        for k in load_keys(env, prefix=p):
+            if k not in keys:
+                keys.append(k)
+    return keys
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # Concall is P0 (best quality). Models tried best-first; the pool only
@@ -1469,14 +1483,16 @@ def main() -> None:
                         help="Run Gemini but skip all Drive writes.")
     parser.add_argument("--backfill", action="store_true",
                         help="Backfill mode: use the dedicated key pool "
-                             "(BACKFILL_GEMINI_KEY*), route the daily digest to "
-                             "daily_backfill_*.md, and stamp backfill_process_date "
-                             "on each processed queue row. Same extractor/prompt/"
-                             "tables as Phase 2 otherwise.")
+                             "(FREE_POOL + BACKFILL_GEMINI_KEY), route the daily "
+                             "digest to daily_backfill_*.md, and stamp "
+                             "backfill_process_date on each processed queue row. "
+                             "Same extractor/prompt/tables as Phase 2 otherwise.")
     parser.add_argument("--key-prefix", default=None,
-                        help="Env-var prefix for the Gemini key pool. Defaults to "
-                             "GEMINI_API_KEY (Phase 2), or BACKFILL_GEMINI_KEY when "
-                             "--backfill is set. Override here if needed.")
+                        help="Env-var prefix(es) for the Gemini key pool — a comma "
+                             "list is allowed (loaded, concatenated, de-duped). "
+                             "Defaults to GEMINI_API_KEY (Phase 2), or "
+                             "'FREE_POOL,BACKFILL_GEMINI_KEY' when --backfill is set. "
+                             "Override here if needed.")
     parser.add_argument("--no-lock", action="store_true",
                         help="Skip the Drive mutual-exclusion lock (testing only).")
     parser.add_argument("--deadline-min", type=float, default=None,
@@ -1498,7 +1514,10 @@ def main() -> None:
         args.workers = 1
 
     # Backfill defaults to the dedicated key pool unless an explicit prefix is given.
-    key_prefix = args.key_prefix or ("BACKFILL_GEMINI_KEY" if args.backfill
+    # FREE_POOL (project default) first, BACKFILL backup second — both independent of
+    # Phase 2's GEMINI pool (a missing prefix just contributes nothing → graceful
+    # fallback to BACKFILL-only). Phase 2 (no --backfill) stays single GEMINI_API_KEY.
+    key_prefix = args.key_prefix or ("FREE_POOL,BACKFILL_GEMINI_KEY" if args.backfill
                                      else "GEMINI_API_KEY")
 
     # Backfill-only: extend the chain with the lite models (P1_MODELS) so the
@@ -1510,8 +1529,12 @@ def main() -> None:
     # Zero-cost pool verification: confirm the keys loaded, then exit.
     if args.check_keys:
         load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-        ks = load_keys(os.environ, prefix=key_prefix)
-        print(f"Key pool '{key_prefix}': {len(ks)} key(s) × {len(pool_models)} "
+        per = {p.strip(): len(load_keys(os.environ, prefix=p.strip()))
+               for p in key_prefix.split(",") if p.strip()}
+        ks = load_keys_multi(os.environ, key_prefix)
+        print(f"Key pool '{key_prefix}': "
+              + " + ".join(f"{p}={n}" for p, n in per.items())
+              + f" = {len(ks)} key(s) (de-duped) × {len(pool_models)} "
               f"model(s) = {len(ks) * len(pool_models)} daily buckets")
         sys.exit(0 if ks else 1)
 
@@ -1523,11 +1546,11 @@ def main() -> None:
     # Load Gemini API keys and build the bucket pool (keys × CONCALL_MODELS).
     # Backfill uses a dedicated pool (separate Cloud projects) so its quota is
     # fully independent of the live Phase 2 pool — T1.4.
-    api_keys = load_keys(os.environ, prefix=key_prefix)
+    api_keys = load_keys_multi(os.environ, key_prefix)
     if not api_keys:
-        print(f"ERROR: no {key_prefix} or {key_prefix}_* found in .env")
+        print(f"ERROR: no keys for prefix(es) '{key_prefix}' found in .env")
         sys.exit(1)
-    log(f"Key pool: prefix '{key_prefix}'"
+    log(f"Key pool: prefix '{key_prefix}' = {len(api_keys)} key(s)"
         + ("  [BACKFILL MODE]" if args.backfill else ""))
     gemini = BucketPool(api_keys, pool_models,
                         inter_call_s=INTER_CALL_SLEEP, logger=log,
