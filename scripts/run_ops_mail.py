@@ -397,6 +397,68 @@ def flags_html(drive, root) -> str:
             f"<tr><th>When</th><th>Flag</th></tr>{rows}</table>")
 
 
+# ---------------- section 2d: document processing (backfill + live) ----------
+
+def docs_processed_html(drive, root) -> tuple[str, int]:
+    """How many documents the pipeline has processed — the ONE global queue
+    (processing_queue.parquet) broken down by doc_type x status, plus how many
+    were summarised in the last 24h, and the Stage-0 page-check coverage
+    (companies whose Screener page we have actually swept per doc_type).
+    Returns (html, done_last_24h)."""
+    q = _read(drive, root, ["company_repo", "_index", "processing_queue.parquet"])
+    if q is None or q.empty:
+        return "<p><i>processing_queue.parquet missing — nothing processed yet.</i></p>", 0
+    for c in ("status", "doc_type", "processed_at", "source"):
+        if c not in q.columns:
+            q[c] = ""
+    pc = _read(drive, root, ["company_repo", "_index", "backfill_pagecheck.parquet"])
+
+    now = pd.Timestamp(datetime.now())
+    cutoff = now - pd.Timedelta(hours=24)
+    st_all = q["status"].astype(str)
+    proc_all = pd.to_datetime(q["processed_at"], errors="coerce")
+    done24_total = int(((st_all == "done") & (proc_all >= cutoff)).sum())
+
+    rows = []
+    for dt, g in q.groupby(q["doc_type"].astype(str)):
+        st = g["status"].astype(str)
+        pr = pd.to_datetime(g["processed_at"], errors="coerce")
+        done = int((st == "done").sum())
+        done24 = int(((st == "done") & (pr >= cutoff)).sum())
+        pend = int((st == "pending").sum())
+        err = int((st == "error").sum())
+        exp = int(st.isin(["expired", "download_failed"]).sum())
+        pcn = 0
+        if pc is not None and not pc.empty:
+            pcn = (pc[pc["doc_type"].astype(str) == str(dt)]["key"]
+                   .astype(str).nunique())
+        rows.append((str(dt), done, done24, pend, err, exp, pcn))
+    rows.sort(key=lambda r: -r[1])
+
+    body = "".join(
+        f"<tr><td>{_esc(dt, 16)}</td>"
+        f"<td align=right>{done:,}</td>"
+        f"<td align=right>{'+' + format(done24, ',') if done24 else '0'}</td>"
+        f"<td align=right>{pend:,}</td>"
+        f"<td align=right>{err:,}</td>"
+        f"<td align=right>{exp:,}</td>"
+        f"<td align=right>{pcn:,}</td></tr>"
+        for dt, done, done24, pend, err, exp, pcn in rows)
+    total_done = int((st_all == "done").sum())
+    head = (f"<p><b>📄 {done24_total:,} docs summarised in the last 24h</b> · "
+            f"{total_done:,} done all-time (one global queue).</p>")
+    table = ("<table border=1 cellpadding=4 cellspacing=0>"
+             "<tr><th>doc_type</th><th>done</th><th>+24h</th><th>pending</th>"
+             "<th>error</th><th>expired</th><th>page-checked cos</th></tr>"
+             + body + "</table>"
+             "<p style='font-size:11px;color:#999'>expired = PDF aged out (2-day "
+             "retention) before summarising — re-fetched automatically. "
+             "page-checked = companies whose Screener page we have swept for that "
+             "doc_type (Stage-0 denominator). Full tier/depth %: "
+             "company_repo/_index/coverage_report.md.</p>")
+    return head + table, done24_total
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -411,7 +473,9 @@ def main() -> None:
     fresh_html, n_bad = freshness_html(drive, root)
     cov_html, n_cov_bad = coverage_html(drive, root)
     mcap_html, n_mcap_bad = mcap_health_html(drive, root)
+    docs_html, docs_24h = docs_processed_html(drive, root)
     body = (f"<h3>Workflow runs (last 26h)</h3>{wf_html}"
+            f"<h3>Document processing</h3>{docs_html}"
             f"<h3>Stock coverage</h3>{cov_html}"
             f"<h3>Market-cap freshness</h3>{mcap_html}"
             f"<h3>Data freshness</h3>{fresh_html}"
@@ -421,10 +485,11 @@ def main() -> None:
             f"sidebar (📧 Email toggles) or toggle_mail.bat.</p>")
     status = "🔴" if (failed or n_bad or n_cov_bad or n_mcap_bad) else "🟢"
     subject = (f"{status} Ops digest — {ok} ok / {failed} failed / "
-               f"{n_bad} stale / coverage {'⚠️' if n_cov_bad else 'ok'} / "
+               f"{n_bad} stale / docs +{docs_24h}/24h / "
+               f"coverage {'⚠️' if n_cov_bad else 'ok'} / "
                f"mcap {'⚠️' if n_mcap_bad else 'ok'} — {date.today()}")
     log(f"ops digest: {ok} ok, {failed} failed, {n_bad} stale, "
-        f"coverage_bad={n_cov_bad}, mcap_bad={n_mcap_bad}")
+        f"docs_24h={docs_24h}, coverage_bad={n_cov_bad}, mcap_bad={n_mcap_bad}")
 
     if args.dry_run:
         prev = os.path.join(os.path.dirname(_SCRIPTS_DIR), "ops_digest_preview.html")
