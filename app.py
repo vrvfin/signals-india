@@ -1176,9 +1176,12 @@ def _gf4_quality_score(gf4_df: pd.DataFrame, symbol: str) -> int:
 
 
 def _quarter_ord(qs) -> int:
-    """'Q3 FY26' -> 2603 for chronological sort; -1 if unparseable."""
-    m = re.match(r"\s*Q([1-4])\s*FY\s*0*(\d+)", str(qs), re.I)
-    return int(m.group(2)) * 100 + int(m.group(1)) if m else -1
+    """'Q3 FY26' / "Q2 FY '26" / 'Q1 FY2026' -> sortable int (year2·100+q); -1 if
+    unparseable. Tolerant of apostrophes/spaces between Q-number and the year."""
+    m = re.match(r"\s*Q([1-4])\D*?(\d{2,4})", str(qs))
+    if not m:
+        return -1
+    return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
 def _guidance_history(gt: pd.DataFrame) -> dict:
@@ -2762,11 +2765,19 @@ def page_graphs():
                         pass
             return p   # fall back to raw period string if unparseable
 
+        def _fy_label(p):
+            digs = "".join(c for c in str(p) if c.isdigit())
+            return f"FY{digs[-2:]}" if digs else str(p)
+
         def _quarterly_html(sym: str) -> str:
             sdf = stmts_by_sym.get(sym, _EMPTY)
             if sdf is None or sdf.empty or "statement" not in sdf.columns:
                 return ""
             q = sdf[sdf["statement"] == "quarterly_pl"]
+            is_annual = False
+            if q.empty:                       # OMAXAUTO etc. lack quarterly_pl
+                q = sdf[sdf["statement"] == "annual_pl"]
+                is_annual = True
             if q.empty:
                 return ""
             def ser(item):
@@ -2799,9 +2810,11 @@ def page_graphs():
                 return (f"<td style='font-size:11px;text-align:right;font-weight:700;"
                         f"color:{col}'>{txt}</td>")
 
-            th = ("<tr><td style='font-size:11px'></td>"
+            _plabel = _fy_label if is_annual else _qtr_label
+            corner = "<span style='color:#8a6d00;font-size:9px'>annual</span>" if is_annual else ""
+            th = (f"<tr><td style='font-size:11px'>{corner}</td>"
                   + "".join(f"<td style='font-size:11px;text-align:right;color:#666;"
-                            f"font-weight:600'>{_qtr_label(p)}</td>"
+                            f"font-weight:600'>{_plabel(p)}</td>"
                             for p in periods)
                   + "<td style='font-size:11px;text-align:right;color:#666;font-weight:600;"
                     "border-left:1px solid #ccc'>YoY</td>"
@@ -2815,14 +2828,16 @@ def page_graphs():
                     + ("—" if d.get(p) is None or pd.isna(d.get(p))
                        else format(d.get(p), ',.0f')) + "</td>"
                     for p in periods)
-                # YoY = latest vs 4 quarters back; QoQ = latest vs previous quarter
                 seq = [v for _, v in vals]
-                cur  = seq[-1] if seq else None
-                yoy_ref = seq[-5] if len(seq) >= 5 else None
-                qoq_ref = seq[-2] if len(seq) >= 2 else None
+                cur = seq[-1] if seq else None
+                if is_annual:                        # YoY = vs prior FY; QoQ n/a
+                    yoy_ref = seq[-2] if len(seq) >= 2 else None
+                    qoq_c = "<td style='font-size:11px;text-align:right;color:#bbb'>—</td>"
+                else:                                # YoY = vs 4q back; QoQ = prior q
+                    yoy_ref = seq[-5] if len(seq) >= 5 else None
+                    qoq_c = _pct_cell(cur, seq[-2] if len(seq) >= 2 else None)
                 yoy_c = _pct_cell(cur, yoy_ref).replace("text-align:right;",
                                                         "text-align:right;border-left:1px solid #ccc;")
-                qoq_c = _pct_cell(cur, qoq_ref)
                 body += (f"<tr><td style='font-size:11px;color:#333'><b>{lbl}</b></td>"
                          f"{cells}{yoy_c}{qoq_c}</tr>")
             return (f"<table style='border-collapse:collapse;width:100%;"
@@ -2899,8 +2914,7 @@ def page_graphs():
             return "qual"
 
         def _q_order(qs):
-            m = re.match(r"\s*Q([1-4])\s*FY\s*0*(\d+)", str(qs), re.I)
-            return int(m.group(2)) * 10 + int(m.group(1)) if m else -1
+            return _quarter_ord(qs)   # tolerant parser (handles "Q2 FY '26" etc.)
 
         def _guidance_latest(sym):
             """(quarter_label, df_of_latest_quarter_with_numeric_cagr) or ('', None)."""
@@ -3013,16 +3027,26 @@ def page_graphs():
 
             # (b) Raw forward-looking statements (GF1) — up to 3, tagged metric·timeframe.
             g = gf1_by_sym.get(sym.upper(), _EMPTY)
+            gf1_latest_q = ""
             if g is not None and not g.empty and "exact_statement" in g.columns:
-                g2 = g.sort_values("processed_at") if "processed_at" in g.columns else g
+                g2 = g.copy()
+                # sort by QUARTER (latest first) — not processed_at, which ties on a
+                # single backfill run and buried the newest quarter (CPPLUS showed
+                # Q3 while Q4 existed). secondary: processed_at for stable order.
+                g2["_qo"] = g2["quarter"].map(_q_order) if "quarter" in g2.columns else -1
+                sort_cols = ["_qo"] + (["processed_at"] if "processed_at" in g2.columns else [])
+                g2 = g2.sort_values(sort_cols, ascending=False)
+                if (g2["_qo"] >= 0).any():
+                    gf1_latest_q = str(g2[g2["_qo"] >= 0]["quarter"].iloc[0])
                 shown = 0
-                for _, gr in g2.iloc[::-1].iterrows():       # newest first
+                for _, gr in g2.iterrows():
                     stmt = str(gr.get("exact_statement", "") or "").strip()
                     if not stmt or stmt.lower() == "nan":
                         continue
+                    qv = str(gr.get("quarter", "") or "").strip()
                     mt = str(gr.get("metric_type", "") or "").strip()
                     tf = str(gr.get("timeframe", "") or "").strip()
-                    tag = " · ".join(t for t in (mt, tf) if t and t.lower() != "nan")
+                    tag = " · ".join(t for t in (qv, mt, tf) if t and t.lower() != "nan")
                     tag_html = f'<i style="color:#1565c0">[{tag}]</i> ' if tag else ""
                     lines.append(f"{tag_html}{stmt[:200]}")
                     shown += 1
@@ -3032,9 +3056,12 @@ def page_graphs():
             if not lines:
                 return ""
             body = "<br>".join(lines[:7])
+            # header quarter = the latest we have ANY data for (guidance or gf1)
+            hdr_q = max([q for q in (src_q, gf1_latest_q) if q],
+                        key=_q_order, default=src_q)
             src = (f'<span style="background:#1565c0;color:#fff;border-radius:4px;'
-                   f'padding:0 6px;font-size:10px;margin-left:6px">concall {src_q}</span>'
-                   if src_q else "")
+                   f'padding:0 6px;font-size:10px;margin-left:6px">concall {hdr_q}</span>'
+                   if hdr_q else "")
             return (f'<div style="background:#eef6ff;border-left:3px solid #1565c0;'
                     f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;'
                     f'line-height:1.55">📋 <b style="font-size:13px">Guidance / outlook</b>'

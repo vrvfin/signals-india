@@ -162,8 +162,11 @@ def _g_kind(metric, value):
 
 
 def _q_order(qs):
-    m = re.match(r"\s*Q([1-4])\s*FY\s*0*(\d+)", str(qs), re.I)
-    return int(m.group(2)) * 100 + int(m.group(1)) if m else -1
+    """Tolerant fiscal-quarter sort key (handles "Q2 FY '26", "Q1 FY2026")."""
+    m = re.match(r"\s*Q([1-4])\D*?(\d{2,4})", str(qs))
+    if not m:
+        return -1
+    return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
 class Cards:
@@ -239,6 +242,10 @@ class Cards:
         if sdf is None or sdf.empty or "statement" not in sdf.columns:
             return ""
         q = sdf[sdf["statement"] == "quarterly_pl"]
+        is_annual = False
+        if q.empty:                          # OMAXAUTO etc. lack quarterly_pl
+            q = sdf[sdf["statement"] == "annual_pl"]
+            is_annual = True
         if q.empty:
             return ""
         ser = lambda it: list(zip(q[q["line_item"] == it]["period"].astype(str),
@@ -262,9 +269,13 @@ class Cards:
             return (f"<td style='font-size:11px;text-align:right;font-weight:700;"
                     f"color:{col}'>{txt}</td>")
 
-        th = ("<tr><td style='font-size:11px'></td>"
+        _fy = lambda p: (f"FY{''.join(c for c in str(p) if c.isdigit())[-2:]}"
+                         if any(c.isdigit() for c in str(p)) else str(p))
+        plabel = _fy if is_annual else _qtr_label
+        corner = "<span style='color:#8a6d00;font-size:9px'>annual</span>" if is_annual else ""
+        th = (f"<tr><td style='font-size:11px'>{corner}</td>"
               + "".join(f"<td style='font-size:11px;text-align:right;color:#666;"
-                        f"font-weight:600'>{_qtr_label(p)}</td>" for p in periods)
+                        f"font-weight:600'>{plabel(p)}</td>" for p in periods)
               + "<td style='font-size:11px;text-align:right;color:#666;font-weight:600;"
                 "border-left:1px solid #ccc'>YoY</td>"
               + "<td style='font-size:11px;text-align:right;color:#666;font-weight:600'>QoQ</td></tr>")
@@ -277,9 +288,14 @@ class Cards:
                 + "</td>" for p in periods)
             seq = [v for _, v in vals]
             cur = seq[-1] if seq else None
-            yoy = pct(cur, seq[-5] if len(seq) >= 5 else None).replace(
-                "text-align:right;", "text-align:right;border-left:1px solid #ccc;")
-            qoq = pct(cur, seq[-2] if len(seq) >= 2 else None)
+            if is_annual:
+                yoy = pct(cur, seq[-2] if len(seq) >= 2 else None).replace(
+                    "text-align:right;", "text-align:right;border-left:1px solid #ccc;")
+                qoq = "<td style='font-size:11px;text-align:right;color:#bbb'>—</td>"
+            else:
+                yoy = pct(cur, seq[-5] if len(seq) >= 5 else None).replace(
+                    "text-align:right;", "text-align:right;border-left:1px solid #ccc;")
+                qoq = pct(cur, seq[-2] if len(seq) >= 2 else None)
             body += (f"<tr><td style='font-size:11px;color:#333'><b>{lbl}</b></td>"
                      f"{cells}{yoy}{qoq}</tr>")
         return f"<table style='border-collapse:collapse;width:100%;margin:2px 0 4px 0'>{th}{body}</table>"
@@ -376,25 +392,35 @@ class Cards:
                 if len(lines) >= 7:
                     break
         g1 = self.gf1_by.get(sym.upper(), _EMPTY)
+        gf1_latest_q = ""
         if g1 is not None and not g1.empty and "exact_statement" in g1.columns:
-            g2 = g1.sort_values("processed_at") if "processed_at" in g1.columns else g1
+            g2 = g1.copy()
+            # sort by QUARTER (latest first), not processed_at (ties on a single
+            # backfill run hid the newest quarter, e.g. CPPLUS Q4 vs Q3).
+            g2["_qo"] = g2["quarter"].map(_q_order) if "quarter" in g2.columns else -1
+            sort_cols = ["_qo"] + (["processed_at"] if "processed_at" in g2.columns else [])
+            g2 = g2.sort_values(sort_cols, ascending=False)
+            if (g2["_qo"] >= 0).any():
+                gf1_latest_q = str(g2[g2["_qo"] >= 0]["quarter"].iloc[0])
             shown = 0
-            for _, gr in g2.iloc[::-1].iterrows():
+            for _, gr in g2.iterrows():
                 stmt = str(gr.get("exact_statement", "") or "").strip()
                 if not stmt or stmt.lower() == "nan":
                     continue
+                qv = str(gr.get("quarter", "") or "").strip()
                 mt = str(gr.get("metric_type", "") or "").strip()
                 tf = str(gr.get("timeframe", "") or "").strip()
-                tag = " · ".join(t for t in (mt, tf) if t and t.lower() != "nan")
+                tag = " · ".join(t for t in (qv, mt, tf) if t and t.lower() != "nan")
                 lines.append((f'<i style="color:#1565c0">[{tag}]</i> ' if tag else "") + stmt[:200])
                 shown += 1
                 if shown >= 3:
                     break
         if not lines:
             return ""
+        hdr_q = max([q for q in (src_q, gf1_latest_q) if q], key=_q_order, default=src_q)
         src = (f'<span style="background:#1565c0;color:#fff;border-radius:4px;'
-               f'padding:0 6px;font-size:10px;margin-left:6px">concall {src_q}</span>'
-               if src_q else "")
+               f'padding:0 6px;font-size:10px;margin-left:6px">concall {hdr_q}</span>'
+               if hdr_q else "")
         return (f'<div style="background:#eef6ff;border-left:3px solid #1565c0;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
                 f'📋 <b style="font-size:13px">Guidance / outlook</b>{src}<br>'
@@ -439,14 +465,12 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;margin:0;padding:12px}
  h1{font-size:16px;margin:6px 8px}
- .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
- @media(max-width:1200px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
- @media(max-width:760px){.grid{grid-template-columns:1fr}}
+ .grid{display:grid;grid-template-columns:1fr;gap:16px;max-width:1100px;margin:0 auto}
  .card{background:#fff;border:1px solid #e3e7ee;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
  .hd{font-size:15px;font-weight:800;color:#1a3d6e;border-top:3px solid #1a3d6e;padding-top:4px;margin-bottom:3px}
  .hd .nm{font-size:12px;font-weight:500;color:#666}
  .row{margin:2px 0}
- .chart{height:300px;margin-top:6px}
+ .chart{height:440px;margin-top:6px}
  table{border-collapse:collapse;width:100%}
 </style></head><body>
 <h1>📊 Signals gallery — __N__ charts — __DATE__ (rendered in your browser)</h1>
@@ -455,7 +479,7 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 const D=__PAYLOAD__;
 function mk(id){
  const el=document.getElementById('ch'+id); if(!el||el.dataset.done)return; el.dataset.done=1;
- const ch=LightweightCharts.createChart(el,{height:300,layout:{textColor:'#333',background:{color:'#fff'}},
+ const ch=LightweightCharts.createChart(el,{height:440,layout:{textColor:'#333',background:{color:'#fff'}},
    rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},grid:{horzLines:{color:'#f2f2f2'},vertLines:{color:'#f7f7f7'}}});
  const cs=ch.addCandlestickSeries(); cs.setData((D[id]||{}).c||[]);
  const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});

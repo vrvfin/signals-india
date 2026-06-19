@@ -179,7 +179,9 @@ jobs:
       # + company_page sections. Uses FREE_POOL keys (default for new programs).
       - name: BSE announcement summaries
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/ingest_announcements.py
+        # 4-day lookback catches filings on weekends / days a run was skipped or
+        # late (newsid dedup prevents repeats) so e.g. an order-win isn't missed.
+        run: python scripts/ingest_announcements.py --lookback-days 4
         continue-on-error: true
         env:
           FREE_POOL:            ${{ secrets.FREE_POOL }}

@@ -211,8 +211,11 @@ def _build_pool():
     if not keys:
         log("No Gemini keys (FREE_POOL/BACKFILL/GEMINI) — cannot summarise.")
         return None
-    log(f"Gemini pool: {len(keys)} keys (FREE_POOL then BACKFILL/GEMINI) x lite models")
-    return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"],
+    # gemini-2.5-flash-lite is the live free model; 2.0-flash-lite's free quota is
+    # exhausted (429 PerDay) and was making the pool give up early — lead with 2.5
+    # and use 2.0-flash (non-lite) as the fallback, not 2.0-flash-lite.
+    log(f"Gemini pool: {len(keys)} keys (FREE_POOL then BACKFILL/GEMINI)")
+    return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash"],
                       inter_call_s=0.5, logger=log, overload_budget=3)
 
 
@@ -230,6 +233,10 @@ def categorise(row: dict) -> tuple[str, str, bool]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", type=str, default=None, help="YYYY-MM-DD (default: today).")
+    ap.add_argument("--lookback-days", type=int, default=1,
+                    help="Scan the last N days ending at --date (default 1 = today "
+                         "only). >1 catches filings on days a run was skipped/late or "
+                         "over a weekend; dedup by newsid prevents repeats.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Optional safety cap on NEW summaries (0 = no cap; dedup "
                          "already bounds it to the day's actual new filings).")
@@ -242,13 +249,19 @@ def main() -> None:
 
     drive = get_drive()
     d = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-    log(f"BSE announcements for {d}  mode={'DRY-RUN' if args.dry_run else 'LIVE'}")
+    lookback = max(1, args.lookback_days)
+    days = [d - timedelta(days=i) for i in range(lookback)]
+    log(f"BSE announcements for {days[-1]}..{d} ({lookback}d)  "
+        f"mode={'DRY-RUN' if args.dry_run else 'LIVE'}")
 
     order, meta = build_watchlist(drive, min_turnover_cr=args.min_turnover)
     wl_codes = set(order)
 
-    rows = fetch_day_announcements(d)
-    log(f"market-wide filings on {d}: {len(rows)}")
+    rows = []
+    for dd in days:
+        day_rows = fetch_day_announcements(dd)
+        log(f"market-wide filings on {dd}: {len(day_rows)}")
+        rows.extend(day_rows)
 
     # filter to watchlist + categorise + drop Phase-2-covered types
     kept, excluded_n, offwl_n = [], 0, 0
