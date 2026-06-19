@@ -217,3 +217,38 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
+
+      # ── Push notification (ntfy.sh → phone + desktop) ─────────────────────
+      # Fires on success, failure AND skip so you always know the run's state.
+      # One-time setup:
+      #   1. Pick an unguessable topic, e.g. "signals-india-vrv-7h2k9".
+      #   2. Install the "ntfy" app (iOS / Android / desktop web at ntfy.sh)
+      #      and SUBSCRIBE to that exact topic.
+      #   3. Repo → Settings → Secrets → Actions → New secret
+      #         Name: NTFY_TOPIC   Value: <your topic>
+      # Safe if the secret is unset: the step logs and exits 0.
+      - name: Notify (ntfy push)
+        if: always()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          JOB_STATUS: ${{ job.status }}
+          SKIPPED: ${{ steps.fresh.outputs.skip }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then
+            echo "NTFY_TOPIC not set — notification skipped (see setup note above)."
+            exit 0
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "$SKIPPED" = "true" ]; then
+            TITLE="Phase 1 skipped"; TAGS="zzz"; PRIO="low"
+            MSG="No run today (non-trading day / no fresh data)."
+          elif [ "$JOB_STATUS" = "success" ]; then
+            TITLE="Phase 1 done"; TAGS="white_check_mark"; PRIO="default"
+            MSG="Daily pipeline finished OK — $(date -u '+%Y-%m-%d %H:%M UTC'). Tap to open the run."
+          else
+            TITLE="Phase 1 FAILED"; TAGS="rotating_light"; PRIO="high"
+            MSG="Daily pipeline FAILED — $(date -u '+%Y-%m-%d %H:%M UTC'). Tap to open the run/logs."
+          fi
+          curl -s -H "Title: $TITLE" -H "Tags: $TAGS" -H "Priority: $PRIO" \
+               -H "Click: $RUN_URL" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" \
+            && echo "ntfy notification sent." || echo "ntfy send failed (non-fatal)."
