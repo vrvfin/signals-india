@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
-                             download_bytes, log)
+                             download_bytes, log, load_portfolio_isins)
 import gradation as G
 
 _EMPTY = pd.DataFrame()
@@ -473,7 +473,7 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
  .chart{height:440px;margin-top:6px}
  table{border-collapse:collapse;width:100%}
 </style></head><body>
-<h1>📊 Signals gallery — __N__ charts — __DATE__ (rendered in your browser)</h1>
+<h1>__TITLE__ — __N__ charts — __DATE__ (rendered in your browser)</h1>
 <div class="grid">__CARDS__</div>
 <script>
 const D=__PAYLOAD__;
@@ -491,7 +491,9 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
 </script></body></html>"""
 
 
-def build_html(ranked, omap, cards: Cards, mcap_map, days):
+def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
+               annot=None):
+    annot = annot or {}
     card_html, data = [], {}
     for j, (_, rr) in enumerate(ranked.iterrows()):
         s = rr["symbol"]
@@ -499,6 +501,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days):
         meta = "".join(x for x in [
             f'<div class="hd">{j + 1}. <b>{s}</b>'
             + (f' <span class="nm">{nmj}</span>' if nmj else "") + "</div>",
+            annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
             cards.llm_summary(s),
@@ -509,27 +512,89 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days):
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
                 .replace("__CARDS__", "".join(card_html))
                 .replace("__N__", str(len(card_html)))
+                .replace("__TITLE__", title)
                 .replace("__DATE__", datetime.now().strftime("%d %b %Y %H:%M")))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--min-strats", type=int, default=2)
-    ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
-    ap.add_argument("--timeframe-days", type=int, default=252)
-    ap.add_argument("--turnover", type=float, default=1.0, help="min ₹cr/day, 0=off")
-    ap.add_argument("--max", type=int, default=0, help="cap chart count, 0=all")
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(_SCRIPTS_DIR),
-                                                  "gallery.html"))
-    ap.add_argument("--no-open", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+# ─────────────────────── guidance-strength scoring ──────────────────────────
+def _parse_cr(text):
+    """Extract a ₹-crore number from free guidance text. Range -> midpoint.
+    'INR3000 crores' -> 3000 ; 'INR 850-900 crores' -> 875 ; '3000' -> 3000."""
+    t = str(text).lower().replace(",", "")
+    nums = re.findall(r"\d+(?:\.\d+)?", t)
+    if not nums:
+        return None
+    vals = [float(n) for n in nums[:2]] if "-" in t.split("cr")[0] or "–" in t else [float(nums[0])]
+    val = sum(vals) / len(vals)
+    if "bn" in t or "billion" in t:
+        val *= 100         # ₹1 bn = 100 cr
+    return val
 
-    drive = get_drive()
-    log("loading signals…")
+
+def _horizon_years(h):
+    h = str(h).strip().upper()
+    fixed = {"NEXT_QTR": 0.25, "1Y": 1.0, "2Y": 2.0, "3Y": 3.0, "3Y+": 4.0}
+    if h in fixed:
+        return fixed[h]
+    m = re.search(r"FY\D*?(\d{2,4})", h)
+    if m:
+        yr = int(m.group(1)) % 100
+        return max(0.5, (2000 + yr) - 2026)     # years from ~now (mid-2026)
+    return 1.0
+
+
+def guidance_scores(guid, base_rev, base_pat,
+                    min_base_rev=50.0, min_base_pat=5.0, cap_cagr=150.0):
+    """{SYMBOL: (score_pct, detail_html)} — for each company's LATEST quarter,
+    the MAX implied annual growth across revenue & PAT guidance. Absolute targets
+    -> CAGR vs current TTM base; growth-rate guidance -> its cagr_pct directly.
+
+    Sanity guards (else micro-caps with ~0 base or mis-parsed targets dominate):
+      • skip a metric whose TTM base is below the floor (CAGR off a tiny base
+        explodes and isn't comparable),
+      • drop implied CAGR <=0 or > cap_cagr (parse noise — >150%/yr ≈ 15x/3y)."""
+    if guid is None or guid.empty:
+        return {}
+    g = guid.copy()
+    g["_qo"] = g["quarter"].map(_q_order) if "quarter" in g.columns else -1
+    g["_c"] = pd.to_numeric(g.get("cagr_pct"), errors="coerce")
+    out = {}
+    for sym, sub in g.groupby(g["symbol"].astype(str).str.upper()):
+        if sub["_qo"].max() >= 0:
+            sub = sub[sub["_qo"] == sub["_qo"].max()]      # latest quarter only
+        best = (-1e9, "")
+        for _, r in sub.iterrows():
+            met = str(r.get("metric", "")).lower()
+            if "revenue" in met or "sales" in met:
+                base, mlabel, floor = base_rev.get(sym), "Revenue", min_base_rev
+            elif "pat" in met or "profit" in met or "earnings" in met:
+                base, mlabel, floor = base_pat.get(sym), "PAT", min_base_pat
+            else:
+                continue
+            if not base or base < floor:        # base too small -> CAGR unreliable
+                continue
+            kind = _g_kind(met, r.get("value"))
+            yrs = _horizon_years(r.get("horizon_fy"))
+            g_pct, detail = None, ""
+            if kind == "absolute":
+                tgt = _parse_cr(r.get("value"))
+                if tgt and tgt > base and yrs > 0:
+                    g_pct = ((tgt / base) ** (1.0 / yrs) - 1) * 100
+                    detail = f"{mlabel} ~{base:,.0f}→{tgt:,.0f} cr / {yrs:.0f}y"
+            elif kind == "growth" and pd.notna(r["_c"]):
+                g_pct = float(r["_c"])
+                detail = f"{mlabel} +{g_pct:.0f}%/yr"
+            if g_pct is not None and 0 < g_pct <= cap_cagr and g_pct > best[0]:
+                best = (g_pct, detail)
+        if best[0] > -1e9:
+            out[sym] = best
+    return out
+
+
+def _select_signals(drive, args, exch):
     sig = _load_signals(drive)
     if sig.empty:
-        log("No signals found."); return
+        return pd.DataFrame()
     if args.zones.strip():
         sig = sig[sig["zone_type"].isin([z.strip() for z in args.zones.split(",")])]
     conv = (sig.groupby("symbol")["strategy_group"].nunique()
@@ -538,7 +603,6 @@ def main():
     best = sig.groupby("symbol")["score"].max().reset_index(name="best_score")
     conv = conv.merge(best, on="symbol", how="left")
     log(f"  {len(conv)} names with >={args.min_strats} strategies")
-
     if args.turnover > 0:
         feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
         if not feats.empty and "symbol" in feats.columns:
@@ -552,42 +616,100 @@ def main():
             tmap = dict(zip(feats["symbol"].astype(str), turn))
             conv = conv[conv["symbol"].astype(str).map(tmap).fillna(-1.0) >= args.turnover]
             log(f"  {len(conv)} pass Rs{args.turnover:.0f}cr turnover floor")
-    if conv.empty:
-        log("Nothing to render."); return
+    conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
+    conv = conv.sort_values(["n_strategies", "best_score"], ascending=[False, False])
+    return pd.concat([conv[conv["_exch"] != "BSE"], conv[conv["_exch"] == "BSE"]],
+                     ignore_index=True)
 
-    # exchange split + rank (NSE first, then BSE-only), like the app
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["signals", "pf", "guidance"], default="signals",
+                    help="signals=ranked signal gallery; pf=portfolio holdings; "
+                         "guidance=top companies by implied guidance CAGR.")
+    ap.add_argument("--min-strats", type=int, default=2)
+    ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
+    ap.add_argument("--timeframe-days", type=int, default=252)
+    ap.add_argument("--turnover", type=float, default=1.0, help="min Rs cr/day, 0=off")
+    ap.add_argument("--max", type=int, default=0,
+                    help="cap chart count (0=all; guidance mode defaults to 100)")
+    ap.add_argument("--out", default="")
+    ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    drive = get_drive()
+    idx = _folder(drive, "company_repo/_index")
+    fund = _folder(drive, "fundamentals")
     uni = _read_csv(drive, _folder(drive, "universe"), "master_list.csv")
     exch = dict(zip(uni["symbol"].astype(str), uni["exchange"].astype(str))) \
         if not uni.empty and {"symbol", "exchange"} <= set(uni.columns) else {}
-    conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
-    conv = conv.sort_values(["n_strategies", "best_score"], ascending=[False, False])
-    nse = conv[conv["_exch"] != "BSE"]
-    bse = conv[conv["_exch"] == "BSE"]
-    ranked = pd.concat([nse, bse], ignore_index=True)
-    if args.max > 0:
-        ranked = ranked.head(args.max)
+
+    log("loading grades / guidance / summary…")
+    grades = _read_parquet(drive, idx, "screener_grades.parquet")
+    guidance = _read_parquet(drive, idx, "guidance_tracker.parquet")
+    summ = _read_parquet(drive, fund, "summary.parquet")
+    isin2sym = {}
+    if not grades.empty and {"isin", "symbol"} <= set(grades.columns):
+        isin2sym = {str(i): str(s) for i, s in zip(grades["isin"], grades["symbol"])}
+    mcap_map, base_rev, base_pat = {}, {}, {}
+    if not summ.empty and "symbol" in summ.columns:
+        for _, r in summ.iterrows():
+            s = str(r["symbol"]).upper()
+            v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
+            if pd.notna(v) and v > 0:
+                mcap_map[s] = v
+            try:
+                base_rev[s] = float(pd.Series(r.get("q_sales_last_4q")).astype(float).sum())
+                base_pat[s] = float(pd.Series(r.get("q_netprofit_last_4q")).astype(float).sum())
+            except Exception:
+                pass
+
+    title, annot = "📊 Signals gallery", {}
+    out_default = "gallery.html"
+
+    if args.mode == "pf":
+        title, out_default = "💼 Portfolio (PF) charts", "gallery_pf.html"
+        isins = load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"]) or set()
+        syms = sorted({isin2sym.get(str(i), "") for i in isins} - {""})
+        ranked = pd.DataFrame({"symbol": syms})
+        ranked["_mc"] = ranked["symbol"].map(lambda s: mcap_map.get(s.upper(), 0))
+        ranked = ranked.sort_values("_mc", ascending=False).reset_index(drop=True)
+        log(f"  PF holdings resolved to {len(ranked)} symbols")
+
+    elif args.mode == "guidance":
+        title, out_default = "📈 Top guidance (implied CAGR)", "gallery_guidance.html"
+        scores = guidance_scores(guidance, base_rev, base_pat)
+        rows = sorted(scores.items(), key=lambda kv: -kv[1][0])
+        top = args.max if args.max > 0 else 100
+        rows = rows[:top]
+        ranked = pd.DataFrame({"symbol": [k for k, _ in rows]})
+        for sym, (sc, detail) in rows:
+            annot[sym] = (f'<div style="background:#0d2f5c;color:#fff;border-radius:6px;'
+                          f'padding:4px 10px;font-size:13px;font-weight:700;margin:3px 0">'
+                          f'📈 Guidance CAGR ~{sc:.0f}%'
+                          + (f' <span style="font-weight:500;opacity:.9">· {detail}</span>'
+                             if detail else "") + "</div>")
+        log(f"  scored {len(scores)} companies with guidance; top {len(ranked)}")
+
+    else:  # signals
+        ranked = _select_signals(drive, args, exch)
+        if args.max > 0:
+            ranked = ranked.head(args.max)
+
+    if ranked.empty:
+        log("Nothing to render."); return
     syms = ranked["symbol"].tolist()
-    log(f"  ranked {len(syms)} charts (NSE {len(nse)} + BSE {len(bse)})")
+    log(f"  {len(syms)} charts selected (mode={args.mode})")
 
     if args.dry_run:
         log("DRY-RUN — top 10: " + ", ".join(syms[:10]))
         return
 
-    idx = _folder(drive, "company_repo/_index")
-    fund = _folder(drive, "fundamentals")
-    log("loading cards (grades/guidance/announcements)…")
-    grades = _read_parquet(drive, idx, "screener_grades.parquet")
-    guidance = _read_parquet(drive, idx, "guidance_tracker.parquet")
+    out_path = args.out or os.path.join(os.path.dirname(_SCRIPTS_DIR), out_default)
+    log("loading gf1 / announcements…")
     gf1 = _read_parquet(drive, idx, "gf1_guidance_statements.parquet")
     ann = _read_parquet(drive, idx, "announcement_ledger.parquet")
-    summ = _read_parquet(drive, fund, "summary.parquet")
-    mcap_map = {}
-    if not summ.empty and {"symbol", "market_cap_cr"} <= set(summ.columns):
-        for _, r in summ.iterrows():
-            v = pd.to_numeric(r.get("market_cap_cr"), errors="coerce")
-            if pd.notna(v) and v > 0:
-                mcap_map[str(r["symbol"]).upper()] = v
-
     log(f"downloading OHLCV for {len(syms)} names…")
     omap = _bulk_parquet(drive, _folder(drive, "data/ohlcv"), syms)
     log("downloading statements…")
@@ -595,12 +717,13 @@ def main():
 
     cards = Cards(grades, stmts, guidance, gf1, ann)
     log("assembling HTML…")
-    html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days)
-    with open(args.out, "w", encoding="utf-8") as f:
+    html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
+                      title=title, annot=annot)
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
-    log(f"wrote {args.out}  ({len(html) / 1e6:.1f} MB, {len(syms)} charts)")
+    log(f"wrote {out_path}  ({len(html) / 1e6:.1f} MB, {len(syms)} charts)")
     if not args.no_open:
-        webbrowser.open("file://" + os.path.abspath(args.out))
+        webbrowser.open("file://" + os.path.abspath(out_path))
         log("opened in default browser.")
 
 

@@ -63,6 +63,6 @@ ar_focus_*.md
 ar_focus_*.pdf
 pf_digest_preview.html
 
-# local chart gallery output (build_gallery.bat)
-gallery.html
+# local chart gallery output (build_gallery.bat / pf_gallery.bat / guidance_gallery.bat)
+gallery*.html
 signals_gallery_*.html
