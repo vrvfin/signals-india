@@ -64,6 +64,9 @@ from _extractor_base import (
 from backfill_coverage import (    # T12: window-aware derived coverage view
     build_coverage, coverage_lookup, save_coverage,
 )
+from backfill_pagecheck import (   # T12 Stage 0: page-check denominator ledger
+    load_pagecheck, save_pagecheck, upsert_pagecheck,
+)
 
 # T12: doc types the per-company Screener #documents primitive can actually fetch
 # (SUBSECTION_TYPES in backfill_company_docs). results/presentation are NOT on that
@@ -165,6 +168,7 @@ def build_company_order(drive, root_id) -> list[dict]:
         for isin in pf_isins:
             row = isin2row.get(str(isin).strip())
             if row and row["symbol"] not in seen:
+                row["tier"] = "portfolio"
                 ordered.append(row); seen.add(row["symbol"])
         log(f"  Portfolio names queued first: {len(ordered)}")
     else:
@@ -176,6 +180,7 @@ def build_company_order(drive, root_id) -> list[dict]:
     if not conviction.empty and "symbol" in conviction.columns:
         for sym in conviction["symbol"].astype(str).str.strip():
             if sym in sym2row and sym not in seen:
+                sym2row[sym]["tier"] = "conviction"
                 ordered.append(sym2row[sym]); seen.add(sym)
         log(f"  Strong (conviction) names queued next: {len(ordered) - n_pf}")
     else:
@@ -184,6 +189,8 @@ def build_company_order(drive, root_id) -> list[dict]:
     # 3) Long tail: remaining universe by market cap desc, else master_list order.
     mcap = _read_csv_from(drive, root_id, "universe", "market_cap.csv")
     remaining = [sym2row[s] for s in sym2row if s not in seen]
+    for r in remaining:
+        r["tier"] = "tail"
     if not mcap.empty and {"symbol", "market_cap_cr"}.issubset(mcap.columns):
         cap = dict(zip(mcap["symbol"].astype(str).str.strip(),
                        pd.to_numeric(mcap["market_cap_cr"], errors="coerce").fillna(0)))
@@ -426,6 +433,9 @@ def main() -> None:
     totals = {"fetched": 0, "found": 0, "new": 0, "downloaded": 0,
               "dup": 0, "download_fail": 0, "errors": 0,
               "skipped_covered": 0}
+    # T12 Stage 0: one page-check row per (company, doc_type) actually fetched —
+    # the coverage DENOMINATOR (records n_docs_found=0 too). Saved at end of run.
+    pagecheck_rows: list[dict] = []
 
     log(f"Plan: types={want_types}, quarters={args.quarters}, years={args.years}, "
         f"since={args.since or '-'}, all={args.all}, "
@@ -485,6 +495,15 @@ def main() -> None:
             for k in ("found", "new", "downloaded", "dup", "download_fail"):
                 totals[k] += int(counts.get(k, 0))
             added_docs += int(counts.get("new", 0))   # fill-to-target accounting
+            # Page-check ledger: record only when the page actually PARSED. bcd
+            # returns a 3-key dict on page-fetch failure (no 'dup' key) vs the full
+            # 5-key dict otherwise — so 'dup' present == page parsed (found may be 0).
+            if "dup" in counts:
+                pagecheck_rows.append({
+                    "key": key, "doc_type": doc_type,
+                    "last_checked_at": datetime.now().isoformat(timespec="seconds"),
+                    "n_docs_found": int(counts.get("found", 0)),
+                })
             if args.sleep:
                 time.sleep(args.sleep)
 
@@ -495,6 +514,16 @@ def main() -> None:
             log("Coverage ledger refreshed (backfill_coverage.parquet).")
         except Exception as _e:
             log(f"  WARNING: coverage refresh failed ({str(_e)[:80]}).")
+
+    # Update the page-check denominator ledger (additive; never gates fetching).
+    if not args.dry_run and index_id and pagecheck_rows:
+        try:
+            merged = upsert_pagecheck(load_pagecheck(drive, index_id), pagecheck_rows)
+            save_pagecheck(drive, index_id, merged)
+            log(f"Page-check ledger updated (+{len(pagecheck_rows)} checks → "
+                f"{len(merged)} rows, backfill_pagecheck.parquet).")
+        except Exception as _e:
+            log(f"  WARNING: page-check ledger update failed ({str(_e)[:80]}).")
 
     print("-" * 60)
     print(f"Companies fetched   : {totals['fetched']}  "
