@@ -74,3 +74,48 @@ VISIBLE REPORT STRUCTURE
    • Formulate a list of 3-5 precise, high-conviction accounting questions regarding unexplained variances, RPT loops, or working capital spikes to present to management.
 
 ========== END OF REPORT ==========
+
+================================
+MACHINE-READABLE APPENDIX (MANDATORY — emit LAST, nothing after it)
+================================
+After the visible report, output EXACTLY ONE fenced ```json code block populated
+STRICTLY from the report above (serialize what you already found — do NOT invent or
+re-analyse). No prose before or after the block. Use null for an unknown scalar and
+[] for an empty list. Keep enum values EXACTLY as listed.
+
+Schema:
+{
+  "fy_year": "FY26",                       // latest fiscal year covered, "FYxx"
+  "guidance": [                            // every explicit forward-looking commitment (§5B)
+    {
+      "metric": "revenue growth",          // what is being guided
+      "guidance_type": "growth|margin|capacity|orderbook|capex|other",
+      "horizon_fy": "FY27",                // target fiscal year, or null
+      "value": 18.0,                       // number only, or null
+      "unit": "%|cr|units|null",
+      "cagr_pct": null,                    // number if a CAGR is given, else null
+      "notes": "short cited note"
+    }
+  ],
+  "red_flags": [                           // LIST ALL — NO LIMIT. One row per discrete finding.
+    {
+      "category": "auditor|notes_to_accounts|accounting_policy|cash_flow|balance_sheet|governance|related_party|tax|other",
+      "flag_type": "auditor_qualification|emphasis_of_matter|caro_adverse|accounting_policy_change|accounting_estimate_change|revenue_recognition_change|notes_to_accounts_deviation|cfo_pat_divergence|working_capital_stretch|cwip_buildup|related_party_transaction|promoter_pledge|kmp_churn|contingent_liability|tax_variance|other",
+      "severity": "low|medium|high",       // materiality / seriousness ("low" = informational disclosure)
+      "evidence": "1-2 line cited fact with the number/quote",
+      "page_ref": "p.142 / Note 34"        // document section + page, or null
+    }
+  ]
+}
+
+You MUST include in red_flags, when present in the report:
+  • EVERY auditor qualification, Emphasis of Matter, and adverse CARO remark
+    (category=auditor).
+  • EVERY note to accounts showing a severe/material deviation, restatement, or
+    unusual change (category=notes_to_accounts).
+  • EVERY change in accounting policy, estimate, or revenue-recognition vs the prior
+    year, with its stated impact (category=accounting_policy).
+  • The forensic financial flags from §4/§5 (CFO–PAT divergence, working-capital
+    stretch, CWIP buildup, related-party transactions, promoter pledge, KMP churn,
+    contingent liabilities, tax variance).
+Do not cap the list — if the report surfaces twenty red flags, output twenty rows.

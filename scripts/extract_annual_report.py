@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import io
+import json
 import os
 import re
 import sys
@@ -79,6 +80,138 @@ QFACTS_COLS = [
     "revenue_q", "ebitda_q", "pat_q", "margin_pct", "volume_q", "capacity_q",
     "revenue_12m", "pat_12m", "processed_at", "source_doc_id",
 ]
+
+# ---- Structured tabulation schemas (from the prompt's machine-readable appendix) ----
+# Mirror concall's guidance_tracker / gf4_quality_flags pattern at AR (FY) grain so
+# downstream work (scorecard, fraud tracker, deep dive, screener) can query AR signals.
+AR_GUIDANCE_COLS = [
+    "isin", "symbol", "company_name", "fy_year",
+    "metric", "guidance_type", "horizon_fy", "value", "unit", "cagr_pct", "notes",
+    "processed_at", "source_doc_id",
+]
+AR_REDFLAG_COLS = [
+    "isin", "symbol", "company_name", "fy_year",
+    "category", "flag_type", "severity", "evidence", "page_ref",
+    "processed_at", "source_doc_id",
+]
+
+_AR_GUIDANCE_TYPES = {"growth", "margin", "capacity", "orderbook", "capex", "other"}
+_AR_FLAG_CATEGORIES = {"auditor", "notes_to_accounts", "accounting_policy", "cash_flow",
+                       "balance_sheet", "governance", "related_party", "tax", "other"}
+_AR_FLAG_TYPES = {
+    "auditor_qualification", "emphasis_of_matter", "caro_adverse",
+    "accounting_policy_change", "accounting_estimate_change", "revenue_recognition_change",
+    "notes_to_accounts_deviation", "cfo_pat_divergence", "working_capital_stretch",
+    "cwip_buildup", "related_party_transaction", "promoter_pledge", "kmp_churn",
+    "contingent_liability", "tax_variance", "other",
+}
+_AR_SEVERITIES = {"low", "medium", "high"}
+
+
+def _s(v):
+    """Trimmed string, or None for empty/null (keeps parquet nulls clean)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _num(v):
+    """Coerce to float via the shared try_float, guarding None."""
+    if v is None or v == "":
+        return None
+    try:
+        return try_float(v)
+    except Exception:
+        return None
+
+
+def _clamp(v, allowed: set, default: str) -> str:
+    s = str(v or "").strip().lower()
+    return s if s in allowed else default
+
+
+def _extract_json_block(text: str) -> dict:
+    """Return the dict from the prompt's machine-readable appendix, or {} on any
+    failure (never raises). Prefers the LAST ```json fenced block; falls back to the
+    last balanced {...} span."""
+    if not text:
+        return {}
+    candidates: list[str] = []
+    fences = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fences:
+        candidates.append(fences[-1])
+    else:
+        # Fallback: widest {...} span (the appendix is the last thing emitted).
+        first, last = text.find("{"), text.rfind("}")
+        if first != -1 and last > first:
+            candidates.append(text[first:last + 1])
+    for raw in candidates:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return {}
+
+
+def parse_ar_structured(text: str, row: pd.Series, fy_year: str,
+                        now_str: str) -> tuple[list[dict], list[dict]]:
+    """Parse the JSON appendix into (guidance_rows, red_flag_rows). Empty lists if the
+    block is absent/invalid — the markdown report + quarterly_facts are unaffected."""
+    data = _extract_json_block(text)
+    if not data:
+        return [], []
+    fy = _s(data.get("fy_year")) or fy_year or ""
+    base = {
+        "isin": str(row.get("isin") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "company_name": str(row.get("company_name") or ""),
+        "fy_year": fy,
+        "processed_at": now_str,
+        "source_doc_id": str(row.get("doc_id") or ""),
+    }
+
+    g_rows: list[dict] = []
+    for g in (data.get("guidance") or []):
+        if not isinstance(g, dict):
+            continue
+        g_rows.append({**base,
+                       "metric": _s(g.get("metric")),
+                       "guidance_type": _clamp(g.get("guidance_type"), _AR_GUIDANCE_TYPES, "other"),
+                       "horizon_fy": _s(g.get("horizon_fy")),
+                       "value": _num(g.get("value")),
+                       "unit": _s(g.get("unit")),
+                       "cagr_pct": _num(g.get("cagr_pct")),
+                       "notes": _s(g.get("notes"))})
+
+    rf_rows: list[dict] = []
+    for f in (data.get("red_flags") or []):
+        if not isinstance(f, dict):
+            continue
+        rf_rows.append({**base,
+                        "category": _clamp(f.get("category"), _AR_FLAG_CATEGORIES, "other"),
+                        "flag_type": _clamp(f.get("flag_type"), _AR_FLAG_TYPES, "other"),
+                        "severity": _clamp(f.get("severity"), _AR_SEVERITIES, "medium"),
+                        "evidence": _s(f.get("evidence")),
+                        "page_ref": _s(f.get("page_ref"))})
+    return g_rows, rf_rows
+
+
+def _upsert_ar(drive, index_id: str, filename: str, cols: list[str],
+               rows: list[dict]) -> None:
+    """Delete existing rows for this source_doc_id, append new (idempotent re-extract).
+    Mirrors concall's _upsert_gf."""
+    if not rows:
+        return
+    df = load_parquet(drive, index_id, filename, cols)
+    sdid = str(rows[0].get("source_doc_id", ""))
+    if sdid and "source_doc_id" in df.columns:
+        df = df[df["source_doc_id"].astype(str) != sdid]
+    new_df = pd.DataFrame([{c: r.get(c) for c in cols} for r in rows])
+    df = pd.concat([df, new_df], ignore_index=True)
+    save_parquet(drive, index_id, filename, df)
 
 
 # ------------------------------------------------------------------ #
@@ -357,8 +490,12 @@ def main() -> None:
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
             if args.dry_run:
+                g_rows, rf_rows = parse_ar_structured(
+                    markdown_text, row, _extract_fy_year(markdown_text, row), "")
                 print(f"\n{'='*60}\nDRY RUN — {row.get('symbol')}\n"
-                      f"{markdown_text[:800]}\n{'='*60}\n")
+                      f"{markdown_text[:800]}\n"
+                      f"-- structured appendix: guidance={len(g_rows)} "
+                      f"red_flags={len(rf_rows)} --\n{'='*60}\n")
                 counts["processed"] += 1
                 continue
 
@@ -389,6 +526,20 @@ def main() -> None:
 
             upsert_facts(drive, index_id, facts)
 
+            # Structured tabulation (guidance + red flags) from the JSON appendix.
+            # Additive: if the block is absent/invalid the lists are empty and only the
+            # markdown + quarterly_facts persist (no regression). Same lock held.
+            try:
+                g_rows, rf_rows = parse_ar_structured(
+                    markdown_text, row, facts["fy_year"],
+                    datetime.now().isoformat(timespec="seconds"))
+                _upsert_ar(drive, index_id, "ar_guidance.parquet", AR_GUIDANCE_COLS, g_rows)
+                _upsert_ar(drive, index_id, "ar_red_flags.parquet", AR_REDFLAG_COLS, rf_rows)
+                log(f"  Tabulated: guidance={len(g_rows)}, red_flags={len(rf_rows)}")
+            except Exception as _e:
+                log(f"  WARNING: AR tabulation failed ({str(_e)[:100]}) — "
+                    f"markdown + quarterly_facts still saved.")
+
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
             save_queue(drive, index_id, queue)
@@ -413,6 +564,8 @@ def main() -> None:
     print(f"Skipped   : {counts['skipped']}")
     if not args.dry_run:
         print("Output: company_repo/_index/quarterly_facts.parquet")
+        print("Output: company_repo/_index/ar_guidance.parquet")
+        print("Output: company_repo/_index/ar_red_flags.parquet")
         print("Output: company_repo/<key>/company_page.md")
         print("Output: company_repo/_daily/annual_report_DD_MMMYYYY.md")
 
