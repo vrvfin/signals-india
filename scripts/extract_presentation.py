@@ -39,6 +39,7 @@ from _extractor_base import (
     load_portfolio_isins,
     acquire_lock, release_lock,
     salvage_json_objects, clamp, sstr, fnum, upsert_structured,  # Stage 3 tabulation
+    run_structured_over_doc,                                     # Stage 3b: from source
 )
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
@@ -114,12 +115,11 @@ def parse_ppt_structured(text, row, quarter, now_str):
     return g_rows[:12], h_rows[:12]
 
 
-def tabulate_ppt(gemini, struct_prompt, report_text, row, quarter, now_str):
-    """SEPARATE bounded JSON-only pass over the produced report (best-effort)."""
-    if not struct_prompt or not report_text:
-        return [], []
-    resp = gemini.call_text(struct_prompt + report_text[:STRUCT_INPUT_CHARS],
-                            f"{row.get('symbol', 'DOC')}_PPT_struct")
+def tabulate_ppt(gemini, struct_prompt, doc_bytes, row, quarter, now_str):
+    """Stage 3b: run the structured JSON pass DIRECTLY over the source deck (Gemini
+    reads the slides) — not the lite model's rambling report. Best-effort."""
+    resp = run_structured_over_doc(gemini, struct_prompt, doc_bytes,
+                                   name=f"{row.get('symbol', 'DOC')}_PPT_struct")
     return parse_ppt_structured(resp, row, quarter, now_str)
 
 
@@ -339,7 +339,7 @@ def main() -> None:
             # untouched (no regression; Phase 2 outputs unchanged).
             try:
                 g_rows, h_rows = tabulate_ppt(
-                    gemini, struct_prompt, markdown_text, row, facts["quarter"],
+                    gemini, struct_prompt, pdf_bytes, row, facts["quarter"],
                     datetime.now().isoformat(timespec="seconds"))
                 upsert_structured(drive, index_id, "ppt_guidance.parquet",
                                   PPT_GUIDANCE_COLS, g_rows)

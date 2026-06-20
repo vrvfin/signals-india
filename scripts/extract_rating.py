@@ -39,6 +39,7 @@ from _extractor_base import (
     load_portfolio_isins,
     acquire_lock, release_lock,
     salvage_json_objects, clamp, sstr, upsert_structured,   # Stage 3 tabulation
+    run_structured_over_doc,                                # Stage 3b: extract from source
 )
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
@@ -114,12 +115,12 @@ def parse_rating_structured(text, row, agency, rating_date, now_str):
     return dr[:10], co[:10], se[:8]
 
 
-def tabulate_rating(gemini, struct_prompt, report_text, row, agency, rating_date, now_str):
-    """SEPARATE bounded JSON-only pass over the produced rating rationale (best-effort)."""
-    if not struct_prompt or not report_text:
-        return [], [], []
-    resp = gemini.call_text(struct_prompt + report_text[:STRUCT_INPUT_CHARS],
-                            f"{row.get('symbol', 'DOC')}_RATING_struct")
+def tabulate_rating(gemini, struct_prompt, doc_bytes, row, agency, rating_date, now_str):
+    """Stage 3b: run the structured JSON pass DIRECTLY over the source rating doc
+    (small/clean) — not the lite model's rambling report — so drivers/concerns/
+    sensitivity actually populate. Best-effort."""
+    resp = run_structured_over_doc(gemini, struct_prompt, doc_bytes,
+                                   name=f"{row.get('symbol', 'DOC')}_RATING_struct")
     return parse_rating_structured(resp, row, agency, rating_date, now_str)
 
 # Common rating agency name variants
@@ -387,7 +388,7 @@ def main() -> None:
             # markdown untouched on failure (no regression; Phase 2 unchanged).
             try:
                 dr, co, se = tabulate_rating(
-                    gemini, struct_prompt, markdown_text, row,
+                    gemini, struct_prompt, pdf_bytes, row,
                     facts.get("agency"), facts.get("rating_date"),
                     datetime.now().isoformat(timespec="seconds"))
                 upsert_structured(drive, index_id, "rating_drivers.parquet",
