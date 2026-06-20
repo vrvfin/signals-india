@@ -207,6 +207,21 @@ jobs:
           python scripts/extract_annual_report.py --all-companies
           --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48 || true
 
+      # ── Stage 3: fetch + extract credit ratings universe-wide (CARE/CRISIL/ICRA).
+      # Ratings are small/fast; --target-pending 100 paces fetch to the same-slot
+      # extract so PDFs don't age out. ICRA rationale links resolve to their PDF.
+      - name: T1c — fetch credit ratings from Screener (3y universe)
+        if: ${{ steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
+        run: |
+          python scripts/run_backfill.py --types rating --years 3 \
+            --max-companies 100 --target-pending 100
+
+      - name: T8b — extract fresh ratings (all companies, FREE_POOL+BACKFILL pool)
+        if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
+        run: >
+          python scripts/extract_rating.py --all-companies
+          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48 || true
+
       - name: T8 — daily AR digest + focus/defocus lists
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
         run: python scripts/daily_ar_summary.py || true
