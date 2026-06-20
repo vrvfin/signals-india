@@ -39,7 +39,14 @@ SCHEMA:
   ]
 }
 
-Capture in red_flags (when present in the analysis): every auditor qualification /
+RED FLAGS = ACTUAL PROBLEMS ONLY. Include a red_flag ONLY when there is a genuine
+concern, deviation, qualification, adverse remark, or risk. If a dimension is CLEAN or
+the data is absent, OMIT it entirely — do NOT emit "no issue", "no material ...",
+"consistent with prior", "within acceptable", "no changes", "DATA_MISSING", "none
+noted", or any absence-of-concern as a red_flag. A clean company should yield few or
+zero red_flags — that is correct, not a failure.
+
+Capture in red_flags (when ACTUALLY present and adverse in the analysis): every auditor qualification /
 Emphasis of Matter / adverse CARO remark (category=auditor); every note to accounts
 with a severe/material deviation or restatement (category=notes_to_accounts); every
 change in accounting policy / estimate / revenue-recognition (category=accounting_policy);

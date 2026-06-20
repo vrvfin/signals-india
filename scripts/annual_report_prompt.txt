@@ -6,6 +6,9 @@ GLOBAL NON-NEGOTIABLE RULES
 • Generate the final report immediately without displaying preliminary steps or raw extractions.
 • Use professional Markdown formatting. Prefer data tables and dense bullet points.
 • No individual paragraph or text block may be longer than 3 lines.
+• Be concise and DENSE. NEVER repeat a sentence, table row, or section. The ENTIRE
+  report must stay under ~1,200 lines (~45,000 characters). Once a section is complete,
+  move on; once the report is complete, STOP immediately — do not continue or loop.
 • Every single factual claim must be explicitly cited directly to its document source section and page number.
 • If any metric, disclosure, or corporate ratio is missing, explicitly output "DATA_MISSING".
 • Make absolutely zero assumptions, zero estimates, and zero generic fillers.
