@@ -1,0 +1,40 @@
+You convert an investor-presentation analysis into ONE structured JSON object.
+
+You are given the analysis text. Extract from it — do NOT invent, do NOT re-analyse.
+
+OUTPUT RULES (critical):
+- Output ONLY one valid JSON object. No markdown, NO code fences, no prose, no comments.
+- It MUST be complete and parseable. Close every brace and bracket.
+- NEVER repeat an entry. Every item must be DISTINCT.
+- HARD CAPS: at most 12 guidance, at most 12 highlights. Stop after the cap — do not loop.
+- Use null for an unknown scalar and [] for an empty list. Keep enum values EXACTLY as listed.
+
+SCHEMA:
+{
+  "quarter": "Q2FY26",
+  "guidance": [
+    {
+      "metric": "<what management guides, e.g. revenue growth>",
+      "guidance_type": "growth|margin|capacity|orderbook|capex|other",
+      "horizon": "<FYxx / H2FY26 / medium-term / null>",
+      "value": <number-or-null>,
+      "unit": "%|cr|units|null",
+      "notes": "<short note>"
+    }
+  ],
+  "highlights": [
+    {
+      "category": "demand|capacity|orderbook|cost|new_product|margin|expansion|other",
+      "statement": "<the operational/strategic highlight management emphasises>",
+      "value": <number-or-null>,
+      "unit": "%|cr|units|null"
+    }
+  ]
+}
+
+guidance = explicit forward-looking commitments management makes.
+highlights = the operational / strategic points the deck emphasises (wins, capacity,
+order book, cost actions, new products) — what management is positioning, quantified
+where stated. DISTINCT entries only.
+
+ANALYSIS TEXT:

@@ -1,0 +1,34 @@
+You convert a credit-rating rationale analysis into ONE structured JSON object.
+
+You are given the analysis text. Extract from it — do NOT invent, do NOT re-analyse.
+
+OUTPUT RULES (critical):
+- Output ONLY one valid JSON object. No markdown, NO code fences, no prose, no comments.
+- It MUST be complete and parseable. Close every brace and bracket.
+- NEVER repeat an entry. Every item must be DISTINCT.
+- HARD CAPS: at most 10 drivers, 10 concerns, 8 sensitivities. Stop after the cap.
+- Use null for an unknown scalar and [] for an empty list. Keep enum values EXACTLY as listed.
+
+SCHEMA:
+{
+  "drivers": [
+    { "driver": "<rating STRENGTH the agency cites>", "evidence": "<short cited fact>" }
+  ],
+  "concerns": [
+    { "concern": "<rating WEAKNESS / risk the agency cites>",
+      "severity": "low|medium|high",
+      "evidence": "<short cited fact>" }
+  ],
+  "sensitivity": [
+    { "direction": "up|down",
+      "trigger": "<explicit upgrade (up) or downgrade (down) trigger the agency states>" }
+  ]
+}
+
+drivers = the credit STRENGTHS (what supports the rating).
+concerns = the credit WEAKNESSES / risks (what pressures the rating) — the red-flag
+equivalent; rate severity by how much it pressures the rating.
+sensitivity = the agency's explicit rating-change triggers ("rating could be upgraded
+if ..." = up; "... downgraded if ..." = down). DISTINCT entries only.
+
+ANALYSIS TEXT:

@@ -38,6 +38,7 @@ from _extractor_base import (
     append_company_page, append_day_page,
     load_portfolio_isins,
     acquire_lock, release_lock,
+    salvage_json_objects, clamp, sstr, fnum, upsert_structured,  # Stage 3 tabulation
 )
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
@@ -62,6 +63,60 @@ QFACTS_COLS = [
     "revenue_q", "ebitda_q", "pat_q", "margin_pct", "volume_q", "capacity_q",
     "revenue_12m", "pat_12m", "processed_at", "source_doc_id",
 ]
+
+# ---- Stage 3: structured tabulation (ADDITIVE — existing outputs unchanged) ----
+STRUCT_PROMPT_FILE = "presentation_structured_prompt.txt"
+STRUCT_INPUT_CHARS = 60000
+PPT_GUIDANCE_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "metric", "guidance_type", "horizon", "value", "unit", "notes",
+    "processed_at", "source_doc_id",
+]
+PPT_HIGHLIGHTS_COLS = [
+    "isin", "symbol", "company_name", "quarter",
+    "category", "statement", "value", "unit",
+    "processed_at", "source_doc_id",
+]
+_PPT_GTYPES = {"growth", "margin", "capacity", "orderbook", "capex", "other"}
+_PPT_HCATS = {"demand", "capacity", "orderbook", "cost", "new_product",
+              "margin", "expansion", "other"}
+
+
+def parse_ppt_structured(text, row, quarter, now_str):
+    """Salvage + dedupe the structured-pass JSON into (guidance_rows, highlight_rows)."""
+    objs = salvage_json_objects(text)
+    if not objs:
+        return [], []
+    base = {"isin": str(row.get("isin") or ""), "symbol": str(row.get("symbol") or ""),
+            "company_name": str(row.get("company_name") or ""), "quarter": quarter,
+            "processed_at": now_str, "source_doc_id": str(row.get("doc_id") or "")}
+    g_rows, h_rows, seen_g, seen_h = [], [], set(), set()
+    for o in objs:
+        if "statement" in o:                                                   # highlight
+            d = {**base, "category": clamp(o.get("category"), _PPT_HCATS, "other"),
+                 "statement": sstr(o.get("statement")), "value": fnum(o.get("value")),
+                 "unit": sstr(o.get("unit"))}
+            k = (d["category"], (d["statement"] or "")[:120])
+            if d["statement"] and k not in seen_h:
+                seen_h.add(k); h_rows.append(d)
+        elif "guidance_type" in o or "metric" in o:                            # guidance
+            d = {**base, "metric": sstr(o.get("metric")),
+                 "guidance_type": clamp(o.get("guidance_type"), _PPT_GTYPES, "other"),
+                 "horizon": sstr(o.get("horizon")), "value": fnum(o.get("value")),
+                 "unit": sstr(o.get("unit")), "notes": sstr(o.get("notes"))}
+            k = (d["metric"], d["horizon"], str(d["value"]), d["guidance_type"])
+            if d["metric"] and k not in seen_g:
+                seen_g.add(k); g_rows.append(d)
+    return g_rows[:12], h_rows[:12]
+
+
+def tabulate_ppt(gemini, struct_prompt, report_text, row, quarter, now_str):
+    """SEPARATE bounded JSON-only pass over the produced report (best-effort)."""
+    if not struct_prompt or not report_text:
+        return [], []
+    resp = gemini.call_text(struct_prompt + report_text[:STRUCT_INPUT_CHARS],
+                            f"{row.get('symbol', 'DOC')}_PPT_struct")
+    return parse_ppt_structured(resp, row, quarter, now_str)
 
 
 # ------------------------------------------------------------------ #
@@ -186,6 +241,8 @@ def main() -> None:
         print(f"ERROR: prompt file not found: {prompt_path}")
         sys.exit(1)
     prompt = prompt_path.read_text(encoding="utf-8")
+    _struct_path = Path(__file__).resolve().parent / STRUCT_PROMPT_FILE
+    struct_prompt = _struct_path.read_text(encoding="utf-8") if _struct_path.exists() else ""
 
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
@@ -271,6 +328,23 @@ def main() -> None:
 
             if facts["quarter"]:
                 upsert_facts(drive, index_id, facts)
+
+            # Stage 3 tabulation (ADDITIVE, best-effort): separate JSON-only pass →
+            # ppt_guidance / ppt_highlights. Failure leaves markdown + quarterly_facts
+            # untouched (no regression; Phase 2 outputs unchanged).
+            try:
+                g_rows, h_rows = tabulate_ppt(
+                    gemini, struct_prompt, markdown_text, row, facts["quarter"],
+                    datetime.now().isoformat(timespec="seconds"))
+                upsert_structured(drive, index_id, "ppt_guidance.parquet",
+                                  PPT_GUIDANCE_COLS, g_rows)
+                upsert_structured(drive, index_id, "ppt_highlights.parquet",
+                                  PPT_HIGHLIGHTS_COLS, h_rows)
+                log(f"  Tabulated: guidance={len(g_rows)}, highlights={len(h_rows)}")
+            except RateLimitExhausted:
+                log("  Structured pass: keys exhausted — tabulation skipped.")
+            except Exception as _e:
+                log(f"  WARNING: presentation tabulation failed ({str(_e)[:90]}).")
 
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
