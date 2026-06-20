@@ -175,7 +175,8 @@ class Cards:
     def __init__(self, grades, statements_map, guidance, gf1, ann):
         self.grades_by = self._group(grades)
         self.stmts = statements_map
-        self.guid_by = {k: g for k, g in guidance.groupby(guidance["symbol"].astype(str))} \
+        self.guid_by = {k: g for k, g in
+                        guidance.groupby(guidance["symbol"].astype(str).str.upper())} \
             if not guidance.empty and "symbol" in guidance.columns else {}
         self.gf1_by = self._group(gf1)
         self.ann_by = self._group(ann)
@@ -302,7 +303,7 @@ class Cards:
 
     # guidance ------------------------------------------------------------
     def _guid_latest(self, sym):
-        g = self.guid_by.get(sym)
+        g = self.guid_by.get(sym.upper())
         if g is None or g.empty or "metric" not in g.columns:
             return "", None
         g = g.copy()
@@ -372,16 +373,21 @@ class Cards:
                 kind = max(set(ks), key=ks.count) if ks else "qual"
                 klab, kcol = _KIND_TAG.get(kind, ("", "#777"))
                 bits, seen = [], set()
-                for h in _HORIZON_ORDER:
-                    hs = sub[sub["horizon_fy"].astype(str).str.upper() == h]
-                    for vv in hs.get("value", []):
-                        t = str(vv).strip()
+                hz_up = sub["horizon_fy"].astype(str).str.upper()
+                for h in _HORIZON_ORDER + ["__other__"]:
+                    if h == "__other__":          # FY27 / FY28 etc. — show them too
+                        hs = sub[~hz_up.isin(_HORIZON_ORDER)]
+                    else:
+                        hs = sub[hz_up == h]
+                    for _, hr in hs.iterrows():
+                        t = str(hr.get("value", "")).strip()
                         if not t or t.lower() in ("na", "nan", "n/a", "-") or t in seen:
                             continue
                         seen.add(t)
                         disp = t + "%" if kind in ("growth", "margin") and re.fullmatch(r"[\d.\-– ]+", t) else t
                         disp = disp[:34] + ("…" if len(disp) > 34 else "")
-                        tag = _HLABEL.get(h, "")
+                        tag = _HLABEL.get(h, "") if h != "__other__" else \
+                            str(hr.get("horizon_fy", "")).strip()
                         bits.append((f'<span style="color:#888">{tag}</span> ' if tag else "")
                                     + f'<b style="color:#0d2f5c">{disp}</b>')
                         break
@@ -442,11 +448,16 @@ class Cards:
 
 
 def _ohlc_arrays(odf, days):
+    """-> (candles, volumes, ema20, ema50) for lightweight-charts. EMAs computed
+    on the windowed close series (matches the app's quick chart)."""
     if odf is None or odf.empty:
-        return [], []
-    d = odf.sort_values("date").tail(days)
-    candles, vols = [], []
-    for _, r in d.iterrows():
+        return [], [], [], []
+    d = odf.sort_values("date").tail(days).reset_index(drop=True)
+    closes = pd.to_numeric(d["close"], errors="coerce")
+    e20 = closes.ewm(span=20, adjust=False).mean()
+    e50 = closes.ewm(span=50, adjust=False).mean()
+    candles, vols, ema20, ema50 = [], [], [], []
+    for i, r in d.iterrows():
         try:
             o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
         except (TypeError, ValueError):
@@ -456,7 +467,11 @@ def _ohlc_arrays(odf, days):
         v = pd.to_numeric(r.get("volume"), errors="coerce")
         vols.append({"time": t, "value": float(v) if pd.notna(v) else 0,
                      "color": "#26a69a" if c >= o else "#ef5350"})
-    return candles, vols
+        if pd.notna(e20.iloc[i]):
+            ema20.append({"time": t, "value": round(float(e20.iloc[i]), 2)})
+        if pd.notna(e50.iloc[i]):
+            ema50.append({"time": t, "value": round(float(e50.iloc[i]), 2)})
+    return candles, vols, ema20, ema50
 
 
 _TPL = """<!doctype html><html><head><meta charset="utf-8">
@@ -474,6 +489,7 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
  table{border-collapse:collapse;width:100%}
 </style></head><body>
 <h1>__TITLE__ — __N__ charts — __DATE__ (rendered in your browser)</h1>
+<div style="font-size:11px;color:#888;margin:-2px 8px 10px">Candlesticks + volume · <b style="color:#2962FF">EMA20</b> · <b style="color:#FF6D00">EMA50</b></div>
 <div class="grid">__CARDS__</div>
 <script>
 const D=__PAYLOAD__;
@@ -482,6 +498,10 @@ function mk(id){
  const ch=LightweightCharts.createChart(el,{height:440,layout:{textColor:'#333',background:{color:'#fff'}},
    rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},grid:{horzLines:{color:'#f2f2f2'},vertLines:{color:'#f7f7f7'}}});
  const cs=ch.addCandlestickSeries(); cs.setData((D[id]||{}).c||[]);
+ const l20=ch.addLineSeries({color:'#2962FF',lineWidth:2,priceLineVisible:false,lastValueVisible:false});
+ l20.setData((D[id]||{}).e20||[]);
+ const l50=ch.addLineSeries({color:'#FF6D00',lineWidth:2,priceLineVisible:false,lastValueVisible:false});
+ l50.setData((D[id]||{}).e50||[]);
  const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});
  vs.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}}); vs.setData((D[id]||{}).v||[]);
  ch.timeScale().fitContent();
@@ -506,8 +526,8 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
             cards.llm_summary(s),
         ] if x)
-        c, v = _ohlc_arrays(omap.get(s, _EMPTY), days)
-        data[str(j)] = {"c": c, "v": v}
+        c, v, e20, e50 = _ohlc_arrays(omap.get(s, _EMPTY), days)
+        data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
         card_html.append(f'<div class="card">{meta}<div class="chart" id="ch{j}"></div></div>')
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
                 .replace("__CARDS__", "".join(card_html))
@@ -670,7 +690,11 @@ def main():
 
     if args.mode == "pf":
         title, out_default = "💼 Portfolio (PF) charts", "gallery_pf.html"
-        isins = load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"]) or set()
+        gid = os.environ["GDRIVE_FOLDER_ID"]
+        # LIVE holdings live in pf_tracking/ (sync_pf.bat); portfolio/ is the older
+        # extractor source and can be stale — prefer pf_tracking, fall back.
+        isins = (load_portfolio_isins(drive, gid, folder_name="pf_tracking")
+                 or load_portfolio_isins(drive, gid, folder_name="portfolio") or set())
         syms = sorted({isin2sym.get(str(i), "") for i in isins} - {""})
         ranked = pd.DataFrame({"symbol": syms})
         ranked["_mc"] = ranked["symbol"].map(lambda s: mcap_map.get(s.upper(), 0))

@@ -515,21 +515,25 @@ def append_company_page(drive, repo_id: str, key: str,
 #  Portfolio filter                                                    #
 # ------------------------------------------------------------------ #
 
-def load_portfolio_isins(drive, folder_id: str) -> set[str] | None:
-    """Return ISIN set from the most-recent file in the portfolio/ Drive subfolder.
+def load_portfolio_isins(drive, folder_id: str,
+                         folder_name: str = "portfolio") -> set[str] | None:
+    """Return ISIN set from the most-recent file in a Drive subfolder.
 
     Mirrors app.py's _find_latest_portfolio_file + _read_portfolio_table:
-      - Locates <GDRIVE_FOLDER_ID>/portfolio/ (read-only, never created)
+      - Locates <GDRIVE_FOLDER_ID>/<folder_name>/ (read-only, never created)
       - Picks the most-recently-modified .xls / .xlsx / .csv (name changes per upload)
       - Auto-detects header row: Screener exports have ~13 blank rows before the header
       - Returns frozenset of ISIN strings, or None when no file found
         (callers fall back to processing all companies when None is returned)
 
+    folder_name defaults to "portfolio" (Phase-2 extractors). The local chart
+    gallery passes "pf_tracking" — where sync_pf.bat uploads the LIVE holdings.
+
     Called by extract_results, extract_rating, extract_presentation,
     extract_annual_report — NOT by extract_concall (concall stays universal).
     """
-    # Find portfolio/ subfolder — do NOT create it; absence means no filter
-    q = (f"name='portfolio' and '{folder_id}' in parents "
+    # Find subfolder — do NOT create it; absence means no filter
+    q = (f"name='{folder_name}' and '{folder_id}' in parents "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
     folders = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
     if not folders:
