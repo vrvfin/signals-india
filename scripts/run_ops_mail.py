@@ -459,6 +459,57 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
     return head + table, done24_total
 
 
+# ---------------- section 2e: structured signals (tabulation) ----------------
+
+# (label, path_parts, key column for distinct-company count)
+_STRUCT_TABLES = [
+    ("AR guidance",        ["company_repo", "_index", "ar_guidance.parquet"],      "isin"),
+    ("AR red flags",       ["company_repo", "_index", "ar_red_flags.parquet"],     "isin"),
+    ("PPT guidance",       ["company_repo", "_index", "ppt_guidance.parquet"],     "isin"),
+    ("PPT highlights",     ["company_repo", "_index", "ppt_highlights.parquet"],   "isin"),
+    ("Rating drivers",     ["company_repo", "_index", "rating_drivers.parquet"],   "isin"),
+    ("Rating concerns",    ["company_repo", "_index", "rating_concerns.parquet"],  "isin"),
+    ("Rating sensitivity", ["company_repo", "_index", "rating_sensitivity.parquet"], "isin"),
+]
+
+
+def structured_signals_html(drive, root) -> str:
+    """Row counts + distinct companies for every Stage-2/3 tabulation table, plus the
+    catalyst event-tag mix — so the daily mail shows tabulation actually producing
+    rows across concall/AR/presentation/rating/announcements."""
+    rows = []
+    for label, parts, keycol in _STRUCT_TABLES:
+        df = _read(drive, root, parts)
+        if df is None or df.empty:
+            rows.append(f"<tr><td>{_esc(label, 22)}</td><td align=right>0</td>"
+                        f"<td align=right>-</td><td>-</td></tr>")
+            continue
+        n = len(df)
+        nco = df[keycol].astype(str).nunique() if keycol in df.columns else "-"
+        # one short sample cell (first non-null text field after the keys)
+        textcol = next((c for c in ("driver", "concern", "flag_type", "metric",
+                                    "statement", "trigger", "category")
+                        if c in df.columns), None)
+        sample = _esc(df[textcol].dropna().iloc[0], 46) if textcol and df[textcol].notna().any() else ""
+        rows.append(f"<tr><td>{_esc(label, 22)}</td><td align=right>{n:,}</td>"
+                    f"<td align=right>{nco}</td><td>{sample}</td></tr>")
+    tbl = ("<table border=1 cellpadding=4 cellspacing=0>"
+           "<tr><th>Table</th><th>rows</th><th>companies</th><th>sample</th></tr>"
+           + "".join(rows) + "</table>")
+
+    # Catalyst event tags (announcement_ledger): event_type / direction mix.
+    led = _read(drive, root, ["company_repo", "_index", "announcement_ledger.parquet"])
+    cat_html = ""
+    if led is not None and not led.empty and "event_type" in led.columns:
+        et = led["event_type"].astype(str).value_counts().head(8).to_dict()
+        dr = (led["direction"].astype(str).value_counts().to_dict()
+              if "direction" in led.columns else {})
+        cat_html = (f"<p style='margin:6px 0 2px'><b>Catalyst event tags</b> "
+                    f"({len(led):,} announcements):</p>"
+                    f"<p>event_type: {_esc(et, 200)}<br>direction: {_esc(dr, 120)}</p>")
+    return tbl + cat_html
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -476,6 +527,7 @@ def main() -> None:
     docs_html, docs_24h = docs_processed_html(drive, root)
     body = (f"<h3>Workflow runs (last 26h)</h3>{wf_html}"
             f"<h3>Document processing</h3>{docs_html}"
+            f"<h3>Structured signals (tabulation)</h3>{structured_signals_html(drive, root)}"
             f"<h3>Stock coverage</h3>{cov_html}"
             f"<h3>Market-cap freshness</h3>{mcap_html}"
             f"<h3>Data freshness</h3>{fresh_html}"
