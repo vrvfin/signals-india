@@ -46,7 +46,8 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
-                             download_bytes, log, load_portfolio_isins)
+                             download_bytes, log, load_portfolio_isins,
+                             find_latest_portfolio_file, isin_symbol_map)
 import gradation as G
 
 _EMPTY = pd.DataFrame()
@@ -101,66 +102,37 @@ def _load_signals(drive):
     return pd.concat(frames, ignore_index=True) if frames else _EMPTY
 
 
-def _load_pf_holdings(drive, folder_name="pf_tracking"):
-    """DataFrame[isin, name] from the latest holdings file in <folder_name>/ —
-    scans every cell for an ISIN pattern so it is format-agnostic (Screener /
-    broker exports). Falls back to portfolio/ if folder_name has nothing."""
+def _load_pf_holdings(drive):
+    """DataFrame[isin, name] from the LIVE holdings file (newest across
+    pf_tracking/ + portfolio/, same source as load_portfolio_isins). Scans every
+    cell for an ISIN pattern so it is format-agnostic (Screener / broker exports)."""
     import re as _re
-    gid = os.environ["GDRIVE_FOLDER_ID"]
-    for fn in (folder_name, "portfolio"):
-        q = (f"name='{fn}' and '{gid}' in parents and "
-             f"mimeType='application/vnd.google-apps.folder' and trashed=false")
-        fol = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
-        if not fol:
+    tgt = find_latest_portfolio_file(drive, os.environ["GDRIVE_FOLDER_ID"])
+    if not tgt:
+        return _EMPTY
+    raw = download_bytes(drive, tgt["id"])
+    try:
+        if tgt["name"].lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+        else:
+            df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+    except Exception as e:
+        log(f"  PF holdings parse failed: {str(e)[:80]}"); return _EMPTY
+    isin_re = _re.compile(r"^IN[A-Z0-9]{10}$")
+    rows = []
+    for _, row in df.iterrows():
+        cells = [("" if pd.isna(c) else str(c).strip()) for c in row.tolist()]
+        isin = next((c for c in cells if isin_re.match(c)), None)
+        if not isin:
             continue
-        files = drive.files().list(
-            q=f"'{fol[0]['id']}' in parents and trashed=false",
-            fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc"
-        ).execute().get("files", [])
-        tgt = next((f for f in files
-                    if f["name"].lower().endswith((".xls", ".xlsx", ".csv"))), None)
-        if not tgt:
-            continue
-        raw = download_bytes(drive, tgt["id"])
-        try:
-            if tgt["name"].lower().endswith(".csv"):
-                df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
-            else:
-                df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
-        except Exception as e:
-            log(f"  PF holdings parse failed: {str(e)[:80]}"); return _EMPTY
-        isin_re = _re.compile(r"^IN[A-Z0-9]{10}$")
-        rows = []
-        for _, row in df.iterrows():
-            cells = [("" if pd.isna(c) else str(c).strip()) for c in row.tolist()]
-            isin = next((c for c in cells if isin_re.match(c)), None)
-            if not isin:
-                continue
-            # name = first cell that looks like a company name (alpha, not the isin)
-            name = next((c for c in cells
-                         if c and c != isin and any(ch.isalpha() for ch in c)
-                         and not isin_re.match(c)), "")
-            rows.append({"isin": isin, "name": name})
-        log(f"  PF holdings: {len(rows)} rows from '{tgt['name']}'")
-        return pd.DataFrame(rows).drop_duplicates("isin")
-    return _EMPTY
-
-
-def _isin_symbol_map(*frames):
-    """isin -> symbol from several tables, skipping blank symbols. screener_grades
-    has empty symbol for some SME names (Z-Tech, Aimtron…); guidance_tracker /
-    master_list fill those, so PF resolves nearly everything. First non-empty wins."""
-    m = {}
-    for df in frames:
-        if df is None or getattr(df, "empty", True):
-            continue
-        if not {"isin", "symbol"} <= set(df.columns):
-            continue
-        for i, s in zip(df["isin"].astype(str), df["symbol"].astype(str)):
-            i, s = i.strip(), s.strip()
-            if i and s and s.lower() != "nan" and i not in m:
-                m[i] = s
-    return m
+        # name = first cell that looks like a company name (alpha, not the isin)
+        name = next((c for c in cells
+                     if c and c != isin and any(ch.isalpha() for ch in c)
+                     and not isin_re.match(c)), "")
+        rows.append({"isin": isin, "name": name})
+    log(f"  PF holdings: {len(rows)} rows from '{tgt['name']}' "
+        f"({tgt.get('_folder','?')}/)")
+    return pd.DataFrame(rows).drop_duplicates("isin")
 
 
 def _bulk_parquet(drive, folder_id, symbols):
@@ -763,15 +735,14 @@ def main():
 
     if args.mode == "pf":
         title, out_default = "💼 Portfolio (PF) charts", "gallery_pf.html"
-        # robust isin->symbol: grades + guidance_tracker (has SME symbols grades
-        # leaves blank) + master_list — skipping empty symbols.
-        isin2sym = _isin_symbol_map(grades, guidance, uni)
+        # auto-healed isin->symbol: master_list + grades + guidance_tracker
+        # (fills SME symbols grades leaves blank), shared isin_symbol_map.
+        isin2sym = isin_symbol_map(uni, grades, guidance)
         # RAW full list — every holding, including ones we can't chart (shown as
         # a name-only card so nothing is silently dropped). No filtering.
-        hold = _load_pf_holdings(drive)            # DataFrame[isin, name]
+        hold = _load_pf_holdings(drive)            # DataFrame[isin, name] (both folders)
         if hold.empty:                             # last-ditch: ISIN set only
-            isins = (load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"],
-                                          folder_name="pf_tracking") or set())
+            isins = load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"]) or set()
             hold = pd.DataFrame({"isin": sorted(isins), "name": ""})
         hold["symbol"] = hold["isin"].map(lambda i: isin2sym.get(str(i), ""))
         hold["_mc"] = hold["symbol"].map(lambda s: mcap_map.get(str(s).upper(), 0) if s else 0)

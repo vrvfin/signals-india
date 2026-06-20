@@ -3338,19 +3338,24 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
 
 
 
-def _find_latest_portfolio_file(drive, portfolio_folder_id):
-    """Return (file_id, filename) of the most-recently-modified .xls/.xlsx/.csv
-    file in the portfolio folder. None, None if nothing matching."""
-    files = drive.files().list(
-        q=f"'{portfolio_folder_id}' in parents and trashed=false",
-        fields="files(id, name, modifiedTime)",
-        orderBy="modifiedTime desc",
-    ).execute().get("files", [])
-    for f in files:
-        n = f["name"].lower()
-        if n.endswith((".xls", ".xlsx", ".csv")):
-            return f["id"], f["name"]
-    return None, None
+def _find_latest_portfolio_file(drive, root_folder_id):
+    """Return (file_id, filename) of the LIVE holdings file = newest .xls/.xlsx/.csv
+    across BOTH pf_tracking/ and portfolio/ (matches the shared load_portfolio_isins
+    so the app and every Phase-2 program use the same list). None, None if nothing."""
+    best = None
+    for fn in ("pf_tracking", "portfolio"):
+        sub = _find_subfolder(drive, root_folder_id, fn)
+        if not sub:
+            continue
+        files = drive.files().list(
+            q=f"'{sub}' in parents and trashed=false",
+            fields="files(id, name, modifiedTime)", orderBy="modifiedTime desc",
+        ).execute().get("files", [])
+        cand = next((f for f in files
+                     if f["name"].lower().endswith((".xls", ".xlsx", ".csv"))), None)
+        if cand and (best is None or cand["modifiedTime"] > best["modifiedTime"]):
+            best = cand
+    return (best["id"], best["name"]) if best else (None, None)
 
 
 def _read_portfolio_table(raw_bytes: bytes, filename: str):
@@ -3411,9 +3416,30 @@ def _read_portfolio_table(raw_bytes: bytes, filename: str):
     return df
 
 
+def _isin_symbol_heal():
+    """isin -> symbol unioned across screener_grades + guidance_tracker (first
+    non-blank wins) so SME holdings master_list lacks (ZTECH, AIMTRON…) still
+    resolve a symbol. Cached via the underlying loaders."""
+    out = {}
+    for df in (load_screener_grades(), load_guidance_tracker()):
+        if df is None or df.empty or not {"isin", "symbol"} <= set(df.columns):
+            continue
+        for i, s in zip(df["isin"].astype(str), df["symbol"].astype(str)):
+            i, s = i.strip(), s.strip()
+            if i and s and s.lower() != "nan" and i not in out:
+                out[i] = s
+    return out
+
+
 def _resolve_isins(pf, universe):
-    """Join portfolio to universe on ISIN to recover NSE symbol + name."""
+    """Join portfolio to universe on ISIN to recover NSE symbol + name, then
+    auto-heal any still-blank symbol from grades/guidance (universe/master_list
+    misses some SME names that are nonetheless tracked elsewhere)."""
     merged = pf.merge(universe[["symbol", "isin", "name"]], on="isin", how="left")
+    heal = _isin_symbol_heal()
+    if heal and "symbol" in merged.columns:
+        need = merged["symbol"].isna() | (merged["symbol"].astype(str).str.strip() == "")
+        merged.loc[need, "symbol"] = merged.loc[need, "isin"].astype(str).map(heal)
     return merged
 
 
@@ -3425,20 +3451,15 @@ def page_portfolio():
     st.caption("Reads the latest Screener.in 'My Investments' export from your "
                "Drive `portfolio/` folder.")
 
-    # Locate file
+    # Locate file — newest across pf_tracking/ (sync_pf.bat) + portfolio/
     drive = drive_service()
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
-    pf_folder_id = _find_subfolder(drive, folder_id, "portfolio")
-    if not pf_folder_id:
-        st.warning(
-            "**Setup**: in your Drive `signals-india` folder, create a subfolder "
-            "named **`portfolio`** and upload your Screener `my-investment-overview.xls` "
-            "export. The page auto-picks the most recent file.")
-        return
-    file_id, fname = _find_latest_portfolio_file(drive, pf_folder_id)
+    file_id, fname = _find_latest_portfolio_file(drive, folder_id)
     if not file_id:
-        st.warning("No .xls / .xlsx / .csv found in the `portfolio/` folder. "
-                   "Upload your Screener export there.")
+        st.warning(
+            "**Setup**: upload your holdings file (Screener export / broker Holdings "
+            "Statement) to the Drive `pf_tracking/` or `portfolio/` folder. "
+            "The page auto-picks the most recent file across both.")
         return
 
     st.caption(f"Using file: **{fname}**")

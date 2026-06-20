@@ -515,49 +515,77 @@ def append_company_page(drive, repo_id: str, key: str,
 #  Portfolio filter                                                    #
 # ------------------------------------------------------------------ #
 
-def load_portfolio_isins(drive, folder_id: str,
-                         folder_name: str = "portfolio") -> set[str] | None:
-    """Return ISIN set from the most-recent file in a Drive subfolder.
+# PF holdings live in two folders historically: pf_tracking/ (where sync_pf.bat
+# uploads the LIVE list) and portfolio/ (older). The SINGLE source of truth is the
+# most-recently-modified holdings file across BOTH — so whichever you upload last
+# wins, every program stays consistent, and a stale folder can't mislead anything.
+PF_FOLDERS = ("pf_tracking", "portfolio")
 
-    Mirrors app.py's _find_latest_portfolio_file + _read_portfolio_table:
-      - Locates <GDRIVE_FOLDER_ID>/<folder_name>/ (read-only, never created)
-      - Picks the most-recently-modified .xls / .xlsx / .csv (name changes per upload)
-      - Auto-detects header row: Screener exports have ~13 blank rows before the header
+
+def find_latest_portfolio_file(drive, folder_id: str, folder_names=PF_FOLDERS):
+    """Newest .xls/.xlsx/.csv across the given subfolders (by modifiedTime).
+    Returns the Drive file dict {id,name,modifiedTime,_folder} or None.
+    Read-only: never creates a folder."""
+    best = None
+    for fn in folder_names:
+        q = (f"name='{fn}' and '{folder_id}' in parents "
+             f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
+        fol = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        if not fol:
+            continue
+        files = drive.files().list(
+            q=f"'{fol[0]['id']}' in parents and trashed=false",
+            fields="files(id, name, modifiedTime)", orderBy="modifiedTime desc",
+        ).execute().get("files", [])
+        cand = next((f for f in files
+                     if f["name"].lower().endswith((".xls", ".xlsx", ".csv"))), None)
+        if cand and (best is None or cand["modifiedTime"] > best["modifiedTime"]):
+            cand = dict(cand, _folder=fn)
+            best = cand
+    return best
+
+
+def isin_symbol_map(*frames) -> dict:
+    """isin -> symbol unioned across several tables (first NON-BLANK wins) so a
+    gap in one source is auto-healed by another. Pass DataFrames that have `isin`
+    + `symbol` columns (master_list, screener_grades, guidance_tracker,
+    announcement_ledger…). screener_grades leaves SME symbols blank; guidance /
+    master_list fill them. Pure (no I/O) — callers pass already-loaded frames."""
+    m: dict = {}
+    for df in frames:
+        if df is None or getattr(df, "empty", True):
+            continue
+        if not {"isin", "symbol"} <= set(df.columns):
+            continue
+        for i, s in zip(df["isin"].astype(str), df["symbol"].astype(str)):
+            i, s = i.strip(), s.strip()
+            if i and s and s.lower() != "nan" and i not in m:
+                m[i] = s
+    return m
+
+
+def load_portfolio_isins(drive, folder_id: str,
+                         folder_name=None) -> set[str] | None:
+    """Return ISIN set from the LIVE portfolio holdings file.
+
+    Single source of truth = the most-recently-modified .xls/.xlsx/.csv across
+    BOTH pf_tracking/ and portfolio/ (auto-heals — newest upload wins, no matter
+    the folder). Pass folder_name='x' to restrict to one folder.
+      - Auto-detects header row (Screener exports have ~13 blank rows first)
       - Returns frozenset of ISIN strings, or None when no file found
         (callers fall back to processing all companies when None is returned)
 
-    folder_name defaults to "portfolio" (Phase-2 extractors). The local chart
-    gallery passes "pf_tracking" — where sync_pf.bat uploads the LIVE holdings.
-
-    Called by extract_results, extract_rating, extract_presentation,
-    extract_annual_report — NOT by extract_concall (concall stays universal).
-    """
-    # Find subfolder — do NOT create it; absence means no filter
-    q = (f"name='{folder_name}' and '{folder_id}' in parents "
-         f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
-    folders = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
-    if not folders:
-        log("  Portfolio filter: no 'portfolio' folder on Drive — processing all companies")
-        return None
-
-    pf_folder_id = folders[0]["id"]
-
-    # Most-recently-modified spreadsheet file (name varies per upload)
-    files = drive.files().list(
-        q=f"'{pf_folder_id}' in parents and trashed=false",
-        fields="files(id, name, modifiedTime)",
-        orderBy="modifiedTime desc",
-    ).execute().get("files", [])
-    target = next(
-        (f for f in files
-         if f["name"].lower().endswith((".xls", ".xlsx", ".csv"))),
-        None,
-    )
+    Called by extract_results/rating/presentation/annual_report, ingest_announcements,
+    build_catalyst_notes, build_investigative_fraud, run_backfill, run_pf_digest,
+    ingest_company_docs — NOT by extract_concall (concall stays universal)."""
+    names = (folder_name,) if folder_name else PF_FOLDERS
+    target = find_latest_portfolio_file(drive, folder_id, names)
     if not target:
-        log("  Portfolio filter: no .xls/.xlsx/.csv in portfolio/ — processing all companies")
+        log(f"  Portfolio filter: no holdings file in {'/'.join(names)} — processing all companies")
         return None
 
-    log(f"  Portfolio filter: reading '{target['name']}'")
+    log(f"  Portfolio filter: reading '{target['name']}' (newest across {','.join(names)}, "
+        f"from {target.get('_folder', '?')}/)")
     raw = download_bytes(drive, target["id"])
     fn = target["name"].lower()
 
