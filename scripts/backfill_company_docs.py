@@ -48,13 +48,29 @@ from ingest_company_docs import (
 )
 
 
+# ICRA serves the rationale as a JS-rendered HTML page whose real content is an
+# embedded PDF (the bare page yields only website boilerplate). Rewrite the link
+# /Rationale/ShowRationaleReport?Id=<N> -> the PDF endpoint /Rating/ShowRationalReportFilePdf/<N>
+# (verified: returns application/pdf). Keeps the original link as the queue identity.
+_ICRA_RATIONALE_RE = re.compile(r"icra\.in/.*ShowRationaleReport.*?[?&]Id=(\d+)", re.I)
+
+
+def _resolve_doc_url(url: str) -> str:
+    m = _ICRA_RATIONALE_RE.search(url or "")
+    if m:
+        return f"https://www.icra.in/Rating/ShowRationalReportFilePdf/{m.group(1)}"
+    return url
+
+
 def fetch_document(session, url: str) -> tuple[bytes, str, str] | None:
     """Fetch a document URL. Returns (data, mime, ext) or None.
 
     Handles two shapes:
       • direct PDF (BSE/NSE annual reports)  -> ('%PDF...', application/pdf, .pdf)
       • HTML rating rationale (CRISIL/ICRA)  -> clean text bytes, text/plain, .txt
+    ICRA rationale links are resolved to their embedded PDF first.
     """
+    url = _resolve_doc_url(url)
     try:
         r = session.get(url, headers={"User-Agent": UA,
                                       "Referer": "https://www.bseindia.com/"},
