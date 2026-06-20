@@ -274,6 +274,16 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    # Backfill flags (defaults leave Phase 2 live behaviour identical).
+    parser.add_argument("--all-companies", action="store_true",
+                        help="Skip the portfolio filter — process every pending "
+                             "rating (universe backfill; use with --max-age-hours).")
+    parser.add_argument("--key-prefix", type=str, default=None,
+                        help="Load keys from this env prefix / comma list (e.g. "
+                             "FREE_POOL,BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
+    parser.add_argument("--max-age-hours", type=float, default=None,
+                        help="Only rows discovered within N hours (guards quota on "
+                             "stale legacy rows).")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -281,11 +291,19 @@ def main() -> None:
 
     drive = get_drive()
 
-    api_keys = load_api_keys()
-    if not api_keys:
-        print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
-        sys.exit(1)
-    log(f"Loaded {len(api_keys)} Gemini API key(s)")
+    if args.key_prefix:
+        from gemini_pool import load_keys_multi
+        api_keys = load_keys_multi(os.environ, args.key_prefix)   # comma list ok
+        if not api_keys:
+            print(f"ERROR: no {args.key_prefix}* keys found in env")
+            sys.exit(1)
+    else:
+        api_keys = load_api_keys()
+        if not api_keys:
+            print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
+            sys.exit(1)
+    log(f"Loaded {len(api_keys)} Gemini API key(s)"
+        + (f" [{args.key_prefix}]" if args.key_prefix else ""))
 
     gemini = GeminiKeyPool(api_keys, GEMINI_MODEL)
 
@@ -303,12 +321,17 @@ def main() -> None:
 
     # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
     # On contention exit cleanly — the next run resumes (rows stay pending).
+    _is_backfill = args.all_companies          # universe backfill path -> yield to Phase 2
     if not args.dry_run:
-        # Phase-2 priority: wait up to 15 min for the lock (backfill yields to us
-        # within ~one document) instead of skipping the slot on contention.
-        if not acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
-                            max_age_min=_LOCK_MAX_AGE_MIN, wait_min=15):
-            log("  Lock unavailable after wait — exiting cleanly.")
+        # PF path = Phase 2 (wait for the lock); backfill yields immediately.
+        if _is_backfill:
+            got = acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
+                               max_age_min=_LOCK_MAX_AGE_MIN, defer_to_phase2=True)
+        else:
+            got = acquire_lock(drive, index_id, _LOCK_NAME, DOC_TYPE,
+                               max_age_min=_LOCK_MAX_AGE_MIN, wait_min=15)
+        if not got:
+            log("  Lock unavailable (yielded to Phase 2 / timed out) — exiting cleanly.")
             sys.exit(0)
         atexit.register(release_lock, drive, index_id, _LOCK_NAME)
 
@@ -317,13 +340,28 @@ def main() -> None:
     pending_idx = queue.index[pending_mask].tolist()
     log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending {DOC_TYPE}")
 
-    # Portfolio filter: skip non-portfolio companies (rows stay pending for future runs)
-    portfolio_isins = load_portfolio_isins(drive, folder_id)
-    if portfolio_isins:
+    # Optional freshness window (discovered_at within N hours) — backfill quota guard.
+    if args.max_age_hours and "discovered_at" in queue.columns:
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(hours=args.max_age_hours)) \
+            .isoformat(timespec="seconds")
         before = len(pending_idx)
         pending_idx = [i for i in pending_idx
-                       if str(queue.loc[i, "isin"]).strip() in portfolio_isins]
-        log(f"  After portfolio filter: {len(pending_idx)}/{before} to process")
+                       if str(queue.loc[i, "discovered_at"]) >= cutoff]
+        log(f"  After {args.max_age_hours:.0f}h freshness filter: "
+            f"{len(pending_idx)}/{before} to process")
+
+    # Portfolio filter: skip non-portfolio companies (rows stay pending). Universe
+    # backfill (--all-companies) bypasses so every fresh rating gets judged.
+    if args.all_companies:
+        log("  --all-companies: portfolio filter bypassed (rating backfill)")
+    else:
+        portfolio_isins = load_portfolio_isins(drive, folder_id)
+        if portfolio_isins:
+            before = len(pending_idx)
+            pending_idx = [i for i in pending_idx
+                           if str(queue.loc[i, "isin"]).strip() in portfolio_isins]
+            log(f"  After portfolio filter: {len(pending_idx)}/{before} to process")
 
     if args.limit:
         pending_idx = pending_idx[: args.limit]
