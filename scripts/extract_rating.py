@@ -38,6 +38,7 @@ from _extractor_base import (
     append_company_page, append_day_page,
     load_portfolio_isins,
     acquire_lock, release_lock,
+    salvage_json_objects, clamp, sstr, upsert_structured,   # Stage 3 tabulation
 )
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
@@ -63,6 +64,59 @@ RATINGS_COLS = [
     "instrument_type", "rated_amount_cr",
     "rating_date", "processed_at", "source_doc_id",
 ]
+
+# ---- Stage 3: structured tabulation (ADDITIVE — ratings.parquet unchanged) ----
+STRUCT_PROMPT_FILE = "rating_structured_prompt.txt"
+STRUCT_INPUT_CHARS = 60000
+_RATING_BASE = ["isin", "symbol", "company_name", "agency", "rating_date",
+                "processed_at", "source_doc_id"]
+RATING_DRIVERS_COLS    = _RATING_BASE[:5] + ["driver", "evidence"] + _RATING_BASE[5:]
+RATING_CONCERNS_COLS   = _RATING_BASE[:5] + ["concern", "severity", "evidence"] + _RATING_BASE[5:]
+RATING_SENSITIVITY_COLS = _RATING_BASE[:5] + ["direction", "trigger"] + _RATING_BASE[5:]
+_SEV = {"low", "medium", "high"}
+_DIR = {"up", "down"}
+
+
+def parse_rating_structured(text, row, agency, rating_date, now_str):
+    """Salvage + dedupe → (drivers, concerns, sensitivity) rows."""
+    objs = salvage_json_objects(text)
+    if not objs:
+        return [], [], []
+    base = {"isin": str(row.get("isin") or ""), "symbol": str(row.get("symbol") or ""),
+            "company_name": str(row.get("company_name") or ""), "agency": agency or "",
+            "rating_date": rating_date or "", "processed_at": now_str,
+            "source_doc_id": str(row.get("doc_id") or "")}
+    dr, co, se = [], [], []
+    sd, sc, ss = set(), set(), set()
+    for o in objs:
+        if "concern" in o:
+            d = {**base, "concern": sstr(o.get("concern")),
+                 "severity": clamp(o.get("severity"), _SEV, "medium"),
+                 "evidence": sstr(o.get("evidence"))}
+            k = (d["concern"] or "")[:120]
+            if d["concern"] and k not in sc:
+                sc.add(k); co.append(d)
+        elif "driver" in o:
+            d = {**base, "driver": sstr(o.get("driver")), "evidence": sstr(o.get("evidence"))}
+            k = (d["driver"] or "")[:120]
+            if d["driver"] and k not in sd:
+                sd.add(k); dr.append(d)
+        elif "trigger" in o or "direction" in o:
+            d = {**base, "direction": clamp(o.get("direction"), _DIR, "up"),
+                 "trigger": sstr(o.get("trigger"))}
+            k = (d["direction"], (d["trigger"] or "")[:120])
+            if d["trigger"] and k not in ss:
+                ss.add(k); se.append(d)
+    return dr[:10], co[:10], se[:8]
+
+
+def tabulate_rating(gemini, struct_prompt, report_text, row, agency, rating_date, now_str):
+    """SEPARATE bounded JSON-only pass over the produced rating rationale (best-effort)."""
+    if not struct_prompt or not report_text:
+        return [], [], []
+    resp = gemini.call_text(struct_prompt + report_text[:STRUCT_INPUT_CHARS],
+                            f"{row.get('symbol', 'DOC')}_RATING_struct")
+    return parse_rating_structured(resp, row, agency, rating_date, now_str)
 
 # Common rating agency name variants
 _AGENCY_PATTERNS = [
@@ -235,6 +289,8 @@ def main() -> None:
         print(f"ERROR: prompt file not found: {prompt_path}")
         sys.exit(1)
     prompt = prompt_path.read_text(encoding="utf-8")
+    _struct_path = Path(__file__).resolve().parent / STRUCT_PROMPT_FILE
+    struct_prompt = _struct_path.read_text(encoding="utf-8") if _struct_path.exists() else ""
 
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
@@ -320,6 +376,27 @@ def main() -> None:
                 )
 
             upsert_ratings(drive, index_id, facts)
+
+            # Stage 3 tabulation (ADDITIVE, best-effort): separate JSON-only pass →
+            # rating_drivers / rating_concerns / rating_sensitivity. ratings.parquet +
+            # markdown untouched on failure (no regression; Phase 2 unchanged).
+            try:
+                dr, co, se = tabulate_rating(
+                    gemini, struct_prompt, markdown_text, row,
+                    facts.get("agency"), facts.get("rating_date"),
+                    datetime.now().isoformat(timespec="seconds"))
+                upsert_structured(drive, index_id, "rating_drivers.parquet",
+                                  RATING_DRIVERS_COLS, dr)
+                upsert_structured(drive, index_id, "rating_concerns.parquet",
+                                  RATING_CONCERNS_COLS, co)
+                upsert_structured(drive, index_id, "rating_sensitivity.parquet",
+                                  RATING_SENSITIVITY_COLS, se)
+                log(f"  Tabulated: drivers={len(dr)}, concerns={len(co)}, "
+                    f"sensitivity={len(se)}")
+            except RateLimitExhausted:
+                log("  Structured pass: keys exhausted — tabulation skipped.")
+            except Exception as _e:
+                log(f"  WARNING: rating tabulation failed ({str(_e)[:90]}).")
 
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")

@@ -46,7 +46,8 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, upload_bytes, log,
-                             load_portfolio_isins, append_company_page)
+                             load_portfolio_isins, append_company_page,
+                             salvage_json_objects, clamp, sstr)  # Stage 3 event tags
 from gemini_pool import (BucketPool, load_keys, AllBucketsExhausted,
                          FatalCallError)
 
@@ -54,7 +55,39 @@ SUMMARY_PROMPT = (
     "You are an equity analyst. This is a BSE corporate filing. In 3-5 crisp "
     "lines for a portfolio manager: (1) what is this filing, (2) why it matters / "
     "the catalyst, (3) one concrete thing to track next. No preamble, no "
-    "boilerplate. If it is routine/immaterial, say so in one line.")
+    "boilerplate. If it is routine/immaterial, say so in one line.\n"
+    "Then on a FINAL separate line output ONLY a compact JSON object (no code "
+    "fences, no other text) classifying the filing:\n"
+    '{"event_type":"<one of: results|order_win|capex|mna|fundraise|debt|rating|'
+    'litigation|management_change|buyback|dividend|expansion|regulatory|other>",'
+    '"materiality":"high|med|low","direction":"bull|bear|neutral"}')
+
+# Stage 3 event-tag vocab (LLM-derived, ADDITIVE to the BSE category/subcategory).
+_EVENT_TYPES = {"results", "order_win", "capex", "mna", "fundraise", "debt", "rating",
+                "litigation", "management_change", "buyback", "dividend", "expansion",
+                "regulatory", "other"}
+_MATERIALITY = {"high", "med", "low"}
+_DIRECTION = {"bull", "bear", "neutral"}
+
+
+def _parse_event_tags(resp: str) -> tuple[dict, str]:
+    """Return (tags, clean_summary). Pull the JSON tail (event_type/materiality/
+    direction) via the shared salvage helper; strip it from the stored summary text.
+    Defaults are safe ('other'/'low'/'neutral') so a missing/garbled tail never breaks
+    the existing summary path."""
+    tags = {"event_type": "other", "materiality": "low", "direction": "neutral"}
+    summary = resp or ""
+    for o in salvage_json_objects(resp):
+        if "event_type" in o or "direction" in o:
+            tags = {
+                "event_type": clamp(o.get("event_type"), _EVENT_TYPES, "other"),
+                "materiality": clamp(o.get("materiality"), _MATERIALITY, "low"),
+                "direction": clamp(o.get("direction"), _DIRECTION, "neutral"),
+            }
+            break
+    # strip any {...} json object(s) from the human summary
+    summary = re.sub(r"\{[^{}]*\}", "", summary).strip()
+    return tags, summary
 DAILY_KEEP_DAYS = 35      # keep ~1 month+ of daily_update_summary_*.md history
 
 ANN_API = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
@@ -74,7 +107,9 @@ EXCLUDE_PAT = re.compile(
 
 LEDGER_COLS = ["newsid", "isin", "symbol", "scrip_cd", "ann_date", "category",
                "subcategory", "flag", "headline", "attachment", "pdf_sha",
-               "summary", "status", "discovered_at", "processed_at"]
+               "summary", "status", "discovered_at", "processed_at",
+               # Stage 3: LLM event tags (ADDITIVE; old rows read NaN).
+               "event_type", "materiality", "direction"]
 
 
 def _folder(drive, parts: str) -> str:
@@ -336,7 +371,9 @@ def main() -> None:
             log(f"  {k['symbol']}: fatal call ({str(e)[:60]}) — skipped"); fail += 1; continue
         except Exception as e:
             log(f"  {k['symbol']}: call error ({str(e)[:60]}) — skipped"); fail += 1; continue
-        summary = (summary or "").strip()
+        # Stage 3: pull the LLM event tags from the response tail; clean_summary is
+        # the human prose with the JSON object stripped out.
+        _tags, summary = _parse_event_tags(summary or "")
         sha = hashlib.sha256(pdf).hexdigest()
         now = datetime.now().isoformat(timespec="seconds")
         done_rows.append({**{c: k.get(c, "") for c in
@@ -344,7 +381,10 @@ def main() -> None:
                               "flag", "headline", "attachment")},
                           "scrip_cd": k["scrip_cd"], "ann_date": k["ann_date"],
                           "pdf_sha": sha, "summary": summary, "status": "done",
-                          "discovered_at": now, "processed_at": now})
+                          "discovered_at": now, "processed_at": now,
+                          "event_type": _tags["event_type"],
+                          "materiality": _tags["materiality"],
+                          "direction": _tags["direction"]})
         digest.append((k["symbol"], k["category"], k["ann_date"],
                        k["headline"], summary))
         # store PDF for the 2-day retention sweep + append company_page section

@@ -18,6 +18,7 @@ Provides:
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import time
@@ -194,6 +195,93 @@ def save_parquet(drive, index_id: str, filename: str,
     else:
         drive.files().create(body={"name": filename, "parents": [index_id]},
                              media_body=media, fields="id").execute()
+
+
+# ------------------------------------------------------------------ #
+#  Structured-tabulation helpers (shared by AR/presentation/rating)   #
+#  Generic version of the proven AR pattern: a SEPARATE bounded JSON-  #
+#  only pass over a produced report, parsed by SALVAGE (every flat     #
+#  {...} object) + dedupe — robust to a lite model that truncates or   #
+#  loops. Pure functions; additive (existing extractors are unchanged).#
+# ------------------------------------------------------------------ #
+
+_FLAT_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+# Absence-of-concern / clean / missing-data phrasing — these are NOT real flags.
+_CLEAN_FLAG_RE = re.compile(
+    r"\b(no material|no significant|no adverse|no emphasis|no eom|no qualif\w*|"
+    r"no red[- ]?flag|no concern|no issue|no change[s]? in|no instance|"
+    r"consistent with (the )?prior|in line with prior|within (the )?(acceptable|normal)|"
+    r"generally align\w*|no unusual|is (minimal|negligible|immaterial)|"
+    r"are (minimal|negligible|immaterial)|marked as|"
+    r"none (were |was )?(noted|disclosed|observed|reported))\b", re.IGNORECASE)
+
+
+def sstr(v):
+    """Trimmed string, or None for empty/null (keeps parquet nulls clean)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def fnum(v):
+    """Coerce to float, guarding None/blank/garbage -> None."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def clamp(v, allowed: set, default: str) -> str:
+    """Lower-cased value if in `allowed`, else `default`."""
+    s = str(v or "").strip().lower()
+    return s if s in allowed else default
+
+
+def is_real_flag(evidence) -> bool:
+    """True only for an ACTUAL concern. Drops blank, short DATA_MISSING, and
+    clean/absence statements (a clean entity should surface few/no flags)."""
+    e = (evidence or "").strip()
+    if not e:
+        return False
+    if "DATA_MISSING" in e.upper() and len(e) < 60:
+        return False
+    if _CLEAN_FLAG_RE.search(e):
+        return False
+    return True
+
+
+def upsert_structured(drive, index_id: str, filename: str, cols: list,
+                      rows: list) -> None:
+    """Delete existing rows for this source_doc_id, append new (idempotent re-extract).
+    Generic version of the AR _upsert_ar; used by presentation/rating tabulation."""
+    if not rows:
+        return
+    df = load_parquet(drive, index_id, filename, cols)
+    sdid = str(rows[0].get("source_doc_id", ""))
+    if sdid and "source_doc_id" in df.columns:
+        df = df[df["source_doc_id"].astype(str) != sdid]
+    new_df = pd.DataFrame([{c: r.get(c) for c in cols} for r in rows])
+    df = pd.concat([df, new_df], ignore_index=True)
+    save_parquet(drive, index_id, filename, df)
+
+
+def salvage_json_objects(text: str) -> list[dict]:
+    """Parse every FLAT {...} object in the text individually — robust to a truncated
+    or repetition-looped response (complete objects recovered, trailing partial one
+    skipped). Structured rows are flat (no nesting), so they survive an unterminated
+    enclosing array/object."""
+    out: list[dict] = []
+    for m in _FLAT_OBJ_RE.findall(text or ""):
+        try:
+            o = json.loads(m)
+            if isinstance(o, dict):
+                out.append(o)
+        except Exception:
+            continue
+    return out
 
 
 # ------------------------------------------------------------------ #
