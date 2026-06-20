@@ -268,6 +268,24 @@ def upsert_structured(drive, index_id: str, filename: str, cols: list,
     save_parquet(drive, index_id, filename, df)
 
 
+def run_structured_over_doc(gemini, struct_prompt: str, doc_bytes: bytes, *,
+                            max_output_tokens: int = 4096, max_text_chars: int = 60000,
+                            name: str = "struct") -> str:
+    """Run a JSON-only structured prompt DIRECTLY over the source document and return
+    the raw response. For small/clean docs (e.g. a rating rationale) this avoids the
+    lite model's rambling intermediate 'report' that starves the structured pass —
+    feed the source straight to the focused JSON prompt. Detects PDF vs text bytes.
+    Empty string when disabled/empty (caller treats as no rows)."""
+    if not struct_prompt or not doc_bytes:
+        return ""
+    if doc_bytes[:5].startswith(b"%PDF"):
+        return gemini.call(doc_bytes, struct_prompt, name,
+                           max_output_tokens=max_output_tokens)
+    text = doc_bytes.decode("utf-8", "replace")[:max_text_chars]
+    return gemini.call_text(struct_prompt + "\n\nDOCUMENT:\n" + text, name,
+                            max_output_tokens=max_output_tokens)
+
+
 def salvage_json_objects(text: str) -> list[dict]:
     """Parse every FLAT {...} object in the text individually — robust to a truncated
     or repetition-looped response (complete objects recovered, trailing partial one
