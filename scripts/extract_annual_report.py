@@ -57,6 +57,8 @@ GEMINI_MODEL    = P1_MODELS          # lite chain, disjoint from concall (P0)
 PROMPT_FILE     = "annual_report_prompt.txt"
 STRUCT_PROMPT_FILE = "ar_structured_prompt.txt"   # JSON-only structured 2nd pass
 STRUCT_INPUT_CHARS = 60000                        # cap report text fed to the 2nd call
+MAX_REPORT_CHARS   = 120000                       # cap stored markdown (lite model can
+                                                  # run away to ~2M chars on big ARs)
 DOC_TYPE_LABEL  = "Annual Report"
 
 OUTPUT_COMPANY_MD   = True
@@ -136,6 +138,31 @@ def _clamp(v, allowed: set, default: str) -> str:
 _FY_RE = re.compile(r'"fy_year"\s*:\s*"([^"]{1,12})"')
 _FLAT_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
+# A red flag whose evidence is an ABSENCE-of-concern / clean / missing-data statement
+# is noise — a clean company should yield few/no flags. Conservative patterns only,
+# to avoid dropping a genuine flag that happens to contain "no ...".
+_CLEAN_FLAG_RE = re.compile(
+    r"\b(no material|no significant|no adverse|no emphasis|no eom|no qualif\w*|"
+    r"no red[- ]?flag|no concern|no issue|no change[s]? in|no instance|"
+    r"consistent with (the )?prior|in line with prior|within (the )?(acceptable|normal)|"
+    r"generally align\w*|no unusual|is (minimal|negligible|immaterial)|"
+    r"are (minimal|negligible|immaterial)|marked as|"
+    r"none (were |was )?(noted|disclosed|observed|reported))\b",
+    re.IGNORECASE)
+
+
+def _is_real_flag(evidence) -> bool:
+    """True only for an ACTUAL concern. Drops blank, DATA_MISSING, and clean/absence
+    statements (a clean company should surface few/no red flags)."""
+    e = (evidence or "").strip()
+    if not e:
+        return False
+    if "DATA_MISSING" in e.upper() and len(e) < 60:   # short "couldn't verify" notes
+        return False
+    if _CLEAN_FLAG_RE.search(e):
+        return False
+    return True
+
 
 def _extract_json_block(text: str) -> dict:
     """Best-effort parse of one clean JSON object (bare or fenced). Returns {} on
@@ -199,6 +226,8 @@ def parse_ar_structured(text: str, row: pd.Series, fy_year: str,
     seen_g, seen_rf = set(), set()
     for o in objs:
         if "flag_type" in o:                                   # red flag
+            if not _is_real_flag(o.get("evidence")):           # drop clean/absence noise
+                continue
             d = {**base,
                  "category": _clamp(o.get("category"), _AR_FLAG_CATEGORIES, "other"),
                  "flag_type": _clamp(o.get("flag_type"), _AR_FLAG_TYPES, "other"),
@@ -554,12 +583,20 @@ def main() -> None:
             log(f"  Parsed: fy={facts['fy_year'] or 'unknown'}, "
                 f"revenue={facts['revenue_q']}, pat={facts['pat_q']}")
 
+            # Storage cap: the lite model can run away to ~2M chars on big ARs — never
+            # write a runaway blob to company_page.md / the daily page.
+            report_md = markdown_text
+            if len(report_md) > MAX_REPORT_CHARS:
+                log(f"  Report {len(report_md):,} chars > cap — truncating stored md.")
+                report_md = (report_md[:MAX_REPORT_CHARS]
+                             + "\n\n_[report truncated — exceeded MAX_REPORT_CHARS]_")
+
             if OUTPUT_COMPANY_MD:
                 append_company_page(
                     drive, repo_id,
                     key=str(row.get("key") or row.get("isin") or row.get("symbol") or ""),
                     doc_type_label=DOC_TYPE_LABEL,
-                    content=markdown_text,
+                    content=report_md,
                     doc_title=str(row.get("title", "")),
                     quarter=facts["quarter"],
                 )
@@ -572,7 +609,7 @@ def main() -> None:
                     symbol=str(row.get("symbol", "")),
                     company_name=str(row.get("company_name", "")),
                     quarter=facts["quarter"],
-                    content=markdown_text,
+                    content=report_md,
                 )
 
             upsert_facts(drive, index_id, facts)
