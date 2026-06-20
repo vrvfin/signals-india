@@ -186,15 +186,26 @@ jobs:
           python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
+      # ── Stage 2: fetch fresh Annual Reports (3y, universe, newest-first) ─────
+      # Only on full night slots (run_extras) so the ARs fetched here are extracted
+      # by the T8 step the SAME slot — big AR PDFs must not age out (2-day retention).
+      # --target-pending 300 paces fetch to extract capacity (newest FY first).
+      - name: T1b — fetch annual reports from Screener (3y universe)
+        if: ${{ steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
+        run: |
+          python scripts/run_backfill.py --types annual_report --years 3 \
+            --max-companies 100 --target-pending 300
+
       # ── T8 — fresh Annual Reports: summarise ALL (not just PF), then judge ──
-      # max-age guard keeps quota off stale legacy rows; BACKFILL pool (D1).
+      # max-age guard keeps quota off stale legacy rows. Stage 2: FREE_POOL+BACKFILL
+      # pool (28 keys, independent of Phase 2) + newest-first + FY-grain supersede.
       # run_extras=false on the short morning run so these extra lock-holders
       # don't overrun the 09:30 cutoff — they run on the full night slots.
-      - name: T8 — extract fresh ARs (all companies, BACKFILL pool)
+      - name: T8 — extract fresh ARs (all companies, FREE_POOL+BACKFILL pool)
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
         run: >
           python scripts/extract_annual_report.py --all-companies
-          --key-prefix BACKFILL_GEMINI_KEY --max-age-hours 48 || true
+          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48 || true
 
       - name: T8 — daily AR digest + focus/defocus lists
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'

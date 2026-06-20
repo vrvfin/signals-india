@@ -39,7 +39,7 @@ from _extractor_base import (
     log, get_or_create_subfolder,
     load_queue, save_queue,
     load_parquet, save_parquet,
-    download_bytes,
+    download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
     append_company_page, append_day_page,
     load_portfolio_isins,
@@ -59,6 +59,13 @@ STRUCT_PROMPT_FILE = "ar_structured_prompt.txt"   # JSON-only structured 2nd pas
 STRUCT_INPUT_CHARS = 60000                        # cap report text fed to the 2nd call
 MAX_REPORT_CHARS   = 120000                       # cap stored markdown (lite model can
                                                   # run away to ~2M chars on big ARs)
+AR_MAX_OUTPUT_TOKENS = 4096                       # model-level cap on the REPORT call.
+                                                  # The lite model rambles non-linearly
+                                                  # (measured: 4096→~67k, 8192→~194k,
+                                                  # 16384→~448k chars), so a TIGHT cap is
+                                                  # what bounds the bloat. ~67k chars
+                                                  # still covers the forensic/guidance
+                                                  # sections the structured pass reads.
 DOC_TYPE_LABEL  = "Annual Report"
 
 OUTPUT_COMPANY_MD   = True
@@ -83,7 +90,13 @@ QFACTS_COLS = [
     "isin", "symbol", "company_name", "quarter", "fy_year",
     "revenue_q", "ebitda_q", "pat_q", "margin_pct", "volume_q", "capacity_q",
     "revenue_12m", "pat_12m", "processed_at", "source_doc_id",
+    # T12 Stage 2: richness proxy for FY-grain supersede. Also keeps this table's
+    # column set aligned with the concall writer (which already has response_chars),
+    # so an AR write no longer silently drops it from the shared parquet.
+    "response_chars",
 ]
+
+SUPERSEDE_THRESHOLD = 1.2   # a new AR must be >20% longer to replace the stored one
 
 # ---- Structured tabulation schemas (from the prompt's machine-readable appendix) ----
 # Mirror concall's guidance_tracker / gf4_quality_flags pattern at AR (FY) grain so
@@ -267,6 +280,63 @@ def tabulate_ar(gemini, struct_prompt: str, report_text: str, row: pd.Series,
     return parse_ar_structured(struct_resp, row, fy_year, now_str)
 
 
+def _purge_ar_fy(drive, index_id: str, isin: str, fy: str, new_doc_id: str) -> None:
+    """Remove an older AR's rows for (isin, FY) from every AR parquet before a richer
+    AR replaces it (rows from `new_doc_id` are left alone). quarterly_facts is filtered
+    on quarter==FY so ONLY AR rows are touched — concall rows (quarter='Q2FY26') are safe."""
+    isin, fy, new_doc_id = str(isin), str(fy), str(new_doc_id)
+    # quarterly_facts: AR rows for this FY, excluding the new doc.
+    qf = load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
+    if not qf.empty:
+        m = ((qf["isin"].astype(str) == isin)
+             & (qf["quarter"].astype(str) == fy)
+             & (qf["source_doc_id"].astype(str) != new_doc_id))
+        if m.any():
+            save_parquet(drive, index_id, "quarterly_facts.parquet",
+                         qf[~m].reset_index(drop=True))
+    # ar_guidance / ar_red_flags: by (isin, fy_year), excluding the new doc.
+    for fname, cols in (("ar_guidance.parquet", AR_GUIDANCE_COLS),
+                        ("ar_red_flags.parquet", AR_REDFLAG_COLS)):
+        df = load_parquet(drive, index_id, fname, cols)
+        if df.empty:
+            continue
+        m = ((df["isin"].astype(str) == isin)
+             & (df["fy_year"].astype(str) == fy)
+             & (df["source_doc_id"].astype(str) != new_doc_id))
+        if m.any():
+            save_parquet(drive, index_id, fname, df[~m].reset_index(drop=True))
+
+
+def _replace_ar_section(drive, repo_id, key: str, fy: str, content: str,
+                        doc_title: str) -> None:
+    """In-place replace of an FY's Annual-Report section in company_page.md (rule 7c).
+    Mirrors the concall replacer; matches append_company_page's '## <FY> Annual Report'
+    header. Falls back to append if not found."""
+    if not key:
+        return
+    comp_id = get_or_create_subfolder(drive, repo_id, key)
+    new_section = (f"\n\n---\n## {fy} {DOC_TYPE_LABEL} — {doc_title}\n"
+                   f"*Processed: {datetime.now().strftime('%Y-%m-%d')} (superseded)*\n\n"
+                   + content)
+    fid = find_file(drive, comp_id, "company_page.md")
+    if not fid:
+        upload_bytes(drive, comp_id, "company_page.md",
+                     (f"# {key} — Company Intelligence\n" + new_section).encode("utf-8"),
+                     "text/markdown")
+        return
+    existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+    pattern = (rf'\n\n---\n## {re.escape(fy)} {re.escape(DOC_TYPE_LABEL)}[^\n]*\n'
+               rf'\*Processed:[^\n]*\n\n.*?(?=\n\n---\n##|\Z)')
+    if re.search(pattern, existing, re.DOTALL):
+        updated = re.sub(pattern, new_section, existing, count=1, flags=re.DOTALL)
+        log(f"  Replaced {fy} AR section in company_page.md (superseded).")
+    else:
+        updated = existing + new_section
+        log(f"  WARN: {fy} AR section not found — appending.")
+    upload_bytes(drive, comp_id, "company_page.md",
+                 updated.encode("utf-8"), "text/markdown", existing_id=fid)
+
+
 def _upsert_ar(drive, index_id: str, filename: str, cols: list[str],
                rows: list[dict]) -> None:
     """Delete existing rows for this source_doc_id, append new (idempotent re-extract).
@@ -325,7 +395,8 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
     chunk_summaries: list[str] = []
     for i, chunk in enumerate(chunks, 1):
         log(f"  Chunk {i}/{len(chunks)}: {len(chunk):,} bytes")
-        summary = gemini.call(chunk, prompt, f"{display_name}_chunk{i}")
+        summary = gemini.call(chunk, prompt, f"{display_name}_chunk{i}",
+                              max_output_tokens=AR_MAX_OUTPUT_TOKENS)
         chunk_summaries.append(f"=== CHUNK {i} ===\n{summary}")
 
     if len(chunk_summaries) == 1:
@@ -333,7 +404,8 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
 
     synthesis_prompt = SYNTHESIS_PROMPT_PREFIX + "\n\n".join(chunk_summaries)
     # Text-only call: all content is already in the prompt, no PDF needed
-    return gemini.call_text(synthesis_prompt, f"{display_name}_synthesis")
+    return gemini.call_text(synthesis_prompt, f"{display_name}_synthesis",
+                            max_output_tokens=AR_MAX_OUTPUT_TOKENS)
 
 
 # ------------------------------------------------------------------ #
@@ -371,6 +443,7 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
         "quarter": fy_year,     # annual reports stored as "FY26" in the quarter column
         "fy_year": fy_year,
         "processed_at": now_str, "source_doc_id": doc_id,
+        "response_chars": len(text or ""),   # richness proxy for supersede
     })
 
     tables = extract_md_tables(text)
@@ -452,8 +525,8 @@ def main() -> None:
     drive = get_drive()
 
     if args.key_prefix:
-        from gemini_pool import load_keys
-        api_keys = load_keys(os.environ, prefix=args.key_prefix)
+        from gemini_pool import load_keys_multi
+        api_keys = load_keys_multi(os.environ, args.key_prefix)   # comma list ok
         if not api_keys:
             print(f"ERROR: no {args.key_prefix}* keys found in env")
             sys.exit(1)
@@ -501,8 +574,16 @@ def main() -> None:
 
     queue = load_queue(drive, index_id)
     pending_mask = (queue["status"] == "pending") & (queue["doc_type"] == DOC_TYPE)
-    pending_idx = queue.index[pending_mask].tolist()
-    log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending {DOC_TYPE}")
+    pending = queue[pending_mask]
+    # Newest-first (latest AR first) — user priority for AR universe backfill.
+    if "announcement_date" in pending.columns:
+        _ord = pd.to_datetime(pending["announcement_date"].astype(str).str[:10],
+                              errors="coerce")
+        pending_idx = list(pending.index[_ord.argsort(kind="stable")[::-1]])
+    else:
+        pending_idx = pending.index.tolist()
+    log(f"Queue: {len(queue)} total rows, {len(pending_idx)} pending {DOC_TYPE} "
+        f"(newest-first)")
 
     # T8: optional freshness window (discovered_at within N hours).
     if args.max_age_hours and "discovered_at" in queue.columns:
@@ -530,7 +611,12 @@ def main() -> None:
     if args.limit:
         pending_idx = pending_idx[: args.limit]
 
-    counts = {"processed": 0, "error": 0, "skipped": 0}
+    counts = {"processed": 0, "error": 0, "skipped": 0, "superseded": 0, "dup": 0}
+
+    # FY-grain supersede (rule 7c): cache the AR rows once; a richer AR for the same
+    # (isin, FY) replaces the stored one, a shorter/equal one is a true dup (skip).
+    _ar_facts_cache = load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
+    _seen_fy_keys: set = set()
 
     for queue_idx in pending_idx:
         # Priority yield: a backfill run steps aside the moment Phase 2 wants the
@@ -560,7 +646,8 @@ def main() -> None:
                     gemini, pdf_bytes, prompt, display_name
                 )
             else:
-                markdown_text = gemini.call(pdf_bytes, prompt, display_name)
+                markdown_text = gemini.call(pdf_bytes, prompt, display_name,
+                                            max_output_tokens=AR_MAX_OUTPUT_TOKENS)
 
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
@@ -583,6 +670,56 @@ def main() -> None:
             log(f"  Parsed: fy={facts['fy_year'] or 'unknown'}, "
                 f"revenue={facts['revenue_q']}, pat={facts['pat_q']}")
 
+            # ── FY-grain supersede decision (rule 7c) ──────────────────────────
+            _fy = str(facts.get("fy_year") or "").strip()
+            _isin_key = str(row.get("isin") or row.get("key") or "").strip()
+            _this_doc = str(facts.get("source_doc_id") or row.get("doc_id") or "")
+            _this_chars = len(markdown_text)
+            _supersede = False
+            _dup = False
+            if _fy and _isin_key:
+                _fkey = (_isin_key, _fy)
+                if _fkey in _seen_fy_keys:
+                    _dup = True                      # same run, same FY — skip
+                elif not _ar_facts_cache.empty:
+                    _m = ((_ar_facts_cache["isin"].astype(str) == _isin_key)
+                          & (_ar_facts_cache["quarter"].astype(str) == _fy)
+                          & (_ar_facts_cache["source_doc_id"].astype(str) != _this_doc))
+                    if _m.any():
+                        _old_chars = pd.to_numeric(
+                            _ar_facts_cache.loc[_m, "response_chars"],
+                            errors="coerce").fillna(0).max()
+                        if _old_chars == 0 or _this_chars >= _old_chars * SUPERSEDE_THRESHOLD:
+                            _supersede = True
+                            log(f"  SUPERSEDE: {row.get('symbol')} {_fy} — new "
+                                f"{_this_chars:,} vs existing {int(_old_chars):,} chars.")
+                        else:
+                            _dup = True
+                            log(f"  DUP (skip): {row.get('symbol')} {_fy} — new "
+                                f"{_this_chars:,} not >{SUPERSEDE_THRESHOLD:.0%} of "
+                                f"{int(_old_chars):,}.")
+                _seen_fy_keys.add(_fkey)
+
+            if _dup:
+                queue.loc[queue_idx, "status"] = "done"
+                queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
+                save_queue(drive, index_id, queue)
+                counts["dup"] += 1
+                continue
+
+            if _supersede:
+                _purge_ar_fy(drive, index_id, _isin_key, _fy, _this_doc)
+                _old = ((queue["doc_type"] == DOC_TYPE)
+                        & (queue["isin"].astype(str) == _isin_key)
+                        & (queue["status"].astype(str) == "done"))
+                # only older AR rows for this company (period/FY match where present)
+                if "period" in queue.columns:
+                    _old = _old & (queue["period"].astype(str).str.contains(_fy, na=False)
+                                   | (queue["period"].astype(str) == ""))
+                if _old.any():
+                    queue.loc[_old, "status"] = "superseded"
+                counts["superseded"] += 1
+
             # Storage cap: the lite model can run away to ~2M chars on big ARs — never
             # write a runaway blob to company_page.md / the daily page.
             report_md = markdown_text
@@ -592,14 +729,18 @@ def main() -> None:
                              + "\n\n_[report truncated — exceeded MAX_REPORT_CHARS]_")
 
             if OUTPUT_COMPANY_MD:
-                append_company_page(
-                    drive, repo_id,
-                    key=str(row.get("key") or row.get("isin") or row.get("symbol") or ""),
-                    doc_type_label=DOC_TYPE_LABEL,
-                    content=report_md,
-                    doc_title=str(row.get("title", "")),
-                    quarter=facts["quarter"],
-                )
+                _key = str(row.get("key") or row.get("isin") or row.get("symbol") or "")
+                if _supersede:
+                    _replace_ar_section(drive, repo_id, _key, _fy, report_md,
+                                        str(row.get("title", "")))
+                else:
+                    append_company_page(
+                        drive, repo_id, key=_key,
+                        doc_type_label=DOC_TYPE_LABEL,
+                        content=report_md,
+                        doc_title=str(row.get("title", "")),
+                        quarter=facts["quarter"],
+                    )
 
             if OUTPUT_DAY_MD:
                 append_day_page(
@@ -650,6 +791,8 @@ def main() -> None:
 
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
+    print(f"Superseded: {counts.get('superseded', 0)}  (richer AR replaced an older one)")
+    print(f"Dup (skip): {counts.get('dup', 0)}  (shorter/equal AR for a covered FY)")
     print(f"Errors    : {counts['error']}")
     print(f"Skipped   : {counts['skipped']}")
     if not args.dry_run:

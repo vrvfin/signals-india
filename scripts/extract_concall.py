@@ -57,23 +57,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
-                         load_keys)
+                         load_keys, load_keys_multi)
 from _extractor_base import (P1_MODELS,   # lite chain — backfill-only fallback
                              acquire_lock, release_lock, phase2_beacon_fresh)
-
-
-def load_keys_multi(env, prefixes_csv: str) -> list[str]:
-    """Load keys across a comma-separated list of env prefixes, concatenated and
-    de-duped (first occurrence wins, order preserved). A single prefix behaves
-    exactly like load_keys(env, prefix=...), so Phase 2 (GEMINI_API_KEY) is
-    unchanged. Backfill uses 'FREE_POOL,BACKFILL_GEMINI_KEY' — a missing prefix
-    simply contributes nothing (graceful fallback to whatever IS present)."""
-    keys: list[str] = []
-    for p in (x.strip() for x in str(prefixes_csv).split(",") if x.strip()):
-        for k in load_keys(env, prefix=p):
-            if k not in keys:
-                keys.append(k)
-    return keys
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
