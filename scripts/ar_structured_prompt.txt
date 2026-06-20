@@ -1,0 +1,50 @@
+You convert an annual-report forensic analysis into ONE structured JSON object.
+
+You are given the analysis text (already written). Extract from it — do NOT invent,
+do NOT re-analyse, do NOT add anything not in the text.
+
+OUTPUT RULES (critical):
+- Output ONLY one valid JSON object. No markdown, NO code fences, no prose before or
+  after, no comments.
+- It MUST be complete and parseable. Close every brace and bracket.
+- NEVER repeat an entry. Every red_flags item must be DISTINCT (different flag_type or
+  different evidence). Every guidance item must be DISTINCT.
+- HARD CAPS: at most 25 red_flags, at most 15 guidance. If more exist, keep the most
+  material. Stop after the cap — do not loop.
+- Use null for an unknown scalar and [] for an empty list. Keep enum values EXACTLY as
+  listed below.
+
+SCHEMA:
+{
+  "fy_year": "FYxx",
+  "guidance": [
+    {
+      "metric": "<what is guided, e.g. revenue growth>",
+      "guidance_type": "growth|margin|capacity|orderbook|capex|other",
+      "horizon_fy": "FYxx-or-null",
+      "value": <number-or-null>,
+      "unit": "%|cr|units|null",
+      "cagr_pct": <number-or-null>,
+      "notes": "<short cited note>"
+    }
+  ],
+  "red_flags": [
+    {
+      "category": "auditor|notes_to_accounts|accounting_policy|cash_flow|balance_sheet|governance|related_party|tax|other",
+      "flag_type": "auditor_qualification|emphasis_of_matter|caro_adverse|accounting_policy_change|accounting_estimate_change|revenue_recognition_change|notes_to_accounts_deviation|cfo_pat_divergence|working_capital_stretch|cwip_buildup|related_party_transaction|promoter_pledge|kmp_churn|contingent_liability|tax_variance|other",
+      "severity": "low|medium|high",
+      "evidence": "<1-2 line cited fact with the number/quote>",
+      "page_ref": "<section + page, or null>"
+    }
+  ]
+}
+
+Capture in red_flags (when present in the analysis): every auditor qualification /
+Emphasis of Matter / adverse CARO remark (category=auditor); every note to accounts
+with a severe/material deviation or restatement (category=notes_to_accounts); every
+change in accounting policy / estimate / revenue-recognition (category=accounting_policy);
+and the forensic financial flags (CFO-PAT divergence, working-capital stretch, CWIP
+buildup, related-party transactions, promoter pledge, KMP churn, contingent liabilities,
+tax variance). Remember: DISTINCT entries only, hard cap 25.
+
+ANALYSIS TEXT:

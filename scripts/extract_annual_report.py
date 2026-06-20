@@ -55,6 +55,8 @@ _LOCK_MAX_AGE_MIN = 360
 DOC_TYPE        = "annual_report"
 GEMINI_MODEL    = P1_MODELS          # lite chain, disjoint from concall (P0)
 PROMPT_FILE     = "annual_report_prompt.txt"
+STRUCT_PROMPT_FILE = "ar_structured_prompt.txt"   # JSON-only structured 2nd pass
+STRUCT_INPUT_CHARS = 60000                        # cap report text fed to the 2nd call
 DOC_TYPE_LABEL  = "Annual Report"
 
 OUTPUT_COMPANY_MD   = True
@@ -131,39 +133,59 @@ def _clamp(v, allowed: set, default: str) -> str:
     return s if s in allowed else default
 
 
+_FY_RE = re.compile(r'"fy_year"\s*:\s*"([^"]{1,12})"')
+_FLAT_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
 def _extract_json_block(text: str) -> dict:
-    """Return the dict from the prompt's machine-readable appendix, or {} on any
-    failure (never raises). Prefers the LAST ```json fenced block; falls back to the
-    last balanced {...} span."""
+    """Best-effort parse of one clean JSON object (bare or fenced). Returns {} on
+    failure — parse_ar_structured does NOT rely on this; it falls back to per-object
+    salvage. Kept for the happy path / fy_year lookup."""
     if not text:
         return {}
-    candidates: list[str] = []
-    fences = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
-    if fences:
-        candidates.append(fences[-1])
-    else:
-        # Fallback: widest {...} span (the appendix is the last thing emitted).
-        first, last = text.find("{"), text.rfind("}")
-        if first != -1 and last > first:
-            candidates.append(text[first:last + 1])
-    for raw in candidates:
+    t = text.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", t, re.DOTALL | re.IGNORECASE)
+    if m:
+        t = m.group(1).strip()
+    first, last = t.find("{"), t.rfind("}")
+    if first != -1 and last > first:
         try:
-            obj = json.loads(raw)
+            obj = json.loads(t[first:last + 1])
             if isinstance(obj, dict):
                 return obj
         except Exception:
-            continue
+            pass
     return {}
+
+
+def _salvage_objects(text: str) -> list[dict]:
+    """Parse every FLAT {...} object in the text individually. Robust to a truncated or
+    repetition-looped response: complete inner objects are recovered and the trailing
+    truncated one is skipped. guidance / red_flag objects are flat (no nesting), so they
+    are captured even when the enclosing JSON never closed (the live failure mode)."""
+    out: list[dict] = []
+    for m in _FLAT_OBJ_RE.findall(text or ""):
+        try:
+            o = json.loads(m)
+            if isinstance(o, dict):
+                out.append(o)
+        except Exception:
+            continue
+    return out
 
 
 def parse_ar_structured(text: str, row: pd.Series, fy_year: str,
                         now_str: str) -> tuple[list[dict], list[dict]]:
-    """Parse the JSON appendix into (guidance_rows, red_flag_rows). Empty lists if the
-    block is absent/invalid — the markdown report + quarterly_facts are unaffected."""
-    data = _extract_json_block(text)
-    if not data:
+    """Parse the structured-extraction response into (guidance_rows, red_flag_rows).
+    Salvage + DEDUPE based, so a truncated or looped model response still yields clean,
+    de-duplicated rows (e.g. a 570x-repeated flag collapses to 1). Empty lists if
+    nothing parseable — markdown report + quarterly_facts are unaffected."""
+    objs = _salvage_objects(text)
+    if not objs:
         return [], []
-    fy = _s(data.get("fy_year")) or fy_year or ""
+    m = _FY_RE.search(text or "")
+    fy = (_s(_extract_json_block(text).get("fy_year"))
+          or (m.group(1) if m else None) or fy_year or "")
     base = {
         "isin": str(row.get("isin") or ""),
         "symbol": str(row.get("symbol") or ""),
@@ -173,30 +195,47 @@ def parse_ar_structured(text: str, row: pd.Series, fy_year: str,
         "source_doc_id": str(row.get("doc_id") or ""),
     }
 
-    g_rows: list[dict] = []
-    for g in (data.get("guidance") or []):
-        if not isinstance(g, dict):
-            continue
-        g_rows.append({**base,
-                       "metric": _s(g.get("metric")),
-                       "guidance_type": _clamp(g.get("guidance_type"), _AR_GUIDANCE_TYPES, "other"),
-                       "horizon_fy": _s(g.get("horizon_fy")),
-                       "value": _num(g.get("value")),
-                       "unit": _s(g.get("unit")),
-                       "cagr_pct": _num(g.get("cagr_pct")),
-                       "notes": _s(g.get("notes"))})
+    g_rows, rf_rows = [], []
+    seen_g, seen_rf = set(), set()
+    for o in objs:
+        if "flag_type" in o:                                   # red flag
+            d = {**base,
+                 "category": _clamp(o.get("category"), _AR_FLAG_CATEGORIES, "other"),
+                 "flag_type": _clamp(o.get("flag_type"), _AR_FLAG_TYPES, "other"),
+                 "severity": _clamp(o.get("severity"), _AR_SEVERITIES, "medium"),
+                 "evidence": _s(o.get("evidence")),
+                 "page_ref": _s(o.get("page_ref"))}
+            k = (d["flag_type"], (d["evidence"] or "")[:120])
+            if k not in seen_rf:
+                seen_rf.add(k)
+                rf_rows.append(d)
+        elif ("guidance_type" in o) or ("metric" in o):        # guidance
+            d = {**base,
+                 "metric": _s(o.get("metric")),
+                 "guidance_type": _clamp(o.get("guidance_type"), _AR_GUIDANCE_TYPES, "other"),
+                 "horizon_fy": _s(o.get("horizon_fy")),
+                 "value": _num(o.get("value")),
+                 "unit": _s(o.get("unit")),
+                 "cagr_pct": _num(o.get("cagr_pct")),
+                 "notes": _s(o.get("notes"))}
+            k = (d["metric"], d["horizon_fy"], str(d["value"]), d["guidance_type"])
+            if k not in seen_g:
+                seen_g.add(k)
+                g_rows.append(d)
+    return g_rows[:15], rf_rows[:25]            # hard caps (defence-in-depth)
 
-    rf_rows: list[dict] = []
-    for f in (data.get("red_flags") or []):
-        if not isinstance(f, dict):
-            continue
-        rf_rows.append({**base,
-                        "category": _clamp(f.get("category"), _AR_FLAG_CATEGORIES, "other"),
-                        "flag_type": _clamp(f.get("flag_type"), _AR_FLAG_TYPES, "other"),
-                        "severity": _clamp(f.get("severity"), _AR_SEVERITIES, "medium"),
-                        "evidence": _s(f.get("evidence")),
-                        "page_ref": _s(f.get("page_ref"))})
-    return g_rows, rf_rows
+
+def tabulate_ar(gemini, struct_prompt: str, report_text: str, row: pd.Series,
+                fy_year: str, now_str: str) -> tuple[list[dict], list[dict]]:
+    """Run the bounded JSON-only structured pass over the produced report and parse it.
+    A SEPARATE call (not the report call) so the markdown report is never compromised;
+    text-only (no PDF re-upload). Returns ([],[]) if disabled/failed."""
+    if not struct_prompt or not report_text:
+        return [], []
+    struct_resp = gemini.call_text(
+        struct_prompt + report_text[:STRUCT_INPUT_CHARS],
+        f"{row.get('symbol', 'DOC')}_AR_struct")
+    return parse_ar_structured(struct_resp, row, fy_year, now_str)
 
 
 def _upsert_ar(drive, index_id: str, filename: str, cols: list[str],
@@ -405,6 +444,13 @@ def main() -> None:
         sys.exit(1)
     prompt = prompt_path.read_text(encoding="utf-8")
 
+    # Structured-extraction prompt (separate, bounded JSON-only pass). Optional — if
+    # absent, tabulation is silently skipped and the markdown report still works.
+    struct_path = Path(__file__).resolve().parent / STRUCT_PROMPT_FILE
+    struct_prompt = struct_path.read_text(encoding="utf-8") if struct_path.exists() else ""
+    if not struct_prompt:
+        log(f"  NOTE: {STRUCT_PROMPT_FILE} not found — AR tabulation disabled this run.")
+
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id  = get_or_create_subfolder(drive, repo_id,   "_index")
@@ -490,11 +536,16 @@ def main() -> None:
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
             if args.dry_run:
-                g_rows, rf_rows = parse_ar_structured(
-                    markdown_text, row, _extract_fy_year(markdown_text, row), "")
+                g_rows, rf_rows = [], []
+                try:
+                    g_rows, rf_rows = tabulate_ar(
+                        gemini, struct_prompt, markdown_text, row,
+                        _extract_fy_year(markdown_text, row), "")
+                except Exception as e:
+                    print(f"  structured pass failed: {str(e)[:90]}")
                 print(f"\n{'='*60}\nDRY RUN — {row.get('symbol')}\n"
                       f"{markdown_text[:800]}\n"
-                      f"-- structured appendix: guidance={len(g_rows)} "
+                      f"-- structured pass: guidance={len(g_rows)} "
                       f"red_flags={len(rf_rows)} --\n{'='*60}\n")
                 counts["processed"] += 1
                 continue
@@ -526,16 +577,18 @@ def main() -> None:
 
             upsert_facts(drive, index_id, facts)
 
-            # Structured tabulation (guidance + red flags) from the JSON appendix.
-            # Additive: if the block is absent/invalid the lists are empty and only the
-            # markdown + quarterly_facts persist (no regression). Same lock held.
+            # Structured tabulation: a SEPARATE bounded JSON-only pass over the report
+            # (best-effort). Additive — on any failure the markdown + quarterly_facts
+            # still persist (no regression). Same lock held.
             try:
-                g_rows, rf_rows = parse_ar_structured(
-                    markdown_text, row, facts["fy_year"],
+                g_rows, rf_rows = tabulate_ar(
+                    gemini, struct_prompt, markdown_text, row, facts["fy_year"],
                     datetime.now().isoformat(timespec="seconds"))
                 _upsert_ar(drive, index_id, "ar_guidance.parquet", AR_GUIDANCE_COLS, g_rows)
                 _upsert_ar(drive, index_id, "ar_red_flags.parquet", AR_REDFLAG_COLS, rf_rows)
                 log(f"  Tabulated: guidance={len(g_rows)}, red_flags={len(rf_rows)}")
+            except RateLimitExhausted:
+                log("  Structured pass: keys exhausted — tabulation skipped this doc.")
             except Exception as _e:
                 log(f"  WARNING: AR tabulation failed ({str(_e)[:100]}) — "
                     f"markdown + quarterly_facts still saved.")
