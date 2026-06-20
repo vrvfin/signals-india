@@ -101,6 +101,68 @@ def _load_signals(drive):
     return pd.concat(frames, ignore_index=True) if frames else _EMPTY
 
 
+def _load_pf_holdings(drive, folder_name="pf_tracking"):
+    """DataFrame[isin, name] from the latest holdings file in <folder_name>/ —
+    scans every cell for an ISIN pattern so it is format-agnostic (Screener /
+    broker exports). Falls back to portfolio/ if folder_name has nothing."""
+    import re as _re
+    gid = os.environ["GDRIVE_FOLDER_ID"]
+    for fn in (folder_name, "portfolio"):
+        q = (f"name='{fn}' and '{gid}' in parents and "
+             f"mimeType='application/vnd.google-apps.folder' and trashed=false")
+        fol = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        if not fol:
+            continue
+        files = drive.files().list(
+            q=f"'{fol[0]['id']}' in parents and trashed=false",
+            fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc"
+        ).execute().get("files", [])
+        tgt = next((f for f in files
+                    if f["name"].lower().endswith((".xls", ".xlsx", ".csv"))), None)
+        if not tgt:
+            continue
+        raw = download_bytes(drive, tgt["id"])
+        try:
+            if tgt["name"].lower().endswith(".csv"):
+                df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+            else:
+                df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+        except Exception as e:
+            log(f"  PF holdings parse failed: {str(e)[:80]}"); return _EMPTY
+        isin_re = _re.compile(r"^IN[A-Z0-9]{10}$")
+        rows = []
+        for _, row in df.iterrows():
+            cells = [("" if pd.isna(c) else str(c).strip()) for c in row.tolist()]
+            isin = next((c for c in cells if isin_re.match(c)), None)
+            if not isin:
+                continue
+            # name = first cell that looks like a company name (alpha, not the isin)
+            name = next((c for c in cells
+                         if c and c != isin and any(ch.isalpha() for ch in c)
+                         and not isin_re.match(c)), "")
+            rows.append({"isin": isin, "name": name})
+        log(f"  PF holdings: {len(rows)} rows from '{tgt['name']}'")
+        return pd.DataFrame(rows).drop_duplicates("isin")
+    return _EMPTY
+
+
+def _isin_symbol_map(*frames):
+    """isin -> symbol from several tables, skipping blank symbols. screener_grades
+    has empty symbol for some SME names (Z-Tech, Aimtron…); guidance_tracker /
+    master_list fill those, so PF resolves nearly everything. First non-empty wins."""
+    m = {}
+    for df in frames:
+        if df is None or getattr(df, "empty", True):
+            continue
+        if not {"isin", "symbol"} <= set(df.columns):
+            continue
+        for i, s in zip(df["isin"].astype(str), df["symbol"].astype(str)):
+            i, s = i.strip(), s.strip()
+            if i and s and s.lower() != "nan" and i not in m:
+                m[i] = s
+    return m
+
+
 def _bulk_parquet(drive, folder_id, symbols):
     """{symbol: DataFrame} — list folder once, download only needed files."""
     all_files = _list_folder(drive, folder_id)
@@ -516,8 +578,21 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
     annot = annot or {}
     card_html, data = [], {}
     for j, (_, rr) in enumerate(ranked.iterrows()):
-        s = rr["symbol"]
-        nmj = cards.name_by.get(s.upper(), "")
+        s = str(rr.get("symbol", "") or "")
+        pfname = str(rr.get("_pfname", "") or "")          # PF holding name (raw list)
+        c, v, e20, e50 = _ohlc_arrays(omap.get(s, _EMPTY), days) if s else ([], [], [], [])
+
+        # Unresolved / not-in-universe holding -> name-only card, nothing dropped
+        if not s or not c:
+            label = pfname or s or "(unknown)"
+            card_html.append(
+                f'<div class="card"><div class="hd">{j + 1}. <b>{label}</b></div>'
+                f'<div style="font-size:12px;color:#999;padding:8px 2px">'
+                f'No chart/price data — not in the tracked universe '
+                f'(delisted / suspended / non-equity).</div></div>')
+            continue
+
+        nmj = cards.name_by.get(s.upper(), "") or pfname
         meta = "".join(x for x in [
             f'<div class="hd">{j + 1}. <b>{s}</b>'
             + (f' <span class="nm">{nmj}</span>' if nmj else "") + "</div>",
@@ -526,7 +601,6 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
             cards.llm_summary(s),
         ] if x)
-        c, v, e20, e50 = _ohlc_arrays(omap.get(s, _EMPTY), days)
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
         card_html.append(f'<div class="card">{meta}<div class="chart" id="ch{j}"></div></div>')
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
@@ -564,15 +638,14 @@ def _horizon_years(h):
 
 
 def guidance_scores(guid, base_rev, base_pat,
-                    min_base_rev=50.0, min_base_pat=5.0, cap_cagr=150.0):
+                    min_base_rev=0.0, min_base_pat=0.0, cap_cagr=1e9):
     """{SYMBOL: (score_pct, detail_html)} — for each company's LATEST quarter,
     the MAX implied annual growth across revenue & PAT guidance. Absolute targets
     -> CAGR vs current TTM base; growth-rate guidance -> its cagr_pct directly.
 
-    Sanity guards (else micro-caps with ~0 base or mis-parsed targets dominate):
-      • skip a metric whose TTM base is below the floor (CAGR off a tiny base
-        explodes and isn't comparable),
-      • drop implied CAGR <=0 or > cap_cagr (parse noise — >150%/yr ≈ 15x/3y)."""
+    RAW by default (no base floor, no CAGR cap) so the top list is the unfiltered
+    ranking — to be tweaked later. Only the math guard (base>0, target>base)
+    applies. Pass min_base_rev/min_base_pat/cap_cagr to re-impose sanity limits."""
     if guid is None or guid.empty:
         return {}
     g = guid.copy()
@@ -690,16 +763,24 @@ def main():
 
     if args.mode == "pf":
         title, out_default = "💼 Portfolio (PF) charts", "gallery_pf.html"
-        gid = os.environ["GDRIVE_FOLDER_ID"]
-        # LIVE holdings live in pf_tracking/ (sync_pf.bat); portfolio/ is the older
-        # extractor source and can be stale — prefer pf_tracking, fall back.
-        isins = (load_portfolio_isins(drive, gid, folder_name="pf_tracking")
-                 or load_portfolio_isins(drive, gid, folder_name="portfolio") or set())
-        syms = sorted({isin2sym.get(str(i), "") for i in isins} - {""})
-        ranked = pd.DataFrame({"symbol": syms})
-        ranked["_mc"] = ranked["symbol"].map(lambda s: mcap_map.get(s.upper(), 0))
-        ranked = ranked.sort_values("_mc", ascending=False).reset_index(drop=True)
-        log(f"  PF holdings resolved to {len(ranked)} symbols")
+        # robust isin->symbol: grades + guidance_tracker (has SME symbols grades
+        # leaves blank) + master_list — skipping empty symbols.
+        isin2sym = _isin_symbol_map(grades, guidance, uni)
+        # RAW full list — every holding, including ones we can't chart (shown as
+        # a name-only card so nothing is silently dropped). No filtering.
+        hold = _load_pf_holdings(drive)            # DataFrame[isin, name]
+        if hold.empty:                             # last-ditch: ISIN set only
+            isins = (load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"],
+                                          folder_name="pf_tracking") or set())
+            hold = pd.DataFrame({"isin": sorted(isins), "name": ""})
+        hold["symbol"] = hold["isin"].map(lambda i: isin2sym.get(str(i), ""))
+        hold["_mc"] = hold["symbol"].map(lambda s: mcap_map.get(str(s).upper(), 0) if s else 0)
+        resolved = hold[hold["symbol"] != ""].sort_values("_mc", ascending=False)
+        unresolved = hold[hold["symbol"] == ""]
+        ranked = pd.concat([resolved, unresolved], ignore_index=True)
+        ranked = ranked.rename(columns={"name": "_pfname"})
+        log(f"  PF holdings: {len(ranked)} total "
+            f"({len(resolved)} chartable, {len(unresolved)} name-only/not-in-universe)")
 
     elif args.mode == "guidance":
         title, out_default = "📈 Top guidance (implied CAGR)", "gallery_guidance.html"
@@ -723,8 +804,8 @@ def main():
 
     if ranked.empty:
         log("Nothing to render."); return
-    syms = ranked["symbol"].tolist()
-    log(f"  {len(syms)} charts selected (mode={args.mode})")
+    syms = [s for s in ranked["symbol"].tolist() if s]      # skip name-only entries
+    log(f"  {len(ranked)} cards selected (mode={args.mode}); {len(syms)} chartable")
 
     if args.dry_run:
         log("DRY-RUN — top 10: " + ", ".join(syms[:10]))
