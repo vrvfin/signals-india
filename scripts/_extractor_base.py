@@ -240,13 +240,20 @@ class GeminiKeyPool:
         except AllBucketsExhausted as exc:
             raise RateLimitExhausted(str(exc))
 
-    def call(self, pdf_bytes: bytes, prompt: str, display_name: str) -> str:
-        """Generate from inline PDF bytes + prompt (bounded key/model fallback)."""
-        return self._guard(lambda: self._pool.call_pdf(pdf_bytes, prompt))
+    def call(self, pdf_bytes: bytes, prompt: str, display_name: str,
+             max_output_tokens: int | None = None) -> str:
+        """Generate from inline PDF bytes + prompt (bounded key/model fallback).
+        `max_output_tokens` (default None) bounds the response — unchanged when None."""
+        return self._guard(
+            lambda: self._pool.call_pdf(pdf_bytes, prompt,
+                                        max_output_tokens=max_output_tokens))
 
-    def call_text(self, prompt: str, display_name: str) -> str:
+    def call_text(self, prompt: str, display_name: str,
+                  max_output_tokens: int | None = None) -> str:
         """Generate from a text-only prompt (synthesis passes)."""
-        return self._guard(lambda: self._pool.call_text(prompt))
+        return self._guard(
+            lambda: self._pool.call_text(prompt,
+                                         max_output_tokens=max_output_tokens))
 
     def summary(self) -> dict:
         return self._pool.summary()

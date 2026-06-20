@@ -292,8 +292,12 @@ class BucketPool:
             self._log("  STEP A WARNING: every model failed the probe — nothing live!")
         return dropped
 
-    def call_pdf(self, pdf_bytes: bytes, prompt: str) -> tuple[str, str]:
+    def call_pdf(self, pdf_bytes: bytes, prompt: str,
+                 max_output_tokens: int | None = None) -> tuple[str, str]:
         """Run prompt over the PDF. Returns (response_text, model_used).
+
+        `max_output_tokens` (default None) bounds the response — used by the AR
+        extractor to stop the lite model running away; None = unbounded (unchanged).
 
         Raises AllBucketsExhausted (transient -> defer row) or FatalCallError
         (deterministic -> mark row error)."""
@@ -303,12 +307,19 @@ class BucketPool:
                 mime_type="application/pdf", data=b64)),
             genai_types.Part.from_text(text=prompt),
         ]
-        return self._run(parts)
+        return self._run(parts, max_output_tokens=max_output_tokens)
 
-    def call_text(self, prompt: str) -> tuple[str, str]:
-        return self._run([genai_types.Part.from_text(text=prompt)])
+    def call_text(self, prompt: str,
+                  max_output_tokens: int | None = None) -> tuple[str, str]:
+        return self._run([genai_types.Part.from_text(text=prompt)],
+                         max_output_tokens=max_output_tokens)
 
-    def _run(self, parts) -> tuple[str, str]:
+    def _run(self, parts, max_output_tokens: int | None = None) -> tuple[str, str]:
+        # Build the generation config once. Default (None) is byte-identical to before.
+        _cfg_kw = {"temperature": 0.1}
+        if max_output_tokens:
+            _cfg_kw["max_output_tokens"] = int(max_output_tokens)
+        gen_config = genai_types.GenerateContentConfig(**_cfg_kw)
         # Thread-safe call engine. Selection + bookkeeping run under self._lock;
         # the slow generate_content() network call runs OUTSIDE the lock so K
         # workers overlap. RPM hygiene is now per-bucket (last_call_ts) instead of
@@ -361,7 +372,7 @@ class BucketPool:
                 resp = client.models.generate_content(
                     model=b.model,
                     contents=parts,
-                    config=genai_types.GenerateContentConfig(temperature=0.1),
+                    config=gen_config,
                 )
                 text = resp.text
             except Exception as exc:
@@ -484,3 +495,17 @@ def load_keys(env: dict, prefix: str = "GEMINI_API_KEY") -> list[str]:
             if p not in keys:
                 keys.append(p)
     return keys
+
+
+def load_keys_multi(env: dict, prefixes_csv: str) -> list[str]:
+    """Load keys across a comma-separated list of env prefixes, concatenated and
+    de-duped (first occurrence wins, order preserved). A single prefix behaves exactly
+    like load_keys(env, prefix=...). Backfill uses 'FREE_POOL,BACKFILL_GEMINI_KEY' — a
+    missing prefix simply contributes nothing (graceful fallback to whatever IS
+    present). Shared by the concall + AR backfill extractors."""
+    out: list[str] = []
+    for p in (x.strip() for x in str(prefixes_csv).split(",") if x.strip()):
+        for k in load_keys(env, prefix=p):
+            if k not in out:
+                out.append(k)
+    return out
