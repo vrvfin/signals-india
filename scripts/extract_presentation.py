@@ -67,6 +67,10 @@ QFACTS_COLS = [
 # ---- Stage 3: structured tabulation (ADDITIVE — existing outputs unchanged) ----
 STRUCT_PROMPT_FILE = "presentation_structured_prompt.txt"
 STRUCT_INPUT_CHARS = 60000
+# Bound the lite model's report (it rambles non-linearly regardless of input size),
+# else the structured pass is starved. Mirrors AR. ENHANCEMENT: same markdown report +
+# quarterly_facts, just not a runaway blob.
+PPT_MAX_OUTPUT_TOKENS = 4096
 PPT_GUIDANCE_COLS = [
     "isin", "symbol", "company_name", "quarter",
     "metric", "guidance_type", "horizon", "value", "unit", "notes",
@@ -293,7 +297,8 @@ def main() -> None:
             log(f"  PDF: {len(pdf_bytes):,} bytes")
 
             display_name = f"{row.get('symbol', 'DOC')}_{str(row.get('doc_id', ''))[:12]}.pdf"
-            markdown_text = gemini.call(pdf_bytes, prompt, display_name)
+            markdown_text = gemini.call(pdf_bytes, prompt, display_name,
+                                        max_output_tokens=PPT_MAX_OUTPUT_TOKENS)
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
             if args.dry_run:

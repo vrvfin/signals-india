@@ -68,6 +68,10 @@ RATINGS_COLS = [
 # ---- Stage 3: structured tabulation (ADDITIVE — ratings.parquet unchanged) ----
 STRUCT_PROMPT_FILE = "rating_structured_prompt.txt"
 STRUCT_INPUT_CHARS = 60000
+# Bound the lite model's report (it rambles non-linearly — measured ~2M chars even on a
+# 4KB rating doc — which starves the structured pass). Mirrors AR. ENHANCEMENT only:
+# output is still the same markdown report + ratings.parquet, just not a runaway blob.
+RATING_MAX_OUTPUT_TOKENS = 4096
 _RATING_BASE = ["isin", "symbol", "company_name", "agency", "rating_date",
                 "processed_at", "source_doc_id"]
 RATING_DRIVERS_COLS    = _RATING_BASE[:5] + ["driver", "evidence"] + _RATING_BASE[5:]
@@ -341,7 +345,8 @@ def main() -> None:
             log(f"  PDF: {len(pdf_bytes):,} bytes")
 
             display_name = f"{row.get('symbol', 'DOC')}_{str(row.get('doc_id', ''))[:12]}.pdf"
-            markdown_text = gemini.call(pdf_bytes, prompt, display_name)
+            markdown_text = gemini.call(pdf_bytes, prompt, display_name,
+                                        max_output_tokens=RATING_MAX_OUTPUT_TOKENS)
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
             if args.dry_run:
