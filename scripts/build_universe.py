@@ -22,6 +22,7 @@ Run from project root, inside the `signals-india` conda env:
 
 from __future__ import annotations
 
+import argparse
 import io
 import os
 import sys
@@ -150,6 +151,50 @@ def fetch_bse_only_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFr
     return out[cols].reset_index(drop=True)
 
 
+def fetch_nse_emerge_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFrame:
+    """NSE Emerge (SME) rows from company_universe.csv — names that HAVE an NSE
+    symbol but are NOT on the mainboard EQUITY_L (so their ISIN is not in
+    `nse_isins`). Mainboard rows already cover the EQ/BE/BZ list; these are the
+    SME-platform names that would otherwise be dropped (they are not BSE-only —
+    `fetch_bse_only_rows` requires an EMPTY nse_symbol — and they are not on the
+    mainboard list). Priced via <nse_symbol>.NS by ingest_ohlcv.py."""
+    cols = ["symbol", "exchange", "name", "isin", "series", "listing_date",
+            "yf_ticker"]
+    try:
+        repo = get_or_create_subfolder(drive, folder_id, "company_repo")
+        idx = get_or_create_subfolder(drive, repo, "_index")
+        q = (f"name='company_universe.csv' and '{idx}' in parents "
+             f"and trashed=false")
+        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        if not files:
+            log("  company_universe.csv not found — NSE Emerge names skipped.")
+            return pd.DataFrame(columns=cols)
+        raw = drive.files().get_media(fileId=files[0]["id"]).execute()
+        uni = pd.read_csv(io.BytesIO(raw)).fillna("")
+    except Exception as e:
+        log(f"  NSE Emerge fetch failed ({str(e)[:80]}) — skipped.")
+        return pd.DataFrame(columns=cols)
+    nse_sym = uni["nse_symbol"].astype(str).str.strip()
+    isin = uni["isin"].astype(str).str.strip()
+    mask = (~nse_sym.isin(["", "nan"]) & ~isin.isin(nse_isins))
+    eme = uni[mask].copy()
+    if eme.empty:
+        return pd.DataFrame(columns=cols)
+    sym = nse_sym[mask].str.upper()
+    out = pd.DataFrame({
+        "symbol": sym.values,
+        "exchange": "NSE",
+        "name": eme["name"].astype(str).str.strip(),
+        "isin": eme["isin"].astype(str).str.strip(),
+        "series": "SME",
+        "listing_date": "",
+        "yf_ticker": sym.values + ".NS",
+    })
+    out = out[out["symbol"].astype(str).str.len() > 0].drop_duplicates("symbol")
+    log(f"  NSE Emerge appended: {len(out)}")
+    return out[cols].reset_index(drop=True)
+
+
 def get_or_create_subfolder(drive, parent_id: str, name: str) -> str:
     """Find a child folder by name, or create it."""
     q = (f"name='{name}' and '{parent_id}' in parents "
@@ -176,7 +221,13 @@ def upload_csv(drive, df: pd.DataFrame, folder_id: str, filename: str) -> str:
 
 
 def main() -> None:
-    print("Stage 2a — Build universe (NSE + BSE-only)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Build the list but skip Drive uploads; write "
+                             "master_list_dryrun.csv locally and print counts.")
+    args = parser.parse_args()
+
+    print("Stage 2a — Build universe (NSE mainboard + NSE Emerge + BSE-only)")
     print("-" * 50)
     df = fetch_nse_equity_list()
     log(f"NSE symbols ready: {len(df)}")
@@ -185,15 +236,31 @@ def main() -> None:
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
 
     nse_isins = set(df["isin"].astype(str).str.strip())
+    emerge = fetch_nse_emerge_rows(drive, folder_id, nse_isins)
     bse = fetch_bse_only_rows(drive, folder_id, nse_isins)
-    if not bse.empty:
-        df = pd.concat([df, bse], ignore_index=True)
+    extra = [x for x in (emerge, bse) if not x.empty]
+    if extra:
+        df = pd.concat([df, *extra], ignore_index=True)
+    df = df.drop_duplicates("symbol").reset_index(drop=True)
     log(f"Unified universe: {len(df)} "
-        f"(NSE {int((df['exchange'] == 'NSE').sum())} + "
+        f"(NSE {int((df['exchange'] == 'NSE').sum())} "
+        f"[incl. Emerge {len(emerge)}] + "
         f"BSE-only {int((df['exchange'] == 'BSE').sum())})")
     print("\nFirst 3 rows:")
     print(df.head(3).to_string(index=False))
     print()
+
+    if args.dry_run:
+        out_path = Path(__file__).resolve().parent / "master_list_dryrun.csv"
+        df.to_csv(out_path, index=False)
+        log(f"DRY-RUN: wrote {out_path} ({len(df)} rows); no Drive upload.")
+        probe = ["AIMTRON", "ANONDITA", "OBSC", "V-MARC", "VMARC", "Z-TECH", "ZTECH"]
+        hits = df[df["name"].astype(str).str.upper().str.contains("|".join(probe))
+                  | df["symbol"].astype(str).str.upper().str.contains("|".join(probe))]
+        print("\nProbe (target SME names now present):")
+        print(hits[["symbol", "exchange", "name", "yf_ticker"]].to_string(index=False)
+              if not hits.empty else "  (none matched — check company_universe.csv)")
+        return
 
     universe_id = get_or_create_subfolder(drive, folder_id, "universe")
     history_id = get_or_create_subfolder(drive, universe_id, "history")
