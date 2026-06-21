@@ -205,7 +205,8 @@ jobs:
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
         run: >
           python scripts/extract_annual_report.py --all-companies
-          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48 || true
+          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48
+          --deadline-min 60 || true
 
       # ── Stage 3: fetch + extract credit ratings universe-wide (CARE/CRISIL/ICRA).
       # Ratings are small/fast; --target-pending 100 paces fetch to the same-slot
@@ -220,7 +221,8 @@ jobs:
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
         run: >
           python scripts/extract_rating.py --all-companies
-          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48 || true
+          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48
+          --deadline-min 30 || true
 
       - name: T8 — daily AR digest + focus/defocus lists
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
