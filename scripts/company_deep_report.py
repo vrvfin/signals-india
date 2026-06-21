@@ -25,7 +25,7 @@ Env:   GEMINI_API_KEY (comma-separated allowed), GDRIVE_FOLDER_ID, GDRIVE_OAUTH_
 Deps:  google-generativeai pandas pyarrow requests + the Drive stack
 """
 from __future__ import annotations
-import os, io, re, sys, json, argparse, datetime as dt, tempfile, webbrowser
+import os, io, re, sys, json, time, argparse, datetime as dt, tempfile, webbrowser
 
 # Ensure scripts/ is on sys.path whether run as `python scripts/foo.py` (CI/root)
 # or as `python foo.py` (local, already in scripts/)
@@ -36,23 +36,33 @@ if _SCRIPTS_DIR not in sys.path:
 import pandas as pd
 import requests
 
-from daily_research_summary import (drive_service, drive_download, drive_upload, _folder_id)
+from daily_research_summary import (drive_service, drive_download, drive_upload,
+                                    drive_find, _folder_id)
 
 # gemini_pool pulls in google-genai. The queue/resolve paths (used by Streamlit to
 # enqueue a company) do NOT need it — only the actual dive does, which runs in CI.
 # Guard the import so importing this module works in environments without
 # google-genai (e.g. Streamlit Cloud): "cannot import name 'genai' from 'google'".
 try:
-    from gemini_pool import BucketPool, AllBucketsExhausted, FatalCallError, load_keys
+    from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
+                             load_keys, load_keys_multi)
 except Exception:  # google-genai not installed here
     BucketPool = None
     load_keys = None
+    load_keys_multi = None
 
     class AllBucketsExhausted(Exception):
         pass
 
     class FatalCallError(Exception):
         pass
+
+
+class DeadlineReached(Exception):
+    """Raised inside a company's doc-summarisation when the wall-clock deadline is
+    hit, so the run exits cleanly (queue + sidecars flushed) and the company stays
+    pending to resume next run from its cached chunk/doc sidecars."""
+    pass
 
 SCRIPTS_DIR = _SCRIPTS_DIR
 INTER_CALL_SLEEP = 6.0
@@ -862,14 +872,53 @@ def _sidecar_path(isin: str, row) -> str:
     return (f"{DRIVE['company_page']}/{isin}/doc_summaries/"
             f"{row['doc_type']}__{d}__{row['doc_id']}.md")
 
-def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False) -> str | None:
+def _partial_prefix(isin: str, row) -> str:
+    """Drive prefix for this doc's per-chunk resume sidecars."""
+    return f"{DRIVE['company_page']}/{isin}/doc_summaries/_partials/{row['doc_id']}"
+
+def _doc_sidecar_cached(svc, root, isin, row) -> bool:
+    """True if the doc's FULL summary sidecar already exists (so reusing it costs no
+    Gemini calls — used to let cached docs bypass the deadline gate)."""
+    try:
+        return drive_find(svc, _sidecar_path(isin, row), root) is not None
+    except Exception:
+        return False
+
+def _sweep_partials(svc, root, isin, row):
+    """Delete this doc's per-chunk resume partials once its full sidecar exists.
+    Best-effort: lists the _partials folder, removes files named {doc_id}_*. Never raises."""
+    try:
+        folder = f"{DRIVE['company_page']}/{isin}/doc_summaries/_partials"
+        fid = _folder_id(svc, folder, root)
+        if not fid:
+            return
+        doc_id = str(row["doc_id"])
+        res = svc.files().list(q=f"'{fid}' in parents and trashed=false",
+                               fields="files(id,name)", pageSize=200).execute().get("files", [])
+        for f in res:
+            if f["name"].startswith(f"{doc_id}_"):
+                try:
+                    svc.files().delete(fileId=f["id"]).execute()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
+                           partial_cache=None, deadline_ts=None) -> str | None:
     """Summarise a PDF completely. Short docs -> single pass. Long docs -> split
     into CHUNK_PAGES page-range chunks, summarise each, then merge.
 
     prefer_text=True extracts TEXT per chunk and uses call_text (fast, light) —
     right for large text-based documents like DRHP/RHP where uploading PDF chunks
     via call_pdf is slow. Default (False) uses call_pdf for best table fidelity
-    (annual reports)."""
+    (annual reports).
+
+    partial_cache=(svc, root, prefix): persist each page-range partial as a Drive
+    sidecar and REUSE it on a later run, so a killed/deadline-stopped run resumes
+    mid-document instead of restarting it. None = no caching (e.g. drhp_block).
+    deadline_ts: if set and reached before a NOT-yet-cached chunk, raise
+    DeadlineReached so the caller can stop cleanly with progress preserved."""
     import fitz
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     n = src.page_count
@@ -881,11 +930,29 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False) ->
         except FatalCallError as e:
             print(f"      {label}: FATAL ({str(e)[:70]}) — skip"); return None
 
+    svc = root = pfx = None
+    if partial_cache:
+        svc, root, pfx = partial_cache
+
     # In text mode, summarise larger page windows per call (text is cheap).
     step = (CHUNK_PAGES * 2) if prefer_text else CHUNK_PAGES
     partials = []
     for start in range(0, n, step):
         end = min(start + step, n)
+        # Reuse a cached partial if we have one (free, instant resume).
+        cached = None
+        if partial_cache:
+            cb = drive_download(svc, f"{pfx}_{start+1}-{end}.md", root)
+            if cb:
+                cached = cb.decode("utf-8", "ignore")
+        if cached is not None:
+            partials.append(cached)
+            print(f"      {label}: chunk pages {start+1}-{end}/{n} cached")
+            continue
+        # Not cached — this chunk costs Gemini calls, so enforce the deadline here.
+        if deadline_ts and time.monotonic() >= deadline_ts:
+            src.close()
+            raise DeadlineReached(f"{label}: chunk budget exhausted at page {start+1}")
         cprompt = (prompt + f"\n\n>>> This is PAGES {start+1}-{end} of {n} of the "
                    f"{label}. Summarise THIS portion faithfully and completely; "
                    f"other passes cover the remaining pages. Keep ALL figures, "
@@ -906,7 +973,14 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False) ->
                     page_text = "\n".join(src[p].get_text()
                                           for p in range(start, end))[:MAX_DOC_TEXT_CHARS]
                     txt, _ = pool.call_text(cprompt + "\n\n=== TEXT ===\n" + page_text)
-            partials.append(f"--- pages {start+1}-{end} ---\n{txt.strip()}")
+            part = f"--- pages {start+1}-{end} ---\n{txt.strip()}"
+            partials.append(part)
+            if partial_cache:                     # persist so next run resumes here
+                try:
+                    drive_upload(svc, f"{pfx}_{start+1}-{end}.md", root,
+                                 part.encode("utf-8"), "text/markdown")
+                except Exception:
+                    pass
             print(f"      {label}: chunk pages {start+1}-{end}/{n} ok")
         except FatalCallError as e:
             print(f"      {label}: chunk {start+1}-{end} FATAL ({str(e)[:50]}) — skip chunk")
@@ -928,11 +1002,13 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False) ->
         # merge failed — return the concatenated partials rather than nothing
         return "\n\n".join(partials)[:MAX_DOC_TEXT_CHARS]
 
-def summarise_doc(svc, root, pool, isin, row) -> str | None:
+def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
     """Return a per-doc summary. Reuse cached sidecar if present, else fetch the
     raw file (PDF or extracted-HTML text) and run its doc-type prompt. Caches the
-    result as a sidecar so future dives reuse it for free. AllBucketsExhausted
-    propagates (caller stops); FatalCallError on one doc -> skip that doc."""
+    result as a sidecar so future dives reuse it for free. Long PDFs additionally
+    cache per-chunk partials so a killed/deadline-stopped run resumes mid-document.
+    AllBucketsExhausted / DeadlineReached propagate (caller stops); FatalCallError
+    on one doc -> skip that doc."""
     sidecar = _sidecar_path(isin, row)
     cached = drive_download(svc, sidecar, root)
     if cached:
@@ -948,10 +1024,14 @@ def summarise_doc(svc, root, pool, isin, row) -> str | None:
     doc_type = str(row["doc_type"])
     prompt = _load_doc_prompt(doc_type)
     label = f"{doc_type} {str(row['announcement_date'])[:10]}"
+    pfx = _partial_prefix(isin, row)
     is_pdf = data[:5].startswith(b"%PDF")
     if is_pdf:
-        # complete-read with page-range chunking for long reports
-        summ = _summarise_pdf_chunked(pool, prompt, data, label)
+        # complete-read with page-range chunking for long reports; partials cached
+        # on Drive so a stopped run resumes here rather than restarting the doc.
+        summ = _summarise_pdf_chunked(pool, prompt, data, label,
+                                      partial_cache=(svc, root, pfx),
+                                      deadline_ts=deadline_ts)
         if not summ:
             return None
     else:
@@ -968,14 +1048,23 @@ def summarise_doc(svc, root, pool, isin, row) -> str | None:
 
     try:
         drive_upload(svc, sidecar, root, summ.encode("utf-8"), "text/markdown")
+        # Full summary persisted -> the per-chunk partials are now redundant; sweep
+        # them to respect Drive space (best-effort, never fatal).
+        if is_pdf:
+            _sweep_partials(svc, root, isin, row)
     except Exception:
         pass
     return summ
 
-def assemble_doc_summaries(svc, root, pool, isin) -> tuple[str, list[dict]]:
+def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str, list[dict]]:
     """Summarise every actual document for this ISIN (reuse-or-generate) and
     return (combined_block, used_docs). Docs already folded into company_page.md
-    (status=done) are skipped — the COMPANY_PAGE_BRIEF already carries them."""
+    (status=done) are skipped — the COMPANY_PAGE_BRIEF already carries them.
+
+    Cached doc/chunk sidecars are always reused (cheap); only docs needing a FRESH
+    Gemini summary are gated by deadline_ts. If the wall-clock budget is hit before a
+    not-yet-cached doc, raise DeadlineReached so the run exits cleanly and resumes
+    next time from the sidecars written so far."""
     q = _read_parquet(svc, DRIVE["proc_queue"], root)
     if q.empty or "isin" not in q.columns:
         return "DATA_MISSING (no document index).", []
@@ -988,7 +1077,12 @@ def assemble_doc_summaries(svc, root, pool, isin) -> tuple[str, list[dict]]:
     for _, r in rows.sort_values("announcement_date").iterrows():
         if str(r.get("status")) == "done":
             continue                       # already in COMPANY_PAGE_BRIEF
-        summ = summarise_doc(svc, root, pool, isin, r)
+        # Reuse-or-generate. A cached summary returns instantly; a fresh one costs
+        # Gemini calls, so only THEN enforce the deadline (let cached docs through).
+        if deadline_ts and time.monotonic() >= deadline_ts \
+                and not _doc_sidecar_cached(svc, root, isin, r):
+            raise DeadlineReached(f"{isin}: doc budget exhausted")
+        summ = summarise_doc(svc, root, pool, isin, r, deadline_ts=deadline_ts)
         if not summ:
             continue
         d = str(r["announcement_date"])[:10]
@@ -1240,7 +1334,7 @@ def _clean_report_md(md: str) -> str:
 
 # --------------------------------------------------------------------------
 def process_one(svc, root, pool, universe, fund, results, ridx, token,
-                interactive=False, do_backfill=DO_BACKFILL):
+                interactive=False, do_backfill=DO_BACKFILL, deadline_ts=None):
     isin, symbol, name, bse_code = resolve_isin(token, universe, interactive=interactive)
     print(f"  deep dive: {token} -> {name} ({symbol} / {isin})")
 
@@ -1263,7 +1357,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
 
     # Phase 2 — summarise every actual document (reuse cached sidecar, else
     # run the doc-type prompt) into a provenance-tagged block.
-    doc_block, used_docs = assemble_doc_summaries(svc, root, pool, isin)
+    doc_block, used_docs = assemble_doc_summaries(svc, root, pool, isin,
+                                                  deadline_ts=deadline_ts)
     print(f"    documents: {len(used_docs)} summarised/reused")
 
     # Phase 3 nightly tables — pre-computed scorecard/fraud/credibility/guidance
@@ -1450,6 +1545,15 @@ def main():
                     help="resolve and print company name then exit (used by bat for confirmation)")
     ap.add_argument("--no-backfill", action="store_true",
                     help="skip pulling full Screener document history before the dive")
+    ap.add_argument("--key-prefix",
+                    default=os.environ.get("DEEPDIVE_KEY_PREFIX",
+                                           "FREE_POOL,BACKFILL_GEMINI_KEY,GEMINI_API_KEY"),
+                    help="comma-separated env prefixes for the Gemini pool, in priority "
+                         "order (default FREE_POOL,BACKFILL_GEMINI_KEY,GEMINI_API_KEY)")
+    ap.add_argument("--deadline-min", type=float,
+                    default=float(os.environ.get("DEEPDIVE_DEADLINE_MIN", "0") or 0),
+                    help="wall-clock budget; stop starting new docs/companies past it so "
+                         "the queue + sidecars flush cleanly (0 = no cap). Resumes next run.")
     args = ap.parse_args()
 
     from dotenv import load_dotenv
@@ -1479,13 +1583,19 @@ def main():
         print("ERROR: google-genai not installed — cannot run the deep dive here. "
               "Install it (pip install google-genai) or run via CI/local with deps.")
         sys.exit(1)
-    api_keys = load_keys(os.environ)
+    # Default to the big FREE_POOL+BACKFILL quota (separate Cloud projects, lightly
+    # used outside the nightly window) and fall back to the Phase-2 GEMINI_API_KEY
+    # pool — dedup keeps order, so a key shared across prefixes is counted once.
+    _load = load_keys_multi or (lambda env, pfx: load_keys(env, prefix=pfx.split(",")[0]))
+    api_keys = _load(os.environ, args.key_prefix)
     if not api_keys:
-        print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
+        print(f"ERROR: no Gemini keys found for prefixes '{args.key_prefix}' in .env")
         sys.exit(1)
     pool = BucketPool(api_keys, DEEPDIVE_MODELS, inter_call_s=INTER_CALL_SLEEP)
     print(f"Pool: {len(api_keys)} key(s) × {len(DEEPDIVE_MODELS)} model(s) "
-          f"= {len(api_keys) * len(DEEPDIVE_MODELS)} daily buckets")
+          f"= {len(api_keys) * len(DEEPDIVE_MODELS)} daily buckets "
+          f"[{args.key_prefix}]")
+    deadline_ts = (time.monotonic() + args.deadline_min * 60) if args.deadline_min > 0 else None
 
     universe = _load_universe(svc, root)
     fund     = _read_parquet(svc, DRIVE["fundamentals"], root)
@@ -1496,13 +1606,18 @@ def main():
         tokens = [t.strip() for t in args.names.split(",") if t.strip()]
         recs = []
         for t in tokens:
+            if deadline_ts and time.monotonic() >= deadline_ts:
+                print("  Deadline reached — stopping (remaining tokens not processed)."); break
             try:
                 recs.append(process_one(svc, root, pool, universe, fund, results, ridx, t,
                                         interactive=args.interactive,
-                                        do_backfill=not args.no_backfill))
+                                        do_backfill=not args.no_backfill,
+                                        deadline_ts=deadline_ts))
             except AllBucketsExhausted as exc:
                 print(f"  All Gemini buckets exhausted — stopping. ({exc})")
                 break
+            except DeadlineReached:
+                print(f"  Deadline reached mid-'{t}' — will resume from cache next run."); break
             except FatalCallError as exc:
                 print(f"  Fatal error for '{t}' (bad prompt/auth) — skipping. ({exc})")
         if recs:
@@ -1522,16 +1637,24 @@ def main():
 
     recs = []
     for i in pending.index:
+        if deadline_ts and time.monotonic() >= deadline_ts:
+            print("  Deadline reached — leaving remaining companies pending for next run.")
+            break
         try:
             rec = process_one(svc, root, pool, universe, fund, results, ridx,
                               queue.at[i, "token"], interactive=args.interactive,
-                              do_backfill=not args.no_backfill)
+                              do_backfill=not args.no_backfill, deadline_ts=deadline_ts)
             recs.append(rec)
             queue.at[i, "status"] = "done"
             queue.at[i, "done_at"] = dt.datetime.now().isoformat()
         except AllBucketsExhausted as exc:
             # Quota exhausted — leave remaining rows pending for next run
             print(f"  All Gemini buckets exhausted — stopping queue drain. ({exc})")
+            break
+        except DeadlineReached:
+            # Hit the wall mid-company — leave THIS row pending (cached chunks/docs
+            # let next run resume cheaply) and stop the drain cleanly.
+            print(f"  Deadline reached mid-'{queue.at[i,'token']}' — pending; resumes next run.")
             break
         except FatalCallError as exc:
             print(f"  FATAL (this company): {str(exc)[:120]}")
