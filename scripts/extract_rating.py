@@ -21,6 +21,7 @@ import atexit
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -284,6 +285,10 @@ def main() -> None:
     parser.add_argument("--max-age-hours", type=float, default=None,
                         help="Only rows discovered within N hours (guards quota on "
                              "stale legacy rows).")
+    parser.add_argument("--deadline-min", type=float, default=None,
+                        help="Wall-clock cap (min): exit cleanly after this so the "
+                             "shared _extract.lock is released before the CI job "
+                             "timeout (prevents a killed step leaving a stale lock).")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -367,8 +372,13 @@ def main() -> None:
         pending_idx = pending_idx[: args.limit]
 
     counts = {"processed": 0, "error": 0, "skipped": 0}
+    _t0 = time.time()
 
     for queue_idx in pending_idx:
+        # Wall-clock cap: release the lock before the CI job timeout (no stale lock).
+        if args.deadline_min and (time.time() - _t0) / 60.0 >= args.deadline_min:
+            log(f"  Deadline {args.deadline_min:.0f} min reached — exiting cleanly.")
+            break
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
         log(f"Processing: {label}")

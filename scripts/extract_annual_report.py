@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -517,6 +518,11 @@ def main() -> None:
     parser.add_argument("--max-age-hours", type=float, default=None,
                         help="T8: only rows discovered within N hours (guards "
                              "against draining quota on stale legacy rows).")
+    parser.add_argument("--deadline-min", type=float, default=None,
+                        help="Wall-clock cap (min): stop starting new docs after this "
+                             "and exit cleanly so the shared _extract.lock is released "
+                             "well before the CI job timeout (prevents a killed step "
+                             "from leaving a stale lock that starves backfill for hours).")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -617,8 +623,16 @@ def main() -> None:
     # (isin, FY) replaces the stored one, a shorter/equal one is a true dup (skip).
     _ar_facts_cache = load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
     _seen_fy_keys: set = set()
+    _t0 = time.time()
 
     for queue_idx in pending_idx:
+        # Wall-clock cap: release the lock cleanly before the CI job timeout so a
+        # killed step never leaves a stale _extract.lock (root cause of multi-hour
+        # backfill starvation).
+        if args.deadline_min and (time.time() - _t0) / 60.0 >= args.deadline_min:
+            log(f"  Deadline {args.deadline_min:.0f} min reached — exiting cleanly "
+                f"(lock released; remaining rows stay pending).")
+            break
         # Priority yield: a backfill run steps aside the moment Phase 2 wants the
         # lock — finishes the current doc loop iteration boundary and exits cleanly.
         if _is_backfill and not args.dry_run and phase2_beacon_fresh(drive, index_id):
