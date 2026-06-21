@@ -27,6 +27,9 @@ jobs:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+      # Stop starting new docs/companies ~15 min before the 120-min wall so the
+      # queue + sidecars flush cleanly (no SIGKILL); remaining work resumes next run.
+      DEEPDIVE_DEADLINE_MIN: "105"
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +43,16 @@ jobs:
           GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
           GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          FREE_POOL:               ${{ secrets.FREE_POOL }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
+          BACKFILL_GEMINI_KEY_1:   ${{ secrets.BACKFILL_GEMINI_KEY_1 }}
+          BACKFILL_GEMINI_KEY_2:   ${{ secrets.BACKFILL_GEMINI_KEY_2 }}
+          BACKFILL_GEMINI_KEY_3:   ${{ secrets.BACKFILL_GEMINI_KEY_3 }}
+          BACKFILL_GEMINI_KEY_4:   ${{ secrets.BACKFILL_GEMINI_KEY_4 }}
+          BACKFILL_GEMINI_KEY_5:   ${{ secrets.BACKFILL_GEMINI_KEY_5 }}
+          BACKFILL_GEMINI_KEY_6:   ${{ secrets.BACKFILL_GEMINI_KEY_6 }}
+          BACKFILL_GEMINI_KEY_7:   ${{ secrets.BACKFILL_GEMINI_KEY_7 }}
+          BACKFILL_GEMINI_KEY_8:   ${{ secrets.BACKFILL_GEMINI_KEY_8 }}
           GMAIL_USER:              ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
@@ -53,6 +66,20 @@ jobs:
             echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
             echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+            # Deep dive runs on the big FREE_POOL+BACKFILL quota (separate Cloud
+            # projects, lightly used outside the nightly window). Secret may be a
+            # multi-line blob — flatten to one comma-joined line so dotenv keeps
+            # every key. GEMINI_API_KEY stays as the last-resort fallback prefix.
+            echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
+            echo "BACKFILL_GEMINI_KEY_1=$BACKFILL_GEMINI_KEY_1"
+            echo "BACKFILL_GEMINI_KEY_2=$BACKFILL_GEMINI_KEY_2"
+            echo "BACKFILL_GEMINI_KEY_3=$BACKFILL_GEMINI_KEY_3"
+            echo "BACKFILL_GEMINI_KEY_4=$BACKFILL_GEMINI_KEY_4"
+            echo "BACKFILL_GEMINI_KEY_5=$BACKFILL_GEMINI_KEY_5"
+            echo "BACKFILL_GEMINI_KEY_6=$BACKFILL_GEMINI_KEY_6"
+            echo "BACKFILL_GEMINI_KEY_7=$BACKFILL_GEMINI_KEY_7"
+            echo "BACKFILL_GEMINI_KEY_8=$BACKFILL_GEMINI_KEY_8"
             echo "GMAIL_USER=$GMAIL_USER"
             echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
             echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
