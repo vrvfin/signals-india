@@ -369,6 +369,10 @@ def main() -> None:
             save_queue(drive, index_id, queue)
             counts["error"] += 1
 
+    if not args.dry_run:
+        from _extractor_base import persist_gemini_usage
+        persist_gemini_usage(drive, index_id, gemini.summary(), DOC_TYPE,
+                             "backfill" if getattr(args, "all_companies", False) else "phase2")
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
     print(f"Errors    : {counts['error']}")
