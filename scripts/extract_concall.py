@@ -1957,6 +1957,10 @@ def main() -> None:
         write_csv_exports(drive, index_id)
 
     pool = gemini.summary()
+    if not args.dry_run:
+        from _extractor_base import persist_gemini_usage
+        persist_gemini_usage(drive, index_id, pool, "concall",
+                             "backfill" if args.backfill else "phase2")
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
     print(f"Deferred  : {counts.get('deferred', 0)}  (still pending — quota/transient)")

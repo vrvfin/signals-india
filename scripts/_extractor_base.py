@@ -22,7 +22,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -286,6 +286,41 @@ def run_structured_over_doc(gemini, struct_prompt: str, doc_bytes: bytes, *,
                             max_output_tokens=max_output_tokens)
 
 
+GEMINI_USAGE_COLS = ["ts", "doc_type", "source", "key_idx", "model",
+                     "ok", "fail", "rpm_cool", "overload_503", "state"]
+
+
+def persist_gemini_usage(drive, index_id: str, summary: dict, doc_type: str,
+                         source: str, keep_days: int = 30) -> None:
+    """Append the pool's per-(key, model) attribution from BucketPool.summary() to
+    gemini_usage.parquet, so ops-mail can show exactly which keys/models summarised
+    how many docs and why others stopped (rpm_cool = PerMinute, overload_503, or
+    state=dead_today = PerDay). Best-effort; never raise (logging must not break a run)."""
+    try:
+        rows = (summary or {}).get("buckets") or []
+        ts = datetime.now().isoformat(timespec="seconds")
+        recs = [{"ts": ts, "doc_type": doc_type, "source": source,
+                 "key_idx": r.get("key_idx"), "model": r.get("model"),
+                 "ok": int(r.get("ok", 0)), "fail": int(r.get("fail", 0)),
+                 "rpm_cool": int(r.get("rpm_cool", 0)),
+                 "overload_503": int(r.get("overload_503", 0)),
+                 "state": str(r.get("state", ""))}
+                for r in rows]
+        # keep only buckets that did something this run (lean table)
+        recs = [r for r in recs if r["ok"] or r["fail"] or r["rpm_cool"] or r["overload_503"]]
+        if not recs:
+            return
+        df = load_parquet(drive, index_id, "gemini_usage.parquet", GEMINI_USAGE_COLS)
+        df = pd.concat([df, pd.DataFrame(recs)], ignore_index=True)
+        cut = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        df = df[df["ts"].astype(str) >= cut].reset_index(drop=True)
+        save_parquet(drive, index_id, "gemini_usage.parquet", df)
+        log(f"  gemini_usage: logged {len(recs)} bucket rows "
+            f"(ok={sum(r['ok'] for r in recs)}).")
+    except Exception as e:
+        log(f"  WARNING: gemini_usage logging failed ({str(e)[:80]}).")
+
+
 def salvage_json_objects(text: str) -> list[dict]:
     """Parse every FLAT {...} object in the text individually — robust to a truncated
     or repetition-looped response (complete objects recovered, trailing partial one
@@ -309,7 +344,11 @@ def salvage_json_objects(text: str) -> list[dict]:
 # P1 doc-types (results / rating / presentation / annual_report) are PF-only and
 # low-volume. They run on LITE models, kept disjoint from concall's quality chain
 # so P1 can never consume concall's premium (key, model) buckets.
-P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite"]
+# gemini-2.0-flash ADDED (additive) — a separate per-(project,model) daily-quota
+# bucket that is reliably up (the catalyst pool uses it), so the pool has more total
+# free-tier quota to draw on. Nothing removed; the startup probe drops any that flap.
+# The new gemini_usage.parquet log shows which models actually contribute.
+P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.0-flash"]
 
 
 class RateLimitExhausted(Exception):

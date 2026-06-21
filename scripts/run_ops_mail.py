@@ -510,6 +510,69 @@ def structured_signals_html(drive, root) -> str:
     return tbl + cat_html
 
 
+# ---------------- section 2f: Gemini key x model usage (24h) ----------------
+
+def gemini_usage_html(drive, root) -> str:
+    """Per-(key, model) attribution over the last 24h from gemini_usage.parquet:
+    how many summaries each bucket produced and WHY others stopped — rpm_cool =
+    PerMinute (the known RPM cap), overload_503 = model 503s, state dead_today =
+    PerDay quota. This is the empirical read on the throughput bottleneck."""
+    df = _read(drive, root, ["company_repo", "_index", "gemini_usage.parquet"])
+    if df is None or df.empty:
+        return ("<p><i>gemini_usage.parquet not present yet — fills after the next "
+                "extract run (concall/AR/rating/presentation).</i></p>")
+    df = df.copy()
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    day = df[df["ts"] >= (datetime.now() - timedelta(hours=24))]
+    if day.empty:
+        return "<p><i>No extract activity logged in the last 24h.</i></p>"
+    for c in ("ok", "fail", "rpm_cool", "overload_503"):
+        day[c] = pd.to_numeric(day[c], errors="coerce").fillna(0).astype(int)
+
+    tot_ok = int(day["ok"].sum())
+    tot_rpm = int(day["rpm_cool"].sum())
+    tot_503 = int(day["overload_503"].sum())
+    perday = day[day["state"].astype(str) == "dead_today"]
+    n_perday = perday[["key_idx", "model"]].drop_duplicates().shape[0]
+    n_keys = day["key_idx"].nunique()
+    n_models = day["model"].nunique()
+
+    head = (f"<p><b>🔑 {tot_ok:,} summaries in 24h</b> across {n_keys} keys × {n_models} "
+            f"models · RPM-cooldowns={tot_rpm:,} · 503s={tot_503:,} · "
+            f"PerDay-dead buckets={n_perday}. "
+            f"<i>(RPM &gt;&gt; PerDay ⇒ rate-limit, not daily quota.)</i></p>")
+
+    # per-model rollup
+    pm = (day.groupby("model")
+             .agg(summaries=("ok", "sum"), rpm=("rpm_cool", "sum"),
+                  s503=("overload_503", "sum"), keys=("key_idx", "nunique"))
+             .reset_index().sort_values("summaries", ascending=False))
+    mrows = "".join(
+        f"<tr><td>{_esc(r['model'],26)}</td><td align=right>{int(r['summaries']):,}</td>"
+        f"<td align=right>{int(r['keys'])}</td><td align=right>{int(r['rpm']):,}</td>"
+        f"<td align=right>{int(r['s503']):,}</td></tr>" for _, r in pm.iterrows())
+    mtbl = ("<p style='margin:6px 0 2px'><b>by model:</b></p>"
+            "<table border=1 cellpadding=4 cellspacing=0><tr><th>model</th>"
+            "<th>summaries</th><th>keys</th><th>RPM-cool</th><th>503</th></tr>"
+            + mrows + "</table>")
+
+    # per-key rollup (top 15 by summaries)
+    pk = (day.groupby("key_idx")
+             .agg(summaries=("ok", "sum"), rpm=("rpm_cool", "sum"),
+                  s503=("overload_503", "sum"),
+                  models=("model", "nunique"))
+             .reset_index().sort_values("summaries", ascending=False).head(15))
+    krows = "".join(
+        f"<tr><td>key{int(r['key_idx'])}</td><td align=right>{int(r['summaries']):,}</td>"
+        f"<td align=right>{int(r['models'])}</td><td align=right>{int(r['rpm']):,}</td>"
+        f"<td align=right>{int(r['s503']):,}</td></tr>" for _, r in pk.iterrows())
+    ktbl = ("<p style='margin:6px 0 2px'><b>by key (top 15):</b></p>"
+            "<table border=1 cellpadding=4 cellspacing=0><tr><th>key</th>"
+            "<th>summaries</th><th>models</th><th>RPM-cool</th><th>503</th></tr>"
+            + krows + "</table>")
+    return head + mtbl + ktbl
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -528,6 +591,7 @@ def main() -> None:
     body = (f"<h3>Workflow runs (last 26h)</h3>{wf_html}"
             f"<h3>Document processing</h3>{docs_html}"
             f"<h3>Structured signals (tabulation)</h3>{structured_signals_html(drive, root)}"
+            f"<h3>Gemini key×model usage (24h)</h3>{gemini_usage_html(drive, root)}"
             f"<h3>Stock coverage</h3>{cov_html}"
             f"<h3>Market-cap freshness</h3>{mcap_html}"
             f"<h3>Data freshness</h3>{fresh_html}"

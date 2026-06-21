@@ -460,6 +460,15 @@ class BucketPool:
             "buckets_parked": states.get(DEAD_RUN, 0),
             "buckets_alive": states.get(ALIVE, 0),
             "elapsed_s": round(time.time() - self._started, 1),
+            # Per-(key, model) attribution so we can SEE who summarised what and why a
+            # bucket stopped: state dead_today = PerDay-quota; rpm_cool = PerMinute
+            # cooldowns (the known RPM cap); overload_503 = model 503s.
+            "buckets": [
+                {"key_idx": b.key_idx, "model": b.model, "ok": b.ok, "fail": b.fail,
+                 "rpm_cool": b.cool_used, "overload_503": b.overload_used,
+                 "state": b.state}
+                for b in self.buckets
+            ],
         }
 
 
