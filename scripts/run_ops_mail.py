@@ -41,6 +41,9 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, log)
 from mailer import send_email, load_mail_settings
 
+# Timestamps are stored in UTC (CI runners); the ops mail reports in IST for the reader.
+_IST = timedelta(hours=5, minutes=30)
+
 # (label, path_parts, timestamp column candidates)
 FRESHNESS = [
     ("results (Screener scrape)",  ["company_repo", "_index", "results.parquet"],            ["scraped_at"]),
@@ -413,19 +416,19 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
             q[c] = ""
     pc = _read(drive, root, ["company_repo", "_index", "backfill_pagecheck.parquet"])
 
-    # processed_at is written by extractors via datetime.now() on CI = UTC. Use UTC here
-    # so the 24h window is not skewed ~5.5h vs the IST machine clock.
-    now = pd.Timestamp(datetime.utcnow())
+    # processed_at is stored in UTC (extractors run on UTC CI). Convert to IST for the
+    # report (user reads in IST); the 24h count is identical, just IST-framed.
+    now = pd.Timestamp(datetime.utcnow()) + _IST
     cutoff = now - pd.Timedelta(hours=24)
     st_all = q["status"].astype(str)
-    proc_all = pd.to_datetime(q["processed_at"], errors="coerce")
+    proc_all = pd.to_datetime(q["processed_at"], errors="coerce") + _IST
     done24_total = int(((st_all == "done") & (proc_all >= cutoff)).sum())
     err24_total = int(((st_all == "error") & (proc_all >= cutoff)).sum())
 
     rows = []
     for dt, g in q.groupby(q["doc_type"].astype(str)):
         st = g["status"].astype(str)
-        pr = pd.to_datetime(g["processed_at"], errors="coerce")
+        pr = pd.to_datetime(g["processed_at"], errors="coerce") + _IST   # UTC->IST
         done = int((st == "done").sum())
         done24 = int(((st == "done") & (pr >= cutoff)).sum())
         pend = int((st == "pending").sum())
@@ -450,7 +453,7 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
     total_done = int((st_all == "done").sum())
     head = (f"<p><b>📄 {done24_total:,} docs summarised in the last 24h</b> "
             f"(+{err24_total:,} errored) · {total_done:,} done all-time "
-            f"(one global queue; 24h window in UTC).</p>")
+            f"(one global queue; last 24h, IST).</p>")
     table = ("<table border=1 cellpadding=4 cellspacing=0>"
              "<tr><th>doc_type</th><th>done</th><th>+24h</th><th>pending</th>"
              "<th>error</th><th>expired</th><th>page-checked cos</th></tr>"
@@ -526,8 +529,8 @@ def gemini_usage_html(drive, root) -> str:
         return ("<p><i>gemini_usage.parquet not present yet — fills after the next "
                 "extract run (concall/AR/rating/presentation).</i></p>")
     df = df.copy()
-    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-    day = df[df["ts"] >= (datetime.utcnow() - timedelta(hours=24))]   # CI ts are UTC
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce") + _IST   # UTC->IST for report
+    day = df[df["ts"] >= (pd.Timestamp(datetime.utcnow()) + _IST - timedelta(hours=24))]
     if day.empty:
         return "<p><i>No extract activity logged in the last 24h.</i></p>"
     for c in ("ok", "fail", "rpm_cool", "overload_503"):
