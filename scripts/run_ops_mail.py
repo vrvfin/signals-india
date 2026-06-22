@@ -413,11 +413,14 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
             q[c] = ""
     pc = _read(drive, root, ["company_repo", "_index", "backfill_pagecheck.parquet"])
 
-    now = pd.Timestamp(datetime.now())
+    # processed_at is written by extractors via datetime.now() on CI = UTC. Use UTC here
+    # so the 24h window is not skewed ~5.5h vs the IST machine clock.
+    now = pd.Timestamp(datetime.utcnow())
     cutoff = now - pd.Timedelta(hours=24)
     st_all = q["status"].astype(str)
     proc_all = pd.to_datetime(q["processed_at"], errors="coerce")
     done24_total = int(((st_all == "done") & (proc_all >= cutoff)).sum())
+    err24_total = int(((st_all == "error") & (proc_all >= cutoff)).sum())
 
     rows = []
     for dt, g in q.groupby(q["doc_type"].astype(str)):
@@ -445,8 +448,9 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
         f"<td align=right>{pcn:,}</td></tr>"
         for dt, done, done24, pend, err, exp, pcn in rows)
     total_done = int((st_all == "done").sum())
-    head = (f"<p><b>📄 {done24_total:,} docs summarised in the last 24h</b> · "
-            f"{total_done:,} done all-time (one global queue).</p>")
+    head = (f"<p><b>📄 {done24_total:,} docs summarised in the last 24h</b> "
+            f"(+{err24_total:,} errored) · {total_done:,} done all-time "
+            f"(one global queue; 24h window in UTC).</p>")
     table = ("<table border=1 cellpadding=4 cellspacing=0>"
              "<tr><th>doc_type</th><th>done</th><th>+24h</th><th>pending</th>"
              "<th>error</th><th>expired</th><th>page-checked cos</th></tr>"
@@ -523,7 +527,7 @@ def gemini_usage_html(drive, root) -> str:
                 "extract run (concall/AR/rating/presentation).</i></p>")
     df = df.copy()
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-    day = df[df["ts"] >= (datetime.now() - timedelta(hours=24))]
+    day = df[df["ts"] >= (datetime.utcnow() - timedelta(hours=24))]   # CI ts are UTC
     if day.empty:
         return "<p><i>No extract activity logged in the last 24h.</i></p>"
     for c in ("ok", "fail", "rpm_cool", "overload_503"):
@@ -537,10 +541,16 @@ def gemini_usage_html(drive, root) -> str:
     n_keys = day["key_idx"].nunique()
     n_models = day["model"].nunique()
 
-    head = (f"<p><b>🔑 {tot_ok:,} summaries in 24h</b> across {n_keys} keys × {n_models} "
+    # Data-driven verdict (was a hardcoded "RPM>>PerDay" claim — wrong when comparable).
+    if tot_rpm >= 2 * max(n_perday, 1):
+        verdict = "rate-limit (RPM/min) dominated"
+    elif n_perday >= 2 * max(tot_rpm, 1):
+        verdict = "daily-quota (PerDay) dominated → add projects"
+    else:
+        verdict = "BOTH RPM + daily-quota limited"
+    head = (f"<p><b>🔑 {tot_ok:,} Gemini calls in 24h</b> across {n_keys} keys × {n_models} "
             f"models · RPM-cooldowns={tot_rpm:,} · 503s={tot_503:,} · "
-            f"PerDay-dead buckets={n_perday}. "
-            f"<i>(RPM &gt;&gt; PerDay ⇒ rate-limit, not daily quota.)</i></p>")
+            f"PerDay-dead buckets={n_perday}. <i>({verdict}.)</i></p>")
 
     # per-model rollup
     pm = (day.groupby("model")
