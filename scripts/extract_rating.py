@@ -40,6 +40,7 @@ from _extractor_base import (
     load_portfolio_isins,
     acquire_lock, release_lock,
     salvage_json_objects, clamp, sstr, upsert_structured,   # Stage 3 tabulation
+    call_over_doc,                                          # detect PDF vs HTML/text
     run_structured_over_doc,                                # Stage 3b: extract from source
 )
 
@@ -397,8 +398,10 @@ def main() -> None:
             log(f"  PDF: {len(pdf_bytes):,} bytes")
 
             display_name = f"{row.get('symbol', 'DOC')}_{str(row.get('doc_id', ''))[:12]}.pdf"
-            markdown_text = gemini.call(pdf_bytes, prompt, display_name,
-                                        max_output_tokens=RATING_MAX_OUTPUT_TOKENS)
+            # Detect PDF vs HTML/text: CRISIL/SMERA/Brickwork rationales arrive as text;
+            # sending them as application/pdf was fatal-erroring ~36% of ratings.
+            markdown_text = call_over_doc(gemini, prompt, pdf_bytes, name=display_name,
+                                          max_output_tokens=RATING_MAX_OUTPUT_TOKENS)
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
             if args.dry_run:

@@ -268,22 +268,30 @@ def upsert_structured(drive, index_id: str, filename: str, cols: list,
     save_parquet(drive, index_id, filename, df)
 
 
+def call_over_doc(gemini, prompt: str, doc_bytes: bytes, *,
+                  max_output_tokens: int | None = None, max_text_chars: int = 120000,
+                  name: str = "doc") -> str:
+    """Call Gemini with `prompt` over a source document, AUTO-DETECTING bytes:
+    `%PDF…` → call_pdf (inline PDF); otherwise → call_text(prompt + decoded text).
+    This stops HTML rationales (CRISIL/SMERA/Brickwork) being sent as application/pdf
+    (a fatal error that marks the doc 'error'). Empty string when no doc/prompt."""
+    if not prompt or not doc_bytes:
+        return ""
+    if doc_bytes[:5].startswith(b"%PDF"):
+        return gemini.call(doc_bytes, prompt, name, max_output_tokens=max_output_tokens)
+    text = doc_bytes.decode("utf-8", "replace")[:max_text_chars]
+    return gemini.call_text(prompt + "\n\nDOCUMENT:\n" + text, name,
+                            max_output_tokens=max_output_tokens)
+
+
 def run_structured_over_doc(gemini, struct_prompt: str, doc_bytes: bytes, *,
                             max_output_tokens: int = 4096, max_text_chars: int = 60000,
                             name: str = "struct") -> str:
-    """Run a JSON-only structured prompt DIRECTLY over the source document and return
-    the raw response. For small/clean docs (e.g. a rating rationale) this avoids the
-    lite model's rambling intermediate 'report' that starves the structured pass —
-    feed the source straight to the focused JSON prompt. Detects PDF vs text bytes.
-    Empty string when disabled/empty (caller treats as no rows)."""
-    if not struct_prompt or not doc_bytes:
-        return ""
-    if doc_bytes[:5].startswith(b"%PDF"):
-        return gemini.call(doc_bytes, struct_prompt, name,
-                           max_output_tokens=max_output_tokens)
-    text = doc_bytes.decode("utf-8", "replace")[:max_text_chars]
-    return gemini.call_text(struct_prompt + "\n\nDOCUMENT:\n" + text, name,
-                            max_output_tokens=max_output_tokens)
+    """Structured JSON-only pass over the source doc (back-compat wrapper over
+    call_over_doc) — feeds the source straight to the focused JSON prompt."""
+    return call_over_doc(gemini, struct_prompt, doc_bytes,
+                         max_output_tokens=max_output_tokens,
+                         max_text_chars=max_text_chars, name=name)
 
 
 GEMINI_USAGE_COLS = ["ts", "doc_type", "source", "key_idx", "model",
