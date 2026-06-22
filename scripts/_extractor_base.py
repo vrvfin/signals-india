@@ -350,6 +350,12 @@ def salvage_json_objects(text: str) -> list[dict]:
 # The new gemini_usage.parquet log shows which models actually contribute.
 P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.0-flash"]
 
+# Extra models added to the BACKFILL chain ONLY (not Phase-2 PF) for more per-(project,
+# model) daily-quota buckets. Measured live (2026-06-22) as having free quota on the
+# FREE_POOL projects. The startup probe drops any that flap. Phase-2 PF extracts keep
+# exactly P1_MODELS, so Phase 2 is unchanged.
+BACKFILL_EXTRA_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash"]
+
 
 class RateLimitExhausted(Exception):
     """Raised when every (key, model) bucket is exhausted/transient. Callers

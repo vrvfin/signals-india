@@ -544,7 +544,10 @@ def main() -> None:
     log(f"Loaded {len(api_keys)} Gemini API key(s)"
         + (f" [{args.key_prefix}]" if args.key_prefix else ""))
 
-    gemini = GeminiKeyPool(api_keys, GEMINI_MODEL)
+    # Backfill (--all-companies) gets extra quota-bucket models; Phase-2 PF keeps P1_MODELS.
+    from _extractor_base import BACKFILL_EXTRA_MODELS
+    _models = list(GEMINI_MODEL) + (BACKFILL_EXTRA_MODELS if args.all_companies else [])
+    gemini = GeminiKeyPool(api_keys, _models)
 
     prompt_path = Path(__file__).resolve().parent / PROMPT_FILE
     if not prompt_path.exists():
