@@ -27,9 +27,11 @@ jobs:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-      # Stop starting new docs/companies ~15 min before the 120-min wall so the
-      # queue + sidecars flush cleanly (no SIGKILL); remaining work resumes next run.
-      DEEPDIVE_DEADLINE_MIN: "105"
+      # NO time restriction (user 2026-06-22): a deep dive must process ALL of a
+      # company's docs in one go. If GitHub kills the job at the 120-min wall, we
+      # resume from where it halted — chunk partials + per-doc sidecars + incremental
+      # deep_dive_queue writes make resume airtight (a kill loses at most the
+      # in-flight company, which stays pending). So no DEEPDIVE_DEADLINE_MIN here.
     steps:
       - uses: actions/checkout@v4
 

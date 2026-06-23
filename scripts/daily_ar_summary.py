@@ -321,7 +321,11 @@ def main() -> None:
         log(f"ar_focus.parquet: {len(out)} rows total")
 
     # ---- FOCUS -> deep_dive_queue (skip if already pending/done today) ----
-    if focus:
+    # PAUSED 2026-06-22 (user): deep_dive_queue is USER-PUSH-ONLY (Streamlit "Add to
+    # Queue" / company_deep_report.py --add). This automatic FOCUS fan-out was an
+    # oversight that filled the queue with non-PF names (e.g. Pennar). Re-enable by
+    # setting env ENABLE_AR_FOCUS_DEEPDIVE_ENQUEUE=1.
+    if focus and os.environ.get("ENABLE_AR_FOCUS_DEEPDIVE_ENQUEUE") == "1":
         dq = load_parquet(drive, index_id, "deep_dive_queue.parquet",
                           ["token", "status", "added_at", "done_at", "error"])
         have = set(dq[dq["status"].astype(str) == "pending"]["token"]

@@ -1635,6 +1635,10 @@ def main():
     if pending.empty:
         print("No pending companies."); return
 
+    def _persist_queue():
+        buf = io.BytesIO(); queue.to_parquet(buf, index=False)
+        drive_upload(svc, DRIVE["queue"], root, buf.getvalue(), "application/octet-stream")
+
     recs = []
     for i in pending.index:
         if deadline_ts and time.monotonic() >= deadline_ts:
@@ -1647,6 +1651,14 @@ def main():
             recs.append(rec)
             queue.at[i, "status"] = "done"
             queue.at[i, "done_at"] = dt.datetime.now().isoformat()
+            # Persist progress AFTER each company so a kill (no time restriction —
+            # GitHub may stop the job at the wall) loses at most the in-flight
+            # company; everything done so far is already on Drive and won't re-run.
+            _persist_queue()
+            update_index(svc, root, [_strip_internal(rec)])
+            if args.open:
+                open_report_local(rec["_report_md"], rec["_slug"],
+                                  rec.get("name",""), rec.get("symbol",""), rec.get("isin",""))
         except AllBucketsExhausted as exc:
             # Quota exhausted — leave remaining rows pending for next run
             print(f"  All Gemini buckets exhausted — stopping queue drain. ({exc})")
@@ -1660,19 +1672,14 @@ def main():
             print(f"  FATAL (this company): {str(exc)[:120]}")
             queue.at[i, "status"] = "error"
             queue.at[i, "error"] = str(exc)[:300]
+            _persist_queue()
         except Exception as e:
             print(f"    FAILED {queue.at[i,'token']}: {e}")
             queue.at[i, "status"] = "error"
             queue.at[i, "error"] = str(e)[:300]
+            _persist_queue()
 
-    buf = io.BytesIO(); queue.to_parquet(buf, index=False)
-    drive_upload(svc, DRIVE["queue"], root, buf.getvalue(), "application/octet-stream")
-    if recs:
-        if args.open:
-            for r in recs:
-                open_report_local(r["_report_md"], r["_slug"],
-                                  r.get("name",""), r.get("symbol",""), r.get("isin",""))
-        update_index(svc, root, [_strip_internal(r) for r in recs])
+    _persist_queue()   # final safety net
     print(f"Done. {len(recs)} report(s) generated.")
 
 
