@@ -132,6 +132,113 @@ def _load_universe(svc, root):
         uni = _read_csv(svc, DRIVE["universe_fallback"], root)
     return uni
 
+# ── deep_dive_queue: ONE coordinated writer (Streamlit-safe lock + dedup) ───────
+# deep_dive_queue is written by several processes (Streamlit "Add to Queue", --add,
+# the drain). Without coordination, writes clobbered each other (a manual clean got
+# overwritten) and the same token was processed 2-3x. These helpers serialize every
+# read-modify-write behind a best-effort Drive-file lock AND dedup on every write, so
+# a lost lock can never corrupt the queue (dedup is the guarantee; the lock just
+# reduces lost-updates). No google-genai dependency → app.py (Streamlit) can use them.
+QUEUE_LOCK_PATH = "company_repo/_index/_deep_dive_queue.lock"
+QUEUE_COLS = ["token", "status", "added_at", "done_at", "error"]
+
+def _safe_err(e) -> str:
+    """Scrub anything resembling an API key before a message is STORED in the queue.
+    The earlier key leak happened because raw str(exception) (containing the env key
+    blob) was written to the error column."""
+    s = f"{type(e).__name__}: {e}"
+    s = re.sub(r"AIza[0-9A-Za-z_\-]{16,}", "[REDACTED_KEY]", s)
+    s = re.sub(r"AQ\.[0-9A-Za-z_\-]{16,}", "[REDACTED_KEY]", s)
+    s = re.sub(r"(GEMINI_API_KEY|FREE_POOL|BACKFILL_GEMINI_KEY)[0-9A-Za-z_=\-]*",
+               "[REDACTED]", s)
+    return s[:200]
+
+def _dedup_queue(df):
+    """One pending row per token; collapse duplicate done (keep latest done_at); a
+    token that is done is not also left pending. Preserves other statuses."""
+    if df is None or df.empty or "token" not in df.columns:
+        return df if df is not None else pd.DataFrame(columns=QUEUE_COLS)
+    df = df.copy()
+    df["status"] = df["status"].astype(str)
+    done = df[df["status"] == "done"]
+    if "done_at" in done.columns:
+        done = done.sort_values("done_at").drop_duplicates("token", keep="last")
+    else:
+        done = done.drop_duplicates("token", keep="last")
+    done_tokens = set(done["token"].astype(str))
+    pend = df[df["status"] == "pending"].drop_duplicates("token", keep="first")
+    pend = pend[~pend["token"].astype(str).isin(done_tokens)]
+    other = df[~df["status"].isin(["pending", "done"])]
+    return pd.concat([done, pend, other], ignore_index=True)
+
+def _acquire_queue_lock(svc, root, owner="deepdive", max_age_s=600, wait_s=90, poll_s=3):
+    """Best-effort Drive-file lock for deep_dive_queue. Steals a lock older than
+    max_age_s (a crashed holder can't starve forever). Polls up to wait_s."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        cur = drive_download(svc, QUEUE_LOCK_PATH, root)
+        fresh = False
+        if cur:
+            try:
+                meta = json.loads(cur.decode("utf-8", "ignore"))
+                fresh = (time.time() - float(meta.get("ts", 0))) < max_age_s
+            except Exception:
+                fresh = False
+        if not fresh:
+            drive_upload(svc, QUEUE_LOCK_PATH, root,
+                         json.dumps({"owner": owner, "ts": time.time()}).encode(),
+                         "application/json")
+            chk = drive_download(svc, QUEUE_LOCK_PATH, root)
+            try:
+                if chk and json.loads(chk.decode("utf-8", "ignore")).get("owner") == owner:
+                    return True
+            except Exception:
+                pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+def _release_queue_lock(svc, root):
+    try:
+        fid = drive_find(svc, QUEUE_LOCK_PATH, root)
+        if fid:
+            svc.files().delete(fileId=fid).execute()
+    except Exception:
+        pass
+
+def queue_update(svc, root, mutate, owner="deepdive"):
+    """Locked read-modify-write of deep_dive_queue: acquire lock, RE-READ the current
+    queue from Drive, apply mutate(df)->df, dedup, write, release. Re-reading under the
+    lock is what prevents a concurrent enqueue from being lost."""
+    got = _acquire_queue_lock(svc, root, owner=owner)
+    try:
+        df = _read_parquet(svc, DRIVE["queue"], root)
+        if df is None or df.empty:
+            df = pd.DataFrame(columns=QUEUE_COLS)
+        df = _dedup_queue(mutate(df))
+        buf = io.BytesIO(); df.to_parquet(buf, index=False)
+        drive_upload(svc, DRIVE["queue"], root, buf.getvalue(), "application/octet-stream")
+        return df
+    finally:
+        if got:
+            _release_queue_lock(svc, root)
+
+def enqueue_tokens(svc, root, tokens, owner="streamlit") -> int:
+    """Add pending rows for tokens, skipping any already pending OR done (locked +
+    deduped). Returns how many were actually added. Use this from EVERY enqueue path
+    (Streamlit, --add, synthesise) so the queue can never be clobbered or duplicated."""
+    toks = list(dict.fromkeys(str(t).strip() for t in tokens if str(t).strip()))
+    added = {"n": 0}
+    def m(df):
+        seen = (set(df[df["status"].astype(str).isin(["pending", "done"])]["token"].astype(str))
+                if not df.empty else set())
+        new = [dict(token=t, status="pending", added_at=dt.datetime.now().isoformat())
+               for t in toks if t not in seen]
+        added["n"] = len(new)
+        return pd.concat([df, pd.DataFrame(new)], ignore_index=True) if new else df
+    queue_update(svc, root, m, owner=owner)
+    return added["n"]
+
 def resolve_isin(token, universe, interactive=False):
     """token may be ISIN / NSE symbol / BSE code / name -> (isin, symbol, name, bse_code).
 
@@ -1571,13 +1678,8 @@ def main():
         return
 
     if args.add:
-        q = _read_parquet(svc, DRIVE["queue"], root)
-        rows = [dict(token=t.strip(), status="pending",
-                     added_at=dt.datetime.now().isoformat()) for t in args.add.split(",")]
-        q = pd.concat([q, pd.DataFrame(rows)], ignore_index=True)
-        buf = io.BytesIO(); q.to_parquet(buf, index=False)
-        drive_upload(svc, DRIVE["queue"], root, buf.getvalue(), "application/octet-stream")
-        print(f"Enqueued {len(rows)}."); return
+        n = enqueue_tokens(svc, root, args.add.split(","), owner="add")
+        print(f"Enqueued {n} (skipped any already pending/done)."); return
 
     if BucketPool is None or load_keys is None:
         print("ERROR: google-genai not installed — cannot run the deep dive here. "
@@ -1628,58 +1730,61 @@ def main():
             update_index(svc, root, [_strip_internal(r) for r in recs])
         return
 
-    queue = _read_parquet(svc, DRIVE["queue"], root)
+    queue = _dedup_queue(_read_parquet(svc, DRIVE["queue"], root))
     if queue.empty or "status" not in queue:
         print("Queue empty. Nothing to do."); return
     pending = queue[queue["status"] == "pending"]
     if pending.empty:
         print("No pending companies."); return
 
-    def _persist_queue():
-        buf = io.BytesIO(); queue.to_parquet(buf, index=False)
-        drive_upload(svc, DRIVE["queue"], root, buf.getvalue(), "application/octet-stream")
+    def _mark(token, added_at, status, **fields):
+        """Locked re-read-merge: set this token's row status on the CURRENT queue, so a
+        concurrent enqueue is never clobbered (the bug that re-populated the queue)."""
+        def m(df):
+            mask = (df["token"].astype(str) == str(token))
+            if "added_at" in df.columns:
+                mask &= (df["added_at"].astype(str) == str(added_at))
+            if not mask.any():       # row vanished (e.g. cleaned) — re-add it as resolved
+                row = dict(token=token, status=status, added_at=added_at, **fields)
+                return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            df.loc[mask, "status"] = status
+            for k, v in fields.items():
+                df.loc[mask, k] = v
+            return df
+        queue_update(svc, root, m, owner="drain")
 
     recs = []
     for i in pending.index:
+        token, added = queue.at[i, "token"], queue.at[i, "added_at"]
         if deadline_ts and time.monotonic() >= deadline_ts:
             print("  Deadline reached — leaving remaining companies pending for next run.")
             break
         try:
             rec = process_one(svc, root, pool, universe, fund, results, ridx,
-                              queue.at[i, "token"], interactive=args.interactive,
+                              token, interactive=args.interactive,
                               do_backfill=not args.no_backfill, deadline_ts=deadline_ts)
             recs.append(rec)
-            queue.at[i, "status"] = "done"
-            queue.at[i, "done_at"] = dt.datetime.now().isoformat()
-            # Persist progress AFTER each company so a kill (no time restriction —
-            # GitHub may stop the job at the wall) loses at most the in-flight
-            # company; everything done so far is already on Drive and won't re-run.
-            _persist_queue()
+            # Mark done on the CURRENT queue (locked) AFTER each company, so a kill (no
+            # time restriction) loses at most the in-flight one and concurrent enqueues
+            # are preserved.
+            _mark(token, added, "done", done_at=dt.datetime.now().isoformat())
             update_index(svc, root, [_strip_internal(rec)])
             if args.open:
                 open_report_local(rec["_report_md"], rec["_slug"],
                                   rec.get("name",""), rec.get("symbol",""), rec.get("isin",""))
         except AllBucketsExhausted as exc:
-            # Quota exhausted — leave remaining rows pending for next run
             print(f"  All Gemini buckets exhausted — stopping queue drain. ({exc})")
             break
         except DeadlineReached:
-            # Hit the wall mid-company — leave THIS row pending (cached chunks/docs
-            # let next run resume cheaply) and stop the drain cleanly.
-            print(f"  Deadline reached mid-'{queue.at[i,'token']}' — pending; resumes next run.")
+            print(f"  Deadline reached mid-'{token}' — pending; resumes next run.")
             break
         except FatalCallError as exc:
-            print(f"  FATAL (this company): {str(exc)[:120]}")
-            queue.at[i, "status"] = "error"
-            queue.at[i, "error"] = str(exc)[:300]
-            _persist_queue()
+            print(f"  FATAL (this company): {_safe_err(exc)}")
+            _mark(token, added, "error", error=_safe_err(exc))
         except Exception as e:
-            print(f"    FAILED {queue.at[i,'token']}: {e}")
-            queue.at[i, "status"] = "error"
-            queue.at[i, "error"] = str(e)[:300]
-            _persist_queue()
+            print(f"    FAILED {token}: {_safe_err(e)}")
+            _mark(token, added, "error", error=_safe_err(e))
 
-    _persist_queue()   # final safety net
     print(f"Done. {len(recs)} report(s) generated.")
 
 

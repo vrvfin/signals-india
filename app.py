@@ -3919,30 +3919,24 @@ def page_deep_dive():
                 import sys as _sys, os as _os
                 _sdir = _os.path.join(_os.path.dirname(__file__), "scripts")
                 if _sdir not in _sys.path: _sys.path.insert(0, _sdir)
-                from company_deep_report import resolve_isin
+                from company_deep_report import resolve_isin, enqueue_tokens
 
                 tokens  = [t.strip() for t in company_input.split(",") if t.strip()]
-                queued, failed = [], []
+                resolved, labels, failed = [], [], []
                 for token in tokens:
                     isin, symbol, name, _ = resolve_isin(token, univ)
                     if isin == token and symbol == token:
                         failed.append(token)
                     else:
-                        queued.append(dict(token=isin, status="pending",
-                                           added_at=datetime.now().isoformat(),
-                                           _label=f"{name} ({symbol})"))
+                        resolved.append(isin); labels.append(f"{name} ({symbol})")
 
-                if queued:
-                    q_b = _app_drive_download(drive, ["company_repo", "_index", "deep_dive_queue.parquet"])
-                    q   = pd.read_parquet(io.BytesIO(q_b)) if q_b else pd.DataFrame()
-                    new_rows = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")}
-                                             for r in queued])
-                    q = pd.concat([q, new_rows], ignore_index=True)
-                    buf = io.BytesIO(); q.to_parquet(buf, index=False)
-                    _app_drive_upload(drive, ["company_repo", "_index", "deep_dive_queue.parquet"],
-                                      buf.getvalue(), "application/octet-stream")
-                    labels = ", ".join(r["_label"] for r in queued)
-                    st.success(f"Queued {len(queued)} company/companies: **{labels}**. "
+                if resolved:
+                    # Coordinated enqueue: lock + dedup (skips tokens already pending/done),
+                    # so concurrent writes can't clobber the queue or duplicate a name.
+                    n = enqueue_tokens(drive, os.environ["GDRIVE_FOLDER_ID"],
+                                       resolved, owner="streamlit")
+                    st.success(f"Queued {n} of {len(resolved)} (skipped any already "
+                               f"queued/done): **{', '.join(labels)}**. "
                                "CI runs at 08:00 IST — you'll receive an email when done.")
                     st.cache_data.clear()
                 if failed:

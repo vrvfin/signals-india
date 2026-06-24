@@ -217,25 +217,11 @@ def upload_synthesis(svc, root: str, isin: str, slug_label: str,
 # Drive: enqueue ISINs in deep_dive_queue.parquet
 # ---------------------------------------------------------------------------
 def enqueue_deep_dive(svc, root: str, isins: list[str]):
-    """Append pending rows to deep_dive_queue.parquet on Drive, skipping already-pending."""
-    raw = _drive_download(svc, DRIVE_QUEUE, root)
-    queue = pd.read_parquet(io.BytesIO(raw)) if raw else pd.DataFrame(
-        columns=["token", "status", "queued_at"])
-
-    already_pending = set(queue[queue.status == "pending"]["token"].tolist())
-    new_rows = []
-    for isin in isins:
-        if isin not in already_pending:
-            new_rows.append(dict(token=isin, status="pending",
-                                 queued_at=dt.datetime.now().isoformat()))
-    if not new_rows:
-        print(f"   Queue: all {len(isins)} ISIN(s) already pending — nothing added.")
-        return
-
-    updated = pd.concat([queue, pd.DataFrame(new_rows)], ignore_index=True)
-    buf = io.BytesIO(); updated.to_parquet(buf, index=False)
-    _drive_upload(svc, DRIVE_QUEUE, root, buf.getvalue(), "application/octet-stream")
-    print(f"   Queue: added {len(new_rows)} ISIN(s) to deep_dive_queue.")
+    """Enqueue ISINs in deep_dive_queue via the ONE coordinated writer (lock + dedup),
+    so this manual path can never clobber the queue or duplicate a name."""
+    from company_deep_report import enqueue_tokens     # shared lock+dedup helper
+    n = enqueue_tokens(svc, root, isins, owner="synthesise")
+    print(f"   Queue: added {n} of {len(isins)} ISIN(s) (skipped already pending/done).")
 
 
 # ---------------------------------------------------------------------------
