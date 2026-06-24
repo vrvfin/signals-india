@@ -326,17 +326,12 @@ def main() -> None:
     # oversight that filled the queue with non-PF names (e.g. Pennar). Re-enable by
     # setting env ENABLE_AR_FOCUS_DEEPDIVE_ENQUEUE=1.
     if focus and os.environ.get("ENABLE_AR_FOCUS_DEEPDIVE_ENQUEUE") == "1":
-        dq = load_parquet(drive, index_id, "deep_dive_queue.parquet",
-                          ["token", "status", "added_at", "done_at", "error"])
-        have = set(dq[dq["status"].astype(str) == "pending"]["token"]
-                   .astype(str).str.upper()) if not dq.empty else set()
-        adds = [{"token": v["symbol"], "status": "pending",
-                 "added_at": today.isoformat(timespec="seconds")}
-                for v in focus if v["symbol"] not in have]
-        if adds:
-            dq = pd.concat([dq, pd.DataFrame(adds)], ignore_index=True)
-            save_parquet(drive, index_id, "deep_dive_queue.parquet", dq)
-            log(f"deep_dive_queue: +{len(adds)} FOCUS name(s) enqueued")
+        # Coordinated enqueue (lock + dedup) so even if re-enabled this can't clobber
+        # the queue or duplicate a name.
+        from company_deep_report import enqueue_tokens
+        n = enqueue_tokens(drive, os.environ["GDRIVE_FOLDER_ID"],
+                           [v["symbol"] for v in focus], owner="ar_focus")
+        log(f"deep_dive_queue: +{n} FOCUS name(s) enqueued (coordinated)")
 
     # ---- mail: body = FOCUS quick summaries with the WHY; full digest PDF attached ----
     if not args.email:
