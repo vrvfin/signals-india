@@ -34,6 +34,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import company_deep_report as cdr          # reuse all DRHP discovery/verify/summarise
+import drhp_seeds as ds                     # backfill -> DRHP inbox (Rule 7 hand-off)
 from gemini_pool import BucketPool, load_keys
 
 LEDGER       = "company_repo/_index/drhp_watch_ledger.parquet"
@@ -96,6 +97,37 @@ def email_summary(name: str, typ: str, summ: str) -> bool:
         return False
 
 
+def _seed_inbox_path() -> str:
+    return f"company_repo/_index/{ds.SEED_FILE}"
+
+
+def _load_seed_inbox(svc, root) -> pd.DataFrame:
+    """The backfill DRHP inbox (drhp_seeds.parquet). Read via the cdr Drive client we
+    already use for the ledger; run_backfill writes it via _extractor_base — same file."""
+    try:
+        return cdr._read_parquet(svc, _seed_inbox_path(), root)
+    except Exception as e:
+        print(f"  (could not read DRHP seed inbox: {type(e).__name__})")
+        return pd.DataFrame(columns=ds.SEED_COLS)
+
+
+def _mark_seeds_consumed(svc, root, consumed_ids: list[str]) -> None:
+    """Flip processed seeds to status='consumed' so they're not re-opened. Re-reads
+    before writing to avoid clobbering a concurrent backfill seed write."""
+    if not consumed_ids:
+        return
+    df = _load_seed_inbox(svc, root)
+    if df.empty or "seed_id" not in df.columns:
+        return
+    mask = df["seed_id"].astype(str).isin(set(consumed_ids))
+    if not mask.any():
+        return
+    df.loc[mask, "status"] = "consumed"
+    buf = io.BytesIO(); df.to_parquet(buf, index=False)
+    cdr.drive_upload(svc, _seed_inbox_path(), root, buf.getvalue(),
+                     "application/octet-stream")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -117,10 +149,24 @@ def main():
     new = [(i, n) for i, n in ipos if i not in done]
     # newest first (Chittorgarh ids increase with recency) so the cap favours fresh filings
     new.sort(key=lambda x: int(x[0]), reverse=True)
-    print(f"IPO watch: {len(ipos)} listed, {len(new)} not-yet-summarised")
+
+    # DRHP seed inbox: prospectus links the company-page backfill surfaced under a
+    # company's AR subsection (Rule 7 hand-off). Same discovery/summarise path; the
+    # synthetic seed_id keys the ledger so a seed already summarised is skipped via `done`.
+    seeds_df = _load_seed_inbox(svc, root)
+    seed_items: list[tuple[str, str]] = []
+    if not seeds_df.empty and "status" in seeds_df.columns:
+        sn = seeds_df[seeds_df["status"].astype(str) == "new"]
+        seed_items = [(str(r["seed_id"]), str(r["name"])) for _, r in sn.iterrows()
+                      if str(r["seed_id"]) not in done and str(r.get("name") or "").strip()]
+
+    print(f"IPO watch: {len(ipos)} listed, {len(new)} not-yet-summarised; "
+          f"{len(seed_items)} backfill DRHP seed(s) pending")
     for i, n in new:
         print(f"   - {n} ({i})")
-    if not new:
+    for i, n in seed_items:
+        print(f"   - [seed] {n} ({i})")
+    if not new and not seed_items:
         return
 
     if args.seed:
@@ -136,14 +182,16 @@ def main():
     if args.dry_run:
         return
 
-    new = new[:args.max]      # bound cost; remaining picked up over subsequent days
+    # Fresh Chittorgarh filings first (time-sensitive), then backfill seeds; one cost
+    # cap over the combined list — leftover seeds drain on subsequent days.
+    targets = (new + seed_items)[:args.max]
 
     pool = BucketPool(load_keys(os.environ), cdr.DEEPDIVE_MODELS,
                       inter_call_s=cdr.INTER_CALL_SLEEP)
     prompt = open(os.path.join(cdr.SCRIPTS_DIR, "drhp_prompt.txt"), encoding="utf-8").read()
 
-    rows, emailed = [], 0
-    for ipo_id, name in new:
+    rows, emailed, processed_seed_ids = [], 0, []
+    for ipo_id, name in targets:
         status, typ = "no_prospectus", None
         chosen = None
         try:
@@ -175,12 +223,18 @@ def main():
             print(f"  {name}: {status}")
         rows.append(dict(ipo_id=ipo_id, name=name, doc=typ or "",
                          status=status, seen_at=dt.datetime.now().isoformat()))
+        if str(ipo_id).startswith("seed_"):
+            processed_seed_ids.append(ipo_id)
 
     led = pd.concat([ledger, pd.DataFrame(rows)], ignore_index=True)
     led = led.drop_duplicates("ipo_id", keep="last")    # latest status per IPO
     buf = io.BytesIO(); led.to_parquet(buf, index=False)
     cdr.drive_upload(svc, LEDGER, root, buf.getvalue(), "application/octet-stream")
-    print(f"IPO watch: processed {len(rows)} new, emailed {emailed}")
+    # Flip backfill seeds we just handled to 'consumed' (ledger already records outcome).
+    if processed_seed_ids:
+        _mark_seeds_consumed(svc, root, processed_seed_ids)
+    print(f"IPO watch: processed {len(rows)} new ({len(processed_seed_ids)} from "
+          f"backfill seeds), emailed {emailed}")
 
 
 if __name__ == "__main__":
