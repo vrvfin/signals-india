@@ -107,6 +107,8 @@ jobs:
           BACKFILL_GEMINI_KEY_6:   ${{ secrets.BACKFILL_GEMINI_KEY_6 }}
           BACKFILL_GEMINI_KEY_7:   ${{ secrets.BACKFILL_GEMINI_KEY_7 }}
           BACKFILL_GEMINI_KEY_8:   ${{ secrets.BACKFILL_GEMINI_KEY_8 }}
+          GROQ_API_KEY:            ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY:        ${{ secrets.CEREBRAS_API_KEY }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -127,6 +129,10 @@ jobs:
             echo "BACKFILL_GEMINI_KEY_6=$BACKFILL_GEMINI_KEY_6"
             echo "BACKFILL_GEMINI_KEY_7=$BACKFILL_GEMINI_KEY_7"
             echo "BACKFILL_GEMINI_KEY_8=$BACKFILL_GEMINI_KEY_8"
+            # Phase 2 alt providers (Groq/Cerebras) — one secret holds KEY_N=value lines;
+            # flatten to a comma-joined line so load_keys picks up every key.
+            echo "GROQ_API_KEY=$(printf '%s' "$GROQ_API_KEY" | tr '\r\n' ',,')"
+            echo "CEREBRAS_API_KEY=$(printf '%s' "$CEREBRAS_API_KEY" | tr '\r\n' ',,')"
           } > .env
 
       - name: Install deps

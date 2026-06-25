@@ -313,8 +313,11 @@ def main() -> None:
 
     # Backfill (--all-companies) gets extra quota-bucket models; Phase-2 PF keeps P1_MODELS.
     from _extractor_base import BACKFILL_EXTRA_MODELS
+    from provider_router import make_extraction_pool
     _models = list(GEMINI_MODEL) + (BACKFILL_EXTRA_MODELS if args.all_companies else [])
-    gemini = GeminiKeyPool(api_keys, _models)
+    # Phase 2: BACKFILL-ONLY Groq/Cerebras fallback when Gemini is exhausted (PF path =
+    # pure Gemini, unchanged). Plain GeminiKeyPool unless --all-companies AND alt keys exist.
+    gemini = make_extraction_pool(api_keys, _models, enable_fallback=args.all_companies)
 
     prompt_path = Path(__file__).resolve().parent / PROMPT_FILE
     if not prompt_path.exists():
