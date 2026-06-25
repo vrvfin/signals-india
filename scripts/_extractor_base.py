@@ -255,14 +255,16 @@ def is_real_flag(evidence) -> bool:
 
 def upsert_structured(drive, index_id: str, filename: str, cols: list,
                       rows: list) -> None:
-    """Delete existing rows for this source_doc_id, append new (idempotent re-extract).
-    Generic version of the AR _upsert_ar; used by presentation/rating tabulation."""
+    """Delete existing rows for EVERY source_doc_id present in `rows`, then append the new
+    rows (idempotent re-extract). `rows` may span ONE doc (per-doc call) or MANY docs (one
+    batched write covering several source_doc_ids) — both dedupe correctly with a single
+    load+save, which is what the batch-write path uses to cut Drive round-trips."""
     if not rows:
         return
     df = load_parquet(drive, index_id, filename, cols)
-    sdid = str(rows[0].get("source_doc_id", ""))
-    if sdid and "source_doc_id" in df.columns:
-        df = df[df["source_doc_id"].astype(str) != sdid]
+    sdids = {str(r.get("source_doc_id", "")) for r in rows if str(r.get("source_doc_id", ""))}
+    if sdids and "source_doc_id" in df.columns:
+        df = df[~df["source_doc_id"].astype(str).isin(sdids)]
     new_df = pd.DataFrame([{c: r.get(c) for c in cols} for r in rows])
     df = pd.concat([df, new_df], ignore_index=True)
     save_parquet(drive, index_id, filename, df)
@@ -546,14 +548,22 @@ def day_filename(doc_type: str, announcement_date: str) -> str:
 
 def append_day_page(drive, repo_id: str, doc_type: str,
                     announcement_date: str, symbol: str,
-                    company_name: str, quarter: str, content: str) -> None:
-    """Append analysis to _daily/<doc_type>_DD_MMMYYYY.md (persisted forever)."""
+                    company_name: str, quarter: str, content: str,
+                    dedup_marker: str | None = None) -> None:
+    """Append analysis to _daily/<doc_type>_DD_MMMYYYY.md (persisted forever).
+
+    `dedup_marker` (e.g. doc_id) makes the append IDEMPOTENT: if the file already contains
+    that marker, the call is a no-op. This lets the batch-write path mark the queue in
+    batches without a CI kill re-appending duplicate sections on the next run."""
     daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
     fname = day_filename(doc_type, announcement_date)
-    entry = f"\n\n---\n## {symbol} — {company_name} | {quarter}\n\n" + content
+    mark = f"<!-- doc:{dedup_marker} -->" if dedup_marker else ""
+    entry = f"\n\n---\n## {symbol} — {company_name} | {quarter}\n{mark}\n" + content
     fid = find_file(drive, daily_id, fname)
     if fid:
         existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+        if dedup_marker and mark in existing:
+            return                      # already written — idempotent no-op
         upload_bytes(drive, daily_id, fname,
                      (existing + entry).encode("utf-8"), "text/markdown",
                      existing_id=fid)
@@ -567,19 +577,28 @@ def append_day_page(drive, repo_id: str, doc_type: str,
 
 def append_company_page(drive, repo_id: str, key: str,
                         doc_type_label: str, content: str,
-                        doc_title: str, quarter: str) -> None:
-    """Append a section to company_repo/<key>/company_page.md (persisted forever)."""
+                        doc_title: str, quarter: str,
+                        dedup_marker: str | None = None) -> None:
+    """Append a section to company_repo/<key>/company_page.md (persisted forever).
+
+    `dedup_marker` (e.g. doc_id) makes the append IDEMPOTENT: if the file already contains
+    that marker, the call is a no-op. This is what lets the batch-write path defer the queue
+    mark-done into batches safely — a CI kill mid-batch re-processes those docs, but the
+    re-append is skipped (and the structured upserts dedupe), so no duplicate sections."""
     if not key:
         log("  WARN: empty key — skipping company_page.md update")
         return
     comp_id = get_or_create_subfolder(drive, repo_id, key)
+    mark = f"<!-- doc:{dedup_marker} -->" if dedup_marker else ""
     header = (
         f"\n\n---\n## {quarter} {doc_type_label} — {doc_title}\n"
-        f"*Processed: {datetime.now().strftime('%Y-%m-%d')}*\n\n"
+        f"*Processed: {datetime.now().strftime('%Y-%m-%d')}*\n{mark}\n\n"
     )
     fid = find_file(drive, comp_id, "company_page.md")
     if fid:
         existing = download_bytes(drive, fid).decode("utf-8", errors="replace")
+        if dedup_marker and mark in existing:
+            return                      # already written — idempotent no-op
         updated = existing + header + content
         upload_bytes(drive, comp_id, "company_page.md",
                      updated.encode("utf-8"), "text/markdown", existing_id=fid)

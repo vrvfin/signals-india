@@ -254,15 +254,18 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
     return facts
 
 
-def upsert_ratings(drive, index_id: str, facts: dict) -> None:
+def upsert_ratings(drive, index_id: str, facts) -> None:
+    """Idempotent by (isin, source_doc_id). `facts` may be a single dict (per-doc) or a
+    LIST of dicts (one batched write covering many docs — used by the batch-write path)."""
+    items = facts if isinstance(facts, list) else [facts]
+    if not items:
+        return
     df = load_parquet(drive, index_id, "ratings.parquet", RATINGS_COLS)
-    mask = (
-        (df["isin"].astype(str) == str(facts["isin"])) &
-        (df["source_doc_id"].astype(str) == str(facts["source_doc_id"]))
-    )
-    df = df[~mask]
-    new_row = pd.DataFrame([{c: facts.get(c) for c in RATINGS_COLS}])
-    df = pd.concat([df, new_row], ignore_index=True)
+    keys = {(str(f.get("isin")), str(f.get("source_doc_id"))) for f in items}
+    if not df.empty and {"isin", "source_doc_id"} <= set(df.columns):
+        df = df[~df.apply(lambda r: (str(r["isin"]), str(r["source_doc_id"])) in keys, axis=1)]
+    new_df = pd.DataFrame([{c: f.get(c) for c in RATINGS_COLS} for f in items])
+    df = pd.concat([df, new_df], ignore_index=True)
     save_parquet(drive, index_id, "ratings.parquet", df)
 
 
@@ -290,6 +293,11 @@ def main() -> None:
                         help="Wall-clock cap (min): exit cleanly after this so the "
                              "shared _extract.lock is released before the CI job "
                              "timeout (prevents a killed step leaving a stale lock).")
+    parser.add_argument("--batch-size", type=int, default=10,
+                        help="Commit the queue + structured parquets once per N docs "
+                             "instead of per-doc (cuts whole-file Drive rewrites). "
+                             "company_page/day_page stay per-doc but idempotent, so a "
+                             "kill mid-batch re-processes <=N docs without duplicates.")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -385,11 +393,46 @@ def main() -> None:
 
     counts = {"processed": 0, "error": 0, "skipped": 0}
     _t0 = time.time()
+    BATCH = max(1, args.batch_size)
+
+    # BATCH-WRITE: company_page/day_page stay per-doc (idempotent via the doc_id marker —
+    # they are per-company/day files). The idempotent parquet upserts (ratings + 3 structured)
+    # and the queue mark-done are BUFFERED and committed once per BATCH, cutting ~12s of
+    # whole-file Drive rewrites per doc to roughly once per batch. A CI kill mid-batch
+    # re-processes <=BATCH docs: the company_page/day_page re-append is skipped (marker) and
+    # the upserts dedupe by source_doc_id → no duplicates, no lost structured rows.
+    b_idx: list = []
+    b_facts: list = []
+    b_dr: list = []
+    b_co: list = []
+    b_se: list = []
+
+    def _flush(force_save: bool = False) -> None:
+        if b_idx:
+            upsert_ratings(drive, index_id, b_facts)        # list form -> one load+save
+            if b_dr:
+                upsert_structured(drive, index_id, "rating_drivers.parquet",
+                                  RATING_DRIVERS_COLS, b_dr)
+            if b_co:
+                upsert_structured(drive, index_id, "rating_concerns.parquet",
+                                  RATING_CONCERNS_COLS, b_co)
+            if b_se:
+                upsert_structured(drive, index_id, "rating_sensitivity.parquet",
+                                  RATING_SENSITIVITY_COLS, b_se)
+            now_s = datetime.now().isoformat(timespec="seconds")
+            for qi in b_idx:
+                queue.loc[qi, "status"] = "done"
+                queue.loc[qi, "processed_at"] = now_s
+            log(f"  [flush] committed {len(b_idx)} doc(s): 1 queue write + batched upserts.")
+        if b_idx or force_save:
+            save_queue(drive, index_id, queue)              # persists done + any error marks
+        b_idx.clear(); b_facts.clear(); b_dr.clear(); b_co.clear(); b_se.clear()
 
     for queue_idx in pending_idx:
-        # Wall-clock cap: release the lock before the CI job timeout (no stale lock).
+        # Wall-clock cap: the final flush below commits the partial batch before the lock
+        # is released, so deadline never loses buffered work.
         if args.deadline_min and (time.time() - _t0) / 60.0 >= args.deadline_min:
-            log(f"  Deadline {args.deadline_min:.0f} min reached — exiting cleanly.")
+            log(f"  Deadline {args.deadline_min:.0f} min reached — flushing + exiting.")
             break
         row = queue.loc[queue_idx]
         label = f"{row.get('symbol', '?')!s:<14} {str(row.get('title', ''))[:55]}"
@@ -400,12 +443,13 @@ def main() -> None:
             log("  SKIP: no drive_file_id")
             counts["skipped"] += 1
             continue
+        doc_id = str(row.get("doc_id", ""))
 
         try:
             pdf_bytes = download_bytes(drive, drive_fid)
             log(f"  PDF: {len(pdf_bytes):,} bytes")
 
-            display_name = f"{row.get('symbol', 'DOC')}_{str(row.get('doc_id', ''))[:12]}.pdf"
+            display_name = f"{row.get('symbol', 'DOC')}_{doc_id[:12]}.pdf"
             # Detect PDF vs HTML/text: CRISIL/SMERA/Brickwork rationales arrive as text;
             # sending them as application/pdf was fatal-erroring ~36% of ratings.
             markdown_text = call_over_doc(gemini, prompt, pdf_bytes, name=display_name,
@@ -430,6 +474,7 @@ def main() -> None:
                     content=markdown_text,
                     doc_title=str(row.get("title", "")),
                     quarter=f"{facts['agency']} {facts['rating']}",
+                    dedup_marker=doc_id,
                 )
 
             if OUTPUT_DAY_MD:
@@ -441,24 +486,17 @@ def main() -> None:
                     company_name=str(row.get("company_name", "")),
                     quarter=f"{facts['agency']} {facts['rating']}",
                     content=markdown_text,
+                    dedup_marker=doc_id,
                 )
 
-            upsert_ratings(drive, index_id, facts)
-
             # Stage 3 tabulation (ADDITIVE, best-effort): separate JSON-only pass →
-            # rating_drivers / rating_concerns / rating_sensitivity. ratings.parquet +
-            # markdown untouched on failure (no regression; Phase 2 unchanged).
+            # rating_drivers / rating_concerns / rating_sensitivity. Buffered, flushed in batch.
             try:
                 dr, co, se = tabulate_rating(
                     gemini, struct_prompt, pdf_bytes, row,
                     facts.get("agency"), facts.get("rating_date"),
                     datetime.now().isoformat(timespec="seconds"))
-                upsert_structured(drive, index_id, "rating_drivers.parquet",
-                                  RATING_DRIVERS_COLS, dr)
-                upsert_structured(drive, index_id, "rating_concerns.parquet",
-                                  RATING_CONCERNS_COLS, co)
-                upsert_structured(drive, index_id, "rating_sensitivity.parquet",
-                                  RATING_SENSITIVITY_COLS, se)
+                b_dr.extend(dr or []); b_co.extend(co or []); b_se.extend(se or [])
                 log(f"  Tabulated: drivers={len(dr)}, concerns={len(co)}, "
                     f"sensitivity={len(se)}")
             except RateLimitExhausted:
@@ -466,23 +504,26 @@ def main() -> None:
             except Exception as _e:
                 log(f"  WARNING: rating tabulation failed ({str(_e)[:90]}).")
 
-            queue.loc[queue_idx, "status"] = "done"
-            queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
-
+            # Buffer the idempotent parquet rows + queue row; committed together at flush.
+            b_facts.append(facts)
+            b_idx.append(queue_idx)
             counts["processed"] += 1
-            log(f"  Done: {row.get('symbol')}")
+            log(f"  Buffered: {row.get('symbol')} ({len(b_idx)}/{BATCH})")
+            if len(b_idx) >= BATCH:
+                _flush()
 
         except RateLimitExhausted:
-            log("All Gemini keys rate-limited — stopping cleanly.")
+            log("All Gemini keys rate-limited — flushing + stopping cleanly.")
             break
 
         except Exception as exc:
             log(f"  ERROR: {str(exc)[:120]}")
             queue.loc[queue_idx, "status"] = "error"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
             counts["error"] += 1
+
+    if not args.dry_run:
+        _flush(force_save=True)     # commit the final partial batch + any error marks
 
     if not args.dry_run:
         from _extractor_base import persist_gemini_usage
