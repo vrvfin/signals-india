@@ -66,3 +66,6 @@ pf_digest_preview.html
 # local chart gallery output (build_gallery.bat / pf_gallery.bat / guidance_gallery.bat)
 gallery*.html
 signals_gallery_*.html
+
+# provider eval harness raw outputs (eval_providers.py) — local only
+scripts/_eval_out/
