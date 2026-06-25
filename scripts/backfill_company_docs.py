@@ -62,6 +62,15 @@ def _resolve_doc_url(url: str) -> str:
     return url
 
 
+def _is_drhp_link(title: str, href: str) -> bool:
+    """A DRHP/RHP/prospectus link (often SEBI public-issues) surfaced under a company's
+    AR subsection — handled by the DRHP pipeline, not the AR backfill."""
+    t = (title or "").strip().lower()
+    h = (href or "").lower()
+    return (t in ("drhp", "rhp") or "prospectus" in t or "red herring" in t
+            or "sebi.gov.in/filings/public-issues" in h or "/public-issues/" in h)
+
+
 def fetch_document(session, url: str) -> tuple[bytes, str, str] | None:
     """Fetch a document URL. Returns (data, mime, ext) or None.
 
@@ -250,9 +259,15 @@ def parse_company_documents(html: str, run_date: dt.date,
             if not href or text.lower() == "all" or "corp-announc" in href:
                 continue
             is_zip = href.lower().endswith(".zip")   # NSE annual-report archive
+            # DRHP/prospectus links (esp. for recently-IPO'd names) get surfaced under
+            # the AR subsection but are NOT annual reports: SEBI public-issue PDFs that
+            # SEBI blocks for bots → they only ever errored in the AR backfill. Tag them
+            # 'drhp' so the AR pipeline ignores them; the DRHP pipeline seeds + processes
+            # them via non-SEBI prospectus discovery (CLAUDE.md rule 7: DRHP own ledger).
+            _dt = ("drhp" if (_is_drhp_link(text, href)) else doc_type)
             out.append({
                 "doc_id":   _doc_id(href),
-                "doc_type": doc_type,
+                "doc_type": _dt,
                 "title":    text,
                 "announcement_date": _date_from_text(text, doc_type, run_date),
                 "pdf_url":  href,
@@ -340,7 +355,7 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
 
     key = isin if isin else symbol
     counts = {"found": len(docs), "new": 0, "downloaded": 0,
-              "dup": 0, "download_fail": 0}
+              "dup": 0, "download_fail": 0, "drhp_docs": []}
 
     if dry_run:
         for d in docs:
@@ -377,6 +392,15 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
 
     new_rows = []
     for d in docs:
+        # DRHP/RHP/prospectus links surface under a company's AR subsection but are
+        # SEBI public-issue PDFs (SEBI blocks bots). They never enter the global queue
+        # (Rule 7 exception) — collect them so run_backfill can seed the DRHP pipeline,
+        # which resolves + summarises them via non-SEBI discovery.
+        if d.get("doc_type") == "drhp":
+            counts["drhp_docs"].append(
+                {"title": d.get("title", ""), "url": d.get("pdf_url", ""),
+                 "date": str(d.get("announcement_date", ""))[:10]})
+            continue
         dedup_key = f"{d['doc_id']}__{str(d['announcement_date'])[:10]}"
         if dedup_key in known:
             counts["dup"] += 1

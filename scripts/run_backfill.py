@@ -67,6 +67,9 @@ from backfill_coverage import (    # T12: window-aware derived coverage view
 from backfill_pagecheck import (   # T12 Stage 0: page-check denominator ledger
     load_pagecheck, save_pagecheck, upsert_pagecheck,
 )
+from drhp_seeds import (           # T12: DRHP links surfaced under AR -> DRHP pipeline
+    load_seeds, save_seeds, upsert_seeds,
+)
 
 # T12: doc types the per-company Screener #documents primitive can actually fetch
 # (SUBSECTION_TYPES in backfill_company_docs). results/presentation are NOT on that
@@ -436,6 +439,7 @@ def main() -> None:
     # T12 Stage 0: one page-check row per (company, doc_type) actually fetched —
     # the coverage DENOMINATOR (records n_docs_found=0 too). Saved at end of run.
     pagecheck_rows: list[dict] = []
+    drhp_seed_rows: list[dict] = []
 
     log(f"Plan: types={want_types}, quarters={args.quarters}, years={args.years}, "
         f"since={args.since or '-'}, all={args.all}, "
@@ -504,6 +508,14 @@ def main() -> None:
                     "last_checked_at": datetime.now().isoformat(timespec="seconds"),
                     "n_docs_found": int(counts.get("found", 0)),
                 })
+            # DRHP/prospectus links found under this company's AR subsection: not
+            # queued/extracted here (Rule 7) — hand off to the DRHP pipeline inbox.
+            for dd in counts.get("drhp_docs", []):
+                drhp_seed_rows.append({
+                    "name": name, "isin": isin, "symbol": sym,
+                    "title": dd.get("title", ""), "url": dd.get("url", ""),
+                    "date": dd.get("date", ""),
+                })
             if args.sleep:
                 time.sleep(args.sleep)
 
@@ -524,6 +536,17 @@ def main() -> None:
                 f"{len(merged)} rows, backfill_pagecheck.parquet).")
         except Exception as _e:
             log(f"  WARNING: page-check ledger update failed ({str(_e)[:80]}).")
+
+    # Hand DRHP/prospectus links off to the DRHP pipeline inbox (Rule 7: NOT the
+    # global queue). ipo_drhp_watch drains drhp_seeds.parquet and summarises each.
+    if not args.dry_run and index_id and drhp_seed_rows:
+        try:
+            merged = upsert_seeds(load_seeds(drive, index_id), drhp_seed_rows)
+            save_seeds(drive, index_id, merged)
+            log(f"DRHP seed inbox updated (+{len(drhp_seed_rows)} links → "
+                f"{len(merged)} rows, drhp_seeds.parquet).")
+        except Exception as _e:
+            log(f"  WARNING: DRHP seed write failed ({str(_e)[:80]}).")
 
     print("-" * 60)
     print(f"Companies fetched   : {totals['fetched']}  "
