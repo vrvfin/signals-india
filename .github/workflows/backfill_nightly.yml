@@ -151,7 +151,7 @@ jobs:
       # lies around; hard 2-day retention has no pending exemption any more).
       # T12: cursor-free, coverage-driven. No --start. --max-companies is the FETCH
       # budget (covered companies self-skip via backfill_coverage.parquet, so each
-      # slot walks forward into the tail naturally). --quarters 8 = last ~2 years of
+      # slot walks forward into the tail naturally). --quarters 40 = last ~10 years of
       # concalls. AR is enabled later by adding a `--types annual_report --years N`
       # step once concall reaches ~100% of the concall-bearing universe.
       # --target-pending 300 = fill-to-target throttle: top the queue up to ~300
@@ -165,7 +165,7 @@ jobs:
         if: ${{ steps.sched.outputs.skip != 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
         run: |
           MAX=${{ github.event.inputs.max_fetch || '150' }}
-          python scripts/run_backfill.py --types concall --quarters 8 \
+          python scripts/run_backfill.py --types concall --quarters 40 \
             --max-companies "$MAX" --target-pending 300
 
       # ── T1 EXTRACT (every run — drain queue until quota/deadline) ───────────
@@ -190,10 +190,10 @@ jobs:
       # Only on full night slots (run_extras) so the ARs fetched here are extracted
       # by the T8 step the SAME slot — big AR PDFs must not age out (2-day retention).
       # --target-pending 300 paces fetch to extract capacity (newest FY first).
-      - name: T1b — fetch annual reports from Screener (3y universe)
+      - name: T1b — fetch annual reports from Screener (10y universe)
         if: ${{ steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
         run: |
-          python scripts/run_backfill.py --types annual_report --years 3 \
+          python scripts/run_backfill.py --types annual_report --years 10 \
             --max-companies 100 --target-pending 300
 
       # ── T8 — fresh Annual Reports: summarise ALL (not just PF), then judge ──
@@ -211,10 +211,10 @@ jobs:
       # ── Stage 3: fetch + extract credit ratings universe-wide (CARE/CRISIL/ICRA).
       # Ratings are small/fast; --target-pending 100 paces fetch to the same-slot
       # extract so PDFs don't age out. ICRA rationale links resolve to their PDF.
-      - name: T1c — fetch credit ratings from Screener (3y universe)
+      - name: T1c — fetch credit ratings from Screener (10y universe)
         if: ${{ steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
         run: |
-          python scripts/run_backfill.py --types rating --years 3 \
+          python scripts/run_backfill.py --types rating --years 10 \
             --max-companies 100 --target-pending 100
 
       - name: T8b — extract fresh ratings (all companies, FREE_POOL+BACKFILL pool)
