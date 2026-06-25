@@ -109,6 +109,11 @@ MAX_INLINE_PDF      = 18 * 1024 * 1024   # Gemini inline-data ceiling (~20MB)
 MAX_DOC_TEXT_CHARS  = 80_000             # cap text extracted from html / per chunk
 MAX_DOC_SUMMARY_CHARS = 6_000            # cap each per-doc summary fed to deep dive
 DO_BACKFILL         = True               # pull full Screener doc history before a dive
+# Completeness (user 2026-06-22): a `done` AR/concall whose stored extraction
+# (response_chars in quarterly_facts) is below these is a partial/thin read — the deep
+# dive re-summarises it IN FULL rather than trusting the thin company_page section. The
+# rich summary is cached as a sidecar, so this is a one-time cost per doc (anti-loop).
+THIN_RESPONSE_CHARS = {"annual_report": 8_000, "concall": 5_500}
 # Chunking — long annual reports (financial-statement notes / RPT schedules sit at
 # the BACK) are read shallowly in a single pass. Split into page-range chunks so
 # every page is actually attended to, then merge the partials into one summary.
@@ -991,6 +996,47 @@ def _doc_sidecar_cached(svc, root, isin, row) -> bool:
     except Exception:
         return False
 
+def _refetch_doc_bytes(row):
+    """Re-fetch a doc's bytes from its source URL (the raw PDF on Drive is deleted by the
+    2-day retention). Reuses the backfill fetcher (handles BSE/NSE PDFs, zips, ICRA HTML).
+    Best-effort — returns bytes or None."""
+    url = str(row.get("pdf_url") or "").strip()
+    if not url:
+        return None
+    try:
+        from backfill_company_docs import fetch_document, screener_session
+        out = fetch_document(screener_session(), url)
+        return out[0] if out else None
+    except Exception:
+        return None
+
+def _thin_doc_ids(svc, root, isin) -> set:
+    """doc_ids for THIS isin whose stored extraction (response_chars in
+    quarterly_facts) is below the per-type threshold — i.e. a partial/thin read the
+    deep dive should re-summarise in full. AR<8000, concall<5500 (user 2026-06-22).
+    Only concall/AR carry response_chars; other types are presence-only."""
+    try:
+        qf = _read_parquet(svc, "company_repo/_index/quarterly_facts.parquet", root)
+        if qf.empty or "source_doc_id" not in qf.columns or "response_chars" not in qf.columns:
+            return set()
+        if "isin" in qf.columns:
+            qf = qf[qf["isin"].astype(str) == isin]
+        if qf.empty:
+            return set()
+        pq = _read_parquet(svc, DRIVE["proc_queue"], root)
+        id2type = (dict(zip(pq["doc_id"].astype(str), pq["doc_type"].astype(str)))
+                   if not pq.empty and "doc_id" in pq.columns else {})
+        thin = set()
+        for _, r in qf.iterrows():
+            did = str(r.get("source_doc_id"))
+            thr = THIN_RESPONSE_CHARS.get(id2type.get(did, ""))
+            rc = pd.to_numeric(r.get("response_chars"), errors="coerce")
+            if thr and pd.notna(rc) and rc < thr:
+                thin.add(did)
+        return thin
+    except Exception:
+        return set()
+
 def _sweep_partials(svc, root, isin, row):
     """Delete this doc's per-chunk resume partials once its full sidecar exists.
     Best-effort: lists the _partials folder, removes files named {doc_id}_*. Never raises."""
@@ -1122,9 +1168,11 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
         return cached.decode("utf-8", "ignore")
 
     fid = str(row.get("drive_file_id") or "").strip()
-    if not fid:
-        return None
-    data = _download_file_id(svc, fid)
+    data = _download_file_id(svc, fid) if fid else None
+    if not data:
+        # PDF aged out (2-day retention) or no stored file — re-fetch from source so a
+        # thin/old doc can still be re-summarised. Best-effort; None if unreachable.
+        data = _refetch_doc_bytes(row)
     if not data:
         return None
 
@@ -1180,10 +1228,14 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str
     if rows.empty:
         return "DATA_MISSING (no documents ingested for this company).", []
 
-    blocks, used = [], []
+    # Thin AR/concall (partial reads) are re-summarised IN FULL even though they are
+    # `done` — so the deep dive never trusts a thin company_page section (user 2026-06-22).
+    thin = _thin_doc_ids(svc, root, isin)
+    blocks, used, n_thin = [], [], 0
     for _, r in rows.sort_values("announcement_date").iterrows():
-        if str(r.get("status")) == "done":
-            continue                       # already in COMPANY_PAGE_BRIEF
+        is_thin = str(r["doc_id"]) in thin
+        if str(r.get("status")) == "done" and not is_thin:
+            continue                       # rich done doc — already in COMPANY_PAGE_BRIEF
         # Reuse-or-generate. A cached summary returns instantly; a fresh one costs
         # Gemini calls, so only THEN enforce the deadline (let cached docs through).
         if deadline_ts and time.monotonic() >= deadline_ts \
@@ -1192,12 +1244,16 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str
         summ = summarise_doc(svc, root, pool, isin, r, deadline_ts=deadline_ts)
         if not summ:
             continue
+        if is_thin and str(r.get("status")) == "done":
+            n_thin += 1
         d = str(r["announcement_date"])[:10]
         title = str(r.get("title", ""))[:90]
         blocks.append(f"### [{r['doc_type']} | {d} | {title}]\n"
                       f"{summ.strip()[:MAX_DOC_SUMMARY_CHARS]}")
         used.append({"doc_type": str(r["doc_type"]), "date": d,
                      "title": title, "doc_id": str(r["doc_id"])})
+    if n_thin:
+        print(f"    completeness: re-summarised {n_thin} thin AR/concall doc(s) in full")
     if not blocks:
         return "DATA_MISSING (documents present but none summarisable).", []
     return "\n\n".join(blocks), used
