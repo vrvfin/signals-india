@@ -230,6 +230,16 @@ jobs:
           --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --max-age-hours 48
           --deadline-min 30 || true
 
+      # ── Phase 3 — parallel ALT drain: clear ratings Gemini left pending using Groq/
+      # Cerebras (independent quota), with concurrent alt calls (thread-safe HTTP) sped up
+      # ~3x. Runs AFTER the Gemini rating step (own lock window, no concurrency) so it only
+      # mops up what Gemini didn't reach. Deadline-capped to release the lock in time.
+      - name: T8c — parallel alt drain for ratings (Groq/Cerebras)
+        if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
+        run: >
+          python scripts/extract_rating_parallel.py --workers 6
+          --max-age-hours 48 --deadline-min 20 || true
+
       - name: T8 — daily AR digest + focus/defocus lists
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
         run: python scripts/daily_ar_summary.py || true

@@ -126,6 +126,61 @@ class FallbackPool:
         self.primary.prime_from_health(drive, index_id)
 
 
+class AltOnlyPool:
+    """Alt-providers-only caller exposing the GeminiKeyPool surface (call / call_text), so
+    call_over_doc / tabulate_* work with it unchanged. NO Gemini → pure HTTP → SAFE to call
+    from many threads concurrently (the Phase-3 parallel drain). Raises RateLimitExhausted
+    when no alt provider can serve (caller defers the row). Thread-safe counters."""
+
+    def __init__(self, alt_pools: dict):
+        import threading
+        self.alt_pools = alt_pools
+        self._ok: dict[str, int] = {}
+        self._fail: dict[str, int] = {}
+        self._clk = threading.Lock()
+
+    def _call(self, prompt: str, max_output_tokens: int | None) -> str:
+        order = _ALT_SMALL if len(prompt) <= _SMALL_CHARS else _ALT_LARGE
+        if len(prompt) > _ALT_MAX_CHARS:
+            prompt = prompt[:_ALT_MAX_CHARS]
+        last = "no alt provider available"
+        for prov, model in order:
+            pool = self.alt_pools.get(prov)
+            if not pool or not pool.keys:
+                continue
+            key = f"{prov}:{model}"
+            try:
+                out = pool.call_text(prompt, model, max_output_tokens=max_output_tokens)
+                if out and out.strip():
+                    with self._clk:
+                        self._ok[key] = self._ok.get(key, 0) + 1
+                    return out
+                last = f"{key}: empty response"
+            except AltLLMError as e:
+                with self._clk:
+                    self._fail[key] = self._fail.get(key, 0) + 1
+                last = f"{key}: {str(e)[:80]}"
+        raise RateLimitExhausted(f"alt-only: no provider served ({last})")
+
+    def call(self, pdf_bytes: bytes, prompt: str, display_name: str = "",
+             max_output_tokens: int | None = None) -> str:
+        text = _pdf_text(pdf_bytes)
+        if not text.strip():
+            raise RateLimitExhausted("alt-only: PDF has no text layer (scanned)")
+        return self._call(prompt + "\n\nDOCUMENT:\n" + text, max_output_tokens)
+
+    def call_text(self, prompt: str, display_name: str = "",
+                  max_output_tokens: int | None = None) -> str:
+        return self._call(prompt, max_output_tokens)
+
+    def summary(self) -> dict:
+        buckets = [{"key_idx": 0, "model": k, "ok": self._ok.get(k, 0),
+                    "fail": self._fail.get(k, 0), "rpm_cool": 0, "overload_503": 0,
+                    "state": "alt"}
+                   for k in (set(self._ok) | set(self._fail))]
+        return {"buckets": buckets, "alt_ok": sum(self._ok.values())}
+
+
 def build_alt_pools(env: dict | None = None) -> dict:
     """{'groq': AltPool, 'cerebras': AltPool} for whichever providers have keys."""
     env = env if env is not None else os.environ
