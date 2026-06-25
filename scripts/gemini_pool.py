@@ -292,6 +292,34 @@ class BucketPool:
             self._log("  STEP A WARNING: every model failed the probe — nothing live!")
         return dropped
 
+    def prime_dead_buckets(self, pairs) -> int:
+        """Phase 1 — pre-mark (key_idx, model) buckets DEAD_TODAY from the persisted
+        health cache, so a fresh run does NOT re-discover yesterday-style PerDay deaths by
+        burning one real call per dead bucket. Returns how many were marked.
+
+        Safety floor: if priming would leave NO live bucket (e.g. a stale/corrupt cache),
+        revive the best-rank bucket per model as a self-test so the run can still probe
+        whether quota has actually reset. Additive — nothing calls this unless wired."""
+        pairs = {(int(k), str(m)) for k, m in (pairs or set())}
+        if not pairs:
+            return 0
+        with self._lock:
+            n = 0
+            for b in self.buckets:
+                if (b.key_idx, b.model) in pairs and b.state == ALIVE:
+                    b.state = DEAD_TODAY
+                    n += 1
+            if n and not any(b.state == ALIVE for b in self.buckets) and self.buckets:
+                seen = set()
+                for b in sorted(self.buckets, key=lambda x: (x.model_rank, x.key_idx)):
+                    if b.model not in seen:
+                        b.state = ALIVE
+                        seen.add(b.model)
+                self._log(f"  prime: cache would kill ALL buckets — revived "
+                          f"{len(seen)} best-rank bucket(s) as a self-test")
+            self._log(f"  prime: marked {n} bucket(s) DEAD_TODAY from health cache")
+            return n
+
     def call_pdf(self, pdf_bytes: bytes, prompt: str,
                  max_output_tokens: int | None = None) -> tuple[str, str]:
         """Run prompt over the PDF. Returns (response_text, model_used).

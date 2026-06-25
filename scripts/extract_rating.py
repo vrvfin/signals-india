@@ -328,6 +328,11 @@ def main() -> None:
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id  = get_or_create_subfolder(drive, repo_id,   "_index")
 
+    # Phase 1 (BACKFILL ONLY): pre-mark PerDay-dead buckets from the health cache so
+    # this run skips them instead of burning a call each to re-discover. PF path unchanged.
+    if args.all_companies:
+        gemini.prime_from_health(drive, index_id)
+
     # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
     # On contention exit cleanly — the next run resumes (rows stay pending).
     _is_backfill = args.all_companies          # universe backfill path -> yield to Phase 2

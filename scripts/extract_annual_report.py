@@ -566,6 +566,11 @@ def main() -> None:
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id  = get_or_create_subfolder(drive, repo_id,   "_index")
 
+    # Phase 1 (BACKFILL ONLY): pre-mark PerDay-dead buckets from the health cache so
+    # this run skips them instead of burning a call each to re-discover. PF path unchanged.
+    if args.all_companies:
+        gemini.prime_from_health(drive, index_id)
+
     # T12 lock + priority: --all-companies is the backfill (T8) path → yield to
     # Phase 2; the PF path is Phase 2 itself → wait up to 15 min for the lock.
     _is_backfill = args.all_companies
