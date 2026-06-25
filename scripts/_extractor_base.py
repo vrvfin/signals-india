@@ -417,6 +417,31 @@ class GeminiKeyPool:
     def summary(self) -> dict:
         return self._pool.summary()
 
+    def prime_from_health(self, drive, index_id: str) -> None:
+        """Phase 1 — pre-mark PerDay-dead buckets from gemini_usage.parquet (see
+        prime_pool_from_health). Convenience so AR/rating extractors can prime their
+        wrapped pool directly."""
+        prime_pool_from_health(self._pool, drive, index_id)
+
+
+def prime_pool_from_health(pool, drive, index_id: str) -> None:
+    """Phase 1 — read gemini_usage.parquet and pre-mark (key, model) buckets that hit
+    PerDay quota since the last reset as DEAD_TODAY, so this run skips them instead of
+    burning a real call to re-discover each. Best-effort: never raises (a logging/cache
+    miss must not break extraction). `pool` may be a BucketPool or a GeminiKeyPool."""
+    try:
+        from datetime import datetime
+        from bucket_health import dead_buckets_since_reset
+        target = getattr(pool, "_pool", pool)   # unwrap GeminiKeyPool if needed
+        df = load_parquet(drive, index_id, "gemini_usage.parquet", GEMINI_USAGE_COLS)
+        dead = dead_buckets_since_reset(df, datetime.utcnow())
+        if dead:
+            n = target.prime_dead_buckets(dead)
+            log(f"  bucket-health: primed {n} PerDay-dead bucket(s) since last reset "
+                f"(skipping re-discovery this run).")
+    except Exception as e:                       # never break a run over the cache
+        log(f"  WARNING: bucket-health priming skipped ({str(e)[:80]}).")
+
 
 # ------------------------------------------------------------------ #
 #  Markdown table parser (handles fenced and unfenced pipe tables)    #

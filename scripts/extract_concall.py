@@ -59,7 +59,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
                          load_keys, load_keys_multi)
 from _extractor_base import (P1_MODELS,   # lite chain — backfill-only fallback
-                             acquire_lock, release_lock, phase2_beacon_fresh)
+                             acquire_lock, release_lock, phase2_beacon_fresh,
+                             prime_pool_from_health)
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -1564,6 +1565,12 @@ def main() -> None:
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
+
+    # Phase 1 (BACKFILL ONLY — Phase 2 live path unchanged): pre-mark buckets that
+    # already hit PerDay quota since the last reset, so this slot skips them instead of
+    # burning one real call each to re-discover the same dead buckets.
+    if args.backfill:
+        prime_pool_from_health(gemini, drive, index_id)
 
     # Mutual-exclusion lock so a live run and a backfill run can't clobber the
     # shared _index parquets concurrently (T1.4). Released on exit via atexit.
