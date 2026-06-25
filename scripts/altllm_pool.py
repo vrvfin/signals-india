@@ -80,9 +80,14 @@ class AltPool:
                 continue
             if r.status_code == 200:
                 try:
-                    return r.json()["choices"][0]["message"]["content"] or ""
+                    msg = r.json()["choices"][0]["message"]
                 except Exception as e:                       # malformed 200
                     raise AltLLMError(f"bad 200 body: {str(e)[:120]}")
+                # reasoning models (gpt-oss, glm) may put the answer in content, or leave
+                # content empty and use reasoning/reasoning_content — accept whichever has text.
+                return (msg.get("content")
+                        or msg.get("reasoning_content")
+                        or msg.get("reasoning") or "")
             if r.status_code in _TRANSIENT:
                 last = f"HTTP {r.status_code}"
                 time.sleep(1.0)
