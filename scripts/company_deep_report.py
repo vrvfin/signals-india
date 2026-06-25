@@ -1010,6 +1010,65 @@ def _refetch_doc_bytes(row):
     except Exception:
         return None
 
+def _writeback_thin_section(svc, root, isin, row, summary) -> bool:
+    """Write a freshly re-summarised thin AR/concall back into its company_page.md section
+    (rule 7C), under _extract.lock, BEST-EFFORT. Safety: REPLACE-ONLY — if the exact
+    section header isn't already present it SKIPS (never appends → no duplicate sections);
+    if the lock is held by Phase 2 / the nightly backfill it SKIPS (report is already
+    complete from the sidecar). Updates response_chars so the doc isn't re-flagged thin.
+    Never raises. Returns True only if the page was actually updated."""
+    dt_ = str(row["doc_type"])
+    if dt_ not in ("annual_report", "concall"):
+        return False
+    try:
+        qf = _read_parquet(svc, "company_repo/_index/quarterly_facts.parquet", root)
+        if qf.empty or "source_doc_id" not in qf.columns:
+            return False
+        m = qf[qf["source_doc_id"].astype(str) == str(row["doc_id"])]
+        if m.empty:
+            return False
+        period = str(m.iloc[0].get("quarter") or "").strip()   # exact label the extractor used
+        if not period:
+            return False
+        label = "Annual Report" if dt_ == "annual_report" else "Concall"
+        page_b = drive_download(svc, f"{DRIVE['company_page']}/{isin}/company_page.md", root)
+        if not page_b:
+            return False
+        if not re.search(rf'##\s+{re.escape(period)}\s+{re.escape(label)}\b',
+                         page_b.decode("utf-8", "ignore")):
+            return False                       # section not found → skip (no append/dup)
+        from _extractor_base import acquire_lock, release_lock
+        index_id = _folder_id(svc, "company_repo/_index", root)
+        repo_id  = _folder_id(svc, "company_repo", root)
+        if not index_id or not repo_id:
+            return False
+        if not acquire_lock(svc, index_id, "_extract.lock", "deepdive_writeback",
+                            wait_min=0.5, defer_to_phase2=True):
+            print(f"      writeback: lock busy — skip page update for {period} {label}")
+            return False
+        try:
+            title = str(row.get("title") or "")[:90]
+            if dt_ == "annual_report":
+                from extract_annual_report import _replace_ar_section
+                _replace_ar_section(svc, repo_id, isin, period, summary, title)
+            else:
+                from extract_concall import replace_company_page_section
+                replace_company_page_section(svc, repo_id, isin, period, summary, title)
+            qf2 = _read_parquet(svc, "company_repo/_index/quarterly_facts.parquet", root)
+            mask = qf2["source_doc_id"].astype(str) == str(row["doc_id"])
+            if mask.any():
+                qf2.loc[mask, "response_chars"] = len(summary)
+                buf = io.BytesIO(); qf2.to_parquet(buf, index=False)
+                drive_upload(svc, "company_repo/_index/quarterly_facts.parquet", root,
+                             buf.getvalue(), "application/octet-stream")
+            print(f"      writeback: enriched {period} {label} section in company_page.md")
+            return True
+        finally:
+            release_lock(svc, index_id, "_extract.lock")
+    except Exception as e:
+        print(f"      writeback skipped ({type(e).__name__}: {str(e)[:60]})")
+        return False
+
 def _thin_doc_ids(svc, root, isin) -> set:
     """doc_ids for THIS isin whose stored extraction (response_chars in
     quarterly_facts) is below the per-type threshold — i.e. a partial/thin read the
@@ -1246,6 +1305,9 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str
             continue
         if is_thin and str(r.get("status")) == "done":
             n_thin += 1
+            # Persist the richer read back into company_page.md's section (7C, best-effort,
+            # replace-only + lock-guarded). The report already has it via the block above.
+            _writeback_thin_section(svc, root, isin, r, summ)
         d = str(r["announcement_date"])[:10]
         title = str(r.get("title", ""))[:90]
         blocks.append(f"### [{r['doc_type']} | {d} | {title}]\n"
