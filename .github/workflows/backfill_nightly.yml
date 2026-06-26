@@ -198,6 +198,17 @@ jobs:
           python scripts/extract_concall.py --backfill --deadline-min "$DEADLINE_MIN" || true
           # "|| true" so the job doesn't fail on AllBucketsExhausted (expected exit).
 
+      # ── T1d — PARALLEL ALT concall drain (Groq/Cerebras, independent quota) ──
+      # Chews the FRESH concall backlog that Gemini's daily quota can't reach (measured:
+      # ~147 fresh pending while the alt lane did 0). Runs AFTER Gemini so Gemini gets
+      # first crack; alt clears the rest on independent quota, in parallel (~3.5s/doc).
+      # Does NOT touch the live concall path. Toggle: repo Variable BACKFILL_ALT_CONCALL=true.
+      - name: T1d — parallel alt concall drain (Groq/Cerebras)
+        if: ${{ steps.sched.outputs.skip != 'true' && vars.BACKFILL_ALT_CONCALL == 'true' }}
+        run: >
+          python scripts/extract_concall_parallel.py --workers 6
+          --max-age-hours 48 --deadline-min 40 || true
+
       # ── Stage 2: fetch fresh Annual Reports (3y, universe, newest-first) ─────
       # Only on full night slots (run_extras) so the ARs fetched here are extracted
       # by the T8 step the SAME slot — big AR PDFs must not age out (2-day retention).
