@@ -523,6 +523,11 @@ def main() -> None:
                              "and exit cleanly so the shared _extract.lock is released "
                              "well before the CI job timeout (prevents a killed step "
                              "from leaving a stale lock that starves backfill for hours).")
+    parser.add_argument("--batch-size", type=int, default=10,
+                        help="Persist the queue once per N docs instead of per-doc "
+                             "(the per-doc save_queue re-uploads the whole queue — O(queue), "
+                             "the 5y scaling cliff). Output writes stay per-doc + idempotent, "
+                             "so a kill between saves re-processes <=N docs without duplicates.")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -637,6 +642,21 @@ def main() -> None:
     _seen_fy_keys: set = set()
     _t0 = time.time()
 
+    # BATCH-WRITE: defer the whole-queue rewrite. save_queue re-uploads the ENTIRE queue
+    # (O(queue) → ~15-30s/doc at 5y scale = a scaling cliff). All per-doc OUTPUT writes stay
+    # immediate and are idempotent — the new-AR append carries a doc_id marker, and
+    # _replace_ar_section / _purge_ar_fy / superseded-mark / _upsert_ar all dedupe — so a CI
+    # kill between saves re-processes those docs WITHOUT duplicates. Queue is persisted every
+    # BATCH docs and once at the end.
+    BATCH = max(1, getattr(args, "batch_size", 10))
+    _since_save = [0]
+
+    def _save_queue_batched(force: bool = False) -> None:
+        _since_save[0] += 1
+        if force or _since_save[0] >= BATCH:
+            save_queue(drive, index_id, queue)
+            _since_save[0] = 0
+
     for queue_idx in pending_idx:
         # Wall-clock cap: release the lock cleanly before the CI job timeout so a
         # killed step never leaves a stale _extract.lock (root cause of multi-hour
@@ -729,7 +749,7 @@ def main() -> None:
             if _dup:
                 queue.loc[queue_idx, "status"] = "done"
                 queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-                save_queue(drive, index_id, queue)
+                _save_queue_batched()
                 counts["dup"] += 1
                 continue
 
@@ -766,6 +786,7 @@ def main() -> None:
                         content=report_md,
                         doc_title=str(row.get("title", "")),
                         quarter=facts["quarter"],
+                        dedup_marker=_this_doc,
                     )
 
             if OUTPUT_DAY_MD:
@@ -777,6 +798,7 @@ def main() -> None:
                     company_name=str(row.get("company_name", "")),
                     quarter=facts["quarter"],
                     content=report_md,
+                    dedup_marker=_this_doc,
                 )
 
             upsert_facts(drive, index_id, facts)
@@ -799,7 +821,7 @@ def main() -> None:
 
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
+            _save_queue_batched()
 
             counts["processed"] += 1
             log(f"  Done: {row.get('symbol')}")
@@ -812,10 +834,11 @@ def main() -> None:
             log(f"  ERROR: {str(exc)[:120]}")
             queue.loc[queue_idx, "status"] = "error"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_queue(drive, index_id, queue)
+            _save_queue_batched()
             counts["error"] += 1
 
     if not args.dry_run:
+        _save_queue_batched(force=True)        # commit the final partial batch + error marks
         from _extractor_base import persist_gemini_usage
         persist_gemini_usage(drive, index_id, gemini.summary(), DOC_TYPE,
                              "backfill" if getattr(args, "all_companies", False) else "phase2")
