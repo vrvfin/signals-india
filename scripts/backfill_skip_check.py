@@ -38,6 +38,18 @@ FULL_DEADLINE_MIN = 200          # normal catch-up extract cap
 CUTOFF_HH, CUTOFF_MM = 9, 30     # 09:30 IST — backfill must release the lock by here
 NIGHT_START = (22, 30)           # 22:30 IST
 MIN_USEFUL_MIN = 30              # below this much runway to the cutoff → skip
+# OPTION A (reversible trial): when env BACKFILL_DAYTIME is truthy, peak Mon–Sat DAYTIME
+# slots run instead of being skipped — they fall in Phase 2's 2h gaps (backfill crons
+# 11/15/19 IST sit between Phase 2's 10/12/14/16/18/20/22 IST). The 15:00 & 19:00 IST slots
+# are AFTER the 13:30 IST quota reset → they tap a 2nd Gemini quota-day. Deadline-capped
+# short so the lock is released before the next Phase-2 slot, and the existing yield-to-
+# Phase-2 beacon still makes backfill step aside the instant Phase 2 runs. Toggle OFF
+# (unset the var) → behaviour reverts exactly to today's (daytime skipped).
+DAYTIME_GAP_DEADLINE_MIN = 50    # fits the ~60-min gap between 2h Phase-2 slots
+
+
+def _daytime_optin() -> bool:
+    return os.environ.get("BACKFILL_DAYTIME", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _mins_to_cutoff(ist_now: datetime) -> int:
@@ -61,16 +73,24 @@ def decide(ist_now: datetime, event: str) -> dict:
     mins = _mins_to_cutoff(ist_now)
 
     # 1) Skip decision.
+    daytime_gap = False
     if manual:
         skip = False
     elif is_peak and not is_sunday:
         skip = not _in_night_window(ist_now)          # peak Mon–Sat: night only
+        if skip and _daytime_optin():                 # OPTION A trial: run the gap slot
+            skip = False
+            daytime_gap = True
     else:
         skip = False                                  # peak Sunday / off-season: all slots
 
     # 2) Deadline + extras. Only the peak Mon–Sat MORNING approach to 09:30 is capped.
     deadline_min = FULL_DEADLINE_MIN
     run_extras = True
+    if daytime_gap:
+        # Short, light slot that releases the lock well before the next 2h Phase-2 slot.
+        deadline_min = DAYTIME_GAP_DEADLINE_MIN
+        run_extras = False                            # core extract only; no long lock-holders
     morning_short = (not manual and is_peak and not is_sunday
                      and _in_night_window(ist_now)
                      and mins < FULL_DEADLINE_MIN + 10)   # can't fit a full cycle
@@ -83,7 +103,8 @@ def decide(ist_now: datetime, event: str) -> dict:
 
     return {"skip": skip, "deadline_min": int(deadline_min),
             "run_extras": run_extras, "is_peak": is_peak,
-            "is_sunday": is_sunday, "mins_to_cutoff": mins}
+            "is_sunday": is_sunday, "mins_to_cutoff": mins,
+            "daytime_gap": daytime_gap}
 
 
 def _emit(d: dict) -> None:
