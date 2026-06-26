@@ -55,6 +55,8 @@ scripts/page_pf_tracking_snippet.py
 scripts/generate_tv_watchlist.py
 scripts/sync_pf.py
 check_company.bat
+company_report.bat
+company_reports/
 tv_watchlist.txt
 1_PF.txt
 07-06-2026.txt
