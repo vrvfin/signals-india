@@ -433,14 +433,23 @@ def prime_pool_from_health(pool, drive, index_id: str) -> None:
     miss must not break extraction). `pool` may be a BucketPool or a GeminiKeyPool."""
     try:
         from datetime import datetime
-        from bucket_health import dead_buckets_since_reset
+        from bucket_health import dead_buckets_since_reset, dead_models_keys_since_reset
         target = getattr(pool, "_pool", pool)   # unwrap GeminiKeyPool if needed
         df = load_parquet(drive, index_id, "gemini_usage.parquet", GEMINI_USAGE_COLS)
-        dead = dead_buckets_since_reset(df, datetime.utcnow())
+        now = datetime.utcnow()
+        dead = set(dead_buckets_since_reset(df, now))          # PerDay-dead (key, model)
+        # Also skip whole MODELS / KEYS that only failed this window (>=10 fails, 0 ok) —
+        # e.g. gemini-2.0-flash flooding 429s. Expand to this pool's (key, model) buckets.
+        dead_models, dead_keys = dead_models_keys_since_reset(df, now)
+        if dead_models or dead_keys:
+            for b in getattr(target, "buckets", []):
+                if b.model in dead_models or b.key_idx in dead_keys:
+                    dead.add((b.key_idx, b.model))
         if dead:
             n = target.prime_dead_buckets(dead)
-            log(f"  bucket-health: primed {n} PerDay-dead bucket(s) since last reset "
-                f"(skipping re-discovery this run).")
+            log(f"  bucket-health: primed {n} dead bucket(s) since reset — PerDay + "
+                f"{len(dead_models)} dead model(s) {sorted(dead_models)} + "
+                f"{len(dead_keys)} dead key(s).")
     except Exception as e:                       # never break a run over the cache
         log(f"  WARNING: bucket-health priming skipped ({str(e)[:80]}).")
 
