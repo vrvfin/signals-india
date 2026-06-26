@@ -73,6 +73,11 @@ class FatalCallError(Exception):
 # ── error classification ────────────────────────────────────────────────────────
 
 PERDAY, PERMIN, OVERLOAD, FATAL = "perday", "permin", "overload", "fatal"
+# KEY_DEAD: a per-KEY permanent auth failure (deleted/disabled service account,
+# invalid/revoked key). NOT per-document — condemn that key for the run and rotate
+# to the next key; only AllBucketsExhausted if EVERY key is dead. The key stays in
+# config, so a later run re-probes it (e.g. once the account is re-enabled).
+KEY_DEAD = "key_dead"
 
 
 def classify_error(exc: Exception) -> tuple[str, float]:
@@ -101,6 +106,13 @@ def classify_error(exc: Exception) -> tuple[str, float]:
                                        "operation was cancelled", "cancelled",
                                        "500 internal", "502", "504")):
         return OVERLOAD, _retry_delay(s, default=8.0)
+    # per-KEY permanent auth failure: deleted/disabled service account, invalid or
+    # revoked key. This condemns the KEY (rotate to the next), not the document.
+    if any(t in s for t in ("ACCOUNT_STATE_INVALID", "API_KEY_INVALID",
+                            "UNAUTHENTICATED", "PERMISSION_DENIED")) \
+            or any(t in _low for t in ("service account is deleted or disabled",
+                                       "api key not valid", "401", "403")):
+        return KEY_DEAD, 0.0
     return FATAL, 0.0
 
 
@@ -427,7 +439,16 @@ class BucketPool:
 
     def _apply_failure(self, b: _Bucket, kind: str, retry_after: float, exc: Exception):
         now = time.time()
-        if kind == PERDAY:
+        if kind == KEY_DEAD:
+            # per-KEY permanent auth failure — condemn EVERY bucket on this key for
+            # the run and rotate. The key stays in config, so a fresh run re-probes it.
+            killed = [bb for bb in self.buckets if bb.key_idx == b.key_idx
+                      and bb.state == ALIVE]
+            for bb in killed:
+                bb.state = DEAD_RUN
+            self._log(f"  key{b.key_idx}: auth failure ({str(exc)[:80]}) — "
+                      f"key DEAD for this run ({len(killed)} bucket(s) dropped), rotating")
+        elif kind == PERDAY:
             b.state = DEAD_TODAY
             self._log(f"  {b.label}: PerDay exhausted — dead until reset (~13:30 IST)")
         elif kind == PERMIN:

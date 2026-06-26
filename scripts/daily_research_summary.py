@@ -130,10 +130,17 @@ CLASSIFY_RULES = [
 # -> caller stops and resumes next run (work already persisted per-file).
 # ----------------------------------------------------------------------------
 def daily_keys() -> list[str]:
-    keys = [os.getenv("DAILY_GEMINI_KEY_1"), os.getenv("DAILY_GEMINI_KEY_2")]
-    keys = [k.strip() for k in keys if k and k.strip()]
+    """Dedicated DAILY keys first (DAILY_GEMINI_KEY_1..n, separate Cloud projects =
+    independent quota), then FREE_POOL_1..18 as overflow. De-duped, order preserved.
+    A dead/disabled DAILY key no longer stalls the run — the pool rotates to the next
+    (see gemini_pool KEY_DEAD)."""
+    from gemini_pool import load_keys
+    keys = load_keys(os.environ, prefix="DAILY_GEMINI_KEY")
+    for k in load_keys(os.environ, prefix="FREE_POOL"):
+        if k not in keys:
+            keys.append(k)
     if not keys:
-        raise RuntimeError("Set DAILY_GEMINI_KEY_1 / DAILY_GEMINI_KEY_2")
+        raise RuntimeError("Set DAILY_GEMINI_KEY_1.. (or FREE_POOL_1..) keys")
     return keys
 
 def build_daily_pool() -> BucketPool:
@@ -479,8 +486,13 @@ def main():
     ledger = pd.read_parquet(LEDGER_PATH) if LEDGER_PATH.exists() else pd.DataFrame(
         columns=["research_n", "doc_hash", "fuzzy_fp", "content_key", "file_name",
                  "source", "doc_type", "processed_at", "status"])
-    seen_hash = set(ledger.doc_hash); seen_fp = set(ledger.fuzzy_fp)
-    seen_ck = set(ledger.get("content_key", pd.Series(dtype=str)))
+    # FAILED rows ('error'/'upload_error') do NOT block a retry — a transient/auth
+    # failure (e.g. a dead key) must not lock a doc out forever. Only rows that truly
+    # finished (ok/dup/needs_ocr/superseded) populate the dedup sets.
+    RETRY_STATUSES = {"error", "upload_error"}
+    blocking = ledger[~ledger.status.isin(RETRY_STATUSES)] if len(ledger) else ledger
+    seen_hash = set(blocking.doc_hash); seen_fp = set(blocking.fuzzy_fp)
+    seen_ck = set(blocking.get("content_key", pd.Series(dtype=str)))
     prior_status = dict(zip(ledger.doc_hash, ledger.status)) if len(ledger) else {}
     counter = int(ledger.research_n.max()) if len(ledger) else 0
 
