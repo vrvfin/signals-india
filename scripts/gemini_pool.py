@@ -166,6 +166,10 @@ class BucketPool:
         call_timeout_s: float = 180.0,  # hard per-call HTTP timeout (no infinite hangs)
         model_overload_keys: int = 3,   # 503 on this many DISTINCT keys -> drop the
                                         # whole model for the run (circuit breaker)
+        model_fail_drop: int = 10,      # >=N fails of ANY type with 0 ok -> the model is
+                                        # dead for the workload; drop it for the run
+        key_fail_drop: int = 10,        # >=N fails of ANY type with 0 ok -> the key is
+                                        # dead for the run; drop it
         logger=print,
     ):
         # NOTE: there is deliberately NO wall-clock cap by default. Termination is
@@ -182,6 +186,8 @@ class BucketPool:
         self.inter_call_s = inter_call_s
         self.overload_backoff_s = overload_backoff_s
         self.model_overload_keys = model_overload_keys
+        self.model_fail_drop = model_fail_drop
+        self.key_fail_drop = key_fail_drop
         # Distinct key indices that have hit 503 per model (circuit-breaker signal).
         # A tiny "ping" probe can pass while real PDF calls 503 (model overloaded for
         # the actual workload), so this is driven by REAL calls, not the probe.
@@ -484,6 +490,36 @@ class BucketPool:
                     self._log(f"  CIRCUIT-BREAK: model '{b.model}' 503'd on "
                               f"{len(ks)} keys — dropping all {len(killed)} remaining "
                               f"buckets for this run; failing over to next model.")
+
+        # GENERALIZED DEAD breaker (ANY error type): a model or key that has ONLY failed
+        # this run (>= threshold fails, 0 ok) is dead for the workload — park its remaining
+        # buckets so we stop retrying it. Catches e.g. gemini-2.0-flash flooding 429s (which
+        # the 503-only breaker missed: ~700 wasted fails/day). The 0-ok guard guarantees a
+        # productive model/key (some fails but real successes) is NEVER dropped.
+        mfail = sum(bb.fail for bb in self.buckets if bb.model == b.model)
+        mok = sum(bb.ok for bb in self.buckets if bb.model == b.model)
+        if mok == 0 and mfail >= self.model_fail_drop:
+            killed = [bb for bb in self.buckets
+                      if bb.model == b.model and bb.state == ALIVE]
+            for bb in killed:
+                bb.state = DEAD_RUN
+            if killed:
+                self._log(f"  MODEL-DEAD: '{b.model}' {mfail} fails / 0 ok — dropping "
+                          f"{len(killed)} bucket(s) for this run.")
+        # KEY breaker requires failure across >=2 DISTINCT models (else a single dead
+        # model would wrongly condemn the whole key + its still-good models). A genuine
+        # dead key fails on everything; a pure auth-dead key is already handled by KEY_DEAD.
+        kfail = sum(bb.fail for bb in self.buckets if bb.key_idx == b.key_idx)
+        kok = sum(bb.ok for bb in self.buckets if bb.key_idx == b.key_idx)
+        kmodels = {bb.model for bb in self.buckets if bb.key_idx == b.key_idx and bb.fail > 0}
+        if kok == 0 and kfail >= self.key_fail_drop and len(kmodels) >= 2:
+            killed = [bb for bb in self.buckets
+                      if bb.key_idx == b.key_idx and bb.state == ALIVE]
+            for bb in killed:
+                bb.state = DEAD_RUN
+            if killed:
+                self._log(f"  KEY-DEAD: key{b.key_idx} {kfail} fails / 0 ok across "
+                          f"{len(kmodels)} models — dropping {len(killed)} bucket(s) this run.")
 
     # -- reporting --
     def _state_summary(self) -> str:
