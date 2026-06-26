@@ -54,6 +54,7 @@ scripts/page_pf_tracking_snippet.py
 # Local-only workflows — run from Task Scheduler / .bat, never CI (user 2026-06-11)
 scripts/generate_tv_watchlist.py
 scripts/sync_pf.py
+check_company.bat
 tv_watchlist.txt
 1_PF.txt
 07-06-2026.txt
