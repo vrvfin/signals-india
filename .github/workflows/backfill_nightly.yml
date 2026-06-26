@@ -89,6 +89,12 @@ jobs:
       # (30 min before Phase 2's 10:00 peak start). Pure stdlib — runs before deps.
       - name: Seasonal skip-check
         id: sched
+        env:
+          # OPTION A trial toggle (reversible): set repo Variable BACKFILL_DAYTIME=true to
+          # let peak-season DAYTIME gap slots (11/15/19 IST) run instead of being skipped —
+          # they sit in Phase 2's 2h gaps and the 15:00/19:00 slots tap the 2nd quota-day.
+          # Unset / set to anything else → reverts exactly to today's night-only behaviour.
+          BACKFILL_DAYTIME: ${{ vars.BACKFILL_DAYTIME }}
         run: python scripts/backfill_skip_check.py
 
       - name: Write credentials (.env)
