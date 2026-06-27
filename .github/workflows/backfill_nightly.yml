@@ -166,19 +166,20 @@ jobs:
       # slot walks forward into the tail naturally). --quarters 40 = last ~10 years of
       # concalls. AR is enabled later by adding a `--types annual_report --years N`
       # step once concall reaches ~100% of the concall-bearing universe.
-      # --target-pending 300 = fill-to-target throttle: top the queue up to ~300
-      # pending concall docs (≈ measured extract ceiling ~300-600/quota-day, well
-      # within the 2-day PDF retention), so extract is never starved AND PDFs never
-      # age out before summarising. --max-companies 150 caps companies fetched per
-      # slot; the walk stops early if the queue hits target-pending first, so the
-      # depth cap — not the company cap — is the real safety limit against
-      # over-fetching the deep tail (uncovered companies yield up to 8 concalls each).
+      # --target-pending 600 = fill-to-target throttle. Raised 300->600 (2026-06-27) now
+      # that the alt concall drain (T1d, Groq/Cerebras, independent quota) adds capacity:
+      # Gemini clears its ~200 first (primary), and the EXCESS fresh-pending is what T1d
+      # mops up — at 300 Gemini cleared the whole backlog so T1d found 0. Combined
+      # Gemini+alt throughput easily clears 600 within the 2-day PDF retention (~6 slots/day).
+      # --max-companies 150 caps companies fetched per slot; the walk stops early if the
+      # queue hits target-pending first, so the depth cap — not the company cap — is the
+      # real safety limit against over-fetching the deep tail.
       - name: T1 — fetch concalls from Screener/BSE (cursor-free walk)
         if: ${{ steps.sched.outputs.skip != 'true' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event.inputs.do_fetch == 'true') }}
         run: |
           MAX=${{ github.event.inputs.max_fetch || '150' }}
           python scripts/run_backfill.py --types concall --quarters 40 \
-            --max-companies "$MAX" --target-pending 300
+            --max-companies "$MAX" --target-pending 600
 
       # ── T1 EXTRACT (every run — drain queue until quota/deadline) ───────────
       # Deadline comes from the seasonal gate: 200 min normally, but the peak
@@ -283,7 +284,9 @@ jobs:
       # ── T2 INCREMENTAL (every run — refresh today's reporters) ──────────────
       - name: T2 — refresh financials for today's reporters (incremental)
         if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
-        run: python scripts/backfill_results_3stmt.py --incremental
+        # || true: this exits 1 when there are no reporters to refresh — a benign no-op that
+        # was failing the whole job (it runs AFTER all extraction, so docs are unaffected).
+        run: python scripts/backfill_results_3stmt.py --incremental || true
 
       # ── T2 DERIVED (every run — recomputes from latest 3stmt) ───────────────
       - name: T2 — derived metrics
