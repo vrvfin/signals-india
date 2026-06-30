@@ -247,6 +247,11 @@ _DAYS_PER_QUARTER = 92
 # doc we already hold. Guards against perpetual re-fetch when a company simply has
 # no document as old as the rolling floor (its earliest is newer than the floor).
 _DEEPER_MARGIN_DAYS = 180
+# Once we've page-checked a company for a doc_type and pulled >=1 doc, don't re-open
+# that page for RECHECK_DAYS — re-scanning only re-finds the same docs (older ones the
+# floor wants usually don't exist). This recency wins over "deeper-window" and is what
+# lets the walk advance past covered companies into the unwalked tail (user 2026-06-30).
+RECHECK_DAYS = 60
 
 
 def _since_for(doc_type: str, args) -> str | None:
@@ -289,16 +294,29 @@ def _needs_fetch(cov_row: dict | None, since_floor: str | None,
     except (TypeError, ValueError):
         pass
 
-    # Deeper-window: requested floor reaches meaningfully older than our oldest doc.
     cov_earliest = str(cov_row.get("covered_earliest_date") or "")
+    last = pd.to_datetime(cov_row.get("last_fetched_at"), errors="coerce")
+
+    # PULLED-DATA RECENCY (user 2026-06-30) — applies to ALL doc types: if we have a
+    # coverage row (we already pulled >=1 doc for this company+doc_type) AND the page was
+    # checked within RECHECK_DAYS, SKIP — even if the floor wants older docs. Re-scanning a
+    # recently-checked page only re-finds the same docs (the older ones the 10y floor asks
+    # for usually don't exist). This wins over the deeper-window gate below, which had jammed
+    # the walk re-scanning already-covered companies instead of advancing to unwalked ones.
+    if cov_earliest and pd.notna(last):
+        age_days = (datetime.now() - last.to_pydatetime()).days
+        if age_days <= RECHECK_DAYS:
+            return False, f"covered-recent-{age_days}d"
+
+    # Deeper-window: floor reaches meaningfully older than our oldest doc — only reached when
+    # the page is NOT recently-checked-with-data, so a genuine deep re-scan is warranted.
     if since_floor and cov_earliest:
         gap_days = (pd.to_datetime(cov_earliest)
                     - pd.to_datetime(since_floor)).days
         if gap_days > _DEEPER_MARGIN_DAYS:
             return True, "deeper-window"
 
-    # Recency: did we check this page within the refetch window?
-    last = pd.to_datetime(cov_row.get("last_fetched_at"), errors="coerce")
+    # Recency fallback (no earliest date, or older than the refetch window).
     if pd.isna(last):
         return True, "stale-no-date"
     age_days = (datetime.now() - last.to_pydatetime()).days
