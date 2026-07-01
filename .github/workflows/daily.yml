@@ -181,8 +181,8 @@ jobs:
         if: steps.fresh.outputs.skip != 'true'
         # 4-day lookback catches filings on weekends / days a run was skipped or late
         # (newsid dedup prevents repeats). --top-n 300: also fetch PER-COMPANY (strScrip)
-        # for PF + top-300 by market cap so their filings are never dropped by the
-        # market-wide page cap (the Kernex miss). --limit 300 bounds per-run summarise;
+        # for PF + top-300 by Phase-1 conviction (aggregated signals) so their filings are
+        # never dropped by the market-wide page cap (the Kernex miss). --limit 300 bounds;
         # the backlog is cleared over subsequent runs (newsid dedup).
         run: python scripts/ingest_announcements.py --lookback-days 4 --top-n 300 --limit 300
         continue-on-error: true

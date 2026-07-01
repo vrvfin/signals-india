@@ -263,9 +263,12 @@ def fetch_company_announcements(code: str, lookback_days: int,
     return out
 
 
-def percompany_scan_codes(drive, meta: dict, top_n: int) -> list[str]:
-    """bse_codes to fetch PER-COMPANY (guaranteed coverage): PF first, then Top-N by market
-    cap. These bypass the market-wide page cap so their filings are never dropped."""
+def percompany_scan_codes(drive, meta: dict, top_n: int,
+                          min_turnover_cr: float = 1.0) -> list[str]:
+    """bse_codes to fetch PER-COMPANY (guaranteed coverage): PF first, then Top-N by the
+    PHASE-1 CONVICTION ranking (aggregated signals sorted by n_strategies then
+    composite_score, with the ₹-turnover liquidity floor — same source build_watchlist uses).
+    These bypass the market-wide page cap so their filings are never dropped."""
     isin_to_code = {v[0]: k for k, v in meta.items() if v[0]}
     sym_to_code = {v[1]: k for k, v in meta.items() if v[1]}
     codes, seen = [], set()
@@ -278,17 +281,27 @@ def percompany_scan_codes(drive, meta: dict, top_n: int) -> list[str]:
         log(f"  PF load failed for per-company list ({str(e)[:50]})")
     n_pf = len(codes)
     if top_n > 0:
-        mc = _read_csv(drive, _folder(drive, "universe"), "market_cap.csv")
-        if not mc.empty and {"symbol", "market_cap_cr"} <= set(mc.columns):
-            mc["_mc"] = pd.to_numeric(mc["market_cap_cr"], errors="coerce")
-            for s in (mc.sort_values("_mc", ascending=False)["symbol"]
-                      .astype(str).str.upper().head(top_n)):
+        turn = _turnover_map(drive) if min_turnover_cr > 0 else {}
+        sig = _read_csv(drive, _folder(drive, "signals/aggregated"), "latest.csv")
+        if not sig.empty and "symbol" in sig.columns:
+            sig["_n"] = pd.to_numeric(sig.get("n_strategies"), errors="coerce").fillna(0)
+            sig["_sc"] = pd.to_numeric(sig.get("composite_score"), errors="coerce").fillna(0)
+            ranked = (sig.sort_values(["_n", "_sc"], ascending=False)["symbol"]
+                      .astype(str).str.upper())
+            added = 0
+            for s in ranked:
+                if added >= top_n:
+                    break
                 c = sym_to_code.get(s)
-                if c and c not in seen:
-                    codes.append(c); seen.add(c)
+                if not c or c in seen:
+                    continue
+                if min_turnover_cr > 0 and turn.get(s, -1.0) < min_turnover_cr:
+                    continue                         # illiquid — skip (matches app.py)
+                codes.append(c); seen.add(c); added += 1
         else:
-            log("  universe/market_cap.csv missing — top-N mcap tier skipped")
-    log(f"per-company scan list: {len(codes)} codes (PF {n_pf} + top-{top_n} mcap)")
+            log("  signals/aggregated/latest.csv missing — top-N conviction tier skipped")
+    log(f"per-company scan list: {len(codes)} codes (PF {n_pf} + "
+        f"top-{top_n} Phase-1 conviction)")
     return codes
 
 
@@ -346,9 +359,10 @@ def main() -> None:
                     help="Optional safety cap on NEW summaries (0 = no cap; dedup "
                          "already bounds it to the day's actual new filings).")
     ap.add_argument("--top-n", type=int, default=300,
-                    help="Also fetch PER-COMPANY (strScrip) for PF + top-N by market cap, so "
-                         "their filings are never dropped by the market-wide page cap (the "
-                         "Kernex miss). 0 = market-wide only.")
+                    help="Also fetch PER-COMPANY (strScrip) for PF + top-N by Phase-1 "
+                         "conviction (aggregated signals: n_strategies then composite_score, "
+                         "with the turnover floor), so their filings are never dropped by the "
+                         "market-wide page cap (the Kernex miss). 0 = market-wide only.")
     ap.add_argument("--min-turnover", type=float, default=1.0,
                     help="₹-turnover floor (cr/day, 20d) on the conviction tier — "
                          "matches app.py default (1.0). PF kept regardless. 0 = off.")
@@ -375,7 +389,8 @@ def main() -> None:
     # A (2026-07-01): PER-COMPANY guaranteed fetch for PF + top-N by market cap (strScrip),
     # so their filings are never dropped by the market-wide page cap. Their codes join the
     # watchlist filter below; dedup-by-newsid removes overlap with the market-wide rows.
-    pc_codes = percompany_scan_codes(drive, meta, args.top_n)
+    pc_codes = percompany_scan_codes(drive, meta, args.top_n,
+                                     min_turnover_cr=args.min_turnover)
     if pc_codes:
         wl_codes |= set(pc_codes)
         got = 0
