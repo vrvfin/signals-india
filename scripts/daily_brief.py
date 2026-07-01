@@ -30,6 +30,17 @@ try:                                                       # reuse the deep-dive
 except Exception:
     news_block = None
 
+try:                                                       # D — sector-gated alt sources
+    from alt_sources import fda_recalls, rbi_circulars, is_pharma, is_finance, FDA_CLASS_MAT
+except Exception:
+    fda_recalls = rbi_circulars = is_pharma = is_finance = None
+    FDA_CLASS_MAT = {}
+
+try:                                                       # sector taxonomy for the FDA/RBI gate
+    from build_classification import load_classification
+except Exception:
+    load_classification = None
+
 LEDGER_COLS = ["newsid", "isin", "symbol", "ann_date", "category", "headline",
                "summary", "status", "materiality", "event_type", "direction"]
 RESEARCH_COLS = ["file_name", "source", "doc_date", "doc_type", "companies", "isins",
@@ -91,6 +102,34 @@ def load_pf(drive, root, index_id):
     return out
 
 
+def _cls_row(cls_df, isin, sym, name):
+    """The company's classification row as a dict, for the pharma/finance gate.
+    Falls back to a name-only dict so gating still works if the taxonomy is missing."""
+    if cls_df is not None and not cls_df.empty:
+        row = cls_df[cls_df["isin"].astype(str) == isin]
+        if row.empty and sym:
+            row = cls_df[cls_df["symbol"].astype(str).str.upper() == sym.upper()]
+        if not row.empty:
+            return row.iloc[0].to_dict()
+    return {"name": name, "symbol": sym}
+
+
+def rbi_html(rbi, fin_syms):
+    """One shared RBI section (circulars are sector-wide, not company-specific)."""
+    if not rbi:
+        return ""
+    who = ", ".join(fin_syms) if fin_syms else "finance holdings"
+    p = ["<h3 style='margin:16px 0 4px'>🏦 RBI circulars & notifications</h3>",
+         f"<p style='color:#555;margin:0 0 6px'>Relevant to your finance holdings: "
+         f"{_esc(who)}</p><ul style='margin:4px 0'>"]
+    for x in rbi[:8]:
+        link, title = _esc(x.get("link", "")), _esc(x.get("title", ""))
+        title_html = f"<a href='{link}'>{title}</a>" if link else title
+        p.append(f"<li>{_esc(x.get('date'))} — [{_esc(x.get('kind'))}] {title_html}</li>")
+    p.append("</ul>")
+    return "\n".join(p)
+
+
 def company_announcements(ledger, isin, symbol, days):
     if ledger is None or ledger.empty:
         return []
@@ -124,9 +163,20 @@ def company_research(research, isin, symbol, name, days):
     return sub.to_dict("records")
 
 
-def company_html(sym, name, anns, res, news_txt):
+def company_html(sym, name, anns, res, news_txt, fda=None):
     hdr = f"<h3 style='margin:16px 0 4px'>{_esc(sym)} — {_esc(name)}</h3>"
     p = [hdr]
+    if fda:
+        p.append("<b>💊 US FDA recalls</b><ul style='margin:4px 0'>")
+        for x in fda[:5]:
+            cls = str(x.get("classification", ""))
+            mat = FDA_CLASS_MAT.get(cls, "")
+            tag = (f"<span style='color:#b00;font-weight:bold'>[{mat}]</span> " if mat == "high"
+                   else (f"<span style='color:#a60'>[{mat}]</span> " if mat == "medium" else ""))
+            p.append(f"<li>{_esc(x.get('date'))} — {tag}<b>{_esc(cls)}</b>: "
+                     f"{_esc(_short(x.get('product'), 90))}"
+                     f"<br><span style='color:#444'>{_esc(_short(x.get('reason'), 200))}</span></li>")
+        p.append("</ul>")
     if anns:
         p.append("<b>📌 Exchange announcements</b><ul style='margin:4px 0'>")
         for a in anns[:8]:
@@ -163,6 +213,9 @@ def main():
     ap.add_argument("--research-days", type=int, default=30, help="research window")
     ap.add_argument("--news-days", type=int, default=30, help="news window")
     ap.add_argument("--no-news", action="store_true", help="skip the Google-News pass")
+    ap.add_argument("--no-alt", action="store_true", help="skip FDA (pharma) + RBI (finance)")
+    ap.add_argument("--fda-days", type=int, default=60, help="US FDA recall window (pharma)")
+    ap.add_argument("--rbi-days", type=int, default=7, help="RBI circular window (finance)")
     ap.add_argument("--limit-companies", type=int, default=0, help="cap PF companies (testing)")
     ap.add_argument("--dry-run", action="store_true", help="write HTML locally, do not email")
     args = ap.parse_args()
@@ -176,10 +229,15 @@ def main():
     pf = load_pf(drive, root, idx)
     if args.limit_companies:
         pf = pf[:args.limit_companies]
+    # D — sector taxonomy for the FDA (pharma) / RBI (finance) gate. Fail-soft: if the
+    # classification frame is missing, _cls_row falls back to name-keyword gating.
+    alt_on = not args.no_alt and is_pharma is not None
+    cls_df = load_classification(drive, root) if (alt_on and load_classification) else None
     print(f"PF companies: {len(pf)} | ann_days={args.ann_days} research_days={args.research_days} "
-          f"news={not args.no_news}")
+          f"news={not args.no_news} alt={alt_on}")
 
-    sections, n_ann, n_res, n_co = [], 0, 0, 0
+    sections, n_ann, n_res, n_co, n_fda = [], 0, 0, 0, 0
+    fin_syms = []
     for isin, sym, name in pf:
         anns = company_announcements(ledger, isin, sym, args.ann_days)
         res = company_research(research, isin, sym, name, args.research_days)
@@ -192,26 +250,53 @@ def main():
             except Exception:
                 news_txt = ""
             time.sleep(0.4)                                # be gentle with Google News
-        if not (anns or res or news_txt):
+        fda = []
+        if alt_on:                                         # D — pharma -> FDA, finance -> RBI
+            crow = _cls_row(cls_df, isin, sym, name)
+            if is_pharma(crow) and fda_recalls:
+                try:
+                    fda = fda_recalls(name, days=args.fda_days)
+                except Exception:
+                    fda = []
+            if is_finance(crow):
+                fin_syms.append(sym)
+        if not (anns or res or news_txt or fda):
             continue
-        sec = company_html(sym, name, anns, res, news_txt)
+        sec = company_html(sym, name, anns, res, news_txt, fda)
         if not sec:                                    # all rows empty after filtering
             continue
         sections.append(sec)
-        n_ann += len(anns); n_res += len(res); n_co += 1
+        n_ann += len(anns); n_res += len(res); n_fda += len(fda); n_co += 1
+
+    # RBI circulars are sector-wide — fetch ONCE and render one shared finance section.
+    rbi = []
+    if alt_on and rbi_circulars and fin_syms:
+        try:
+            rbi = rbi_circulars(days=args.rbi_days)
+        except Exception:
+            rbi = []
+    rbi_sec = rbi_html(rbi, sorted(set(fin_syms)))
+    if rbi_sec:
+        sections.append(rbi_sec)
 
     today = dt.date.today().strftime("%d %b %Y")
-    subject = f"📋 PF Daily Brief — {today} — {n_co} cos · {n_ann} announcements · {n_res} research"
+    alt_bits = (f"{n_fda} FDA · {len(rbi)} RBI" if (n_fda or rbi) else "")
+    subject = (f"📋 PF Daily Brief — {today} — {n_co} cos · {n_ann} announcements · "
+               f"{n_res} research" + (f" · {alt_bits}" if alt_bits else ""))
     if sections:
+        intro = (f"{n_co} companies with updates · {n_ann} exchange announcements "
+                 f"(last {args.ann_days}d) · {n_res} research items (last {args.research_days}d) · "
+                 f"news from reputable sources")
+        if alt_bits:
+            intro += f" · {n_fda} US-FDA recalls (pharma) · {len(rbi)} RBI circulars (finance)"
         body = (f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222'>"
                 f"<h2 style='margin:0 0 4px'>📋 PF Daily Brief — {today}</h2>"
-                f"<p style='color:#555;margin:0 0 8px'>{n_co} companies with updates · "
-                f"{n_ann} exchange announcements (last {args.ann_days}d) · {n_res} research items "
-                f"(last {args.research_days}d) · news from reputable sources.</p><hr>"
+                f"<p style='color:#555;margin:0 0 8px'>{intro}.</p><hr>"
                 + "<hr>".join(sections) + "</div>")
     else:
         body = f"<p>No new PF announcements/research in the window ({today}).</p>"
-    print(f"brief: {n_co} companies with updates, {n_ann} announcements, {n_res} research items")
+    print(f"brief: {n_co} companies with updates, {n_ann} announcements, {n_res} research items, "
+          f"{n_fda} FDA recalls, {len(rbi)} RBI circulars")
 
     if args.dry_run:
         outp = os.path.join(os.path.dirname(_HERE), "company_reports", "pf_daily_brief.html")
