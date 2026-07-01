@@ -105,6 +105,17 @@ EXCLUDE_PAT = re.compile(
     r"credit rating|rating|earnings call|con(ference)? ?call|audio|video",
     re.I)
 
+# High-confidence ROUTINE noise (pure logistics, no catalyst value) — dropped so the
+# per-company sweep doesn't flood the summariser/banner. Deliberately conservative: keeps
+# postal-ballot NOTICES (where things like "increase in borrowing power" live), orders,
+# board outcomes, fundraising, results, resignations, M&A, Reg-30 substantive disclosures.
+ROUTINE_DROP = re.compile(
+    r"(?i)(trading window|newspaper (advertisement|publication|clipping|ad\b)|"
+    r"scrutin|loss of (share|certificate)|duplicate (share|certificate)|"
+    r"issue of duplicate|share certificate|compliance certificate|"
+    r"certificate under (regulation|reg)|reg(ulation)?\.? *74\b|book closure|"
+    r"sub-?division|split of|dividend (distribution )?tax|record date for)")
+
 LEDGER_COLS = ["newsid", "isin", "symbol", "scrip_cd", "ann_date", "category",
                "subcategory", "flag", "headline", "attachment", "pdf_sha",
                "summary", "status", "discovered_at", "processed_at",
@@ -222,6 +233,65 @@ def fetch_day_announcements(d: date, max_pages: int = 30) -> list[dict]:
     return out
 
 
+def fetch_company_announcements(code: str, lookback_days: int,
+                                max_pages: int = 6) -> list[dict]:
+    """PER-COMPANY BSE filings (strScrip=code) over the last lookback_days. Guarantees a
+    watchlist company's filings are seen regardless of the market-wide page cap — which was
+    dropping PF filings on heavy days (the Kernex borrowing-power miss)."""
+    out, s = [], requests.Session()
+    s.headers.update(API_HDR)
+    to_d = date.today()
+    from_d = to_d - timedelta(days=max(0, lookback_days - 1))
+    for pageno in range(1, max_pages + 1):
+        params = {"pageno": pageno, "strCat": "-1", "subcategory": "-1",
+                  "strPrevDate": from_d.strftime("%Y%m%d"),
+                  "strToDate": to_d.strftime("%Y%m%d"),
+                  "strSearch": "P", "strScrip": str(code), "strType": "C"}
+        try:
+            r = s.get(ANN_API, params=params, timeout=30)
+            rows = r.json().get("Table", []) if r.status_code == 200 else []
+        except Exception:
+            break
+        if not rows:
+            break
+        for rr in rows:
+            rr.setdefault("SCRIP_CD", str(code))     # ensure the watchlist filter matches
+        out += rows
+        if len(rows) < 50:
+            break
+        time.sleep(0.2)
+    return out
+
+
+def percompany_scan_codes(drive, meta: dict, top_n: int) -> list[str]:
+    """bse_codes to fetch PER-COMPANY (guaranteed coverage): PF first, then Top-N by market
+    cap. These bypass the market-wide page cap so their filings are never dropped."""
+    isin_to_code = {v[0]: k for k, v in meta.items() if v[0]}
+    sym_to_code = {v[1]: k for k, v in meta.items() if v[1]}
+    codes, seen = [], set()
+    try:
+        for isin in (load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"]) or []):
+            c = isin_to_code.get(str(isin).strip())
+            if c and c not in seen:
+                codes.append(c); seen.add(c)
+    except Exception as e:
+        log(f"  PF load failed for per-company list ({str(e)[:50]})")
+    n_pf = len(codes)
+    if top_n > 0:
+        mc = _read_csv(drive, _folder(drive, "universe"), "market_cap.csv")
+        if not mc.empty and {"symbol", "market_cap_cr"} <= set(mc.columns):
+            mc["_mc"] = pd.to_numeric(mc["market_cap_cr"], errors="coerce")
+            for s in (mc.sort_values("_mc", ascending=False)["symbol"]
+                      .astype(str).str.upper().head(top_n)):
+                c = sym_to_code.get(s)
+                if c and c not in seen:
+                    codes.append(c); seen.add(c)
+        else:
+            log("  universe/market_cap.csv missing — top-N mcap tier skipped")
+    log(f"per-company scan list: {len(codes)} codes (PF {n_pf} + top-{top_n} mcap)")
+    return codes
+
+
 def _download_pdf(attachment: str) -> bytes | None:
     """Fetch the announcement PDF from BSE (Live then His host). None on failure."""
     for base in ATTACH_HOSTS:
@@ -275,6 +345,10 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0,
                     help="Optional safety cap on NEW summaries (0 = no cap; dedup "
                          "already bounds it to the day's actual new filings).")
+    ap.add_argument("--top-n", type=int, default=300,
+                    help="Also fetch PER-COMPANY (strScrip) for PF + top-N by market cap, so "
+                         "their filings are never dropped by the market-wide page cap (the "
+                         "Kernex miss). 0 = market-wide only.")
     ap.add_argument("--min-turnover", type=float, default=1.0,
                     help="₹-turnover floor (cr/day, 20d) on the conviction tier — "
                          "matches app.py default (1.0). PF kept regardless. 0 = off.")
@@ -298,8 +372,20 @@ def main() -> None:
         log(f"market-wide filings on {dd}: {len(day_rows)}")
         rows.extend(day_rows)
 
+    # A (2026-07-01): PER-COMPANY guaranteed fetch for PF + top-N by market cap (strScrip),
+    # so their filings are never dropped by the market-wide page cap. Their codes join the
+    # watchlist filter below; dedup-by-newsid removes overlap with the market-wide rows.
+    pc_codes = percompany_scan_codes(drive, meta, args.top_n)
+    if pc_codes:
+        wl_codes |= set(pc_codes)
+        got = 0
+        for c in pc_codes:
+            cr = fetch_company_announcements(c, lookback)
+            rows.extend(cr); got += len(cr)
+        log(f"per-company fetch: {len(pc_codes)} companies -> {got} filing-rows")
+
     # filter to watchlist + categorise + drop Phase-2-covered types
-    kept, excluded_n, offwl_n = [], 0, 0
+    kept, excluded_n, offwl_n, routine_n = [], 0, 0, 0
     for r in rows:
         code = str(r.get("SCRIP_CD", "")).strip()
         if code not in wl_codes:
@@ -307,6 +393,9 @@ def main() -> None:
         cat, sub, excluded = categorise(r)
         if excluded:
             excluded_n += 1; continue
+        _subj = (r.get("NEWSSUB") or r.get("HEADLINE") or "").strip()
+        if ROUTINE_DROP.search(f"{cat} {sub} {_subj}"):
+            routine_n += 1; continue                 # pure logistics — no catalyst value
         isin, sym, name = meta.get(code, ("", "", ""))
         kept.append({"newsid": str(r.get("NEWSID", "")), "scrip_cd": code,
                      "isin": isin, "symbol": sym, "name": name,
@@ -324,7 +413,8 @@ def main() -> None:
 
     log("-" * 60)
     log(f"on watchlist: {len(kept)} | off-watchlist dropped: {offwl_n} | "
-        f"excluded (AR/concall/rating/pres/audio): {excluded_n}")
+        f"excluded (AR/concall/rating/pres/audio): {excluded_n} | "
+        f"routine-noise dropped: {routine_n}")
     log(f"NEW (not in ledger): {len(new)} | already in ledger: {len(kept)-len(new)}")
     log(f"by category (NEW): {dict(Counter(k['category'] for k in new).most_common())}")
     log(f"critical-flagged (NEW): {sum(1 for k in new if k['flag']=='critical')}")
