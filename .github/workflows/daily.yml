@@ -191,6 +191,23 @@ jobs:
           BACKFILL_GEMINI_KEY:  ${{ secrets.BACKFILL_GEMINI_KEY }}
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
 
+      # ---- PF Daily Brief email (A announcements + B research + C news) ----
+      # Runs AFTER the announcement summaries so the ledger is fresh. Assembles a
+      # per-PF-company brief — materiality-ranked exchange filings (announcement_ledger)
+      # + company-relevant research snippets (research_index) + reputable-source news
+      # (Google-News RSS via company_deep_report.news_block) — and emails it.
+      # Pure READER of existing Drive parquets + RSS; NO Gemini spend. GDRIVE creds come
+      # from the .env written above (load_dotenv); only the Gmail secrets are per-step.
+      # continue-on-error so a mail hiccup never fails the pipeline.
+      - name: PF Daily Brief email
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/daily_brief.py --ann-days 3 --research-days 30 --news-days 21
+        continue-on-error: true
+        env:
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:        ${{ secrets.NOTIFY_EMAIL }}
+
       # ---- Truth gate: the ONLY step allowed to fail the run ----
       - name: Health check (truth gate)
         if: steps.fresh.outputs.skip != 'true'
