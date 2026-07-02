@@ -665,6 +665,130 @@ def load_mcap() -> pd.DataFrame:
     return df
 
 
+# ── Catalyst banners (A announcements · B research · D FDA/RBI) ──────────────
+# Same data + snippet logic as daily_brief.py / build_gallery.py so the app,
+# the mail and the local galleries all tell the same story.
+def _research_snip_app(md, name, maxlen=300):
+    """Company-relevant line out of a research summary_md (which opens with a
+    generic OUTPUT-SECTION / DOCUMENT-HEADER table); else first substantive prose."""
+    import re as _re
+    md = str(md or "")
+    key = (str(name).split()[0] if name else "").lower()
+    skip = ("output section", "document header", "field", "source/author",
+            "document type", "document date", "companies |", "| companies", "===")
+    rel = []
+    for ln in md.splitlines():
+        s = ln.strip()
+        if not s or not key or key not in s.lower():
+            continue
+        if any(p in s.lower()[:14] or s.lower().startswith(p) for p in skip):
+            continue
+        rel.append(s.strip("|").strip())
+    out = " | ".join(rel[:3]) if rel else ""
+    if not out:
+        for ln in md.splitlines():
+            s = ln.strip()
+            if len(s) > 55 and not s.startswith(("|", "#", "=", "-")) \
+                    and "OUTPUT SECTION" not in s and "DOCUMENT HEADER" not in s:
+                out = s
+                break
+        out = out or md.replace("=", "")
+    out = " ".join(out.split())
+    return (out[:maxlen] + "…") if len(out) > maxlen else out
+
+
+def _research_banner_html(sym, name, isin="", days=45, max_items=3):
+    """Purple research banner: recent research_index items mentioning the company."""
+    df = load_parquet(["company_repo", "_index", "research_index.parquet"])
+    if df.empty:
+        return ""
+    il = str(isin or "").lower()
+    sl, nl = str(sym or "").lower(), str(name or "").lower()
+
+    def hit(r):
+        blob = f"{r.get('isins','')}{r.get('companies','')}".lower()
+        return ((il and il in blob) or (len(sl) > 2 and sl in blob)
+                or (len(nl) > 3 and nl in blob))
+    sub = df[df.apply(hit, axis=1)]
+    if sub.empty:
+        return ""
+    if "doc_date" in sub.columns:
+        from datetime import date as _date, timedelta as _td
+        cut = (_date.today() - _td(days=days)).isoformat()
+        sub = sub[sub["doc_date"].astype(str) >= cut].sort_values(
+            "doc_date", ascending=False)
+    lines = []
+    for _, r in sub.head(max_items).iterrows():
+        snip = _research_snip_app(r.get("summary_md"), name or sym)
+        if snip:
+            lines.append(f'<b style="color:#4a148c">{str(r.get("doc_date",""))[:10]}'
+                         f' · {str(r.get("source",""))[:40]}:</b> {snip}')
+    if not lines:
+        return ""
+    return (f'<div style="background:#f3e5f5;border-left:3px solid #7b1fa2;'
+            f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
+            f'📄 <b style="font-size:13px">Research</b><br>' + "<br>".join(lines) + "</div>")
+
+
+def _alt_sources_mod():
+    """Lazy import of scripts/alt_sources.py (requests+re only, no keys)."""
+    try:
+        import sys as _s, os as _o
+        _sd = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "scripts")
+        if _sd not in _s.path:
+            _s.path.insert(0, _sd)
+        import alt_sources
+        return alt_sources
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False, max_entries=50)
+def _fda_recalls_cached(name, days=180):
+    m = _alt_sources_mod()
+    try:
+        return m.fda_recalls(name, days=days) if m else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _rbi_circulars_cached(days=7, limit=8):
+    m = _alt_sources_mod()
+    try:
+        return m.rbi_circulars(days=days, limit=limit) if m else []
+    except Exception:
+        return []
+
+
+def _company_class_row(symbol, name=""):
+    """Classification row (dict) for the pharma/finance gate; name-only fallback."""
+    cls = load_csv(["company_repo", "_index", "company_classification.csv"])
+    if not cls.empty and "symbol" in cls.columns:
+        row = cls[cls["symbol"].astype(str).str.upper() == str(symbol).upper()]
+        if not row.empty:
+            return row.iloc[0].to_dict()
+    return {"name": name, "symbol": symbol}
+
+
+def _fda_banner_html(name, days=180):
+    """Red/amber US-FDA recall banner (pharma only; caller gates)."""
+    recalls = _fda_recalls_cached(name, days=days)
+    if not recalls:
+        return ""
+    lines = []
+    for x in recalls[:3]:
+        cls = str(x.get("classification", ""))
+        col = "#b00020" if cls == "Class I" else "#a66300"
+        lines.append(f'<b style="color:{col}">{x.get("date","")} · {cls}:</b> '
+                     f'{str(x.get("product",""))[:90]} — '
+                     f'{str(x.get("reason",""))[:160]}')
+    return (f'<div style="background:#fdecea;border-left:3px solid #c62828;'
+            f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
+            f'💊 <b style="font-size:13px">US FDA recalls ({days}d)</b><br>'
+            + "<br>".join(lines) + "</div>")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_all_strategy_signals():
     def _do():
@@ -2158,6 +2282,53 @@ def page_stock_detail():
                 f"{_cr.get('catalyst_type', '')} · {_cr.get('as_of', '')}"
             )
 
+    # ── Catalyst banners: announcements (A) + research (B) + FDA (D, pharma) ──
+    # Same sources/logic as the daily PF brief mail + local galleries.
+    _name_sd, _isin_sd = "", ""
+    _gr = load_parquet(["company_repo", "_index", "screener_grades.parquet"])
+    if not _gr.empty and "symbol" in _gr.columns:
+        _grow = _gr[_gr["symbol"].astype(str).str.upper() == symbol]
+        if not _grow.empty:
+            _name_sd = str(_grow.iloc[-1].get("company_name", "") or "")
+            _isin_sd = str(_grow.iloc[-1].get("isin", "") or "")
+    _ann_sd = load_parquet(["company_repo", "_index", "announcement_ledger.parquet"])
+    if not _ann_sd.empty and {"symbol", "summary"} <= set(_ann_sd.columns):
+        _arows = _ann_sd[(_ann_sd["symbol"].astype(str).str.upper() == symbol)
+                         & (_ann_sd["status"].astype(str) == "done")].copy()
+        if not _arows.empty and "ann_date" in _arows.columns:
+            from datetime import date as _date, timedelta as _td
+            _cut = (_date.today() - _td(days=30)).isoformat()
+            _arows = _arows[_arows["ann_date"].astype(str) >= _cut]
+            _mrank = {"high": 0, "medium": 1, "": 2, "none": 2, "low": 3}
+            if "materiality" not in _arows.columns:
+                _arows["materiality"] = ""
+            _arows["_mr"] = (_arows["materiality"].astype(str).str.lower()
+                             .map(lambda x: _mrank.get(x, 2)))
+            for _, _ar in _arows.sort_values(["_mr", "ann_date"],
+                                             ascending=[True, False]).head(3).iterrows():
+                _s = str(_ar.get("summary", "") or "").strip()
+                if not _s or _s.lower() == "nan":
+                    continue
+                _mat = str(_ar.get("materiality", "")).lower()
+                _tag = (f'<span style="color:#b00;font-weight:bold">[{_mat}]</span> '
+                        if _mat == "high" else
+                        (f'<span style="color:#a60">[{_mat}]</span> '
+                         if _mat == "medium" else ""))
+                st.markdown(
+                    f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
+                    f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;'
+                    f'line-height:1.55">🧠 {_tag}<b style="color:#8a6d00">'
+                    f'{str(_ar.get("ann_date",""))[:10]} · {_ar.get("category","")}:</b> '
+                    f'{_s[:400]}</div>', unsafe_allow_html=True)
+    _res_html = _research_banner_html(symbol, _name_sd, _isin_sd)
+    if _res_html:
+        st.markdown(_res_html, unsafe_allow_html=True)
+    _alt = _alt_sources_mod()
+    if _alt and _alt.is_pharma(_company_class_row(symbol, _name_sd)):
+        _fda_html = _fda_banner_html(_name_sd or symbol)
+        if _fda_html:
+            st.markdown(_fda_html, unsafe_allow_html=True)
+
     signals = load_all_strategy_signals()
     sym_sigs = signals[signals["symbol"] == symbol] if not signals.empty else pd.DataFrame()
 
@@ -3097,6 +3268,9 @@ def page_graphs():
                             f'{row.get("category","")}:</b> {s[:400]}</div>')
             return _catalyst_line(sym)   # fall back to catalyst note
 
+        def _research_blob(sym):
+            return _research_banner_html(sym, name_by_sym.get(sym.upper(), ""))
+
         # ── One-click full HTML gallery (client-side charts → zero server-figure
         #    memory; renders ALL ranked names in one downloadable file) ──────────
         def _ohlc_arrays(odf, days):
@@ -3126,6 +3300,7 @@ def page_graphs():
                     + (f' <span class="nm">{nmj}</span>' if nmj else "") + "</div>",
                     f'<div class="row">{_mcap_str(s)}{_grades_strip(s)}</div>',
                     _quarterly_html(s), _growth_blob(s), _gf1_blob(s), _llm_summary(s),
+                    _research_blob(s),
                 ] if x)
                 c, v = _ohlc_arrays(omap.get(s, _EMPTY), tf_days)
                 data[str(j)] = {"c": c, "v": v}
@@ -3245,7 +3420,8 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
                     del fig
 
                 # ── Below the chart: >30% growth highlight + GF1 guidance + LLM summary ──
-                for blob in (_growth_blob(sym), _gf1_blob(sym), _llm_summary(sym)):
+                for blob in (_growth_blob(sym), _gf1_blob(sym), _llm_summary(sym),
+                             _research_blob(sym)):
                     if blob:
                         st.markdown(blob, unsafe_allow_html=True)
         # Release the slice's Plotly figures promptly — memory crept across
@@ -3481,6 +3657,28 @@ def page_portfolio():
         st.error("universe/master_list.csv missing. Run `build_universe.py` first.")
         return
     pf = _resolve_isins(pf, universe)
+
+    # ── D: RBI circulars — sector-wide, shown once if any holding is finance ──
+    _alt = _alt_sources_mod()
+    if _alt is not None:
+        _fin_syms = []
+        for _, _hr in pf.iterrows():
+            _hs = str(_hr.get("symbol") or "")
+            if not _hs or _hs == "nan":
+                continue
+            if _alt.is_finance(_company_class_row(_hs, str(_hr.get("name", "") or ""))):
+                _fin_syms.append(_hs)
+        if _fin_syms:
+            _rbi = _rbi_circulars_cached(days=7)
+            if _rbi:
+                with st.expander(f"🏦 RBI circulars & notifications (last 7d) — relevant "
+                                 f"to: {', '.join(sorted(set(_fin_syms)))}"):
+                    for _x in _rbi:
+                        _lk = str(_x.get("link", "") or "")
+                        _ti = str(_x.get("title", "") or "")
+                        _tt = f"[{_ti}]({_lk})" if _lk else _ti
+                        st.markdown(f"- {_x.get('date','')} · "
+                                    f"*{_x.get('kind','')}* — {_tt}")
 
     unresolved = pf[pf["symbol"].isna()]
     if not unresolved.empty:
