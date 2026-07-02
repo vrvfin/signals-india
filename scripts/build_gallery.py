@@ -203,10 +203,41 @@ def _q_order(qs):
     return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
+def _research_snip(md, name, maxlen=300):
+    """Company-relevant line out of a research summary_md (which opens with a generic
+    OUTPUT-SECTION / DOCUMENT-HEADER table); else the first substantive prose line.
+    Mirrors daily_brief._research_snippet so the gallery matches the mail."""
+    md = str(md or "")
+    key = (name.split()[0] if name else "").lower()
+    skip = ("output section", "document header", "field", "source/author",
+            "document type", "document date", "companies |", "| companies", "===")
+    rel = []
+    for ln in md.splitlines():
+        s = ln.strip()
+        if not s or not key or key not in s.lower():
+            continue
+        if any(p in s.lower()[:14] or s.lower().startswith(p) for p in skip):
+            continue
+        rel.append(s.strip("|").strip())
+    if rel:
+        out = " | ".join(rel[:3])
+    else:
+        out = ""
+        for ln in md.splitlines():
+            s = ln.strip()
+            if len(s) > 55 and not s.startswith(("|", "#", "=", "-")) \
+                    and "OUTPUT SECTION" not in s and "DOCUMENT HEADER" not in s:
+                out = s
+                break
+        out = out or md.replace("=", "")
+    out = " ".join(out.split())
+    return (out[:maxlen] + "…") if len(out) > maxlen else out
+
+
 class Cards:
     """Holds the loaded lookups and builds each card's HTML + chart data."""
 
-    def __init__(self, grades, statements_map, guidance, gf1, ann):
+    def __init__(self, grades, statements_map, guidance, gf1, ann, research=None):
         self.grades_by = self._group(grades)
         self.stmts = statements_map
         self.guid_by = {k: g for k, g in
@@ -214,6 +245,7 @@ class Cards:
             if not guidance.empty and "symbol" in guidance.columns else {}
         self.gf1_by = self._group(gf1)
         self.ann_by = self._group(ann)
+        self.research = research if research is not None else _EMPTY
         self.name_by = {}
         if not grades.empty and {"symbol", "company_name"} <= set(grades.columns):
             for _, r in grades.iterrows():
@@ -480,6 +512,40 @@ class Cards:
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
                 f'🧠 <b style="color:#8a6d00">{adate} · {row.get("category","")}:</b> {s[:400]}</div>')
 
+    def research_card(self, sym, name, isin="", days=45, max_items=3):
+        """Recent research (research_index) mentioning this company — same matching
+        as daily_brief.company_research (isins/companies blob; no symbol column)."""
+        df = self.research
+        if df is None or df.empty:
+            return ""
+        il = str(isin or "").lower()
+        sl, nl = str(sym or "").lower(), str(name or "").lower()
+
+        def hit(r):
+            blob = f"{r.get('isins','')}{r.get('companies','')}".lower()
+            return ((il and il in blob) or (len(sl) > 2 and sl in blob)
+                    or (len(nl) > 3 and nl in blob))
+        sub = df[df.apply(hit, axis=1)]
+        if sub.empty:
+            return ""
+        if "doc_date" in sub.columns:
+            from datetime import date, timedelta
+            cut = (date.today() - timedelta(days=days)).isoformat()
+            sub = sub[sub["doc_date"].astype(str) >= cut].sort_values(
+                "doc_date", ascending=False)
+        lines = []
+        for _, r in sub.head(max_items).iterrows():
+            snip = _research_snip(r.get("summary_md"), name or sym)
+            if not snip:
+                continue
+            lines.append(f'<b style="color:#4a148c">{str(r.get("doc_date",""))[:10]}'
+                         f' · {str(r.get("source",""))[:40]}:</b> {snip}')
+        if not lines:
+            return ""
+        return (f'<div style="background:#f3e5f5;border-left:3px solid #7b1fa2;'
+                f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
+                f'📄 <b style="font-size:13px">Research</b><br>' + "<br>".join(lines) + "</div>")
+
 
 def _ohlc_arrays(odf, days):
     """-> (candles, volumes, ema20, ema50) for lightweight-charts. EMAs computed
@@ -571,7 +637,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
-            cards.llm_summary(s),
+            cards.llm_summary(s), cards.research_card(s, nmj),
         ] if x)
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
         card_html.append(f'<div class="card">{meta}<div class="chart" id="ch{j}"></div></div>')
@@ -783,15 +849,16 @@ def main():
         return
 
     out_path = args.out or os.path.join(os.path.dirname(_SCRIPTS_DIR), out_default)
-    log("loading gf1 / announcements…")
+    log("loading gf1 / announcements / research…")
     gf1 = _read_parquet(drive, idx, "gf1_guidance_statements.parquet")
     ann = _read_parquet(drive, idx, "announcement_ledger.parquet")
+    res_idx = _read_parquet(drive, idx, "research_index.parquet")
     log(f"downloading OHLCV for {len(syms)} names…")
     omap = _bulk_parquet(drive, _folder(drive, "data/ohlcv"), syms)
     log("downloading statements…")
     stmts = _bulk_parquet(drive, _folder(drive, "fundamentals/statements"), syms)
 
-    cards = Cards(grades, stmts, guidance, gf1, ann)
+    cards = Cards(grades, stmts, guidance, gf1, ann, research=res_idx)
     log("assembling HTML…")
     html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
                       title=title, annot=annot)

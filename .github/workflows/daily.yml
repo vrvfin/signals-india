@@ -203,7 +203,7 @@ jobs:
       # continue-on-error so a mail hiccup never fails the pipeline.
       - name: PF Daily Brief email
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/daily_brief.py --ann-days 3 --research-days 30 --news-days 21 --fda-days 60 --rbi-days 7
+        run: python scripts/daily_brief.py --research-days 30 --news-days 21 --fda-days 60 --rbi-days 7
         continue-on-error: true
         env:
           GMAIL_USER:          ${{ secrets.GMAIL_USER }}
