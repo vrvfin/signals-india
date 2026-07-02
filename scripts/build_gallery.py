@@ -203,35 +203,11 @@ def _q_order(qs):
     return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
-def _research_snip(md, name, maxlen=300):
-    """Company-relevant line out of a research summary_md (which opens with a generic
-    OUTPUT-SECTION / DOCUMENT-HEADER table); else the first substantive prose line.
-    Mirrors daily_brief._research_snippet so the gallery matches the mail."""
-    md = str(md or "")
-    key = (name.split()[0] if name else "").lower()
-    skip = ("output section", "document header", "field", "source/author",
-            "document type", "document date", "companies |", "| companies", "===")
-    rel = []
-    for ln in md.splitlines():
-        s = ln.strip()
-        if not s or not key or key not in s.lower():
-            continue
-        if any(p in s.lower()[:14] or s.lower().startswith(p) for p in skip):
-            continue
-        rel.append(s.strip("|").strip())
-    if rel:
-        out = " | ".join(rel[:3])
-    else:
-        out = ""
-        for ln in md.splitlines():
-            s = ln.strip()
-            if len(s) > 55 and not s.startswith(("|", "#", "=", "-")) \
-                    and "OUTPUT SECTION" not in s and "DOCUMENT HEADER" not in s:
-                out = s
-                break
-        out = out or md.replace("=", "")
-    out = " ".join(out.split())
-    return (out[:maxlen] + "…") if len(out) > maxlen else out
+def _research_snip(md, name, symbol="", maxlen=300):
+    """Substantive company snippet ("" = drop the item) — shared extractor, see
+    research_snippet.py (section-body harvest, word-bounded keys, label-row filter)."""
+    from research_snippet import research_snippet
+    return research_snippet(md, name, symbol, maxlen=maxlen)
 
 
 class Cards:
@@ -535,7 +511,7 @@ class Cards:
                 "doc_date", ascending=False)
         lines = []
         for _, r in sub.head(max_items).iterrows():
-            snip = _research_snip(r.get("summary_md"), name or sym)
+            snip = _research_snip(r.get("summary_md"), name, sym)
             if not snip:
                 continue
             lines.append(f'<b style="color:#4a148c">{str(r.get("doc_date",""))[:10]}'

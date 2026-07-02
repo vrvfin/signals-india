@@ -668,33 +668,18 @@ def load_mcap() -> pd.DataFrame:
 # ── Catalyst banners (A announcements · B research · D FDA/RBI) ──────────────
 # Same data + snippet logic as daily_brief.py / build_gallery.py so the app,
 # the mail and the local galleries all tell the same story.
-def _research_snip_app(md, name, maxlen=300):
-    """Company-relevant line out of a research summary_md (which opens with a
-    generic OUTPUT-SECTION / DOCUMENT-HEADER table); else first substantive prose."""
-    import re as _re
-    md = str(md or "")
-    key = (str(name).split()[0] if name else "").lower()
-    skip = ("output section", "document header", "field", "source/author",
-            "document type", "document date", "companies |", "| companies", "===")
-    rel = []
-    for ln in md.splitlines():
-        s = ln.strip()
-        if not s or not key or key not in s.lower():
-            continue
-        if any(p in s.lower()[:14] or s.lower().startswith(p) for p in skip):
-            continue
-        rel.append(s.strip("|").strip())
-    out = " | ".join(rel[:3]) if rel else ""
-    if not out:
-        for ln in md.splitlines():
-            s = ln.strip()
-            if len(s) > 55 and not s.startswith(("|", "#", "=", "-")) \
-                    and "OUTPUT SECTION" not in s and "DOCUMENT HEADER" not in s:
-                out = s
-                break
-        out = out or md.replace("=", "")
-    out = " ".join(out.split())
-    return (out[:maxlen] + "…") if len(out) > maxlen else out
+def _research_snip_app(md, name, symbol="", maxlen=300):
+    """Substantive company snippet ("" = drop the item) — delegates to the shared
+    scripts/research_snippet.py so app, mail and galleries stay identical."""
+    try:
+        import sys as _s, os as _o
+        _sd = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "scripts")
+        if _sd not in _s.path:
+            _s.path.insert(0, _sd)
+        from research_snippet import research_snippet
+        return research_snippet(md, name, symbol, maxlen=maxlen)
+    except Exception:
+        return ""
 
 
 def _research_banner_html(sym, name, isin="", days=45, max_items=3):
@@ -719,7 +704,7 @@ def _research_banner_html(sym, name, isin="", days=45, max_items=3):
             "doc_date", ascending=False)
     lines = []
     for _, r in sub.head(max_items).iterrows():
-        snip = _research_snip_app(r.get("summary_md"), name or sym)
+        snip = _research_snip_app(r.get("summary_md"), name, sym)
         if snip:
             lines.append(f'<b style="color:#4a148c">{str(r.get("doc_date",""))[:10]}'
                          f' · {str(r.get("source",""))[:40]}:</b> {snip}')

@@ -59,29 +59,10 @@ def _short(s, n=320):
 
 
 def _research_snippet(md, name, symbol, maxlen=340):
-    """Pull the COMPANY-RELEVANT bit out of a research summary_md (which starts with a
-    generic 'OUTPUT SECTION / DOCUMENT HEADER' table). Prefer lines that mention the company
-    (e.g. a sector note's Bajaj-Consumer row); else the first substantive prose line."""
-    md = str(md or "")
-    key = (name.split()[0] if name else (symbol or "")).lower()
-    _skip = ("output section", "document header", "field", "source/author", "companies |",
-             "| companies", "document type", "document date", "|---", "---|", "===")
-    rel = []
-    for ln in md.splitlines():
-        s = ln.strip()
-        if not s or not key or key not in s.lower():
-            continue
-        if any(s.lower().startswith(p) or p in s.lower()[:14] for p in _skip):
-            continue
-        rel.append(s.strip("|").strip())
-    if rel:
-        return _short(" | ".join(rel[:3]), maxlen)
-    for ln in md.splitlines():                                # fallback: first real prose
-        s = ln.strip()
-        if len(s) > 55 and not s.startswith(("|", "#", "=", "-")) \
-                and "OUTPUT SECTION" not in s and "DOCUMENT HEADER" not in s:
-            return _short(s, maxlen)
-    return _short(md.replace("=", ""), maxlen)
+    """Substantive company snippet ("" = drop the item) — shared extractor, see
+    research_snippet.py (section-body harvest, word-bounded keys, label-row filter)."""
+    from research_snippet import research_snippet
+    return research_snippet(md, name, symbol, maxlen=maxlen)
 
 
 def load_pf(drive, root, index_id):
@@ -193,7 +174,9 @@ def company_html(sym, name, anns, res, news_txt, fda=None):
             snip = _research_snippet(r.get("summary_md"), name, sym)
             if not snip:                                   # skip rows with empty summary_md
                 continue
-            th = f"<br><i style='color:#777'>themes: {_esc(str(r.get('themes'))[:120])}</i>" if r.get("themes") else ""
+            _tv = str(r.get("themes") or "").strip()
+            th = (f"<br><i style='color:#777'>themes: {_esc(_tv[:120])}</i>"
+                  if _tv not in ("", "[]", "nan") else "")
             rli.append(f"<li>{_esc(r.get('doc_date'))} — [{_esc(r.get('source'))}] "
                        f"{_esc(snip)}{th}</li>")
         if rli:
