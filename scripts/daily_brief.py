@@ -46,6 +46,7 @@ LEDGER_COLS = ["newsid", "isin", "symbol", "ann_date", "category", "headline",
 RESEARCH_COLS = ["file_name", "source", "doc_date", "doc_type", "companies", "isins",
                  "sectors", "themes", "summary_md"]
 _MAT = {"high": 0, "medium": 1, "": 2, "none": 2, "low": 3}
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))       # CI runs UTC; report in IST
 
 
 def _esc(s):
@@ -209,7 +210,9 @@ def company_html(sym, name, anns, res, news_txt, fda=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ann-days", type=int, default=3, help="exchange-announcement window")
+    ap.add_argument("--ann-days", type=int, default=0,
+                    help="exchange-announcement window in days; 0 = auto (Mon=3 to cover "
+                         "the weekend, other weekdays=1 ≈ last 24-48h)")
     ap.add_argument("--research-days", type=int, default=30, help="research window")
     ap.add_argument("--news-days", type=int, default=30, help="news window")
     ap.add_argument("--no-news", action="store_true", help="skip the Google-News pass")
@@ -233,13 +236,16 @@ def main():
     # classification frame is missing, _cls_row falls back to name-keyword gating.
     alt_on = not args.no_alt and is_pharma is not None
     cls_df = load_classification(drive, root) if (alt_on and load_classification) else None
-    print(f"PF companies: {len(pf)} | ann_days={args.ann_days} research_days={args.research_days} "
-          f"news={not args.no_news} alt={alt_on}")
+    now_ist = dt.datetime.now(dt.timezone.utc).astimezone(IST)
+    # 24-48h on weekdays, 72h on Monday (weekday()==0) so the weekend's filings aren't missed
+    ann_days = args.ann_days or (3 if now_ist.weekday() == 0 else 1)
+    print(f"PF companies: {len(pf)} | {now_ist:%d %b %Y %H:%M IST} | ann_days={ann_days} "
+          f"research_days={args.research_days} news={not args.no_news} alt={alt_on}")
 
     sections, n_ann, n_res, n_co, n_fda = [], 0, 0, 0, 0
     fin_syms = []
     for isin, sym, name in pf:
-        anns = company_announcements(ledger, isin, sym, args.ann_days)
+        anns = company_announcements(ledger, isin, sym, ann_days)
         res = company_research(research, isin, sym, name, args.research_days)
         news_txt = ""
         if not args.no_news and news_block:
@@ -279,22 +285,24 @@ def main():
     if rbi_sec:
         sections.append(rbi_sec)
 
-    today = dt.date.today().strftime("%d %b %Y")
+    today = now_ist.strftime("%d %b %Y")
+    stamp = now_ist.strftime("%d %b %Y, %H:%M IST")
     alt_bits = (f"{n_fda} FDA · {len(rbi)} RBI" if (n_fda or rbi) else "")
     subject = (f"📋 PF Daily Brief — {today} — {n_co} cos · {n_ann} announcements · "
                f"{n_res} research" + (f" · {alt_bits}" if alt_bits else ""))
     if sections:
         intro = (f"{n_co} companies with updates · {n_ann} exchange announcements "
-                 f"(last {args.ann_days}d) · {n_res} research items (last {args.research_days}d) · "
+                 f"(last {ann_days}d) · {n_res} research items (last {args.research_days}d) · "
                  f"news from reputable sources")
         if alt_bits:
             intro += f" · {n_fda} US-FDA recalls (pharma) · {len(rbi)} RBI circulars (finance)"
         body = (f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222'>"
-                f"<h2 style='margin:0 0 4px'>📋 PF Daily Brief — {today}</h2>"
+                f"<h2 style='margin:0 0 2px'>📋 PF Daily Brief</h2>"
+                f"<div style='color:#888;font-size:12px;margin:0 0 6px'>as of {stamp}</div>"
                 f"<p style='color:#555;margin:0 0 8px'>{intro}.</p><hr>"
                 + "<hr>".join(sections) + "</div>")
     else:
-        body = f"<p>No new PF announcements/research in the window ({today}).</p>"
+        body = f"<p>No new PF announcements/research in the window (as of {stamp}).</p>"
     print(f"brief: {n_co} companies with updates, {n_ann} announcements, {n_res} research items, "
           f"{n_fda} FDA recalls, {len(rbi)} RBI circulars")
 
