@@ -378,6 +378,11 @@ def main() -> None:
                     help="Scan the last N days ending at --date (default 1 = today "
                          "only). >1 catches filings on days a run was skipped/late or "
                          "over a weekend; dedup by newsid prevents repeats.")
+    ap.add_argument("--alt-only", action="store_true",
+                    help="Skip Gemini entirely — summarise on Groq/Cerebras (own quota). "
+                         "For clearing backlog when the Gemini quota-day is dead: the "
+                         "pool otherwise grinds through dead/cooling buckets for minutes "
+                         "per call before giving up.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Optional safety cap on NEW summaries (0 = no cap; dedup "
                          "already bounds it to the day's actual new filings).")
@@ -412,8 +417,12 @@ def main() -> None:
     # A (2026-07-01): PER-COMPANY guaranteed fetch for PF + top-N by market cap (strScrip),
     # so their filings are never dropped by the market-wide page cap. Their codes join the
     # watchlist filter below; dedup-by-newsid removes overlap with the market-wide rows.
-    pc_codes = percompany_scan_codes(drive, meta, args.top_n,
-                                     min_turnover_cr=args.min_turnover)
+    try:
+        pc_codes = percompany_scan_codes(drive, meta, args.top_n,
+                                         min_turnover_cr=args.min_turnover)
+    except Exception as e:                     # transient network — degrade, don't die
+        log(f"per-company scan failed ({str(e)[:70]}) — continuing market-wide only")
+        pc_codes = []
     if pc_codes:
         wl_codes |= set(pc_codes)
         got = 0
@@ -503,15 +512,23 @@ def main() -> None:
         log("No new PDF-bearing announcements — nothing to summarise.")
         return
 
-    pool = _build_pool()
-    if pool is None:
-        return
-    pool.probe_models()
+    altpool = None                     # set on Gemini exhaustion (Groq/Cerebras, own quota)
+    pool = None
+    if args.alt_only:
+        altpool = _build_alt_pool()
+        if altpool is None:
+            log("--alt-only but no GROQ/CEREBRAS keys — cannot summarise.")
+            return
+        log("ALT-ONLY mode: Groq/Cerebras text summaries (Gemini skipped).")
+    else:
+        pool = _build_pool()
+        if pool is None:
+            return
+        pool.probe_models()
 
     repo_id = _folder(drive, "company_repo")
     done_rows, fail = [], 0
     digest = []          # (symbol, category, headline, summary) for the daily md
-    altpool = None                     # set on Gemini exhaustion (Groq/Cerebras, own quota)
     for i, k in enumerate(new, 1):
         pdf = _download_pdf(k["attachment"])
         if pdf is None:
