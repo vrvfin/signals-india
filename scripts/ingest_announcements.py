@@ -47,7 +47,8 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, upload_bytes, log,
                              load_portfolio_isins, append_company_page,
-                             salvage_json_objects, clamp, sstr)  # Stage 3 event tags
+                             salvage_json_objects, clamp, sstr,
+                             RateLimitExhausted)  # Stage 3 event tags · alt fallback
 from gemini_pool import (BucketPool, load_keys, AllBucketsExhausted,
                          FatalCallError)
 
@@ -159,7 +160,7 @@ def _turnover_map(drive) -> dict:
 
 
 def build_watchlist(drive, min_turnover_cr: float = 1.0):
-    """(order, meta) — PF first, then n_strategies>=2 from the latest Phase-1
+    """(order, meta, n_pf) — PF first, then n_strategies>=2 from the latest Phase-1
     output, with a ₹-turnover liquidity floor on the conviction tier (matches
     app.py's default min_turnover_cr=1.0). PF is kept regardless of liquidity.
     Returns ordered list of bse_code and maps for isin/symbol/name."""
@@ -205,7 +206,7 @@ def build_watchlist(drive, min_turnover_cr: float = 1.0):
     log(f"watchlist: {len(order)} companies (PF {n_pf} + conviction "
         f"{len(order)-n_pf}; dropped {dropped_illiquid} illiquid "
         f"<Rs{min_turnover_cr:.0f}cr/day)")
-    return order, meta
+    return order, meta, n_pf
 
 
 # ---------------------------------------------------------------- discovery
@@ -337,6 +338,28 @@ def _build_pool():
                       inter_call_s=0.5, logger=log, overload_budget=3)
 
 
+def _build_alt_pool():
+    """Groq/Cerebras text-only pool (independent quota) — used when Gemini
+    exhausts mid-run so the announcement backlog still clears. None if no keys."""
+    try:
+        from provider_router import build_alt_pools, AltOnlyPool
+        alt = build_alt_pools(os.environ)
+        return AltOnlyPool(alt) if alt else None
+    except Exception as e:
+        log(f"  alt pool unavailable ({str(e)[:60]})")
+        return None
+
+
+def _pdf_text(pdf_bytes: bytes, max_chars: int = 60000) -> str:
+    """Extract text for the alt (text-only) providers. '' for scanned PDFs."""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return "\n".join(p.get_text() for p in doc)[:max_chars]
+    except Exception:
+        return ""
+
+
 def categorise(row: dict) -> tuple[str, str, bool]:
     """(category, subcategory, excluded?) — excluded = already covered by Phase 2."""
     cat = (row.get("CATEGORYNAME") or "").strip()
@@ -377,7 +400,7 @@ def main() -> None:
     log(f"BSE announcements for {days[-1]}..{d} ({lookback}d)  "
         f"mode={'DRY-RUN' if args.dry_run else 'LIVE'}")
 
-    order, meta = build_watchlist(drive, min_turnover_cr=args.min_turnover)
+    order, meta, n_pf = build_watchlist(drive, min_turnover_cr=args.min_turnover)
     wl_codes = set(order)
 
     rows = []
@@ -426,6 +449,27 @@ def main() -> None:
     known = set(ledger["newsid"].astype(str)) if not ledger.empty and "newsid" in ledger else set()
     new = [k for k in kept if k["newsid"] not in known]
 
+    # cross-source dedup: the SAME filing arrives twice — market-wide rows prefix the
+    # headline with "Company Ltd - 530367 - ", per-company (strScrip) rows don't, and
+    # BSE assigns them DIFFERENT NEWSIDs. Key on (scrip, date, normalised headline)
+    # so we don't summarise (and pay Gemini for) every watchlist filing twice.
+    def _hkey(scrip, d, h):
+        return (str(scrip), str(d),
+                re.sub(r"^.*?\b\d{5,6}\b\s*-\s*", "", str(h)).strip().lower()[:80])
+    seen_h = set()
+    if not ledger.empty and {"scrip_cd", "ann_date", "headline"} <= set(ledger.columns):
+        for _, lr in ledger.iterrows():
+            seen_h.add(_hkey(lr["scrip_cd"], lr["ann_date"], lr["headline"]))
+    uniq, xdup_n = [], 0
+    for k in new:
+        hk = _hkey(k["scrip_cd"], k["ann_date"], k["headline"])
+        if hk in seen_h:
+            xdup_n += 1; continue
+        seen_h.add(hk); uniq.append(k)
+    if xdup_n:
+        log(f"cross-source dups dropped (same filing, different NEWSID): {xdup_n}")
+    new = uniq
+
     log("-" * 60)
     log(f"on watchlist: {len(kept)} | off-watchlist dropped: {offwl_n} | "
         f"excluded (AR/concall/rating/pres/audio): {excluded_n} | "
@@ -435,9 +479,13 @@ def main() -> None:
     log(f"critical-flagged (NEW): {sum(1 for k in new if k['flag']=='critical')}")
     log(f"with PDF attachment (NEW): {sum(1 for k in new if k['attachment'])}")
 
-    # order: PF & conviction rank (watchlist order) with critical first within ties
+    # order: PF FIRST (critical first within PF), then non-PF criticals, then the
+    # conviction tail. PF must outrank non-PF criticals — on a quota-starved day only
+    # the first few get summarised, and those must be YOUR holdings (the Kernex miss
+    # 2026-07-02: 157 non-PF criticals sorted ahead of a PF postal-ballot filing).
     order_rank = {c: i for i, c in enumerate(order)}
-    new.sort(key=lambda k: (0 if k["flag"] == "critical" else 1,
+    new.sort(key=lambda k: (0 if order_rank.get(k["scrip_cd"], 1 << 30) < n_pf else 1,
+                            0 if k["flag"] == "critical" else 1,
                             order_rank.get(k["scrip_cd"], 1 << 30)))
 
     if args.dry_run:
@@ -463,14 +511,31 @@ def main() -> None:
     repo_id = _folder(drive, "company_repo")
     done_rows, fail = [], 0
     digest = []          # (symbol, category, headline, summary) for the daily md
+    altpool = None                     # set on Gemini exhaustion (Groq/Cerebras, own quota)
     for i, k in enumerate(new, 1):
         pdf = _download_pdf(k["attachment"])
         if pdf is None:
             fail += 1; continue
         try:
-            summary, _model = pool.call_pdf(pdf, SUMMARY_PROMPT)
-        except AllBucketsExhausted:
-            log("  Gemini buckets exhausted — stopping (remaining picked up next run).")
+            summary = None
+            if altpool is None:
+                try:
+                    summary, _model = pool.call_pdf(pdf, SUMMARY_PROMPT)
+                except AllBucketsExhausted:
+                    altpool = _build_alt_pool()
+                    if altpool is None:
+                        log("  Gemini buckets exhausted, no alt keys — stopping "
+                            "(remaining picked up next run).")
+                        break
+                    log("  Gemini buckets exhausted — continuing on Groq/Cerebras "
+                        "text fallback (independent quota).")
+            if summary is None:                        # alt path: text-only providers
+                txt = _pdf_text(pdf)
+                if len(txt) < 200:                     # scanned/image PDF — alt can't read
+                    fail += 1; continue
+                summary = altpool.call_text(SUMMARY_PROMPT + "\n\nFILING TEXT:\n" + txt)
+        except RateLimitExhausted:
+            log("  alt providers exhausted too — stopping (remaining picked up next run).")
             break
         except FatalCallError as e:
             log(f"  {k['symbol']}: fatal call ({str(e)[:60]}) — skipped"); fail += 1; continue

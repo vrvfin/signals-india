@@ -469,15 +469,11 @@ def bse_announcements(bse_code, limit=40):
     except Exception as e:
         return f"DATA_MISSING (BSE fetch failed: {type(e).__name__})"
 
-# Reputable sources only (user-chosen whitelist: dailies + markets + wires,
-# plus the Economic Times pharma/business verticals which are the same publisher).
-NEWS_WHITELIST = (
-    "economic times", "etmarkets", "etpharma", "express pharma",       # ET family
-    "business standard", "mint", "livemint", "hindu businessline",
-    "businessline", "financial express",                               # dailies
-    "moneycontrol", "cnbc", "ndtv profit", "bq prime", "quint",        # markets
-    "reuters", "press trust", "pti", "bloomberg",                      # wires
-)
+# NEWS_WHITELIST + news_block moved to alt_sources.py (light deps: requests+bs4
+# only) so daily_brief/CI can import them WITHOUT this module's heavy chain
+# (daily_research_summary -> pdf_ocr -> fitz, absent in Phase-1 CI). Re-exported
+# here so existing callers keep working.
+from alt_sources import NEWS_WHITELIST, news_block  # noqa: F401
 
 def nse_announcements(symbol, limit=20):
     """Best-effort NSE corporate announcements. NSE blocks datacenter IPs often
@@ -502,48 +498,6 @@ def nse_announcements(symbol, limit=20):
         return "\n".join(out)
     except Exception:
         return ""
-
-def news_block(name, symbol, limit=25, days=365):
-    """Recent company news headlines from Google News RSS, filtered to reputable
-    sources. Headlines + source + date only (article bodies are JS-redirected and
-    not reliably fetchable). External signal — corroborate/contrast vs financials."""
-    import urllib.parse
-    try:
-        from bs4 import BeautifulSoup
-        q = urllib.parse.quote(f'"{name}" OR {symbol}')
-        url = (f"https://news.google.com/rss/search?q={q}%20when:{days}d"
-               "&hl=en-IN&gl=IN&ceid=IN:en")
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-        if r.status_code != 200:
-            return "DATA_MISSING (news fetch failed)."
-        soup = BeautifulSoup(r.text, "lxml-xml")
-        seen, out = set(), []
-        for it in soup.find_all("item"):
-            title = (it.title.get_text() if it.title else "").strip()
-            src = (it.source.get_text() if it.source else "").strip()
-            pub = (it.pubDate.get_text() if it.pubDate else "")
-            if not title or not src:
-                continue
-            if not any(w in src.lower() for w in NEWS_WHITELIST):
-                continue
-            headline = re.sub(r"\s*-\s*[^-]+$", "", title).strip()   # drop " - Source"
-            key = headline.lower()[:60]
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                d = dt.datetime.strptime(pub[:16], "%a, %d %b %Y").strftime("%Y-%m-%d")
-            except Exception:
-                d = pub[:16]
-            out.append((d, f"- {d} | {headline} [{src}]"))
-            if len(out) >= limit:
-                break
-        if not out:
-            return "No recent news from whitelisted sources."
-        out.sort(reverse=True)
-        return "\n".join(line for _, line in out)
-    except Exception as e:
-        return f"DATA_MISSING (news fetch failed: {type(e).__name__})"
 
 # Trusted equity-research / business-media YouTube channels (edit to taste).
 # Match is a case-insensitive substring of the channelTitle; the company's own

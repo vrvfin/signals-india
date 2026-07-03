@@ -140,6 +140,66 @@ def rbi_circulars(days: int = 7, limit: int = 6) -> list[dict]:
     return out
 
 
+# ── Google-News RSS (C) ──────────────────────────────────────────────────────
+# Moved here from company_deep_report.py (2026-07-02): that module's import chain
+# pulls pdf_ocr -> fitz (PyMuPDF), which Phase-1 CI does not install — so
+# daily_brief's `from company_deep_report import news_block` failed silently in CI
+# and the mail never had news. This module is requests+bs4 only.
+
+# Reputable sources only (user-chosen whitelist: dailies + markets + wires,
+# plus the Economic Times pharma/business verticals which are the same publisher).
+NEWS_WHITELIST = (
+    "economic times", "etmarkets", "etpharma", "express pharma",       # ET family
+    "business standard", "mint", "livemint", "hindu businessline",
+    "businessline", "financial express",                               # dailies
+    "moneycontrol", "cnbc", "ndtv profit", "bq prime", "quint",        # markets
+    "reuters", "press trust", "pti", "bloomberg",                      # wires
+)
+
+
+def news_block(name, symbol, limit=25, days=365):
+    """Recent company news headlines from Google News RSS, filtered to reputable
+    sources. Headlines + source + date only (article bodies are JS-redirected and
+    not reliably fetchable). External signal — corroborate/contrast vs financials."""
+    import urllib.parse
+    try:
+        from bs4 import BeautifulSoup
+        q = urllib.parse.quote(f'"{name}" OR {symbol}')
+        url = (f"https://news.google.com/rss/search?q={q}%20when:{days}d"
+               "&hl=en-IN&gl=IN&ceid=IN:en")
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        if r.status_code != 200:
+            return f"DATA_MISSING (news fetch failed: HTTP {r.status_code})."
+        soup = BeautifulSoup(r.text, "lxml-xml")
+        seen, out = set(), []
+        for it in soup.find_all("item"):
+            title = (it.title.get_text() if it.title else "").strip()
+            src = (it.source.get_text() if it.source else "").strip()
+            pub = (it.pubDate.get_text() if it.pubDate else "")
+            if not title or not src:
+                continue
+            if not any(w in src.lower() for w in NEWS_WHITELIST):
+                continue
+            headline = re.sub(r"\s*-\s*[^-]+$", "", title).strip()   # drop " - Source"
+            key = headline.lower()[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                d = dt.datetime.strptime(pub[:16], "%a, %d %b %Y").strftime("%Y-%m-%d")
+            except Exception:
+                d = pub[:16]
+            out.append((d, f"- {d} | {headline} [{src}]"))
+            if len(out) >= limit:
+                break
+        if not out:
+            return "No recent news from whitelisted sources."
+        out.sort(reverse=True)
+        return "\n".join(line for _, line in out)
+    except Exception as e:
+        return f"DATA_MISSING (news fetch failed: {type(e).__name__})"
+
+
 def _selftest():
     print("FDA fda_search_name samples:",
           [fda_search_name(n) for n in

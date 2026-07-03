@@ -25,10 +25,10 @@ from ingest_company_docs import get_drive, get_or_create_subfolder, find_file, d
 from _extractor_base import load_parquet, load_portfolio_isins
 from mailer import send_email
 
-try:                                                       # reuse the deep-dive news feed (C)
-    from company_deep_report import news_block
-except Exception:
-    news_block = None
+try:                                                       # deep-dive news feed (C) —
+    from alt_sources import news_block                     # light module (requests+bs4);
+except Exception:                                          # company_deep_report's chain
+    news_block = None                                      # needs fitz, absent in Phase-1 CI
 
 try:                                                       # D — sector-gated alt sources
     from alt_sources import fda_recalls, rbi_circulars, is_pharma, is_finance, FDA_CLASS_MAT
@@ -42,7 +42,8 @@ except Exception:
     load_classification = None
 
 LEDGER_COLS = ["newsid", "isin", "symbol", "ann_date", "category", "headline",
-               "summary", "status", "materiality", "event_type", "direction"]
+               "summary", "status", "materiality", "event_type", "direction",
+               "processed_at"]
 RESEARCH_COLS = ["file_name", "source", "doc_date", "doc_type", "companies", "isins",
                  "sectors", "themes", "summary_md"]
 _MAT = {"high": 0, "medium": 1, "": 2, "none": 2, "low": 3}
@@ -116,10 +117,16 @@ def company_announcements(ledger, isin, symbol, days):
     if ledger is None or ledger.empty:
         return []
     cut = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    # window on ann_date OR processed_at: a backlog filing summarised only today
+    # (quota-starved earlier runs) is NEW information — it must reach the next mail
+    # even though its ann_date is older than the window.
+    recent = ledger["ann_date"].astype(str) >= cut
+    if "processed_at" in ledger.columns:
+        recent = recent | (ledger["processed_at"].astype(str).str[:10] >= cut)
     m = (((ledger["isin"].astype(str) == isin)
           | (ledger["symbol"].astype(str).str.upper() == symbol.upper()))
          & (ledger["status"].astype(str) == "done")
-         & (ledger["ann_date"].astype(str) >= cut))
+         & recent)
     sub = ledger[m].copy()
     if sub.empty:
         return []
