@@ -282,18 +282,63 @@ def parse_company_documents(html: str, run_date: dt.date,
     return deduped
 
 
-def fetch_company_page(session, symbol: str) -> str:
-    for url in (_SCREENER_CO.format(symbol=symbol),
-                _SCREENER_CO_STD.format(symbol=symbol)):
-        try:
-            r = session.get(url, timeout=30)
-        except Exception as e:
-            log(f"  fetch error {url}: {str(e)[:80]}")
-            continue
-        if r.status_code == 200 and 'id="documents"' in r.text:
-            return r.text
-        log(f"  HTTP {r.status_code} (or no #documents) for {url}")
+def fetch_company_page(session, symbol: str, bse_code: str = "") -> str:
+    """Fetch the Screener company page. Screener accepts EITHER the NSE symbol or the
+    BSE scrip code as the URL token — BSE-only companies (no NSE symbol) MUST use the
+    bse_code (e.g. screener.in/company/539730/). Tries symbol first, then bse_code."""
+    tokens = [t for t in (str(symbol or "").strip(), str(bse_code or "").strip())
+              if t and t.lower() != "nan"]
+    for tok in tokens:
+        for url in (_SCREENER_CO.format(symbol=tok),
+                    _SCREENER_CO_STD.format(symbol=tok)):
+            try:
+                r = session.get(url, timeout=30)
+            except Exception as e:
+                log(f"  fetch error {url}: {str(e)[:80]}")
+                continue
+            if r.status_code == 200 and 'id="documents"' in r.text:
+                return r.text
+            log(f"  HTTP {r.status_code} (or no #documents) for {url}")
     return ""
+
+
+def _bse_annual_report_docs(bse_code: str, have_years: set[str]) -> list[dict]:
+    """BSE-website AR search (api.bseindia.com AnnualReport_New): direct PDF links for
+    every filed Annual Report, keyed by year. Used to FILL years the Screener page
+    doesn't list (and as the source when Screener is unreachable). Best-effort."""
+    code = str(bse_code or "").strip()
+    if not code or code.lower() == "nan":
+        return []
+    out = []
+    try:
+        import requests as _rq
+        r = _rq.get("https://api.bseindia.com/BseIndiaAPI/api/AnnualReport_New/w"
+                    f"?scripcode={code}",
+                    headers={"User-Agent": UA, "Referer": "https://www.bseindia.com/"},
+                    timeout=25)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        items = data.get("Table", data) if isinstance(data, dict) else data
+        for it in items or []:
+            year = str(it.get("Year") or it.get("year") or "").strip()[:4]
+            link = str(it.get("PDFDownload") or it.get("PDF_NAME") or
+                       it.get("PDFDownloadNew") or "").strip()
+            if not (year.isdigit() and link):
+                continue
+            ann = f"{year}-03-31"
+            if ann in have_years:
+                continue                      # Screener already covers this FY
+            if not link.startswith("http"):
+                link = "https://www.bseindia.com" + ("/" + link.lstrip("/"))
+            out.append({"doc_id": _doc_id(link), "doc_type": "annual_report",
+                        "title": f"BSE Annual Report {year}", "pdf_url": link,
+                        "announcement_date": ann, "is_zip": False})
+    except Exception as e:
+        log(f"  BSE AR search failed: {str(e)[:70]}")
+    if out:
+        log(f"  BSE AR search: +{len(out)} year(s) not on Screener page")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -320,12 +365,14 @@ def resolve_company(token: str, symbol: str, isin: str,
 def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
              max_docs: int = 0, dry_run: bool = False,
              drive=None, repo_id=None, index_id=None,
-             since: str | None = None) -> dict:
+             since: str | None = None, bse_code: str = "") -> dict:
     """Fetch full doc history for one company, queue NEW docs. Returns counts.
 
     `since` (ISO date, T12): drop documents older than this date BEFORE the
     `max_docs` cap, so a deep request ("10 years") is not truncated to newest-N.
-    Default None → byte-for-byte identical to the pre-T12 behaviour."""
+    `bse_code`: Screener URL fallback token for BSE-only companies (no NSE symbol),
+    and enables the BSE-website Annual-Report search to fill years Screener misses.
+    Defaults keep behaviour byte-for-byte identical for existing callers."""
     want_types = want_types or set(SUBSECTION_TYPES.values())
     run_date = dt.date.today()
 
@@ -337,12 +384,17 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
         index_id = get_or_create_subfolder(drive, repo_id, "_index")
 
     session = screener_session()
-    html = fetch_company_page(session, symbol)
+    html = fetch_company_page(session, symbol, bse_code=bse_code)
+    docs = parse_company_documents(html, run_date, want_types) if html else []
     if not html:
-        log(f"  could not fetch Screener page for {symbol}")
+        log(f"  could not fetch Screener page for {symbol or bse_code}")
+    # BSE-website AR search: fill FY years the Screener page doesn't list (or supply
+    # ALL years when Screener is unreachable). Direct-source, same downstream pipeline.
+    if "annual_report" in want_types:
+        have = {d["announcement_date"] for d in docs if d["doc_type"] == "annual_report"}
+        docs += _bse_annual_report_docs(bse_code, have)
+    if not docs:
         return {"found": 0, "new": 0, "downloaded": 0}
-
-    docs = parse_company_documents(html, run_date, want_types)
     docs.sort(key=lambda d: d["announcement_date"], reverse=True)
     if since:
         _floor = str(since)[:10]

@@ -380,12 +380,18 @@ def _fmt_screener_table(table) -> str:
         lines.append(f"{label}: {vals}")
     return "\n".join(lines)
 
-def _scrape_screener_financials(symbol: str) -> str | None:
-    """Live-scrape the 6 Screener financial tables into a compact text block."""
+def _scrape_screener_financials(symbol: str, bse_code=None) -> str | None:
+    """Live-scrape the 6 Screener financial tables into a compact text block.
+    Screener accepts NSE symbol OR BSE scrip code as the URL token — BSE-only
+    companies (no NSE symbol) resolve via bse_code (e.g. /company/539730/)."""
     from bs4 import BeautifulSoup
     sess = _screener_session()
-    for view in ("consolidated/", ""):
-        url = f"https://www.screener.in/company/{symbol}/{view}"
+    tokens = [t for t in (str(symbol or "").strip(), str(bse_code or "").strip())
+              if t and t.lower() != "nan"]
+    candidates = []          # (n_periods, rendered_block) — pick the view with MORE
+    for tok in tokens:
+      for view in ("consolidated/", ""):
+        url = f"https://www.screener.in/company/{tok}/{view}"
         try:
             r = sess.get(url, timeout=30)
         except Exception:
@@ -395,22 +401,46 @@ def _scrape_screener_financials(symbol: str) -> str | None:
         soup = BeautifulSoup(r.text, "lxml")
         blocks = [f"SCREENER STRUCTURED FINANCIALS ({'consolidated' if view else 'standalone'}) "
                   f"— fetched {dt.date.today().isoformat()}:"]
+        # Top ratios strip (Market Cap / P/E / Book Value / ROE / ROCE ...) — the page
+        # header list, not a table; supplies mcap etc. for BSE-only names missing from
+        # the NSE-keyed fundamentals parquet.
+        top = soup.find(id="top-ratios")
+        if top:
+            kv = []
+            for li in top.find_all("li"):
+                nm = li.find(class_="name"); vl = li.find(class_="value") or li.find(class_="number")
+                if nm and vl:
+                    kv.append(f"{nm.get_text(' ', strip=True)}: {vl.get_text(' ', strip=True)}")
+            if kv:
+                blocks.append("\n== KEY METRICS ==\n" + "\n".join(kv))
         got = False
+        n_periods = 0
         for sec_id, label in SCREENER_SECTIONS:
             sec = soup.find(id=sec_id)
             tbl = sec.find("table") if sec else None
             if tbl is None:
                 continue
+            if sec_id == "profit-loss":          # history depth = P&L year columns
+                n_periods = max(0, len(tbl.select("thead th")) - 1)
             blocks.append(f"\n== {label} ==\n{_fmt_screener_table(tbl)}")
             got = True
-        return "\n".join(blocks) if got else None
+        if got:
+            # Don't return the first hit: consolidated view can be near-empty for a
+            # company that only recently consolidated (2 columns) while standalone
+            # carries the full 10-year history. Keep both, pick the deeper one.
+            candidates.append((n_periods, "\n".join(blocks)))
+      if candidates:
+          break                                  # this token worked — don't retry via bse_code
+    if candidates:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        return candidates[0][1]
     return None
 
-def screener_financials_block(svc, root, isin, symbol) -> str:
+def screener_financials_block(svc, root, isin, symbol, bse_code=None) -> str:
     """Always try a LIVE Screener fetch; cache it to Drive on success; fall back
     to the cached copy if live fails (Screener down / no cookie / unreachable)."""
     cache_path = f"{DRIVE['company_page']}/{isin}/screener_financials.txt"
-    live = _scrape_screener_financials(symbol)
+    live = _scrape_screener_financials(symbol, bse_code=bse_code)
     if live:
         try:
             drive_upload(svc, cache_path, root, live.encode("utf-8"), "text/plain")
@@ -1522,7 +1552,7 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
     if do_backfill and isin.startswith("INE"):
         try:
             from backfill_company_docs import backfill as _backfill
-            c = _backfill(symbol, isin)
+            c = _backfill(symbol, isin, bse_code=str(bse_code or ""))
             print(f"    backfill: {c.get('downloaded',0)} new doc(s), "
                   f"{c.get('found',0)} on Screener")
         except Exception as e:
@@ -1548,7 +1578,7 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
 
     # Screener structured financials — LIVE fetch (cache to Drive), used as an
     # independent cross-check the model reconciles against the Annual Reports.
-    screener_cross = screener_financials_block(svc, root, isin, symbol)
+    screener_cross = screener_financials_block(svc, root, isin, symbol, bse_code=bse_code)
     print(f"    screener cross-check: "
           f"{'live' if not screener_cross.startswith(('DATA_MISSING','[STALE')) else screener_cross[:40]}")
 
