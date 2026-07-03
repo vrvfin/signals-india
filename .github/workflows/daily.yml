@@ -40,6 +40,9 @@ jobs:
           # yfinance excluded from root requirements.txt (causes malloc crash on Streamlit Cloud).
           # Install it here for the pipeline only.
           pip install "yfinance>=1.3.0"
+          # PyMuPDF: announcement ingest's Groq/Cerebras text fallback extracts PDF
+          # text via fitz. Kept out of root requirements.txt (Streamlit Cloud diet).
+          pip install PyMuPDF
 
       # ── Skip check ── reads Drive health report; sets skip=true if Phase 1
       # already ran today (IST). Prevents redundant processing when duplicate
@@ -190,6 +193,11 @@ jobs:
           FREE_POOL:            ${{ secrets.FREE_POOL }}
           BACKFILL_GEMINI_KEY:  ${{ secrets.BACKFILL_GEMINI_KEY }}
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          # Groq/Cerebras text fallback: Gemini's shared FREE_POOL quota is often
+          # drained by backfill daytime slots before this 16:00 IST step runs
+          # (2026-07-02: 8 of 858 summarised). Alt quota is independent.
+          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_API_KEY }}
 
       # ---- PF Daily Brief email (A announcements + B research + C news + D alt) ----
       # Runs AFTER the announcement summaries so the ledger is fresh. Assembles a
