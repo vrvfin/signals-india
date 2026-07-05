@@ -250,10 +250,69 @@ Label each finding sequentially (Note A1, C3, D2…). Run these stress-tests
 [DO NOT DISPLAY PHASE 2]
 
 ================================
-PHASE 3 — EXECUTIVE DEEP-SCAN SCORECARD (VISIBLE)
+PHASE 3 — VISIBLE REPORT
 ================================
-Output priority: 1) Layer 1 Scorecard 2) PM One-Pager 3) Layer 2 Notes.
-If context budget is constrained, reduce Layer 2 first; never reduce Layer 1 or PM One-Pager.
+Render the visible report in THIS reading order (proper research-report sequence):
+  1) Layer 0 — Business, Strategy & News Flow  (understand the business first)
+  2) Layer 1 — Executive Scorecard             (financials + forensic)
+  3) Layer 2 — Analytical Notes (appendix)
+  4) PM One-Pager (Phase 4), then Physical Documents (Phase 5).
+If context budget is constrained, trim Layer 2 first, then compress Layer 0 prose (keep
+its tables); never drop Layer 0's or Layer 1's core sections or the PM One-Pager.
+Layer 0 is QUALITATIVE (what the business is and where it's going); Layer 1 is the
+numbers and forensic risk. Do not merge them.
+
+------------------------ LAYER 0 — BUSINESS, STRATEGY & NEWS FLOW ------------------------
+The qualitative foundation of the report. Draw from Annual Reports, Concall Summaries,
+Presentations, the Company Page brief and the DRHP (if present). Dense bullets/small
+tables; cite EVERY claim to a source; output DATA_MISSING (or DATA_NOT_DISCLOSED) where
+the filings are silent — never fill these with generic industry text or a guessed moat.
+
+0.1 BUSINESS OVERVIEW
+   • What the company actually does: products/services, key brands, end-markets served,
+     geographies, B2B vs B2C mix, and manufacturing footprint (plants + locations).
+   • Where it sits in the value chain and who its customers are (name them if disclosed).
+
+0.2 SEGMENT / PRODUCT-WISE PERFORMANCE
+   • Table: Segment/Product | Revenue (latest + prior yr) | % of total | Margin | YoY growth
+     — from segment reporting in the AR / concall. If not disclosed: DATA_NOT_DISCLOSED.
+   • One line: which segment is driving growth vs which is dragging, with the cited number.
+
+0.3 OPERATIONS — CAPACITY & UTILISATION
+   • Installed capacity by product/plant, current utilisation %, and any expansion / capex
+     underway (amount, location, commissioning timeline). Cite [Annual Report]/[Concall]/[BSE].
+
+0.4 RAW MATERIAL & COST STRUCTURE
+   • Key raw materials/inputs; raw-material cost as % of sales; supplier concentration or
+     import dependence; pricing / pass-through dynamics disclosed. Else DATA_MISSING.
+
+0.5 WHY THE BUSINESS WORKS (OR DOESN'T)
+   • The competitive edge as EVIDENCED by the numbers (margins, market share, pricing
+     power, return ratios) and the structural forces pulling the other way. Ground every
+     point in a cited figure or a management/AR statement — no textbook moats.
+
+0.6 MANAGEMENT STRATEGY & GROWTH PLANS
+   • How management intends to grow: stated strategy, target segments/geographies, new
+     products, capex roadmap, and any QUANTIFIED guidance (revenue / margin / capacity
+     targets with a horizon). Cite [Concall Summary] / [Annual Report] / [SYSTEM guidance].
+   • Cross-check the ambition against the said-vs-delivered credibility score in
+     [PHASE3_QUANT_SNAPSHOT]; if guidance is rosy but credibility is poor, raise [WARNING].
+
+0.7 RISKS TO THESIS
+   • The specific developments that would BREAK the bull case — demand shock, input-cost
+     spike, regulation, customer/geographic concentration, balance-sheet stress, execution
+     slippage. These are BUSINESS/thesis risks (distinct from the forensic accounting flags
+     in Layer 1). 3-6 bullets, each tied to a source.
+
+0.8 NEWS FLOW (dated digest)
+   • 4-8 bullet chronological digest of material recent events from NEWS_CONTEXT, BSE/NSE
+     announcements and YOUTUBE_RESEARCH: approvals, expansions, order wins, M&A, promoter/
+     RPT actions, dividends, litigation, key management commentary. Cite each
+     [News: <source>, <date>] / [BSE/NSE, <date>] / [YouTube: <channel>, <date>]. Flag any
+     item that corroborates or contradicts a forensic finding. If none of these inputs were
+     supplied, output DATA_MISSING.
+
+========== END OF LAYER 0 ==========
 
 ------------------------ LAYER 1 — EXECUTIVE SCORECARD ------------------------
 Dense tables and 1-3 line bullets; no long paragraphs.
@@ -262,17 +321,10 @@ Dense tables and 1-3 line bullets; no long paragraphs.
    • Tabulate counts (from Phase 0) of Annual Reports, Concalls, Ratings, Research-index
      items parsed. Itemise every coverage gap / DATA_MISSING.
 
-2. BUSINESS PROFILE & GROWTH TRAJECTORY
+2. FINANCIAL TRAJECTORY (5-YEAR)
    • Table: 5-yr Revenue, PAT, Margin. Identify the most material structural shift, else:
-     NO_MATERIAL_STRUCTURAL_SHIFT_IDENTIFIED
-   • RECENT DEVELOPMENTS (MANDATORY if NEWS_CONTEXT / BSE-NSE announcements /
-     YOUTUBE_RESEARCH are present): a 3-6 bullet dated digest of material recent events —
-     regulatory approvals, capacity/plant expansions, order wins, M&A / promoter-group
-     actions, dividends, litigation, and notable management commentary from interviews/
-     videos. Cite each with its real source: [News: <source>, <date>], [BSE/NSE, <date>],
-     or [YouTube: <channel>, <date>]. Do NOT leave this empty when any of these were
-     supplied. Mark video/tip claims [UNVERIFIED]. Flag any item that corroborates or
-     contradicts a forensic finding (e.g. a related-party/promoter merger → RPT analysis).
+     NO_MATERIAL_STRUCTURAL_SHIFT_IDENTIFIED.
+   • Recent developments / news flow are covered in Layer 0.8 — do NOT duplicate them here.
 
 3. CAPITAL EFFICIENCY & MANAGEMENT ALLOCATION
    • Table: 3-yr ROE & ROCE. Evaluate allocation behaviour and macro-stress response.
@@ -312,7 +364,7 @@ Dense tables and 1-3 line bullets; no long paragraphs.
 ================================
 PHASE 4 — PM ONE-PAGER TEAR SHEET (VISIBLE, LAST)
 ================================
-Derived exclusively from Layer 1.
+Derived from Layer 0 (business/strategy) + Layer 1 (financial/forensic). No new facts.
 
 [HEADER] Company Name: | Sector/Industry: | Market Cap (if available):
 [BUSINESS SNAPSHOT] Core activity [max 2 lines] | 5-yr Revenue CAGR | 5-yr PAT CAGR
