@@ -729,11 +729,73 @@ def _select_signals(drive, args, exch):
                      ignore_index=True)
 
 
+_ADD_BADGE = {"fresh": ("🆕 FRESH", "#8e44ad"), "new": ("NEW", "#2980b9"),
+              "recent": ("RECENT", "#16a085")}
+
+
+def _build_meta_annot(ranked, feats, mem) -> dict:
+    """symbol.upper() -> meta HTML: strategies · price · 1/3/6/12M returns ·
+    tenure (came Nx since <date>) + FRESH/NEW/RECENT/DROPPED badge."""
+    fcols = ["close", "return_1m_pct", "return_3m_pct", "return_6m_pct", "return_12m_pct"]
+    fmap = {}
+    if feats is not None and not feats.empty and "symbol" in feats.columns:
+        keep = [c for c in fcols if c in feats.columns]
+        for _, r in feats[["symbol"] + keep].iterrows():
+            fmap[str(r["symbol"]).upper()] = r
+    mmap = {}
+    if mem is not None and not mem.empty and "symbol" in mem.columns:
+        mk = [c for c in ["days_present", "first_seen", "add_tier", "dropped_last_7d"]
+              if c in mem.columns]
+        for _, r in mem[["symbol"] + mk].iterrows():
+            mmap[str(r["symbol"]).upper()] = r
+    annot = {}
+    for _, rr in ranked.iterrows():
+        u = str(rr.get("symbol", "") or "").upper()
+        if not u:
+            continue
+        bits = [f'⚡ {int(rr.get("n_strategies", 0) or 0)} strat']
+        f = fmap.get(u)
+        if f is not None:
+            px = f.get("close")
+            if pd.notna(px):
+                bits.append(f'₹{float(px):,.0f}')
+            rets = []
+            for lbl, col in [("1M", "return_1m_pct"), ("3M", "return_3m_pct"),
+                             ("6M", "return_6m_pct"), ("12M", "return_12m_pct")]:
+                v = f.get(col)
+                if pd.notna(v):
+                    c = "#1a7a3a" if float(v) >= 0 else "#c0392b"
+                    rets.append(f'<span style="color:{c}">{lbl} {float(v):+.0f}%</span>')
+            if rets:
+                bits.append(" ".join(rets))
+        m = mmap.get(u)
+        if m is not None:
+            dp = int(m.get("days_present", 0) or 0)
+            fs = m.get("first_seen")
+            fss = pd.Timestamp(fs).strftime("%d %b") if pd.notna(fs) else "?"
+            bits.append(f'★ came {dp}× since {fss}')
+            if bool(m.get("dropped_last_7d")):
+                bits.append('<span style="background:#c0392b;color:#fff;'
+                            'padding:0 6px;border-radius:6px">📉 DROPPED</span>')
+            else:
+                b = _ADD_BADGE.get(str(m.get("add_tier", "") or ""))
+                if b:
+                    bits.append(f'<span style="background:{b[1]};color:#fff;'
+                                f'padding:0 6px;border-radius:6px">{b[0]}</span>')
+        annot[u] = (f'<div style="font-size:12px;color:#333;margin:2px 0;'
+                    f'line-height:1.6">{" · ".join(bits)}</div>')
+    return annot
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["signals", "pf", "guidance"], default="signals",
                     help="signals=ranked signal gallery; pf=portfolio holdings; "
                          "guidance=top companies by implied guidance CAGR.")
+    ap.add_argument("--view", choices=["full", "additions", "drops"], default="full",
+                    help="signals mode: full=all ranked (existing limits); "
+                         "additions=first seen last 14d (fresh/new/recent); "
+                         "drops=fell off the select list in last 7d.")
     ap.add_argument("--min-strats", type=int, default=2)
     ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
     ap.add_argument("--timeframe-days", type=int, default=252)
@@ -811,7 +873,31 @@ def main():
         log(f"  scored {len(scores)} companies with guidance; top {len(ranked)}")
 
     else:  # signals
-        ranked = _select_signals(drive, args, exch)
+        mem = _read_parquet(drive, _folder(drive, "signals/aggregated"),
+                            "membership.parquet")
+        feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+        if args.view == "drops":
+            title, out_default = "📉 Recent drops (7d)", "gallery_drops.html"
+            if mem.empty or "dropped_last_7d" not in mem.columns:
+                log("No membership.parquet — run build_signal_membership.py first.")
+                return
+            dr = mem[mem["dropped_last_7d"] == True].sort_values(
+                "days_present", ascending=False)
+            ranked = pd.DataFrame({"symbol": dr["symbol"].astype(str).tolist()})
+            ranked["n_strategies"] = 0
+            ranked["_exch"] = ranked["symbol"].map(exch).fillna("NSE")
+            log(f"  {len(ranked)} names dropped from the select list in last 7d")
+        else:
+            ranked = _select_signals(drive, args, exch)
+            if args.view == "additions":
+                title, out_default = "🆕 Recent additions (14d)", "gallery_additions.html"
+                if not mem.empty and "add_tier" in mem.columns:
+                    add = set(mem[mem["add_tier"].isin(["fresh", "new", "recent"])]
+                              ["symbol"].astype(str).str.upper())
+                    ranked = ranked[ranked["symbol"].astype(str).str.upper()
+                                    .isin(add)].reset_index(drop=True)
+                log(f"  {len(ranked)} recent additions (fresh/new/recent)")
+        annot = _build_meta_annot(ranked, feats_g, mem)
         if args.max > 0:
             ranked = ranked.head(args.max)
 
