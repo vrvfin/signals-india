@@ -736,7 +736,9 @@ _ADD_BADGE = {"fresh": ("🆕 FRESH", "#8e44ad"), "new": ("NEW", "#2980b9"),
 def _build_meta_annot(ranked, feats, mem) -> dict:
     """symbol.upper() -> meta HTML: strategies · price · 1/3/6/12M returns ·
     tenure (came Nx since <date>) + FRESH/NEW/RECENT/DROPPED badge."""
-    fcols = ["close", "return_1m_pct", "return_3m_pct", "return_6m_pct", "return_12m_pct"]
+    fcols = ["close", "dist_from_52w_high_pct",
+             "return_1m_pct", "return_3m_pct", "return_6m_pct", "return_12m_pct",
+             "rs_rank_1m", "rs_rank_3m", "rs_rank_6m", "rs_rank_12m"]
     fmap = {}
     if feats is not None and not feats.empty and "symbol" in feats.columns:
         keep = [c for c in fcols if c in feats.columns]
@@ -744,8 +746,8 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
             fmap[str(r["symbol"]).upper()] = r
     mmap = {}
     if mem is not None and not mem.empty and "symbol" in mem.columns:
-        mk = [c for c in ["days_present", "first_seen", "add_tier", "dropped_last_7d"]
-              if c in mem.columns]
+        mk = [c for c in ["days_present", "window_snapshots", "first_seen",
+                          "add_tier", "dropped_last_7d"] if c in mem.columns]
         for _, r in mem[["symbol"] + mk].iterrows():
             mmap[str(r["symbol"]).upper()] = r
     annot = {}
@@ -759,21 +761,29 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
             px = f.get("close")
             if pd.notna(px):
                 bits.append(f'₹{float(px):,.0f}')
+            dh = f.get("dist_from_52w_high_pct")
+            if pd.notna(px) and pd.notna(dh) and (1 + float(dh) / 100) != 0:
+                hi = float(px) / (1 + float(dh) / 100)
+                bits.append(f'52wH ₹{hi:,.0f} ({float(dh):+.0f}%)')
             rets = []
-            for lbl, col in [("1M", "return_1m_pct"), ("3M", "return_3m_pct"),
-                             ("6M", "return_6m_pct"), ("12M", "return_12m_pct")]:
-                v = f.get(col)
+            for lbl, rcol, kcol in [("1M", "return_1m_pct", "rs_rank_1m"),
+                                    ("3M", "return_3m_pct", "rs_rank_3m"),
+                                    ("6M", "return_6m_pct", "rs_rank_6m"),
+                                    ("12M", "return_12m_pct", "rs_rank_12m")]:
+                v = f.get(rcol)
                 if pd.notna(v):
                     c = "#1a7a3a" if float(v) >= 0 else "#c0392b"
-                    rets.append(f'<span style="color:{c}">{lbl} {float(v):+.0f}%</span>')
+                    rk = f.get(kcol)
+                    rks = (f' <span style="color:#999">#{float(rk):.0f}</span>'
+                           if pd.notna(rk) else "")
+                    rets.append(f'<span style="color:{c}">{lbl} {float(v):+.0f}%</span>{rks}')
             if rets:
                 bits.append(" ".join(rets))
         m = mmap.get(u)
         if m is not None:
             dp = int(m.get("days_present", 0) or 0)
-            fs = m.get("first_seen")
-            fss = pd.Timestamp(fs).strftime("%d %b") if pd.notna(fs) else "?"
-            bits.append(f'★ came {dp}× since {fss}')
+            tot = int(m.get("window_snapshots", 0) or 0)
+            bits.append(f'★ came {dp}× of {tot}d' if tot else f'★ came {dp}×')
             if bool(m.get("dropped_last_7d")):
                 bits.append('<span style="background:#c0392b;color:#fff;'
                             'padding:0 6px;border-radius:6px">📉 DROPPED</span>')

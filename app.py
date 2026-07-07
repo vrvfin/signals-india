@@ -2803,10 +2803,12 @@ def page_graphs():
 
         feat_by_sym = _slim_map(
             load_parquet(["features", "latest.parquet"]),
-            ["close", "return_1m_pct", "return_3m_pct", "return_6m_pct", "return_12m_pct"])
+            ["close", "dist_from_52w_high_pct",
+             "return_1m_pct", "return_3m_pct", "return_6m_pct", "return_12m_pct",
+             "rs_rank_1m", "rs_rank_3m", "rs_rank_6m", "rs_rank_12m"])
         mem_by_sym = _slim_map(
             load_parquet(["signals", "aggregated", "membership.parquet"]),
-            ["days_present", "first_seen", "add_tier", "dropped_last_7d"])
+            ["days_present", "window_snapshots", "first_seen", "add_tier", "dropped_last_7d"])
         _BADGE = {
             "fresh":  '<span style="background:#8e44ad;color:#fff;padding:0 5px;border-radius:6px">🆕 FRESH</span>',
             "new":    '<span style="background:#2980b9;color:#fff;padding:0 5px;border-radius:6px">NEW</span>',
@@ -2821,21 +2823,31 @@ def page_graphs():
                 px = f.get("close")
                 if pd.notna(px):
                     bits.append(f'₹{float(px):,.0f}')
+                # 52-week high (derived from close + dist) and % down from it
+                dh = f.get("dist_from_52w_high_pct")
+                if pd.notna(px) and pd.notna(dh) and (1 + float(dh) / 100) != 0:
+                    hi = float(px) / (1 + float(dh) / 100)
+                    bits.append(f'52wH ₹{hi:,.0f} ({float(dh):+.0f}%)')
+                # returns with their cross-section RS-rank percentile (#nn = top)
                 rets = []
-                for lbl, col in [("1M", "return_1m_pct"), ("3M", "return_3m_pct"),
-                                 ("6M", "return_6m_pct"), ("12M", "return_12m_pct")]:
-                    v = f.get(col)
+                for lbl, rcol, kcol in [("1M", "return_1m_pct", "rs_rank_1m"),
+                                        ("3M", "return_3m_pct", "rs_rank_3m"),
+                                        ("6M", "return_6m_pct", "rs_rank_6m"),
+                                        ("12M", "return_12m_pct", "rs_rank_12m")]:
+                    v = f.get(rcol)
                     if pd.notna(v):
                         c = "#27ae60" if float(v) >= 0 else "#e74c3c"
-                        rets.append(f'<span style="color:{c}">{lbl} {float(v):+.0f}%</span>')
+                        rk = f.get(kcol)
+                        rks = (f' <span style="color:#999">#{float(rk):.0f}</span>'
+                               if pd.notna(rk) else "")
+                        rets.append(f'<span style="color:{c}">{lbl} {float(v):+.0f}%</span>{rks}')
                 if rets:
                     bits.append(" ".join(rets))
             m = mem_by_sym.get(u)
             if m is not None:
                 dp = int(m.get("days_present", 0) or 0)
-                fs = m.get("first_seen")
-                fs_s = pd.Timestamp(fs).strftime("%d %b") if pd.notna(fs) else "?"
-                bits.append(f'★ came {dp}× since {fs_s}')
+                tot = int(m.get("window_snapshots", 0) or 0)
+                bits.append(f'★ came {dp}× of {tot}d' if tot else f'★ came {dp}×')
                 if bool(m.get("dropped_last_7d")):
                     bits.append('<span style="background:#c0392b;color:#fff;'
                                 'padding:0 5px;border-radius:6px">📉 DROPPED</span>')
