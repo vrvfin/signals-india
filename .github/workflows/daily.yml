@@ -170,6 +170,13 @@ jobs:
         run: python scripts/aggregate_signals.py
         continue-on-error: true
 
+      # Per-symbol signal-appearance history (tenure / fresh-new-recent / drops).
+      # Reads the dated snapshots aggregate_signals just wrote; must run after it.
+      - name: Signal membership
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/build_signal_membership.py
+        continue-on-error: true
+
       - name: Market state
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/market_state.py
