@@ -2530,14 +2530,16 @@ def page_graphs():
     with c5:
         view = st.radio(
             "View",
-            ["NSE · 1–40", "NSE · 41–80", "NSE · 81–120", "NSE · 121–160",
+            ["🆕 Recent additions", "📉 Recent drops",
+             "NSE · 1–40", "NSE · 41–80", "NSE · 81–120", "NSE · 121–160",
              "NSE · 161–200", "NSE · 201–240", "NSE · 241–280", "NSE · 281–320",
              "NSE · 321–360",
              "BSE-only · 1–40", "BSE-only · 41–80", "BSE-only · 81–120", "Detailed"],
-            help="NSE views = stocks listed on NSE (may also trade on BSE). "
-                 "BSE-only = stocks not on NSE. Each view renders ONE slice of ≤40 "
-                 "charts so Cloud memory stays safe (real tabs would render all at "
-                 "once and crash). Detailed = paginated candlesticks over the full set.")
+            help="Recent additions = names that first appeared in the last 14 days "
+                 "(🆕fresh/new/recent). Recent drops = names that fell off the select "
+                 "list in the last 7 days. NSE/BSE views = ranked slices of ≤40 charts "
+                 "so Cloud memory stays safe. Detailed = paginated candlesticks. "
+                 "(Full 500-600 render is the local gallery — build_gallery.bat.)")
     view_mode = "Detailed" if view == "Detailed" else "Quick Scan"
     with c6:
         if view_mode == "Quick Scan":
@@ -2624,24 +2626,67 @@ def page_graphs():
         "BSE-only · 41–80":  ("bse",  40,  80),
         "BSE-only · 81–120": ("bse",  80, 120),
     }
+    _QS_CAP = 40   # ≤40 charts per view keeps Cloud memory safe (rich cards)
     if view_mode == "Quick Scan":
-        uni = load_csv(["universe", "master_list.csv"])
-        exch = {}
-        if not uni.empty and {"symbol", "exchange"} <= set(uni.columns):
-            exch = dict(zip(uni["symbol"].astype(str), uni["exchange"].astype(str)))
-        conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
-        conv = conv.sort_values(["n_strategies", "best_score"],
-                                ascending=[False, False]).reset_index(drop=True)
-        nse = conv[conv["_exch"] != "BSE"].reset_index(drop=True)   # NSE-listed
-        bse = conv[conv["_exch"] == "BSE"].reset_index(drop=True)   # BSE-only
-        which, lo, hi = SEG[view]
-        src = nse if which == "nse" else bse
-        conv = src.iloc[lo:hi].reset_index(drop=True)
-        label = "NSE-listed" if which == "nse" else "BSE-only"
-        st.caption(f"{label} · rank {lo + 1}–{lo + len(conv)} of {len(src)}.")
-        if conv.empty:
-            st.info("No stocks in this segment for the current filters.")
-            return
+        _mem = load_parquet(["signals", "aggregated", "membership.parquet"])
+        if view == "🆕 Recent additions":
+            # Names that first appeared in the last 14d (fresh/new/recent) AND still
+            # pass the active filters. Ordered fresh → new → recent, then score.
+            if _mem.empty or "add_tier" not in _mem.columns:
+                st.info("No membership history yet — build_signal_membership.py "
+                        "hasn't run. Additions appear after the next daily run.")
+                return
+            add = _mem[_mem["add_tier"].isin(["fresh", "new", "recent"])]
+            trank = {"fresh": 0, "new": 1, "recent": 2}
+            tmap = {str(r["symbol"]).upper(): trank.get(str(r["add_tier"]), 9)
+                    for _, r in add.iterrows()}
+            conv = conv[conv["symbol"].astype(str).str.upper().isin(tmap)].copy()
+            if conv.empty:
+                st.info("No recent additions match the current filters "
+                        "(lower Min strategies / turnover to widen).")
+                return
+            conv["_tr"] = conv["symbol"].astype(str).str.upper().map(tmap).fillna(9)
+            conv = (conv.sort_values(["_tr", "best_score"], ascending=[True, False])
+                        .head(_QS_CAP).reset_index(drop=True))
+            st.caption(f"🆕 {len(conv)} recent additions (fresh/new/recent) matching "
+                       f"filters. Full list in the local gallery.")
+        elif view == "📉 Recent drops":
+            # Names that fell off the select list in the last 7 days (were selects
+            # before). These are NOT current signals, so render without signal lines.
+            if _mem.empty or "dropped_last_7d" not in _mem.columns:
+                st.info("No membership history yet — drops appear after the next "
+                        "daily run.")
+                return
+            dr = _mem[_mem["dropped_last_7d"] == True].sort_values(
+                "days_present", ascending=False)
+            if dr.empty:
+                st.info("No stocks dropped out of the select list in the last 7 days.")
+                return
+            conv = pd.DataFrame({"symbol": dr["symbol"].astype(str).tolist()})
+            conv["n_strategies"] = 0
+            conv["best_score"] = 0.0
+            n_all = len(conv)
+            conv = conv.head(_QS_CAP).reset_index(drop=True)
+            st.caption(f"📉 {len(conv)} of {n_all} names dropped from the select list "
+                       f"in the last 7 days (most-established first).")
+        else:
+            uni = load_csv(["universe", "master_list.csv"])
+            exch = {}
+            if not uni.empty and {"symbol", "exchange"} <= set(uni.columns):
+                exch = dict(zip(uni["symbol"].astype(str), uni["exchange"].astype(str)))
+            conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
+            conv = conv.sort_values(["n_strategies", "best_score"],
+                                    ascending=[False, False]).reset_index(drop=True)
+            nse = conv[conv["_exch"] != "BSE"].reset_index(drop=True)   # NSE-listed
+            bse = conv[conv["_exch"] == "BSE"].reset_index(drop=True)   # BSE-only
+            which, lo, hi = SEG[view]
+            src = nse if which == "nse" else bse
+            conv = src.iloc[lo:hi].reset_index(drop=True)
+            label = "NSE-listed" if which == "nse" else "BSE-only"
+            st.caption(f"{label} · rank {lo + 1}–{lo + len(conv)} of {len(src)}.")
+            if conv.empty:
+                st.info("No stocks in this segment for the current filters.")
+                return
 
     # ── Sort ──────────────────────────────────────────────────────────────────
     SORT_OPTIONS = {
@@ -2746,6 +2791,59 @@ def page_graphs():
         guidance_by_sym  = _group_exact(guidance_df)
         catalyst_by_sym  = _group_upper(catalyst_df)
         scorecard_by_sym = _group_upper(scorecard_df)
+
+        # ── Meta line: strategies · price · 1/3/6/12M returns · tenure + badge ──
+        def _slim_map(df, cols):
+            if df is None or df.empty or "symbol" not in df.columns:
+                return {}
+            keep = [c for c in cols if c in df.columns]
+            sub = df[["symbol"] + keep].copy()
+            sub["symbol"] = sub["symbol"].astype(str).str.upper()
+            return {r["symbol"]: r for _, r in sub.iterrows()}
+
+        feat_by_sym = _slim_map(
+            load_parquet(["features", "latest.parquet"]),
+            ["close", "return_1m_pct", "return_3m_pct", "return_6m_pct", "return_12m_pct"])
+        mem_by_sym = _slim_map(
+            load_parquet(["signals", "aggregated", "membership.parquet"]),
+            ["days_present", "first_seen", "add_tier", "dropped_last_7d"])
+        _BADGE = {
+            "fresh":  '<span style="background:#8e44ad;color:#fff;padding:0 5px;border-radius:6px">🆕 FRESH</span>',
+            "new":    '<span style="background:#2980b9;color:#fff;padding:0 5px;border-radius:6px">NEW</span>',
+            "recent": '<span style="background:#16a085;color:#fff;padding:0 5px;border-radius:6px">RECENT</span>',
+        }
+
+        def _meta_line(sym: str, crow) -> str:
+            u = sym.upper()
+            bits = [f'⚡ {int(crow.get("n_strategies", 0) or 0)} strat']
+            f = feat_by_sym.get(u)
+            if f is not None:
+                px = f.get("close")
+                if pd.notna(px):
+                    bits.append(f'₹{float(px):,.0f}')
+                rets = []
+                for lbl, col in [("1M", "return_1m_pct"), ("3M", "return_3m_pct"),
+                                 ("6M", "return_6m_pct"), ("12M", "return_12m_pct")]:
+                    v = f.get(col)
+                    if pd.notna(v):
+                        c = "#27ae60" if float(v) >= 0 else "#e74c3c"
+                        rets.append(f'<span style="color:{c}">{lbl} {float(v):+.0f}%</span>')
+                if rets:
+                    bits.append(" ".join(rets))
+            m = mem_by_sym.get(u)
+            if m is not None:
+                dp = int(m.get("days_present", 0) or 0)
+                fs = m.get("first_seen")
+                fs_s = pd.Timestamp(fs).strftime("%d %b") if pd.notna(fs) else "?"
+                bits.append(f'★ came {dp}× since {fs_s}')
+                if bool(m.get("dropped_last_7d")):
+                    bits.append('<span style="background:#c0392b;color:#fff;'
+                                'padding:0 5px;border-radius:6px">📉 DROPPED</span>')
+                else:
+                    b = _BADGE.get(str(m.get("add_tier", "") or ""))
+                    if b:
+                        bits.append(b)
+            return ' · '.join(bits)
 
         def _catalyst_line(sym: str) -> str:
             """💡 headline · 👁 what-to-track for the latest catalyst note."""
@@ -3375,6 +3473,13 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
                               + _scorecard_badge(sym, scorecard_by_sym.get(sym.upper(), _EMPTY)))
                 if line1_html.strip():
                     st.markdown(line1_html, unsafe_allow_html=True)
+
+                # Meta: strategies · price · 1/3/6/12M returns · tenure + badge
+                meta = _meta_line(sym, crow)
+                if meta:
+                    st.markdown(
+                        f'<div style="font-size:11px;color:#333;margin:1px 0 3px 0;'
+                        f'line-height:1.5">{meta}</div>', unsafe_allow_html=True)
 
                 # last-6-quarter table (Sales / Profit / EPS)
                 qhtml = _quarterly_html(sym)
