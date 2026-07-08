@@ -102,6 +102,12 @@ jobs:
         run: python scripts/build_pead_flags.py
         continue-on-error: true
 
+      # >100% PAT/EPS surge flagger — consistent vs one-off (user 2026-07-08).
+      # Writes growth_surge.parquet + mails last-24h reporters (toggle 'growth_surge').
+      - name: Growth surge flags + mail (last 24h reporters)
+        run: python scripts/flag_growth_surge.py
+        continue-on-error: true
+
       - name: Send daily emails (today's match + tomorrow's calendar)
         run: python scripts/run_pead_daily.py --days-ahead 1
 

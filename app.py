@@ -5048,6 +5048,8 @@ _MAIL_TOGGLES = [
     ("ops_digest",      "🩺 Ops digest (08:30)"),
     ("ar_focus",        "📚 AR focus/defocus digest"),
     ("pf_digest",       "💼 PF daily digest"),
+    ("growth_surge",    "💥 Results surge >100% PAT (20:00)"),
+    ("combined_strength", "🏆 Combined strength: tech+results+guidance (21:30)"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"
 

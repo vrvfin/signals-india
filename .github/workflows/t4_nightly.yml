@@ -127,6 +127,13 @@ jobs:
       - name: 8-factor scorecard blend
         run: python scripts/build_scorecard.py
 
+      # 3-axis shortlist: strong technical + results + guidance (user 2026-07-08).
+      # Needs conviction.csv (daily.yml), growth_surge + guidance_vs_actual (pead),
+      # screener_grades (above). Writes daily/weekly/quarterly CSVs + mails top 30.
+      - name: Combined strength list + mail (tech + results + guidance)
+        run: python scripts/build_combined_strength.py
+        continue-on-error: true
+
       - name: Fraud tracker (T7 — snapshot + history)
         run: python scripts/build_fraud_tracker.py
         continue-on-error: true

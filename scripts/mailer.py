@@ -42,6 +42,8 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "ops_digest":      "Ops digest: runs pass/fail + freshness + samples",
     "ar_focus":        "AR digest: focus/defocus lists (PDF attached)",
     "pf_digest":       "PF daily digest: filings/research/flags/docs/community",
+    "growth_surge":    "Results surge: >100% PAT YoY, consistent vs one-off (last 24h)",
+    "combined_strength": "Combined strength: strong tech + results + guidance",
 }
 
 

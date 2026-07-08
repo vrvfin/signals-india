@@ -64,6 +64,75 @@ def _by_isin(df, isin, col="isin"):
     return df[df[col].astype(str) == isin]
 
 
+def _fmt_num(v, prefix="", suffix="") -> str:
+    try:
+        f = float(v)
+        if f != f:
+            return ""
+        return f"{prefix}{f:,.0f}{suffix}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _doc_snippet(doc_type, doc_id, isin, ctx) -> str | None:
+    """Content snippet for a processed doc (user 2026-07-08): the extracted
+    numbers/guidance, not just the title. Matches on source_doc_id first
+    (precise), falls back to the company's latest rows. Returns HTML or None."""
+    doc_id = str(doc_id or "")
+
+    def _match(df):
+        if df.empty:
+            return df
+        hit = df[df["source_doc_id"].astype(str) == doc_id] if doc_id else df.iloc[0:0]
+        return hit if not hit.empty else _by_isin(df, isin).tail(3)
+
+    if doc_type == "results":
+        r = _match(ctx["rgem"])
+        if r.empty:
+            return None
+        x = r.iloc[-1]
+        parts = []
+        rev = _fmt_num(x.get("revenue_cr"), "₹", " cr")
+        if rev:
+            yoy = _fmt_num(x.get("revenue_yoy_pct"), "+", "% YoY")
+            parts.append(f"Rev {rev}" + (f" ({yoy})" if yoy else ""))
+        pat = _fmt_num(x.get("pat_cr"), "₹", " cr")
+        if pat:
+            yoy = _fmt_num(x.get("pat_yoy_pct"), "+", "% YoY")
+            parts.append(f"PAT {pat}" + (f" ({yoy})" if yoy else ""))
+        eps = _fmt_num(x.get("eps"), "₹")
+        if eps:
+            parts.append(f"EPS {eps}")
+        return " · ".join(parts) if parts else None
+
+    if doc_type == "concall":
+        g = _match(ctx["guid"])
+        if not g.empty:
+            parts = [f"{esc(x.get('metric', ''), 14)}: {esc(x.get('value', ''), 24)}"
+                     f" ({esc(x.get('horizon_fy', ''), 8)})"
+                     for _, x in g.head(3).iterrows() if str(x.get("value", "")).strip()]
+            if parts:
+                return "guidance — " + " · ".join(parts)
+        f1 = _match(ctx["gf1"])
+        if not f1.empty:
+            x = f1.iloc[-1]
+            stmt = str(x.get("exact_statement", "") or "").strip()
+            if stmt:
+                return f"“{esc(stmt, 180)}”"
+        return None
+
+    if doc_type == "presentation":
+        p = _match(ctx["ppt"])
+        if p.empty:
+            return None
+        parts = [f"{esc(x.get('metric', ''), 14)}: {esc(x.get('value', ''), 24)}"
+                 f" ({esc(x.get('horizon', ''), 8)})"
+                 for _, x in p.head(3).iterrows() if str(x.get("value", "")).strip()]
+        return ("guidance — " + " · ".join(parts)) if parts else None
+
+    return None
+
+
 def company_section(isin, sym, name, bse_code, ctx, hours) -> str | None:
     """HTML <li> block for one PF company, or None if fully quiet."""
     cutoff_iso = (datetime.now() - timedelta(hours=hours)).isoformat()
@@ -124,8 +193,13 @@ def company_section(isin, sym, name, bse_code, ctx, hours) -> str | None:
                 & (q["status"].astype(str) == "done")
                 & (q["processed_at"].astype(str) >= cutoff_iso)]
         for _, x in hit.head(4).iterrows():
-            bullets.append(f"📄 {esc(x.get('doc_type', '?'), 16)} processed: "
-                           f"{esc(x.get('title', ''), 110)}")
+            line = (f"📄 {esc(x.get('doc_type', '?'), 16)} processed: "
+                    f"{esc(x.get('title', ''), 110)}")
+            snip = _doc_snippet(str(x.get("doc_type", "")), x.get("doc_id"),
+                                isin, ctx)
+            if snip:
+                line += f"<br>&nbsp;&nbsp;↳ {snip}"
+            bullets.append(line)
 
     # 5. community (links included) — same strict 24h block
     for c in social_sources.community_items(name,
@@ -198,6 +272,11 @@ def main() -> None:
         "ft":   _read(drive, root, P + ["fraud_tracker.parquet"]),
         "cat":  _read(drive, root, P + ["catalyst_index.parquet"]),
         "sc":   _read(drive, root, P + ["company_scorecard.parquet"]),
+        # content snippets for processed docs (user 2026-07-08)
+        "rgem": _read(drive, root, P + ["results_gemini.parquet"]),
+        "guid": _read(drive, root, P + ["guidance_tracker.parquet"]),
+        "gf1":  _read(drive, root, P + ["gf1_guidance_statements.parquet"]),
+        "ppt":  _read(drive, root, P + ["ppt_guidance.parquet"]),
     }
 
     sections, quiet = [], []
