@@ -306,6 +306,7 @@ def main():
     cu = store.read_csv(["company_repo", "_index", "company_universe.csv"])
     isin_map = {}
     bse_map: dict[str, str] = {}
+    alias_map: dict[str, str] = {}   # NSE symbol -> BSE ticker (media often uses it)
     if cu is not None and not cu.empty:
         sc = "nse_symbol" if "nse_symbol" in cu.columns else "symbol"
         for _, r in cu.iterrows():
@@ -314,6 +315,7 @@ def main():
                 isin_map[s] = (str(r.get("isin", "")).strip(),
                                str(r.get("name", "")).strip())
                 bse_map[s] = str(r.get("bse_code", "")).strip()
+                alias_map[s] = str(r.get("bse_symbol", "")).strip()
 
     # ---- user research intake (third evidence source) ----
     ridx = store.read_parquet(["company_repo", "_index", "research_index.parquet"])
@@ -371,6 +373,15 @@ def main():
         except news_fetch.NewsFetchBudgetExceeded:
             log("  news RSS budget hit — stopping note generation for this run")
             break
+        # Relevance double-check (user 2026-07-09): Google News matches article
+        # BODIES, so passing-mention pieces (MF holding lists, sector round-ups)
+        # slip through the quoted-name search. Keep only headlines that actually
+        # name the company (distinctive name token or NSE symbol).
+        n_raw = len(items)
+        items = news_fetch.relevant_items(items, cname, sym,
+                                          aliases=(alias_map.get(sym, ""),))
+        if n_raw and len(items) < n_raw:
+            log(f"  {sym}: relevance filter kept {len(items)}/{n_raw} headlines")
         # Exchange filings (user 2026-06-12): often the catalyst itself.
         filings = _recent_filings(bse_map.get(sym, ""), NEWS_DAYS)
         research = _research_notes(ridx, isin)

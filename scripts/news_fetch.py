@@ -114,6 +114,40 @@ def fetch_news(query: str, days_back: int = 30,
     return items
 
 
+_GENERIC_NAME_TOKENS = frozenset({
+    "limited", "ltd", "ltd.", "india", "indian", "industries", "industry",
+    "enterprises", "enterprise", "corporation", "corp", "company", "co",
+    "pvt", "private", "the", "of", "and", "&", "group", "holdings",
+    "international", "services", "solutions", "products", "systems",
+})
+
+
+def relevant_items(items: list[dict], company_name: str, symbol: str = "",
+                   aliases: tuple = ()) -> list[dict]:
+    """Relevance double-check: keep only items whose HEADLINE names the company.
+
+    Google News matches article bodies too, so a quoted-name search still returns
+    pieces where the company is a passing mention (MF holding lists, sector
+    round-ups). A headline is kept if it contains the NSE symbol, an alias
+    (e.g. the BSE ticker — media writes "KOEL" for Kirloskar Oil Engines), or
+    any distinctive token of the company name (generic suffixes like Limited/
+    India/Industries don't count). If the name yields NO distinctive token,
+    items pass through unfiltered rather than being wrongly dropped."""
+    tokens = [t for t in str(company_name or "").lower().split()
+              if len(t) >= 3 and t not in _GENERIC_NAME_TOKENS]
+    syms = [s for s in ([str(symbol or "").lower()]
+                        + [str(a or "").lower() for a in aliases])
+            if len(s) >= 3]
+    if not tokens and not syms:
+        return items
+    out = []
+    for it in items:
+        t = str(it.get("title", "")).lower()
+        if any(s in t for s in syms) or any(tok in t for tok in tokens):
+            out.append(it)
+    return out
+
+
 def keyword_hits(items: list[dict], keywords: list[str]) -> list[dict]:
     """Subset of items whose title matches any keyword (case-insensitive).
     Each returned dict gains a 'matched' list of the keywords that fired."""

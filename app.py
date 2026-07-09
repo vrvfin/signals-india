@@ -682,6 +682,24 @@ def _research_snip_app(md, name, symbol="", maxlen=300):
         return ""
 
 
+def _fresh_badge(date_str):
+    """🆕 NEW (today) / 🕓 RECENT (last 7d) / grey age chip — one glance tells you
+    whether new information has flowed through since you last looked."""
+    from datetime import date as _d
+    try:
+        age = (_d.today() - _d.fromisoformat(str(date_str)[:10])).days
+    except Exception:
+        return ""
+    if age <= 0:
+        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
+                'border-radius:6px;font-size:10px;font-weight:700">🆕 NEW</span> ')
+    if age <= 7:
+        return ('<span style="background:#1565c0;color:#fff;padding:1px 6px;'
+                'border-radius:6px;font-size:10px;font-weight:700">🕓 RECENT</span> ')
+    return (f'<span style="background:#9e9e9e;color:#fff;padding:1px 6px;'
+            f'border-radius:6px;font-size:10px">↺ {age}d old</span> ')
+
+
 def _research_banner_html(sym, name, isin="", days=45, max_items=3):
     """Purple research banner: recent research_index items mentioning the company."""
     df = load_parquet(["company_repo", "_index", "research_index.parquet"])
@@ -710,9 +728,11 @@ def _research_banner_html(sym, name, isin="", days=45, max_items=3):
                          f' · {str(r.get("source",""))[:40]}:</b> {snip}')
     if not lines:
         return ""
+    newest = str(sub["doc_date"].iloc[0])[:10] if "doc_date" in sub.columns else ""
     return (f'<div style="background:#f3e5f5;border-left:3px solid #7b1fa2;'
             f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-            f'📄 <b style="font-size:13px">Research</b><br>' + "<br>".join(lines) + "</div>")
+            f'{_fresh_badge(newest)}📄 <b style="font-size:13px">Research</b><br>'
+            + "<br>".join(lines) + "</div>")
 
 
 def _alt_sources_mod():
@@ -768,9 +788,10 @@ def _fda_banner_html(name, days=180):
         lines.append(f'<b style="color:{col}">{x.get("date","")} · {cls}:</b> '
                      f'{str(x.get("product",""))[:90]} — '
                      f'{str(x.get("reason",""))[:160]}')
+    newest = max((str(x.get("date", "")) for x in recalls[:3]), default="")
     return (f'<div style="background:#fdecea;border-left:3px solid #c62828;'
             f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-            f'💊 <b style="font-size:13px">US FDA recalls ({days}d)</b><br>'
+            f'{_fresh_badge(newest)}💊 <b style="font-size:13px">US FDA recalls ({days}d)</b><br>'
             + "<br>".join(lines) + "</div>")
 
 
@@ -2262,8 +2283,15 @@ def page_stock_detail():
         _crows = _cat[_cat["symbol"].astype(str).str.upper() == symbol]
         if not _crows.empty:
             _cr = _crows.sort_values("as_of").iloc[-1]
+            from datetime import date as _cd
+            try:
+                _cage = (_cd.today()
+                         - _cd.fromisoformat(str(_cr.get("as_of", ""))[:10])).days
+            except Exception:
+                _cage = 99
+            _ctag = "🆕 NEW · " if _cage <= 0 else ("🕓 RECENT · " if _cage <= 7 else "")
             st.caption(
-                f"💡 **{_cr.get('headline', '')}** · "
+                f"{_ctag}💡 **{_cr.get('headline', '')}** · "
                 f"{_cr.get('catalyst_type', '')} · {_cr.get('as_of', '')}"
             )
 
@@ -2302,7 +2330,8 @@ def page_stock_detail():
                 st.markdown(
                     f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
                     f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;'
-                    f'line-height:1.55">🧠 {_tag}<b style="color:#8a6d00">'
+                    f'line-height:1.55">{_fresh_badge(_ar.get("ann_date", ""))}'
+                    f'🧠 {_tag}<b style="color:#8a6d00">'
                     f'{str(_ar.get("ann_date",""))[:10]} · {_ar.get("category","")}:</b> '
                     f'{_s[:400]}</div>', unsafe_allow_html=True)
     _res_html = _research_banner_html(symbol, _name_sd, _isin_sd)
@@ -2867,7 +2896,8 @@ def page_graphs():
                 head = str(r.get("headline", "")).strip()
                 if not head:
                     return ""
-                out = (f'💡 <b>{r.get("as_of", "")}</b> '
+                out = (f'{_fresh_badge(r.get("as_of", ""))}'
+                       f'💡 <b>{r.get("as_of", "")}</b> '
                        f'[{r.get("catalyst_type", "?")}] {head[:150]}')
                 track = str(r.get("what_to_track", "") or "").strip()
                 if track and track.lower() != "nan":
@@ -3333,20 +3363,8 @@ def page_graphs():
                     f'line-height:1.55">📋 <b style="font-size:13px">Guidance / outlook</b>'
                     f'{src}<br>{body}</div>')
 
-        import datetime as _dtg
-        _today_g = _dtg.date.today()
-
-        def _fresh_badge(date_str):
-            """🆕 NEW vs ↺ unchanged so you can tell at a glance whether to re-read."""
-            try:
-                age = (_today_g - _dtg.date.fromisoformat(str(date_str)[:10])).days
-            except Exception:
-                return ""
-            if age <= 1:
-                return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
-                        'border-radius:6px;font-size:10px;font-weight:700">🆕 NEW</span> ')
-            return (f'<span style="background:#9e9e9e;color:#fff;padding:1px 6px;'
-                    f'border-radius:6px;font-size:10px">↺ {age}d old · unchanged</span> ')
+        # freshness chips come from the module-level _fresh_badge
+        # (NEW=today / RECENT=last 7d / grey age chip)
 
         def _llm_summary(sym):
             a = ann_by_sym.get(sym.upper(), _EMPTY)

@@ -203,6 +203,23 @@ def _q_order(qs):
     return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
+def _fresh_badge(date_str):
+    """🆕 NEW (today) / 🕓 RECENT (last 7d) / grey age chip — same tiers as app.py."""
+    from datetime import date as _d
+    try:
+        age = (_d.today() - _d.fromisoformat(str(date_str)[:10])).days
+    except Exception:
+        return ""
+    if age <= 0:
+        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
+                'border-radius:6px;font-size:10px;font-weight:700">🆕 NEW</span> ')
+    if age <= 7:
+        return ('<span style="background:#1565c0;color:#fff;padding:1px 6px;'
+                'border-radius:6px;font-size:10px;font-weight:700">🕓 RECENT</span> ')
+    return (f'<span style="background:#9e9e9e;color:#fff;padding:1px 6px;'
+            f'border-radius:6px;font-size:10px">↺ {age}d old</span> ')
+
+
 def _research_snip(md, name, symbol="", maxlen=300):
     """Substantive company snippet ("" = drop the item) — shared extractor, see
     research_snippet.py (section-body harvest, word-bounded keys, label-row filter)."""
@@ -486,7 +503,8 @@ class Cards:
         adate = str(row.get("ann_date", ""))[:10]
         return (f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-                f'🧠 <b style="color:#8a6d00">{adate} · {row.get("category","")}:</b> {s[:400]}</div>')
+                f'{_fresh_badge(adate)}🧠 <b style="color:#8a6d00">{adate} · '
+                f'{row.get("category","")}:</b> {s[:400]}</div>')
 
     def research_card(self, sym, name, isin="", days=45, max_items=3):
         """Recent research (research_index) mentioning this company — same matching
@@ -518,9 +536,11 @@ class Cards:
                          f' · {str(r.get("source",""))[:40]}:</b> {snip}')
         if not lines:
             return ""
+        newest = str(sub["doc_date"].iloc[0])[:10] if "doc_date" in sub.columns else ""
         return (f'<div style="background:#f3e5f5;border-left:3px solid #7b1fa2;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-                f'📄 <b style="font-size:13px">Research</b><br>' + "<br>".join(lines) + "</div>")
+                f'{_fresh_badge(newest)}📄 <b style="font-size:13px">Research</b><br>'
+                + "<br>".join(lines) + "</div>")
 
 
 def _ohlc_arrays(odf, days):
