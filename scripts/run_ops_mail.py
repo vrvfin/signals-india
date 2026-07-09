@@ -420,10 +420,17 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
     # report (user reads in IST); the 24h count is identical, just IST-framed.
     now = pd.Timestamp(datetime.utcnow()) + _IST
     cutoff = now - pd.Timedelta(hours=24)
+    # 7-day ROLLING error window (user 2026-07-09): the old cumulative error count
+    # only ever grows (error rows stay 'error' forever) so it read as alarming while
+    # the pipeline was actually healthy. Rolling reflects current health.
+    cutoff7 = now - pd.Timedelta(days=7)
     st_all = q["status"].astype(str)
     proc_all = pd.to_datetime(q["processed_at"], errors="coerce") + _IST
     done24_total = int(((st_all == "done") & (proc_all >= cutoff)).sum())
     err24_total = int(((st_all == "error") & (proc_all >= cutoff)).sum())
+    done7_total = int(((st_all == "done") & (proc_all >= cutoff7)).sum())
+    err7_total = int(((st_all == "error") & (proc_all >= cutoff7)).sum())
+    rate7 = err7_total / max(1, done7_total + err7_total) * 100
 
     rows = []
     for dt, g in q.groupby(q["doc_type"].astype(str)):
@@ -432,13 +439,15 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
         done = int((st == "done").sum())
         done24 = int(((st == "done") & (pr >= cutoff)).sum())
         pend = int((st == "pending").sum())
-        err = int((st == "error").sum())
+        done7 = int(((st == "done") & (pr >= cutoff7)).sum())
+        err7 = int(((st == "error") & (pr >= cutoff7)).sum())
+        e7pct = err7 / max(1, done7 + err7) * 100
         exp = int(st.isin(["expired", "download_failed"]).sum())
         pcn = 0
         if pc is not None and not pc.empty:
             pcn = (pc[pc["doc_type"].astype(str) == str(dt)]["key"]
                    .astype(str).nunique())
-        rows.append((str(dt), done, done24, pend, err, exp, pcn))
+        rows.append((str(dt), done, done24, pend, err7, e7pct, exp, pcn))
     rows.sort(key=lambda r: -r[1])
 
     body = "".join(
@@ -446,19 +455,22 @@ def docs_processed_html(drive, root) -> tuple[str, int]:
         f"<td align=right>{done:,}</td>"
         f"<td align=right>{'+' + format(done24, ',') if done24 else '0'}</td>"
         f"<td align=right>{pend:,}</td>"
-        f"<td align=right>{err:,}</td>"
+        f"<td align=right>{err7:,} ({e7pct:.1f}%)</td>"
         f"<td align=right>{exp:,}</td>"
         f"<td align=right>{pcn:,}</td></tr>"
-        for dt, done, done24, pend, err, exp, pcn in rows)
+        for dt, done, done24, pend, err7, e7pct, exp, pcn in rows)
     total_done = int((st_all == "done").sum())
     head = (f"<p><b>📄 {done24_total:,} docs summarised in the last 24h</b> "
-            f"(+{err24_total:,} errored) · {total_done:,} done all-time "
-            f"(one global queue; last 24h, IST).</p>")
+            f"(+{err24_total:,} errored) · 7-day error rate "
+            f"<b>{rate7:.1f}%</b> ({err7_total:,}/{done7_total + err7_total:,}) · "
+            f"{total_done:,} done all-time (one global queue; IST).</p>")
     table = ("<table border=1 cellpadding=4 cellspacing=0>"
              "<tr><th>doc_type</th><th>done</th><th>+24h</th><th>pending</th>"
-             "<th>error</th><th>expired</th><th>page-checked cos</th></tr>"
+             "<th>err 7d</th><th>expired</th><th>page-checked cos</th></tr>"
              + body + "</table>"
-             "<p style='font-size:11px;color:#999'>expired = PDF aged out (2-day "
+             "<p style='font-size:11px;color:#999'>err 7d = errors in the last 7 days "
+             "(rolling; % of that window's attempts) — all-time errors stay in the "
+             "queue but aren't reported here. expired = PDF aged out (2-day "
              "retention) before summarising — re-fetched automatically. "
              "page-checked = companies whose Screener page we have swept for that "
              "doc_type (Stage-0 denominator). Full tier/depth %: "
