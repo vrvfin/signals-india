@@ -70,6 +70,19 @@ Edit `OUTPUT_DIR` in both scripts to point inside your Obsidian vault:
 2. If last run failed at "Health check" step → usually a transient data issue, re-trigger: GitHub → Actions → Daily Pipeline → Run workflow
 3. If no run at all today → check cron-job.org dashboard to confirm the 16:00 IST trigger fired
 
+### Evening mails arriving after 9:30 PM IST (should be ~7 PM)
+**Symptom:** The daily mail batch lands ~22:45 IST–01:00 IST instead of 19:00 IST
+**Cause:** The 19:00 IST cron-job.org `workflow_dispatch` job for `pead.yml` isn't firing,
+so pead falls back to the late-drifting GitHub `schedule` cron — and `t4_nightly` (4 mails)
+chains off pead, so it's late too. (ops digest still arrives at 7 PM via its own working job.)
+**Fix:**
+1. `gh run list --workflow pead.yml --limit 3 --json event,createdAt` — if every recent run is
+   `event: schedule` (none `workflow_dispatch`), the cron-job.org job is missing/broken.
+2. In the cron-job.org dashboard, confirm/create a job that POSTs at 13:30 UTC (19:00 IST) to
+   `https://api.github.com/repos/vrvfin/signals-india/actions/workflows/pead.yml/dispatches`
+   with body `{"ref":"main"}` and `Authorization: Bearer <PAT>` (clone the working ops_mail job
+   and change only the workflow filename). PAT needs `actions: write` / classic `workflow` scope.
+
 ### Phase 2 — "cancelled" runs
 **Symptom:** GitHub Actions shows Phase 2 run as "cancelled"
 **Cause:** Two scenarios: (a) run hit the 3-hour timeout — normal during peak concall season when queue is large; (b) manual cancellation
@@ -128,6 +141,16 @@ Phase 2 (phase2.yml) — 3-7× per day (peak season)
   Steps: ingest_company_docs → scrape_results_table → extract_concall
          → extract_results → extract_rating → extract_presentation
          → extract_annual_report → cleanup → write_phase2_status
+
+Evening mail batch — daily 19:00 IST (all 8 mails)
+  Anchored by TWO cron-job.org workflow_dispatch jobs at 19:00 IST (13:30 UTC):
+    • pead.yml     → 3 mails (results-vs-guidance, tomorrow calendar, guidance digest)
+                     then t4_nightly chains off its completion (workflow_run) →
+                     4 mails (fraud scan, catalyst, AR digest, PF digest) ~19:15–20:30
+    • ops_mail.yml → 1 mail (ops digest)
+  GitHub `schedule` crons in these two ymls are LATE FALLBACKS ONLY (drift to ~22:45–
+  01:00 IST). The guard job skips them once the 19:00 cron-job.org run has succeeded,
+  so no duplicate mail. (deepdive 08:00 + ipo_drhp_watch 09:00 mails are separate.)
 
 Streamlit app — reads Drive, 5-min cache
   Live at: [check share.streamlit.io for your app URL]
