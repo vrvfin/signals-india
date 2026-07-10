@@ -775,7 +775,12 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
         u = str(rr.get("symbol", "") or "").upper()
         if not u:
             continue
-        bits = [f'⚡ {int(rr.get("n_strategies", 0) or 0)} strat']
+        # ⚡ bit only when n_strategies is known: 0 is meaningful (drops view =
+        # no longer a select) but NaN/missing (PF holding with no signals) is not.
+        bits = []
+        ns = rr.get("n_strategies")
+        if ns is not None and pd.notna(ns):
+            bits.append(f'⚡ {int(ns)} strat')
         f = fmap.get(u)
         if f is not None:
             px = f.get("close")
@@ -867,6 +872,11 @@ def main():
     title, annot = "📊 Signals gallery", {}
     out_default = "gallery.html"
 
+    # Meta-line inputs (52wH, returns+ranks, tenure) — used by signals AND pf modes
+    mem = _read_parquet(drive, _folder(drive, "signals/aggregated"),
+                        "membership.parquet")
+    feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+
     if args.mode == "pf":
         title, out_default = "💼 Portfolio (PF) charts", "gallery_pf.html"
         # auto-healed isin->symbol: master_list + grades + guidance_tracker
@@ -884,6 +894,17 @@ def main():
         unresolved = hold[hold["symbol"] == ""]
         ranked = pd.concat([resolved, unresolved], ignore_index=True)
         ranked = ranked.rename(columns={"name": "_pfname"})
+        # Same enriched meta line as the signals gallery (52wH, returns+ranks,
+        # tenure, badges). n_strategies joined from live signals so holdings that
+        # are also selects show real coverage; non-select holdings omit the ⚡ bit.
+        sig_pf = _load_signals(drive)
+        if not sig_pf.empty:
+            if args.zones.strip():
+                sig_pf = sig_pf[sig_pf["zone_type"].isin(
+                    [z.strip() for z in args.zones.split(",")])]
+            nmap = sig_pf.groupby("symbol")["strategy_group"].nunique()
+            ranked["n_strategies"] = ranked["symbol"].map(nmap)
+        annot = _build_meta_annot(ranked, feats_g, mem)
         log(f"  PF holdings: {len(ranked)} total "
             f"({len(resolved)} chartable, {len(unresolved)} name-only/not-in-universe)")
 
@@ -903,9 +924,6 @@ def main():
         log(f"  scored {len(scores)} companies with guidance; top {len(ranked)}")
 
     else:  # signals
-        mem = _read_parquet(drive, _folder(drive, "signals/aggregated"),
-                            "membership.parquet")
-        feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
         if args.view == "drops":
             title, out_default = "📉 Recent drops (7d)", "gallery_drops.html"
             if mem.empty or "dropped_last_7d" not in mem.columns:
