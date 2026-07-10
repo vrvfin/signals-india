@@ -234,21 +234,50 @@ def parse_feed_html(html: str, doc_type: str, run_date: date) -> list[dict]:
     return rows
 
 
-def download_pdf(session, url) -> bytes | None:
+def _get_once(session, url, timeout=60):
+    """One GET with the standard headers; None on network error."""
     try:
-        r = session.get(url, headers={"User-Agent": UA,
-                                      "Referer": "https://www.bseindia.com/"},
-                         timeout=60, allow_redirects=True)
+        return session.get(url, headers={"User-Agent": UA,
+                                         "Referer": "https://www.bseindia.com/"},
+                           timeout=timeout, allow_redirects=True)
     except requests.RequestException as e:
         log(f"    download error: {str(e)[:100]}")
+        return None
+
+
+def download_pdf(session, url) -> bytes | None:
+    """Fetch a document PDF. BSE's Akamai serves an ~8KB HTML block page from
+    AnnPdfOpen.aspx for REAL, existing PDFs (verified 2026-07-09: 4 of the last
+    20 queue errors were fresh Q4FY26 concalls bounced this way — RALLIS/TANLA/
+    EPIGRAL/CRAMC; cookie-refresh retries do NOT help). The SAME attachment is
+    served un-blocked at xml-data/corpfiling/AttachLive/<Pname> (fallback
+    AttachHis) — the endpoint the announcement pipeline already uses. So: try
+    the stored URL once (fast path unchanged), and on a BSE non-PDF response
+    rewrite AnnPdfOpen.aspx?Pname=X to AttachLive/X then AttachHis/X."""
+    r = _get_once(session, url)
+    if r is not None and r.status_code == 200 and r.content[:5].startswith(b"%PDF"):
+        return r.content
+
+    m = re.search(r"(?i)bseindia\.com/.*[?&]Pname=([^&]+)", str(url))
+    if m:
+        pname = m.group(1)
+        for base in ("https://www.bseindia.com/xml-data/corpfiling/AttachLive/",
+                     "https://www.bseindia.com/xml-data/corpfiling/AttachHis/"):
+            r2 = _get_once(session, base + pname, timeout=60)
+            if r2 is not None and r2.status_code == 200 \
+                    and r2.content[:5].startswith(b"%PDF"):
+                log(f"    BSE AnnPdfOpen blocked — recovered via "
+                    f"{base.rsplit('/', 2)[-2]}")
+                return r2.content
+            time.sleep(1)
+
+    if r is None:
         return None
     if r.status_code != 200 or not r.content:
         log(f"    download HTTP {r.status_code}")
         return None
-    if not r.content[:5].startswith(b"%PDF"):
-        log(f"    not a PDF (got {r.content[:20]!r})")
-        return None
-    return r.content
+    log(f"    not a PDF (got {r.content[:20]!r})")
+    return None
 
 
 # ---------- Queue ----------
