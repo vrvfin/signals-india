@@ -140,10 +140,11 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
     # --- axis 3 context: latest cred_score per isin from GF_TRACK rows ---
     cred_by = {}
     if not gva.empty:
-        gt = gva[gva["source"].astype(str) == "gf_track"].dropna(subset=["cred_score"])
+        gt = gva[gva["source"].astype(str) == "gf_track"]
         for iso, grp in gt.groupby(gt["isin"].astype(str).str.strip()):
-            cred_by[iso] = float(pd.to_numeric(grp["cred_score"],
-                                               errors="coerce").dropna().iloc[-1])
+            vals = pd.to_numeric(grp["cred_score"], errors="coerce").dropna()
+            if not vals.empty:      # cred_score can be text ("NA" etc.) — skip
+                cred_by[iso] = float(vals.iloc[-1])
 
     rows, unmapped = [], []
     for sym, t in tech.items():
