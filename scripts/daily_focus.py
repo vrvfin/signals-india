@@ -62,21 +62,64 @@ def _proc_date(val) -> dt.date | None:
         return None
 
 
-def _doc_label(i: int, r: pd.Series) -> str:
-    return (f"[doc_{i:02d} | {r.get('doc_date','NA')} | {r.get('source','NA')} | "
+def _doc_label(r: pd.Series) -> str:
+    # PERSISTENT id (same as the daily digest '## research_NNNN' header) so every
+    # citation in the focus note maps 1:1 to the digest + Source Map.
+    return (f"[research_{int(r['research_n']):04d} | {r.get('doc_date','NA')} | {r.get('source','NA')} | "
             f"{r.get('doc_type','NA')} | {r.get('file_name','NA')}]")
 
 
-def _blocks(df: pd.DataFrame, start_i: int) -> tuple[str, int]:
-    """Render summaries to labelled blocks; returns (text, next_index)."""
-    parts, i = [], start_i
+def _blocks(df: pd.DataFrame) -> str:
+    """Render summaries to blocks labelled with the persistent research_NNNN id."""
+    parts = []
     for _, r in df.iterrows():
         summ = str(r.get("summary_md", "")).strip()
         if not summ:
             continue
-        parts.append(f"--- {_doc_label(i, r)} ---\n{summ}")
-        i += 1
-    return "\n\n".join(parts), i
+        parts.append(f"--- {_doc_label(r)} ---\n{summ}")
+    return "\n\n".join(parts)
+
+
+def _source_map(led: pd.DataFrame, today_txt: str, roll_txt: str, target: dt.date) -> str:
+    """Deterministic citation -> file table (built in Python, NOT by the LLM).
+    Rows come from the exact refs present in the post-trim prompt text, so every
+    [research_NNNN] the model could cite has a row. ROLLING sorted newest-first
+    (processed timeline). File name is backticked for quick folder search."""
+    by_n = led.drop_duplicates("research_n").set_index("research_n")
+
+    def refs(txt: str) -> list[int]:
+        return [int(m) for m in re.findall(r"--- \[research_(\d+)", txt)]
+
+    def row(n: int) -> str | None:
+        if n not in by_n.index:
+            return None
+        r = by_n.loc[n]
+        try:
+            pdt = dt.datetime.fromisoformat(str(r.get("processed_at")))
+            age = (target - pdt.date()).days
+            proc = f"today {pdt:%H:%M}" if age <= 0 else f"D-{age} ({pdt:%d %b %H:%M})"
+        except Exception:
+            proc = "NA"
+        ref_md = str(r.get("daily_md_ref") or "")
+        digest = ref_md.split("/")[-1].split("#")[0] if ref_md else "NA"
+        fname = str(r.get("file_name", "NA")).replace("|", "/")
+        return (f"| research_{n:04d} | {proc} | {r.get('source','NA')} | "
+                f"{r.get('doc_type','NA')} | `{fname}` | {digest} |")
+
+    def pkey(n: int) -> str:
+        return str(by_n.loc[n].get("processed_at", "")) if n in by_n.index else ""
+
+    lines = ["## 📎 Source Map — citation → file",
+             "",
+             "| Ref | Processed | Source | Type | File name | Digest |",
+             "|---|---|---|---|---|---|"]
+    for n in refs(today_txt):
+        if (ln := row(n)):
+            lines.append(ln)
+    for n in sorted(refs(roll_txt), key=pkey, reverse=True):
+        if (ln := row(n)):
+            lines.append(ln)
+    return "\n".join(lines)
 
 
 def _trim(today_txt: str, roll_txt: str) -> str:
@@ -117,17 +160,20 @@ def main():
     roll_start = target - dt.timedelta(days=args.days)
 
     today_df = led[led.pdate == target]
-    roll_df  = led[(led.pdate >= roll_start) & (led.pdate < target)]
+    # newest-first so the char-budget trim drops the OLDEST rolling docs, not the
+    # newest (previously chronological order made _trim cut yesterday's docs first)
+    roll_df  = (led[(led.pdate >= roll_start) & (led.pdate < target)]
+                .sort_values("processed_at", ascending=False))
 
     if today_df.empty and roll_df.empty:
         print(f"No documents for {target} or the {args.days} days before it."); return
 
-    today_txt, nxt = _blocks(today_df, 1)
-    roll_txt, _    = _blocks(roll_df, nxt)
+    today_txt = _blocks(today_df)
+    roll_txt  = _blocks(roll_df)
     roll_txt = _trim(today_txt, roll_txt)
 
-    n_today = today_txt.count("--- [doc_")
-    n_roll  = roll_txt.count("--- [doc_")
+    n_today = today_txt.count("--- [research_")
+    n_roll  = roll_txt.count("--- [research_")
     print(f"Daily Focus for {target}: {n_today} today + {n_roll} rolling ({args.days}d). Calling Gemini...")
 
     prompt = (PROMPT_FILE.read_text(encoding="utf-8")
@@ -144,7 +190,9 @@ def main():
     header  = (f"# Daily Focus — {target:%d %b %Y}\n\n"
                f"*Generated {dt.datetime.now():%d %b %Y %H:%M} IST · "
                f"{n_today} today + {n_roll} rolling ({args.days}d)*\n\n---\n\n")
-    body    = header + result
+    # deterministic citation -> file table, ALWAYS the LAST section of the note
+    src_map = _source_map(led, today_txt, roll_txt, target)
+    body    = header + result.rstrip() + "\n\n---\n\n" + src_map + "\n"
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     outpath = OUT_DIR / f"daily_focus_{stamp}.md"
