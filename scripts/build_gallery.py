@@ -753,6 +753,20 @@ _ADD_BADGE = {"fresh": ("🆕 FRESH", "#8e44ad"), "new": ("NEW", "#2980b9"),
               "recent": ("RECENT", "#16a085")}
 
 
+def _dh_chip(dh):
+    """Bold colored chip for % below 52w high — green near the high (strength),
+    amber 5-15% off, red deeper. The single most scanned number on a card."""
+    if dh is None or pd.isna(dh):
+        return ""
+    v = float(dh)
+    if v >= -0.5:
+        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 8px;'
+                'border-radius:6px;font-weight:700">🏔 at 52w high</span>')
+    col = "#1a7a3a" if v >= -5 else ("#a66300" if v >= -15 else "#c0392b")
+    return (f'<span style="background:{col};color:#fff;padding:1px 8px;'
+            f'border-radius:6px;font-weight:700">▼ {abs(v):.0f}% off high</span>')
+
+
 def _build_meta_annot(ranked, feats, mem) -> dict:
     """symbol.upper() -> meta HTML: strategies · price · 1/3/6/12M returns ·
     tenure (came Nx since <date>) + FRESH/NEW/RECENT/DROPPED badge."""
@@ -787,9 +801,13 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
             if pd.notna(px):
                 bits.append(f'₹{float(px):,.0f}')
             dh = f.get("dist_from_52w_high_pct")
-            if pd.notna(px) and pd.notna(dh) and (1 + float(dh) / 100) != 0:
-                hi = float(px) / (1 + float(dh) / 100)
-                bits.append(f'52wH ₹{hi:,.0f} ({float(dh):+.0f}%)')
+            if pd.notna(dh):
+                chip = _dh_chip(dh)
+                if pd.notna(px) and (1 + float(dh) / 100) != 0:
+                    hi = float(px) / (1 + float(dh) / 100)
+                    bits.append(f'{chip} <span style="color:#666">52wH ₹{hi:,.0f}</span>')
+                elif chip:
+                    bits.append(chip)
             rets = []
             for lbl, rcol, kcol in [("1M", "return_1m_pct", "rs_rank_1m"),
                                     ("3M", "return_3m_pct", "rs_rank_3m"),
@@ -890,7 +908,16 @@ def main():
             hold = pd.DataFrame({"isin": sorted(isins), "name": ""})
         hold["symbol"] = hold["isin"].map(lambda i: isin2sym.get(str(i), ""))
         hold["_mc"] = hold["symbol"].map(lambda s: mcap_map.get(str(s).upper(), 0) if s else 0)
-        resolved = hold[hold["symbol"] != ""].sort_values("_mc", ascending=False)
+        # Sort: deepest % below 52w high FIRST (laggards on top for review);
+        # no-data names fall to the end, tie-break by mcap.
+        dh_map = {}
+        if not feats_g.empty and {"symbol", "dist_from_52w_high_pct"} <= set(feats_g.columns):
+            dh_map = dict(zip(feats_g["symbol"].astype(str),
+                              pd.to_numeric(feats_g["dist_from_52w_high_pct"],
+                                            errors="coerce")))
+        hold["_dh"] = hold["symbol"].map(lambda s: dh_map.get(str(s)) if s else None)
+        resolved = hold[hold["symbol"] != ""].sort_values(
+            ["_dh", "_mc"], ascending=[True, False], na_position="last")
         unresolved = hold[hold["symbol"] == ""]
         ranked = pd.concat([resolved, unresolved], ignore_index=True)
         ranked = ranked.rename(columns={"name": "_pfname"})
