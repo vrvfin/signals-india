@@ -342,7 +342,9 @@ def main() -> None:
     subject = (f"💥 Results surge — {len(fresh)} cos >100% PAT YoY "
                f"(last {args.hours:.0f}h)" + (f" · 💼{n_pf} PF" if n_pf else ""))
     sent = send_email(subject, build_html(fresh, since, args.hours))
-    log(f"Email {'sent' if sent else 'FAILED'}: {subject}")
+    # ascii-only in log lines — local console is cp1252, emoji crash print()
+    log(f"Email {'sent' if sent else 'FAILED'}: "
+        f"{subject.encode('ascii', 'ignore').decode().strip()}")
 
 
 if __name__ == "__main__":

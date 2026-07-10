@@ -354,7 +354,9 @@ def main() -> None:
     subject = (f"🏆 Combined strength — {len(daily_df)} stocks "
                f"(tech+results+guidance)" + (f" · 💼{n_pf} PF" if n_pf else ""))
     sent = send_email(subject, build_html(rows, today))
-    log(f"Email {'sent' if sent else 'FAILED'}: {subject}")
+    # ascii-only in log lines — local console is cp1252, emoji crash print()
+    log(f"Email {'sent' if sent else 'FAILED'}: "
+        f"{subject.encode('ascii', 'ignore').decode().strip()}")
 
 
 if __name__ == "__main__":
