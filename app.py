@@ -5094,6 +5094,7 @@ _MAIL_TOGGLES = [
     ("pf_digest",       "💼 PF daily digest"),
     ("growth_surge",    "💥 Results surge >100% PAT (20:00)"),
     ("combined_strength", "🏆 Combined strength: tech+results+guidance (21:30)"),
+    ("pf_docs_digest",  "📂 PF new documents + summaries (21:30)"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"
 

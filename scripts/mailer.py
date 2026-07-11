@@ -44,6 +44,7 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "pf_digest":       "PF daily digest: filings/research/flags/docs/community",
     "growth_surge":    "Results surge: >100% PAT YoY, consistent vs one-off (last 24h)",
     "combined_strength": "Combined strength: strong tech + results + guidance",
+    "pf_docs_digest":  "PF new documents: AR/concall/presn/rating/announcement + summary",
 }
 
 

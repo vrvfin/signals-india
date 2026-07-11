@@ -157,3 +157,11 @@ jobs:
         if: always()
         run: python scripts/run_pf_digest.py
         continue-on-error: true
+
+      # PF "new documents" digest (user 2026-07-11): collects Phase-2 summaries of
+      # newly-arrived AR/concall/presentation/results/rating + announcements per PF
+      # stock, deduped via pf_docs_mailed.parquet. Daily 2-day window.
+      - name: PF new-documents digest mail (narrative summaries per holding)
+        if: always()
+        run: python scripts/run_pf_docs_digest.py
+        continue-on-error: true

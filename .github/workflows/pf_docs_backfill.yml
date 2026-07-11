@@ -1,0 +1,59 @@
+name: pf_docs_backfill
+
+# One-shot / manual: send the PF "new documents" digest over a wider window
+# (user 2026-07-11 — one-time 30-day catch-up now that AR season has landed).
+# Dispatch-only, no Gemini, ~2 min. The daily version runs inside t4_nightly with
+# the default 2-day window; this is only for a manual wider catch-up.
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Arrival window in days (docs newer than this)"
+        default: "30"
+
+concurrency:
+  group: pf-docs-backfill
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas pyarrow python-dotenv \
+            google-api-python-client google-auth google-auth-oauthlib
+
+      - name: PF new-documents digest (wide window)
+        run: python scripts/run_pf_docs_digest.py --days "${{ github.event.inputs.days || '30' }}"
