@@ -543,12 +543,35 @@ class Cards:
                 + "<br>".join(lines) + "</div>")
 
 
-def _ohlc_arrays(odf, days):
+def _resample_ohlc(d, rule):
+    """Resample daily OHLCV to weekly ('W-FRI') / monthly ('ME') bars:
+    open=first, high=max, low=min, close=last, volume=sum."""
+    x = d.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.dropna(subset=["date"]).set_index("date").sort_index()
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    agg = (x.resample(rule).agg({"open": "first", "high": "max", "low": "min",
+                                 "close": "last", "volume": "sum"})
+            .dropna(subset=["close"]).reset_index())
+    return agg
+
+
+def _ohlc_arrays(odf, days, resample=None):
     """-> (candles, volumes, ema20, ema50) for lightweight-charts. EMAs computed
-    on the windowed close series (matches the app's quick chart)."""
+    on the (optionally resampled) close series, so weekly/monthly views carry
+    weekly/monthly EMAs. resample: None=daily, 'W-FRI'=weekly, 'ME'=monthly."""
     if odf is None or odf.empty:
         return [], [], [], []
-    d = odf.sort_values("date").tail(days).reset_index(drop=True)
+    if resample:
+        d = _resample_ohlc(odf, resample)
+        nbars = 200 if str(resample).startswith("W") else 120   # ~4y wk / ~10y mo
+        d = d.tail(nbars).reset_index(drop=True)
+    else:
+        d = odf.sort_values("date").tail(days).reset_index(drop=True)
+    if d.empty:
+        return [], [], [], []
     closes = pd.to_numeric(d["close"], errors="coerce")
     e20 = closes.ewm(span=20, adjust=False).mean()
     e50 = closes.ewm(span=50, adjust=False).mean()
@@ -608,13 +631,14 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
 
 
 def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
-               annot=None):
+               annot=None, resample=None):
     annot = annot or {}
     card_html, data = [], {}
     for j, (_, rr) in enumerate(ranked.iterrows()):
         s = str(rr.get("symbol", "") or "")
         pfname = str(rr.get("_pfname", "") or "")          # PF holding name (raw list)
-        c, v, e20, e50 = _ohlc_arrays(omap.get(s, _EMPTY), days) if s else ([], [], [], [])
+        c, v, e20, e50 = (_ohlc_arrays(omap.get(s, _EMPTY), days, resample=resample)
+                          if s else ([], [], [], []))
 
         # Unresolved / not-in-universe holding -> name-only card, nothing dropped
         if not s or not c:
@@ -852,6 +876,9 @@ def main():
     ap.add_argument("--min-strats", type=int, default=2)
     ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
     ap.add_argument("--timeframe-days", type=int, default=252)
+    ap.add_argument("--resample", choices=["D", "W", "M"], default="D",
+                    help="candle timeframe: D=daily (default), W=weekly, "
+                         "M=monthly. EMAs are recomputed on the chosen bars.")
     ap.add_argument("--turnover", type=float, default=1.0, help="min Rs cr/day, 0=off")
     ap.add_argument("--max", type=int, default=0,
                     help="cap chart count (0=all; guidance mode defaults to 100)")
@@ -985,6 +1012,16 @@ def main():
         log("DRY-RUN — top 10: " + ", ".join(syms[:10]))
         return
 
+    # Timeframe: daily (default) / weekly / monthly — resample bars + EMAs, and
+    # tag the title + output filename so the three files sit side by side.
+    _rs_map = {"D": (None, "", ""),
+               "W": ("W-FRI", " · Weekly", "_weekly"),
+               "M": ("ME", " · Monthly", "_monthly")}
+    resample, tf_title, tf_suffix = _rs_map[args.resample]
+    title += tf_title
+    if tf_suffix and not args.out:
+        out_default = out_default.replace(".html", f"{tf_suffix}.html")
+
     out_path = args.out or os.path.join(os.path.dirname(_SCRIPTS_DIR), out_default)
     log("loading gf1 / announcements / research…")
     gf1 = _read_parquet(drive, idx, "gf1_guidance_statements.parquet")
@@ -998,7 +1035,7 @@ def main():
     cards = Cards(grades, stmts, guidance, gf1, ann, research=res_idx)
     log("assembling HTML…")
     html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
-                      title=title, annot=annot)
+                      title=title, annot=annot, resample=resample)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     log(f"wrote {out_path}  ({len(html) / 1e6:.1f} MB, {len(syms)} charts)")
