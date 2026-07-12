@@ -71,9 +71,16 @@ DOC_LABEL = {"concall": "Concall", "annual_report": "Annual Report",
 # doc_type -> keywords that appear in the company_page.md section header
 _SECTION_KW = {"concall": ("concall",), "annual_report": ("annual", "ar"),
                "presentation": ("ppt", "presentation"), "results": ("result",)}
-# priority order of narrative subsections to lift from a company_page section
-_SUMMARY_HEADS = ("executive summary", "forward guidance", "q&a summary",
-                  "management commentary", "growth drivers", "summary")
+# priority order of narrative subsections to lift from a company_page section.
+# Covers concall headers (A-1 Executive Summary…) AND AR headers (numbered
+# "2. FINANCIAL PERFORMANCE…", "7. INVESTMENT THESIS…").
+_SUMMARY_HEADS = ("executive summary", "investment thesis", "forward guidance",
+                  "financial performance", "growth trajectory", "q&a summary",
+                  "management commentary", "growth drivers", "company overview",
+                  "summary")
+# boilerplate/methodology subsections to never lift as the "summary"
+_SKIP_HEADS = ("source coverage", "data integrity", "probing questions",
+               "forensic financial risk scorecard", "credibility", "mgmt said")
 
 QUEUE_COLS = ["doc_id", "isin", "symbol", "company_name", "doc_type", "title",
               "announcement_date", "status", "discovered_at", "processed_at", "period"]
@@ -145,46 +152,71 @@ def _find_region(sections, period: str, doc_type: str) -> str | None:
                 break
     if start is None:
         return None
-    parts = [sections[start][1]]
+    region = [sections[start]]
     for h, body in sections[start + 1:]:
         if _is_boundary(h):
             break
-        parts.append(body)
-    return "\n".join(parts)
+        region.append((h, body))
+    return region
 
 
-def _lift_summary(body: str, limit: int = SUMMARY_LIMIT) -> str:
-    """Pull the most summary-like subsection (Executive Summary etc.); else the
-    first prose paragraph. Skips markdown tables (| ... |)."""
-    if not body:
+_META_RE = re.compile(
+    r"^(company name|sector\b|industry\b|annual report fiscal|reporting period|"
+    r"call date|date of\b|active reporting|processed:|table_a\b)", re.I)
+
+
+def _prose(text: str) -> str:
+    """Human prose only: drop tables, code fences, headers, [TAG] lines, metadata."""
+    out = []
+    for l in text.splitlines():
+        raw = l.strip()
+        s = raw.lstrip("*#>- ").strip()            # strip md emphasis/quote/bullet first
+        if (not s or raw.startswith("|") or raw.startswith("```")
+                or re.match(r"^#{1,6}\s", l) or re.match(r"^\[[A-Z ]+\]", s)
+                or _META_RE.match(s) or not (set(s) - set("-:|*# "))):
+            continue
+        out.append(s)
+    return " ".join(out).strip()
+
+
+def _lift_summary(region: list, limit: int = SUMMARY_LIMIT) -> str:
+    """Best narrative subsection across a doc's region. Handles AR (meaningful
+    content in top-level '## 2. FINANCIAL PERFORMANCE…' sections) AND concall
+    ('### A-1 Executive Summary' sub-headers), skipping boilerplate sections."""
+    if not region:
         return ""
-    # subsections keyed by '### ' / '#### ' headers
-    subs, cur_h, cur_b = [], "", []
-    for ln in body.splitlines():
-        if re.match(r"^#{3,4}\s", ln):
-            if cur_h or cur_b:
-                subs.append((cur_h, "\n".join(cur_b)))
-            cur_h, cur_b = ln, []
-        else:
-            cur_b.append(ln)
-    if cur_h or cur_b:
-        subs.append((cur_h, "\n".join(cur_b)))
+    # candidates = each region section header + its ###/#### sub-headers
+    cands: list = []
+    for h, body in region:
+        cands.append((h, body))
+        cur_h, cur_b = "", []
+        for ln in body.splitlines():
+            if re.match(r"^#{3,4}\s", ln):
+                if cur_h or cur_b:
+                    cands.append((cur_h, "\n".join(cur_b)))
+                cur_h, cur_b = ln, []
+            else:
+                cur_b.append(ln)
+        if cur_h or cur_b:
+            cands.append((cur_h, "\n".join(cur_b)))
 
-    def _prose(text: str) -> str:
-        keep = [l for l in text.splitlines()
-                if l.strip() and not l.lstrip().startswith("|")
-                and not re.match(r"^#{1,6}\s", l) and set(l.strip()) - set("-:| ")]
-        return " ".join(keep).strip()
+    def _pick(h, text):
+        if any(sk in h.lower() for sk in _SKIP_HEADS):
+            return None
+        p = _prose(text)
+        return (p[:limit].rstrip() + ("…" if len(p) > limit else "")) if len(p) > 60 else None
 
-    for want in _SUMMARY_HEADS:
-        for h, text in subs:
+    for want in _SUMMARY_HEADS:                       # priority-ordered
+        for h, text in cands:
             if want in h.lower():
-                p = _prose(text)
-                if len(p) > 40:
-                    return p[:limit].rstrip() + ("…" if len(p) > limit else "")
-    # fallback: first prose in the whole section
-    p = _prose(body)
-    return p[:limit].rstrip() + ("…" if len(p) > limit else "") if p else ""
+                got = _pick(h, text)
+                if got:
+                    return got
+    for h, text in cands:                             # fallback: first non-boilerplate prose
+        got = _pick(h, text)
+        if got:
+            return got
+    return ""
 
 
 # ------------------------------------------------------------------ #
