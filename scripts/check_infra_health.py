@@ -49,29 +49,68 @@ from mailer import send_email, load_mail_settings, esc
 REPO = os.environ.get("GH_REPO", "vrvfin/signals-india")
 _SECRETS_URL = f"https://github.com/{REPO}/settings/secrets/actions"
 
-# ---- remediation playbooks (exact steps) ----
-FIX_SCREENER = (
-    "1. Open https://www.screener.in and LOG IN.<br>"
-    "2. DevTools (F12) → Application → Cookies → screener.in → copy the "
-    "<b>sessionid</b> value.<br>"
-    f"3. <a href='{_SECRETS_URL}'>Repo → Settings → Secrets → Actions</a> → "
-    "<b>SCREENER_SESSION_COOKIE</b> → Update → paste → Save.<br>"
-    "4. Re-run: <code>gh workflow run pead.yml</code> (and fundamentals.yml on Mon).")
-FIX_GDRIVE = (
-    "The Google Drive OAuth token was revoked/expired. Regenerate it locally "
-    "(the OAuth flow writes a fresh token), then update the "
-    f"<b>GDRIVE_OAUTH_TOKEN_JSON</b> secret at <a href='{_SECRETS_URL}'>Actions "
-    "secrets</a>. Nothing on Drive updates until this is fixed.")
-FIX_GEMINI = (
-    "No Gemini summaries succeeded in 24h. Either every free-tier bucket hit its "
-    "daily quota (add a NEW Google-Cloud PROJECT's keys — more keys from the same "
-    "project add ZERO quota) or the keys are invalid. Check FREE_POOL / GEMINI_API_KEY "
-    f"at <a href='{_SECRETS_URL}'>Actions secrets</a>.")
-FIX_GMAIL = (
-    "Mailer could not authenticate. Verify <b>GMAIL_USER</b> + "
-    "<b>GMAIL_APP_PASSWORD</b> (a Google App Password, not the account password) and "
-    f"that <b>NOTIFY_EMAIL</b> is the inbox you read, at "
-    f"<a href='{_SECRETS_URL}'>Actions secrets</a>. Also check Gmail Spam/Promotions.")
+
+def _fix(secret: str, where: str, fmt: str, steps: list[str]) -> str:
+    """Uniform remediation block: exact SECRET name, WHERE to update (link),
+    the expected VALUE FORMAT (with an example), then click-by-click steps."""
+    return (
+        f"&nbsp;&nbsp;• <b>Secret:</b> <code>{secret}</code><br>"
+        f"&nbsp;&nbsp;• <b>Where:</b> <a href='{_SECRETS_URL}'>{_SECRETS_URL}</a> "
+        f"→ <code>{secret}</code> → <b>Update</b><br>"
+        f"&nbsp;&nbsp;• <b>Value format:</b> {where and where + '<br>'}{fmt}<br>"
+        f"&nbsp;&nbsp;• <b>Steps:</b><br>"
+        + "".join(f"&nbsp;&nbsp;&nbsp;&nbsp;{i}. {s}<br>" for i, s in enumerate(steps, 1)))
+
+
+FIX_SCREENER = _fix(
+    "SCREENER_SESSION_COOKIE",
+    "Paste <u>only the cookie VALUE</u> — NOT <code>sessionid=…</code>, NOT the whole "
+    "cookie header, NOT the <code>csrftoken</code>. No surrounding quotes or spaces.",
+    "a ~32–40 char letters+digits string, e.g. <code>abcd1234efgh5678ijkl9012mnop3456</code> "
+    "(format: <code>[a-z0-9]{32,}</code>)",
+    ["Open https://www.screener.in and LOG IN (confirm you see your account, not 'Login').",
+     "F12 → Application (Chrome) / Storage (Firefox) → Cookies → https://www.screener.in",
+     "Click the row named <b>sessionid</b> and copy its <b>Value</b> column only.",
+     "Update the secret above with that value, Save.",
+     "Verify: <code>gh workflow run pead.yml</code> → the scrape log should say "
+     "'page 1: N companies', NOT 'No results scraped'."])
+FIX_GDRIVE = _fix(
+    "GDRIVE_OAUTH_TOKEN_JSON",
+    "The full OAuth token JSON (one line), starting with <code>{&quot;token&quot;:</code> "
+    "or <code>{&quot;refresh_token&quot;:</code>.",
+    "a JSON object: <code>{&quot;token&quot;:&quot;ya29…&quot;,&quot;refresh_token&quot;"
+    ":&quot;1//…&quot;,&quot;client_id&quot;:…}</code>",
+    ["Re-run the local OAuth flow (any get_drive() call) — it writes a fresh token file.",
+     "Copy the ENTIRE contents of that token JSON (single line).",
+     "Update the secret above, Save. Nothing on Drive updates until this is fixed."])
+FIX_GEMINI = _fix(
+    "FREE_POOL / GEMINI_API_KEY",
+    "Comma-separated API keys, or one key per <code>FREE_POOL_1..18</code>.",
+    "keys look like <code>AQ.…</code> (newer) or <code>AIza…</code> (older)",
+    ["If all buckets hit daily quota: add a key from a NEW Google-Cloud PROJECT "
+     "(more keys from the SAME project add ZERO quota).",
+     "If keys are invalid: regenerate at aistudio.google.com and update the secret."])
+FIX_GMAIL = _fix(
+    "GMAIL_USER / GMAIL_APP_PASSWORD / NOTIFY_EMAIL",
+    "GMAIL_APP_PASSWORD is a 16-char Google <u>App Password</u>, not your login password.",
+    "GMAIL_USER=<code>you@gmail.com</code> · GMAIL_APP_PASSWORD=<code>abcd efgh ijkl mnop</code> "
+    "(16 chars, spaces optional) · NOTIFY_EMAIL=<code>inbox-you-read@…</code>",
+    ["Create an App Password: Google Account → Security → 2-Step → App passwords.",
+     "Confirm NOTIFY_EMAIL is the inbox you actually read; check Spam/Promotions."])
+FIX_DRIVE = (
+    "&nbsp;&nbsp;<b>1. IMMEDIATE relief:</b> "
+    "<code>python scripts/cleanup_company_docs.py --retain-days 1</code> — permanently "
+    "deletes processed raw PDFs older than 1 day (they are re-fetchable).<br>"
+    "&nbsp;&nbsp;<b>2. Root cause:</b> the annual_report backfill pulls ~800 huge AR PDFs/day "
+    "(~13 GB) — far more than a 16 GB free account holds even with 2-day retention.<br>"
+    "&nbsp;&nbsp;<b>3. Permanent fix:</b> lower the AR backfill fetch cap and/or delete each "
+    "AR PDF immediately after extraction (ARs are 30–300 MB each; the 2-day buffer is not "
+    "worth 13 GB), or move the repo to a Google account with more storage.")
+FIX_CHANNEL = (
+    "&nbsp;&nbsp;A code-red can only reach you if the alert channels are configured. "
+    f"Set the missing secret at <a href='{_SECRETS_URL}'>{_SECRETS_URL}</a>. "
+    "NTFY_TOPIC = an unguessable topic string you also SUBSCRIBE to in the ntfy phone app. "
+    "NOTIFY_EMAIL = the inbox you actually read.")
 
 # label, path parts, ts column, CRIT-threshold hours, severity-if-stale, issue-key, fix
 # results + financials_3stmt share key "screener_cookie" (same root cause + the log
@@ -145,6 +184,76 @@ def check_freshness(drive, root) -> list[Issue]:
 
 
 # ---------------- gemini health ----------------
+
+def _gb(x) -> str:
+    try:
+        return f"{int(x) / 1e9:.2f} GB"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def check_drive_storage(drive) -> list[Issue]:
+    """Account storage %: WARN >=80%, CRIT >=92% (writes fail near 100%). When over,
+    enumerate PDFs to attribute the bloat (usually the annual_report backfill)."""
+    try:
+        sq = drive.about().get(fields="storageQuota").execute().get("storageQuota", {})
+        limit = int(sq.get("limit", 0) or 0)
+        usage = int(sq.get("usage", 0) or 0)
+    except Exception as e:
+        return [Issue("drive_full", "WARN", "Drive storage: quota unreadable",
+                      f"about().get failed: {esc(e, 80)}", FIX_DRIVE)]
+    if not limit:
+        return []
+    pct = 100 * usage / limit
+    if pct < 80:
+        return []
+    sev = "CRIT" if pct >= 92 else "WARN"
+    # attribute: sum PDF bytes + count + top doc_type prefix
+    pdf_n = pdf_sz = 0
+    top: dict = {}
+    try:
+        page = None
+        while True:
+            r = drive.files().list(
+                q="mimeType='application/pdf' and trashed=false",
+                fields="nextPageToken,files(name,quotaBytesUsed)",
+                pageSize=1000, pageToken=page).execute()
+            for f in r.get("files", []):
+                s = int(f.get("quotaBytesUsed", 0) or 0)
+                pdf_n += 1
+                pdf_sz += s
+                pre = str(f.get("name", "")).split("__")[0][:20]
+                top[pre] = top.get(pre, 0) + s
+            page = r.get("nextPageToken")
+            if not page:
+                break
+    except Exception:
+        pass
+    big = max(top.items(), key=lambda kv: kv[1]) if top else ("", 0)
+    detail = (f"Drive is <b>{pct:.0f}% full</b> ({_gb(usage)} / {_gb(limit)}). "
+              f"Raw PDFs = <b>{_gb(pdf_sz)}</b> across {pdf_n:,} files; the biggest "
+              f"bucket is <b>{esc(big[0], 20)}</b> ({_gb(big[1])}). "
+              + ("<b>Writes will start FAILING near 100% — data loss risk.</b>"
+                 if sev == "CRIT" else "Approaching the limit."))
+    return [Issue("drive_full", sev, f"Drive storage {pct:.0f}% full", detail, FIX_DRIVE)]
+
+
+def check_alert_channels() -> list[Issue]:
+    """Meta-check: can a code-red actually REACH the user? A silently-unset NTFY_TOPIC
+    or NOTIFY_EMAIL means the alert itself is dead — the very failure mode that let the
+    cookie hide 20 days. WARN (not CRIT, so it can't loop on its own missing email)."""
+    out = []
+    if not os.environ.get("NTFY_TOPIC", "").strip():
+        out.append(Issue("channel_ntfy", "WARN", "Phone alerts OFF (NTFY_TOPIC unset)",
+                         "Code-reds are email-only. If email is filtered, you get nothing.",
+                         FIX_CHANNEL))
+    if not os.environ.get("NOTIFY_EMAIL", "").strip() and \
+            not os.environ.get("GMAIL_USER", "").strip():
+        out.append(Issue("channel_email", "WARN", "Alert email not configured",
+                         "NOTIFY_EMAIL and GMAIL_USER are both unset — no mail can send.",
+                         FIX_CHANNEL))
+    return out
+
 
 def check_gemini(drive, root) -> list[Issue]:
     df = _read(drive, root, ["company_repo", "_index", "gemini_usage.parquet"])
@@ -295,12 +404,14 @@ def main() -> None:
         drive = get_drive()
         root = os.environ["GDRIVE_FOLDER_ID"]
         issues += check_freshness(drive, root)
+        issues += check_drive_storage(drive)
         issues += check_gemini(drive, root)
     except Exception as e:
         issues.append(Issue("gdrive_token", "CRIT", "Google Drive access FAILED",
                             f"get_drive() raised: <code>{esc(e, 100)}</code>. Nothing "
                             f"can read or write Drive until this is fixed.", FIX_GDRIVE))
 
+    issues += check_alert_channels()
     wf_issues, wf_notes = check_workflows_and_logs(os.environ.get("GITHUB_TOKEN", ""))
     issues += wf_issues
     notes += wf_notes
