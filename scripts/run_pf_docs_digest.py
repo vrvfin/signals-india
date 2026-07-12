@@ -55,7 +55,11 @@ SUMMARY_LIMIT = 1600            # chars of narrative per doc in the mail
 CAP = {"annual_report": 1, "concall": 2, "presentation": 1, "results": 2,
        "rating": 2, "announcement": 4}
 PER_STOCK_CAP = 8              # hard ceiling per stock block (rest -> "+N more")
-AR_MAX_AGE_DAYS = 450         # only a current-FY AR counts as "new" (skip backfilled old FYs)
+# ARs: announcement_date is the fiscal-year-END (FY2025 -> 2025-03-31), NOT the
+# declaration date. A day-based cutoff wrongly drops recent FY2025 ARs whose FY-end
+# is >1yr old. Key on FY-end YEAR instead: keep the last AR_FY_LOOKBACK+1 years
+# (today.year - AR_FY_LOOKBACK), i.e. this + last AR season. cap=1 -> latest per co.
+AR_FY_LOOKBACK = 1
 MAILED_NAME = "pf_docs_mailed.parquet"
 MAILED_COLS = ["item_id", "isin", "symbol", "doc_type", "arrival_date", "mailed_at"]
 
@@ -232,7 +236,7 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
     Windows on the doc's TRUE date (rating_date / ann_date / recent arrival) and caps
     per (stock, type) so a bulk historical backfill can't flood the digest."""
     out: dict = {}
-    ar_floor = (date.today() - timedelta(days=AR_MAX_AGE_DAYS)).isoformat()
+    ar_min_year = date.today().year - AR_FY_LOOKBACK   # e.g. 2026 -> keep FY-end >= 2025
 
     # --- narrative docs from the global queue (concall/AR/presentation/results) ---
     q = load_parquet(drive, index_id, "processing_queue.parquet", QUEUE_COLS)
@@ -244,9 +248,10 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
               # which for an AR is the FY-end months earlier)
               & (q["discovered_at"].astype(str) >= since_date)]
         q = q[~q["doc_id"].astype(str).isin(mailed_ids)]
-        # a current-FY AR only (skip backfilled FY2017.. whose FY-end is long past)
-        q = q[~((q["doc_type"].astype(str) == "annual_report")
-                & (q["announcement_date"].astype(str) < ar_floor))]
+        # ARs: keep only recent fiscal years (by FY-end YEAR, not a day-window — the
+        # FY-end lags the declaration, so a day-cutoff wrongly dropped recent FY2025 ARs).
+        ar_yr = pd.to_numeric(q["announcement_date"].astype(str).str[:4], errors="coerce")
+        q = q[~((q["doc_type"].astype(str) == "annual_report") & (ar_yr < ar_min_year))]
         for (isin, dt), grp in q.groupby([q["isin"].astype(str), q["doc_type"].astype(str)]):
             grp = grp.sort_values("announcement_date", ascending=False).head(CAP.get(dt, 3))
             for _, r in grp.iterrows():
