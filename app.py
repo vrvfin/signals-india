@@ -5095,6 +5095,7 @@ _MAIL_TOGGLES = [
     ("growth_surge",    "💥 Results surge >100% PAT (20:00)"),
     ("combined_strength", "🏆 Combined strength: tech+results+guidance (21:30)"),
     ("pf_docs_digest",  "📂 PF new documents + summaries (21:30)"),
+    ("infra_health",    "🔴 Infra code-red alerts (08:45) — CRIT always sends"),
 ]
 _MAIL_SETTINGS_NAME = "mail_settings.json"
 
