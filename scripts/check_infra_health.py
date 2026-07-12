@@ -73,14 +73,17 @@ FIX_GMAIL = (
     f"that <b>NOTIFY_EMAIL</b> is the inbox you read, at "
     f"<a href='{_SECRETS_URL}'>Actions secrets</a>. Also check Gmail Spam/Promotions.")
 
-# label, path parts, ts column, CRIT-threshold hours, severity-if-stale, name, fix
+# label, path parts, ts column, CRIT-threshold hours, severity-if-stale, issue-key, fix
+# results + financials_3stmt share key "screener_cookie" (same root cause + the log
+# signature) so they collapse into ONE code-red row. mcap is a distinct key (a missed
+# weekly run can stale it independently of the cookie).
 FRESHNESS = [
     ("results (Screener scrape)", ["company_repo", "_index", "results.parquet"],
-     "scraped_at", 48, "CRIT", "SCREENER_SESSION_COOKIE", FIX_SCREENER),
+     "scraped_at", 48, "CRIT", "screener_cookie", FIX_SCREENER),
     ("financials_3stmt", ["company_repo", "_index", "financials_3stmt.parquet"],
-     "scraped_at", 96, "WARN", "SCREENER_SESSION_COOKIE", FIX_SCREENER),
+     "scraped_at", 96, "WARN", "screener_cookie", FIX_SCREENER),
     ("fundamentals/summary (mcap)", ["fundamentals", "summary.parquet"],
-     "fetched_at", 16 * 24, "WARN", "SCREENER_SESSION_COOKIE", FIX_SCREENER),
+     "fetched_at", 16 * 24, "WARN", "mcap_stale", FIX_SCREENER),
 ]
 
 # regex-free substring signatures -> (severity, issue-key, human, fix)
