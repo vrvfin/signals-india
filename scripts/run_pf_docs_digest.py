@@ -263,12 +263,63 @@ def _add(out, isin, sym, name, item):
     e["items"].append(item)
 
 
+def _ar_display(announcement_date: str) -> str:
+    """Unambiguous AR name (user 2026-07-12): announcement_date is the FY-END
+    (2026-03-31 = the 2025-26 Annual Report) -> 'Annual Report FY2025-26
+    (yr ended Mar 2026)'. Avoids the confusing bare 'FY25/FY26' labels."""
+    yr = str(announcement_date or "")[:4]
+    if not yr.isdigit():
+        return ""
+    y = int(yr)
+    # the doc-type label ("📗 Annual Report") is rendered separately, so this is
+    # just the fiscal-year qualifier
+    return f"FY{y - 1}-{str(y)[2:]} (yr ended Mar {y})"
+
+
+def _structured_fallback(dt: str, doc_id: str, isin: str, tables: dict) -> str:
+    """When company_page.md has no clean narrative for a doc, fall back to the
+    structured guidance rows the extractors DID tabulate (precise doc match
+    first, else the company's latest rows)."""
+    src = {"annual_report": "ar_g", "concall": "guid",
+           "presentation": "ppt"}.get(dt)
+    if not src:
+        return ""
+    df = tables.get(src)
+    if df is None or df.empty:
+        return ""
+    hit = df[df["source_doc_id"].astype(str) == str(doc_id)]
+    if hit.empty:
+        hit = df[df["isin"].astype(str) == isin].tail(3)
+    parts = []
+    for _, x in hit.head(3).iterrows():
+        v = str(x.get("value", "") or "").strip()
+        if not v or v.lower() == "nan":
+            continue
+        hz = str(x.get("horizon_fy") or x.get("horizon") or "").strip()
+        parts.append(f"{esc(x.get('metric', ''), 14)}: {esc(v, 24)}"
+                     + (f" ({esc(hz, 8)})" if hz else ""))
+    return ("guidance — " + " · ".join(parts)) if parts else ""
+
+
 def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
     """Return {isin: {'symbol','name','items':[(doc_type, header, summary, id, arr)]}}.
     Windows on the doc's TRUE date (rating_date / ann_date / recent arrival) and caps
     per (stock, type) so a bulk historical backfill can't flood the digest."""
     out: dict = {}
     ar_min_year = date.today().year - AR_FY_LOOKBACK   # e.g. 2026 -> keep FY-end >= 2025
+
+    # structured-guidance fallbacks when company_page.md lacks a clean narrative
+    tables = {
+        "guid": load_parquet(drive, index_id, "guidance_tracker.parquet",
+                             ["isin", "metric", "value", "horizon_fy",
+                              "processed_at", "source_doc_id"]),
+        "ar_g": load_parquet(drive, index_id, "ar_guidance.parquet",
+                             ["isin", "metric", "value", "horizon_fy",
+                              "processed_at", "source_doc_id"]),
+        "ppt": load_parquet(drive, index_id, "ppt_guidance.parquet",
+                            ["isin", "metric", "value", "horizon",
+                             "processed_at", "source_doc_id"]),
+    }
 
     # --- narrative docs from the global queue (concall/AR/presentation/results) ---
     q = load_parquet(drive, index_id, "processing_queue.parquet", QUEUE_COLS)
@@ -288,11 +339,17 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
             grp = grp.sort_values("announcement_date", ascending=False).head(CAP.get(dt, 3))
             for _, r in grp.iterrows():
                 period = str(r.get("period") or "").strip()
+                doc_id = str(r["doc_id"])
                 summary = _lift_summary(_find_region(
                     _company_page(drive, repo_id, isin, cache), period, dt) or "")
-                header = " · ".join([x for x in [period, esc(r.get("title", ""), 70)] if x])
+                if not summary:   # narrative missing -> structured guidance rows
+                    summary = _structured_fallback(dt, doc_id, isin, tables)
+                # unambiguous doc name: ARs get FY2024-25-style labels
+                label = (_ar_display(r.get("announcement_date"))
+                         if dt == "annual_report" else period)
+                header = " · ".join([x for x in [label, esc(r.get("title", ""), 70)] if x])
                 _add(out, isin, str(r.get("symbol") or ""), str(r.get("company_name") or ""),
-                     (dt, header, summary, str(r["doc_id"]),
+                     (dt, header, summary, doc_id,
                       str(r.get("announcement_date") or "")[:10]))
 
     # --- ratings from ratings.parquet, windowed on the actual rating_date ---
@@ -359,7 +416,8 @@ def build_html(blocks: dict, since_date: str, days: float) -> str:
             body = (f"<div style='margin:2px 0 8px 6px;font-size:12.5px;color:#333;"
                     f"border-left:3px solid #ccc;padding-left:8px'>{esc(summary, SUMMARY_LIMIT)}</div>"
                     if summary else "<div style='margin:2px 0 8px 6px;font-size:12px;"
-                    "color:#999'>(summary not found in company_page.md)</div>")
+                    "color:#999'>(summary pending — the nightly backfill will extract "
+                    "this document in a later pass)</div>")
             parts.append(
                 f"<div style='margin:6px 0'><b>{icon} {DOC_LABEL.get(dt, dt)}</b> "
                 f"<span style='color:#777;font-size:12px'>[{arr}] {header}</span></div>"

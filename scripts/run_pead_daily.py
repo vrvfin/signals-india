@@ -121,6 +121,38 @@ def _actual_cell(comp_rows: pd.DataFrame, *terms: str) -> str:
     return "-"
 
 
+_SRC_LABEL = {"concall": "concall", "presentation": "investor presentation",
+              "annual_report": "annual report"}
+
+
+def _verdict_sentence(fr, v: str, color: str) -> str:
+    """Self-explanatory guidance-vs-actual line (user 2026-07-12), e.g.
+    'Revenue growth guided ~15% for FY26 (concall) → actual +21% YoY →
+    BEAT by +6.2pp'. kind decides the units: growth/margin compare in
+    percentage-points; level compares ₹Cr and the delta is %."""
+    metric = str(fr.get("metric", "") or "").title()
+    metric = {"Pat": "PAT", "Ebitda": "EBITDA", "Eps": "EPS",
+              "Opm": "OPM"}.get(metric, metric)
+    fy = str(fr.get("quarter", "") or "")
+    src = _SRC_LABEL.get(str(fr.get("guidance_source") or ""), "concall")
+    kind = str(fr.get("kind") or "")
+    gv, av = fr.get("guided_value"), fr.get("actual_value")
+    d = pd.to_numeric(fr.get("delta_pct"), errors="coerce")
+    if kind == "growth":
+        what = f"{metric} growth guided ~{_fmt_val(gv)}% for {fy} ({src})"
+        act = f"actual {float(av):+,.1f}% YoY" if pd.notna(pd.to_numeric(av, errors='coerce')) else "actual n/a"
+        by = f"by {d:+.1f}pp" if pd.notna(d) else ""
+    elif kind == "margin":
+        what = f"{metric} guided ~{_fmt_val(gv)}% for {fy} ({src})"
+        act = f"actual {_fmt_val(av)}%"
+        by = f"by {d:+.1f}pp" if pd.notna(d) else ""
+    else:   # level (₹Cr); old rows without kind also land here
+        what = f"{metric} guided ~₹{_fmt_val(gv)} cr for {fy} ({src})"
+        act = f"actual ₹{_fmt_val(av)} cr"
+        by = f"by {d:+.1f}%" if pd.notna(d) else ""
+    return (f"{what} → {act} → <b style='color:{color}'>{v}</b> {by}")
+
+
 def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
                   pead: pd.DataFrame, sym_map: dict) -> str | None:
     if reporters.empty:
@@ -140,17 +172,14 @@ def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
         f = (pead[pead["isin"].astype(str) == isin]
              if (isin and not pead.empty) else pd.DataFrame())
         if f.empty:
-            verdict_cell = "<i style='color:#999'>no guidance on record</i>"
+            verdict_cell = ("<i style='color:#999'>no quantified guidance on "
+                            "record for this company</i>")
         else:
             bits = []
             for _, fr in f.iterrows():
                 v = str(fr.get("verdict", "NA"))
                 color = _VERDICT_COLOR.get(v, "#777")
-                bits.append(
-                    f'{fr.get("metric","")} ({fr.get("quarter","")}): '
-                    f'guided {_fmt_val(fr.get("guided_value"))} vs '
-                    f'actual {_fmt_val(fr.get("actual_value"))} '
-                    f'<b style="color:{color}">{v}</b> ({fr.get("delta_pct","")}%)')
+                bits.append(_verdict_sentence(fr, v, color))
             verdict_cell = "<br>".join(bits)
         rows_html.append(
             f"<tr><td><b>{sym}</b></td><td>{comp[:34]}</td><td>{qtr}</td>"
@@ -162,10 +191,15 @@ def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
             f"<tr><th>Symbol</th><th>Company</th><th>Qtr</th><th>Result date</th>"
             f"<th>Sales ₹Cr (YoY)</th><th>Net profit ₹Cr (YoY)</th>"
             f"<th>Guidance vs Actual</th></tr>{''.join(rows_html)}</table>"
-            f"<p style='font-size:11px;color:#999'>Result date = first seen on "
-            f"Screener's latest-results feed. Sales = Revenue for banks/financials. "
-            f"BEAT/MISS = actual beat/missed guidance by &gt;2 "
-            f"(% for levels, pp for growth/margin).</p>")
+            f"<p style='font-size:11px;color:#999'><b>How to read the guidance "
+            f"column:</b> 'guided' = what management publicly committed to (in the "
+            f"named concall / presentation / annual report) for that fiscal year; "
+            f"'actual' = the reported number from Screener's financials. "
+            f"<b>BEAT</b> = actual exceeded guidance by more than 2 "
+            f"(percentage-points for growth/margin guidance, % for ₹Cr levels); "
+            f"<b>MISS</b> = fell short by more than 2; <b>INLINE</b> = within ±2. "
+            f"Result date = first seen on Screener's latest-results feed. "
+            f"Sales = Revenue for banks/financials.</p>")
 
 
 def main() -> None:

@@ -58,9 +58,9 @@ MAIL_TOP_N = 30                 # mail shows the top N; full list lives on Drive
 HIST_NAME = "combined_strength_history.parquet"
 HIST_COLS = ["isin", "symbol", "company_name", "as_of",
              "n_strategies", "composite_score", "strategies",
-             "pat_yoy_pct", "surge_class", "yoy_tier",
-             "guidance_cagr", "guidance_tier", "cred_score",
-             "rank_score", "in_pf"]
+             "pat_yoy_pct", "pat_qtr", "surge_class", "yoy_tier",
+             "guidance_cagr", "guidance_tier", "guid_from", "cred_score",
+             "rank_score", "in_pf"]   # pat_qtr/guid_from additive (old rows -> None)
 
 SURGE_COLS = ["isin", "symbol", "company_name", "quarter",
               "pat_yoy_pct", "pat_qoq_pct", "eps_yoy_pct",
@@ -112,8 +112,14 @@ def _tier_pts(tier: str) -> float:
 
 def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
                gva: pd.DataFrame, sym_to_isin: dict, names: dict,
-               pf: set[str], today: str) -> tuple[list[dict], int]:
-    """Intersect the three axes. Returns (rows, n_unmapped_tech_symbols)."""
+               pf: set[str], today: str,
+               pat_qtr_by: dict | None = None,
+               guid_src_by: dict | None = None) -> tuple[list[dict], int]:
+    """Intersect the three axes. Returns (rows, n_unmapped_tech_symbols).
+    pat_qtr_by: isin -> quarter label the PAT YoY belongs to (user 2026-07-12).
+    guid_src_by: isin -> quarter of the concall whose guidance set the max CAGR."""
+    pat_qtr_by = pat_qtr_by or {}
+    guid_src_by = guid_src_by or {}
     # --- axis 1: technical (symbol-keyed) ---
     tech: dict[str, dict] = {}
     if not conv.empty:
@@ -182,15 +188,21 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
                        80.0 if guid_cagr >= MIN_GUIDANCE_CAGR else 0.0)
         rank = round(min(100.0, 0.4 * min(100.0, t["composite_score"])
                      + 0.3 * results_pts + 0.3 * guid_pts), 1)
+        # quarter the PAT figure belongs to: growth_surge row if present, else the
+        # latest pat_yoy period from financials_derived
+        pat_qtr = (str(s["quarter"]) if s is not None
+                   else pat_qtr_by.get(iso, ""))
         rows.append({
             "isin": iso, "symbol": sym, "company_name": names.get(iso, ""),
             "as_of": today,
             "n_strategies": t["n_strategies"],
             "composite_score": round(t["composite_score"], 1),
             "strategies": t["strategies"],
-            "pat_yoy_pct": pat_yoy, "surge_class": surge_class or None,
+            "pat_yoy_pct": pat_yoy, "pat_qtr": pat_qtr,
+            "surge_class": surge_class or None,
             "yoy_tier": yoy_tier,
             "guidance_cagr": guid_cagr, "guidance_tier": guid_tier,
+            "guid_from": guid_src_by.get(iso, ""),
             "cred_score": cred_by.get(iso),
             "rank_score": rank, "in_pf": iso in pf,
         })
@@ -224,11 +236,15 @@ def build_html(rows: list[dict], today: str) -> str:
         pf_badge = "💼 " if r["in_pf"] else ""
         yoy_bg = G.TIER_COLOR.get(G.grade_growth(r["pat_yoy_pct"]), "")
         guid_bg = G.TIER_COLOR.get(r["guidance_tier"], "")
-        surge_txt = f" ({r['surge_class']})" if r["surge_class"] else ""
-        cagr_txt = (f"{r['guidance_cagr']:.0f}% CAGR"
+        surge_txt = f" · {r['surge_class']}" if r["surge_class"] else ""
+        qtr_txt = f" ({esc(r.get('pat_qtr') or '', 10)})" if r.get("pat_qtr") else ""
+        gsrc = str(r.get("guid_from") or "").strip()
+        gsrc_txt = f"<br><span style='font-size:11px;color:#555'>{esc(gsrc, 10)} concall</span>" if gsrc else ""
+        hi_flag = " ⚠" if (r["guidance_cagr"] or 0) > 100 else ""
+        cagr_txt = (f"{r['guidance_cagr']:.0f}% CAGR{hi_flag}"
                     if r["guidance_cagr"] is not None else r["guidance_tier"])
         cred_txt = f"{r['cred_score']:.1f}/5" if r["cred_score"] is not None else ""
-        yoy_txt = (f"+{r['pat_yoy_pct']:,.0f}%" if r["pat_yoy_pct"] is not None
+        yoy_txt = (f"+{r['pat_yoy_pct']:,.0f}%{qtr_txt}" if r["pat_yoy_pct"] is not None
                    else r["yoy_tier"])
         out.append(
             "<tr>"
@@ -239,7 +255,7 @@ def build_html(rows: list[dict], today: str) -> str:
             f"<td style='{td}'>{r['n_strategies']} strat · "
             f"{r['composite_score']:.0f}</td>"
             f"<td style='{td}background:{yoy_bg};'>{yoy_txt}{surge_txt}</td>"
-            f"<td style='{td}background:{guid_bg};'>{cagr_txt}</td>"
+            f"<td style='{td}background:{guid_bg};'>{cagr_txt}{gsrc_txt}</td>"
             f"<td style='{td}'>{cred_txt}</td>"
             "</tr>")
     out.append("</table>"
@@ -247,10 +263,16 @@ def build_html(rows: list[dict], today: str) -> str:
                   f"…plus {n_total - len(rows)} more — full list on Drive.</p>"
                   if n_total > len(rows) else "")
                + "<p style='font-size:11px;color:#999;font-family:Arial,sans-serif'>"
-               "Tech = strategies agreeing · composite. Cred = GF_TRACK mgmt "
-               "credibility (5=delivers). Weekly/quarterly lists live on Drive "
-               "under signals/combined_strength/. Toggle this mail in the app "
-               "sidebar (📧 Email toggles).</p></div>")
+               "<b>How to read:</b> PAT YoY = that quarter's net-profit growth "
+               "(quarter in brackets; Screener financials). Guidance = the highest "
+               "growth/CAGR management committed to, in the concall quarter shown "
+               "under it — <b>⚠ on values &gt;100%</b>: usually a low current base "
+               "or a multi-year absolute target compressed into a CAGR, verify in "
+               "the company page before acting. Tech = strategies agreeing · "
+               "composite. Cred = GF_TRACK mgmt credibility (5=delivers). "
+               "Weekly/quarterly lists live on Drive under "
+               "signals/combined_strength/. Toggle this mail in the app sidebar "
+               "(📧 Email toggles).</p></div>")
     return "\n".join(out)
 
 
@@ -293,9 +315,39 @@ def main() -> None:
                 sym_to_isin.setdefault(bse.split(".")[0], iso)
 
     pf = load_portfolio_isins(drive, root_id) or set()
+
+    # source attribution (user 2026-07-12): which quarter the PAT figure is from,
+    # and which concall's guidance produced the max CAGR grades uses.
+    pat_qtr_by: dict = {}
+    derived = load_parquet(drive, index_id, "financials_derived.parquet",
+                           ["isin", "metric", "period", "period_type", "value"])
+    if not derived.empty:
+        d = derived[(derived["metric"].astype(str) == "pat_yoy_pct")
+                    & (derived["period_type"].astype(str) == "quarterly")]
+        for iso, grp in d.groupby(d["isin"].astype(str).str.strip()):
+            pat_qtr_by[iso] = str(grp["period"].iloc[-1])   # emit order = chronological
+    # fallback: Screener results scrape's latest_q (derived can be the small
+    # incremental subset until build_derived_from_statements re-lifts it mid-chain)
+    res = load_parquet(drive, index_id, "results.parquet",
+                       ["isin", "latest_q", "scraped_at"])
+    if not res.empty:
+        r = res[res["isin"].astype(str).str.strip() != ""]
+        for iso, grp in r.groupby(r["isin"].astype(str).str.strip()):
+            pat_qtr_by.setdefault(iso, str(grp["latest_q"].iloc[-1]))
+    guid_src_by: dict = {}
+    gt = load_parquet(drive, index_id, "guidance_tracker.parquet",
+                      ["isin", "quarter", "cagr_pct"])
+    if not gt.empty:
+        gt = gt.copy()
+        gt["cagr_pct"] = pd.to_numeric(gt["cagr_pct"], errors="coerce")
+        gt = gt.dropna(subset=["cagr_pct"])
+        for iso, grp in gt.groupby(gt["isin"].astype(str).str.strip()):
+            guid_src_by[iso] = str(grp.loc[grp["cagr_pct"].idxmax(), "quarter"])
+
     today = date.today().isoformat()
     rows, unmapped = build_list(conv, surge, grades, gva,
-                                sym_to_isin, names, pf, today)
+                                sym_to_isin, names, pf, today,
+                                pat_qtr_by, guid_src_by)
     if unmapped:
         log(f"tech symbols with no isin mapping (skipped): {len(unmapped)} "
             f"e.g. {', '.join(sorted(unmapped)[:8])}")

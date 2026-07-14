@@ -48,7 +48,8 @@ from _extractor_base import (get_drive, get_or_create_subfolder,
 
 PEAD_COLS = ["isin", "symbol", "quarter", "metric", "guided_value",
              "actual_value", "delta_pct", "verdict", "as_of",
-             "guidance_source"]   # additive col (readers get None on old rows)
+             "guidance_source",   # additive col (readers get None on old rows)
+             "kind"]              # additive: level (₹Cr) | growth (YoY %) | margin (pp)
 OUT_NAME = "pead_flags.parquet"
 GVA_NAME = "guidance_vs_actual.parquet"   # unified view (user 2026-07-08)
 GUIDANCE_NAME = "guidance_tracker.parquet"
@@ -195,6 +196,7 @@ def compute_flags(g_df: pd.DataFrame, fin_df: pd.DataFrame, now: str) -> list[di
             "delta_pct": round(float(delta), 2) if delta is not None else None,
             "verdict": _verdict(delta), "as_of": now,
             "guidance_source": str(g.get("guidance_source") or "concall"),
+            "kind": kind,
         })
     return out
 
