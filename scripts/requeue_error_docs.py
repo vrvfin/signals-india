@@ -60,6 +60,10 @@ def main() -> None:
                     default="Secretarial|DRHP|Right Issue",
                     help="Regex that excludes a title ('' = exclude nothing).")
     ap.add_argument("--max", type=int, default=200, help="Hard cap per run.")
+    ap.add_argument("--max-retries", type=int, default=2,
+                    help="Give up on a doc after this many requeues (loop guard "
+                         "for the daily scheduled run — a permanently-bad doc "
+                         "would otherwise cycle error->refetch->error forever).")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -89,6 +93,30 @@ def main() -> None:
     if args.pf_only:
         pf = load_portfolio_isins(drive, root_id) or set()
         mask &= q["isin"].astype(str).isin(pf)
+
+    # retry-cap ledger: doc identity -> times requeued. Identity is content-based
+    # (isin|doc_type|title|ann_date) because the backfill re-queues a FRESH row
+    # (new doc_id) after the flip, so a queue column could not carry the count.
+    LEDGER = "requeue_ledger.parquet"
+    LEDGER_COLS = ["identity", "count", "last_at"]
+
+    def _identity(df):
+        return (df["isin"].astype(str) + "|" + df["doc_type"].astype(str) + "|"
+                + df["title"].astype(str).str[:60] + "|"
+                + df["announcement_date"].astype(str).str[:10])
+
+    lfid = find_file(drive, index_id, LEDGER)
+    led = (pd.read_parquet(io.BytesIO(download_bytes(drive, lfid))) if lfid
+           else pd.DataFrame(columns=LEDGER_COLS))
+    counts = dict(zip(led["identity"], led["count"])) if not led.empty else {}
+    ident = _identity(q)
+    exhausted = ident.map(lambda i: counts.get(i, 0) >= args.max_retries)
+    n_gaveup = int((mask & exhausted).sum())
+    if n_gaveup:
+        log(f"skipping {n_gaveup} row(s) already requeued {args.max_retries}x "
+            f"(permanent failures — see _index/{LEDGER}).")
+    mask &= ~exhausted
+
     idx = q.index[mask][:args.max]
     sel = q.loc[idx]
     log(f"matching stuck rows: {int(mask.sum())} · flipping (cap {args.max}): {len(sel)}")
@@ -116,6 +144,14 @@ def main() -> None:
         save_parquet(drive, index_id, "processing_queue.parquet", q)
         log(f"queue updated: {int(hit.sum())} row(s) error -> expired "
             f"(backfill re-fetches on its next nightly pass).")
+        # bump the retry ledger for every flipped identity
+        now = datetime.now().isoformat(timespec="seconds")
+        for i in _identity(sel).tolist():
+            counts[i] = counts.get(i, 0) + 1
+        led = pd.DataFrame([{"identity": k, "count": v, "last_at": now}
+                            for k, v in counts.items()], columns=LEDGER_COLS)
+        save_parquet(drive, index_id, LEDGER, led)
+        log(f"retry ledger: {len(led)} identities tracked.")
     finally:
         release_lock(drive, index_id, "_extract.lock")
 

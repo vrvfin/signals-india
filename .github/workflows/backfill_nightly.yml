@@ -210,6 +210,14 @@ jobs:
           python scripts/extract_concall_parallel.py --workers 6
           --max-age-hours 48 --deadline-min 40 || true
 
+      # Requeue stuck 'error' PF ARs (user 2026-07-15): flips genuine-AR error rows
+      # to 'expired' so the fetch below re-downloads + T8 re-extracts them the SAME
+      # night. Bounded: PF-only, recent FYs, title-filtered (no DRHP/rights junk),
+      # retry ledger gives up after 2 attempts — no infinite error loops.
+      - name: Requeue stuck PF annual-report errors (max 2 tries/doc)
+        if: steps.sched.outputs.skip != 'true' && steps.sched.outputs.run_extras == 'true'
+        run: python scripts/requeue_error_docs.py || true
+
       # ── Stage 2: fetch fresh Annual Reports (3y, universe, newest-first) ─────
       # Only on full night slots (run_extras) so the ARs fetched here are extracted
       # by the T8 step the SAME slot — big AR PDFs must not age out (2-day retention).
