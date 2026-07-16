@@ -61,9 +61,23 @@ FEEDS = {
     "results":       {"path": "/announcements/results/", "doc_type": "results"},
 }
 MAX_PAGES = 1          # Screener's announcement feeds ignore ?page= (extra
-                       # pages just repeat page 1). Same-day completeness comes
-                       # from running the pipeline several times a day.
-LOOKBACK_DAYS = 2      # ingest announcements within this many days of today
+                       # pages just repeat page 1 — re-verified 2026-07-16:
+                       # pages 2/3 return byte-identical HTML). Page 1 is a hard
+                       # 25-item rolling window; same-day completeness comes from
+                       # running the pipeline several times a day.
+LOOKBACK_DAYS = 30     # Ingest anything on page 1 dated within this many days.
+                       # WAS 2 — which silently dropped every LATE-APPEARING /
+                       # BACKDATED item (verified 2026-07-16: 9 of the 25 feed
+                       # items — Cipla AGM transcript + "Corrigendum to the
+                       # intimation dated 3rd July", Hindustan Zinc AGM, and 6
+                       # SME transcripts, all dated Jul 03-09 — were sitting on
+                       # page 1 yet skipped as "Outside lookback window" by every
+                       # 2-hourly run since). Screener indexes small-caps and
+                       # AGM/corrigendum filings days after their stated date, so
+                       # a 2-day window loses them permanently.
+                       # Cost of 30 is ~nil: the feed is capped at 25 items and
+                       # dedup is by (doc_id, announcement_date), so anything
+                       # already ingested is skipped as 'dup'.
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -366,8 +380,8 @@ def main() -> None:
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
 
     # T12 Phase-2 safety: serialize the queue write via the global _extract.lock.
-    # On contention exit cleanly — the next scheduled run re-ingests (the feeds are
-    # a 2-day lookback, so a skipped slot loses nothing).
+    # On contention exit cleanly — the next scheduled run re-ingests (the feed
+    # lookback covers page 1's whole span, so a skipped slot loses nothing).
     # Phase-2 priority: wait up to 15 min for the lock (backfill yields to us
     # within ~one document) instead of skipping the ingest on contention.
     if not acquire_lock(drive, index_id, _LOCK_NAME, "ingest",
