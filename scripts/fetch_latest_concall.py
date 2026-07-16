@@ -85,16 +85,45 @@ def find_subfolder(drive, parent_id: str, name: str) -> str | None:
     return files[0]["id"] if files else None
 
 
-def list_daily_files(drive, daily_folder_id: str, limit: int = 30) -> list[dict]:
-    """Return list of .md files in _daily/, newest first."""
-    files = drive.files().list(
-        q=f"'{daily_folder_id}' in parents and trashed=false",
-        fields="files(id, name, modifiedTime)",
-        orderBy="modifiedTime desc",
-        pageSize=limit,
-    ).execute().get("files", [])
-    return [f for f in files
-            if f["name"].endswith(".md") and f["name"].startswith("concall_")]
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def _fname_date(name: str):
+    """Sort key from the DATE IN THE FILENAME (concall_15_jul2026.md -> 2026-07-15).
+    modifiedTime is unreliable: the backfill re-stamps hundreds of old rating_*.md
+    files at midnight, so 'newest modifiedTime' is NOT 'newest concall'."""
+    m = re.search(r"concall_(\d{1,2})_([a-z]{3})(\d{4})", name.lower())
+    if not m:
+        return (0, 0, 0)
+    d, mon, y = int(m.group(1)), _MONTHS.get(m.group(2), 0), int(m.group(3))
+    return (y, mon, d)
+
+
+def list_daily_files(drive, daily_folder_id: str, limit: int = 40) -> list[dict]:
+    """Concall digests in _daily/, newest first BY FILENAME DATE.
+
+    Filters by name SERVER-SIDE ('concall_' prefix) — the old version pulled the
+    30 most-recently-*modified* files of ANY type and filtered client-side, so the
+    backfill's midnight re-stamp of old rating_*.md files crowded the real concall
+    digests out of the window entirely (the '2026-07-16 daily concall fetch showed
+    nothing / yesterday not found' bug)."""
+    out, tok = [], None
+    while True:
+        resp = drive.files().list(
+            q=(f"'{daily_folder_id}' in parents and trashed=false "
+               f"and name contains 'concall_'"),
+            fields="nextPageToken, files(id, name, modifiedTime)",
+            pageSize=100, pageToken=tok,
+        ).execute()
+        out.extend(f for f in resp.get("files", [])
+                   if f["name"].endswith(".md") and f["name"].startswith("concall_"))
+        tok = resp.get("nextPageToken")
+        if not tok:
+            break
+    out.sort(key=lambda f: _fname_date(f["name"]), reverse=True)
+    return out[:limit]
 
 
 def download_file(drive, file_id: str) -> bytes:
