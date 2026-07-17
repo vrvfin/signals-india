@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -102,12 +103,40 @@ class ScreenerClient:
             return bool(num_el and num_el.get_text(strip=True))
         return False
 
+    @staticmethod
+    def _latest_quarter(soup: BeautifulSoup):
+        """Newest period ('Mon YYYY') in the #quarters table, as a datetime.
+        None when the section is missing/unparseable."""
+        sec = soup.find("section", id="quarters")
+        table = sec.find("table") if sec else None
+        head = table.find("thead") if table else None
+        if not head:
+            return None
+        best = None
+        for th in head.find_all("th"):
+            try:
+                d = datetime.strptime(th.get_text(strip=True), "%b %Y")
+            except ValueError:
+                continue
+            best = d if best is None or d > best else best
+        return best
+
+    # Consolidated older than this = possibly frozen (company stopped
+    # consolidated reporting — JUSTDIAL froze at Mar 2024); compare standalone.
+    STALE_QUARTER_DAYS = 270
+
     def fetch_company(self, symbol: str) -> BeautifulSoup | None:
         """Return the parsed HTML of a company page. Prefers consolidated (group
         accounts) but falls through to standalone when consolidated is an empty
         stub — many small BSE names have no consolidated financials and Screener
-        serves a 200 page with every ratio blank (see _has_live_ratios)."""
+        serves a 200 page with every ratio blank (see _has_live_ratios) — OR when
+        consolidated is FROZEN: a company that stopped consolidated reporting
+        keeps a live-looking page whose quarterly table never advances (JUSTDIAL
+        stuck at Mar 2024 while standalone had Jun 2026). A consolidated page
+        whose newest quarter is > STALE_QUARTER_DAYS old is compared against
+        standalone and the variant with the newer quarter wins."""
         fallback = None
+        stale_cons = None                             # (latest_q, soup)
         for variant in ("consolidated/", ""):
             url = f"{BASE_URL}/company/{symbol}/{variant}"
             self._wait()
@@ -120,9 +149,25 @@ class ScreenerClient:
             self._check_auth(r, symbol)
             if r.status_code == 200 and "company" in r.url.lower():
                 soup = BeautifulSoup(r.text, "lxml")
-                if self._has_live_ratios(soup):
+                if not self._has_live_ratios(soup):
+                    fallback = fallback or soup       # empty stub — last resort
+                    continue
+                lq = self._latest_quarter(soup)
+                if variant == "consolidated/":
+                    if lq is not None and \
+                            (datetime.now() - lq).days <= self.STALE_QUARTER_DAYS:
+                        return soup                   # fresh consolidated — done
+                    stale_cons = (lq, soup)           # stale/unknown — compare
+                    continue
+                # standalone variant
+                if stale_cons is None:
                     return soup
-                fallback = fallback or soup   # empty stub — keep only as last resort
+                c_lq, c_soup = stale_cons
+                if lq is not None and (c_lq is None or lq > c_lq):
+                    return soup                       # standalone is fresher
+                return c_soup
+        if stale_cons is not None:
+            return stale_cons[1]
         return fallback
 
     # ---------- Parsers ----------
