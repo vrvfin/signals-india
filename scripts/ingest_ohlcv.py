@@ -189,6 +189,91 @@ def fetch_ohlcv_batch(symbols: list[str], period: str) -> dict[str, pd.DataFrame
             out[symbols[0]] = norm
     return out
 
+# ---------- Split/bonus scale repair (shared with repair_split_history.py) ----
+# Yahoo restates the WHOLE history on a split/bonus ex-date, but we only ever
+# append — so stored history keeps the old price scale and a fake cliff appears
+# at the ex-date (e.g. VMARCIND 6:1 -> fake -83%). Before appending, compare the
+# stored tail with the fresh fetch on overlapping dates; if the scale drifted,
+# rescale our own stored bars in place. We never overwrite from Yahoo history
+# (Yahoo can lag restating SME names); the junction check is the arbiter.
+
+SCALE_TOL = 0.02        # >2% overlap drift = stale scale (dividend drift ~0.5%)
+JUNCTION_TOL = 0.25     # residual jump allowed at a repaired boundary
+MIN_STALE_RUN = 3       # scale changes persist; 1-2 day deviations are glitches
+MAX_SEGMENTS = 10       # more distinct ratio steps than this = not a scale issue
+
+
+def detect_drift(stored: pd.DataFrame, fresh: pd.DataFrame):
+    """Returns (stale, boundary, segments). boundary = first date of the
+    trailing in-sync run; segments = [(seg_start, factor), ...] oldest first."""
+    m = stored.merge(fresh[["date", "close"]], on="date",
+                     how="inner", suffixes=("", "_fresh"))
+    if len(m) < 5:
+        return False, None, []
+    m = m.sort_values("date").reset_index(drop=True)
+    m["ratio"] = m["close"] / m["close_fresh"]
+    m["stale"] = (m["ratio"] - 1.0).abs() > SCALE_TOL
+    # A real scale change PERSISTS; an isolated deviant bar is a data glitch
+    # (e.g. Yahoo's bad 2026-05-21 session flagged 193 false positives).
+    # Ignore stale runs shorter than MIN_STALE_RUN consecutive sessions.
+    grp = (m["stale"] != m["stale"].shift()).cumsum()
+    for _, g in m.groupby(grp):
+        if g["stale"].iloc[0] and len(g) < MIN_STALE_RUN:
+            m.loc[g.index, "stale"] = False
+    if not m["stale"].any():
+        return False, None, []
+    i = len(m) - 1
+    while i >= 0 and not m.loc[i, "stale"]:
+        i -= 1
+    boundary = m.loc[i + 1, "date"] if i + 1 < len(m) else None
+    if boundary is None:
+        return True, None, []
+    stale_pre = m[(m["date"] < boundary) & m["stale"]]
+    if stale_pre.empty:
+        return False, None, []
+    seg = (stale_pre["ratio"].round(2).diff().abs() > 0.01).cumsum()
+    segments = [(g["date"].min(), float(g["ratio"].median()))
+                for _, g in stale_pre.groupby(seg)]
+    # A real restatement is a handful of flat steps. Dozens of wandering
+    # ratios = stored data disagrees bar-by-bar (bad seed / feed mismatch) —
+    # not a scale problem; refuse so it surfaces for manual attention.
+    if len(segments) > MAX_SEGMENTS:
+        return True, None, []
+    return True, boundary, segments
+
+
+def rescale_in_place(stored: pd.DataFrame, boundary, segments):
+    """Divide OHLC of bars before `boundary` by their segment factor (volume
+    multiplied). Bars older than the first observed segment use its factor."""
+    out = stored.copy()
+    starts = [s for s, _ in segments] + [boundary]
+    for k, (_, factor) in enumerate(segments):
+        lo = starts[k] if k > 0 else None
+        hi = starts[k + 1]
+        mask = out["date"] < hi
+        if lo is not None:
+            mask &= out["date"] >= lo
+        for c in ("open", "high", "low", "close"):
+            if c in out.columns:
+                out.loc[mask, c] = out.loc[mask, c] / factor
+        if "volume" in out.columns:
+            out.loc[mask, "volume"] = (out.loc[mask, "volume"] * factor).round()
+    return out
+
+
+def junction_ok(df: pd.DataFrame, dates) -> bool:
+    """No residual jump > JUNCTION_TOL at any repaired boundary."""
+    s = df.sort_values("date").reset_index(drop=True)
+    for d in dates:
+        idx = s.index[s["date"] >= d]
+        if len(idx) == 0 or idx[0] == 0:
+            continue
+        a, b = s.loc[idx[0] - 1, "close"], s.loc[idx[0], "close"]
+        if a > 0 and abs(b / a - 1.0) > JUNCTION_TOL:
+            return False
+    return True
+
+
 def merge_and_upload(drive, ohlcv_folder_id: str, symbol: str,
                      new_df: pd.DataFrame, existing_files: dict[str, str]) -> dict:
     """Upsert new rows into the symbol's parquet on Drive."""
@@ -206,8 +291,21 @@ def merge_and_upload(drive, ohlcv_folder_id: str, symbol: str,
                 "rows_added": 0,
                 "total_rows": len(existing_df) if existing_df is not None else 0}
 
+    rescaled = False
     if existing_df is not None and len(existing_df) > 0:
         existing_df["date"] = pd.to_datetime(existing_df["date"])
+        # Split/bonus guard: if stored history is on a stale price scale
+        # (Yahoo restated retroactively; we only append), rescale it in place
+        # BEFORE appending — otherwise the ex-date becomes a fake cliff.
+        stale, boundary, segments = detect_drift(existing_df, new_df)
+        if stale and boundary is not None and segments:
+            fixed = rescale_in_place(existing_df, boundary, segments)
+            check_dates = [d for d, _ in segments] + [boundary]
+            if junction_ok(fixed, check_dates):
+                existing_df = fixed
+                rescaled = True
+            # else: leave stored data untouched (Yahoo-side inconsistency);
+            # the append below is still safe — newest bars are on the live scale.
         max_existing_date = existing_df["date"].max()
         truly_new = new_df[new_df["date"] > max_existing_date]
         merged = pd.concat([existing_df, truly_new], ignore_index=True)
@@ -218,12 +316,13 @@ def merge_and_upload(drive, ohlcv_folder_id: str, symbol: str,
         merged = new_df
         rows_added = len(new_df)
 
-    if rows_added == 0:
+    if rows_added == 0 and not rescaled:
         return {"symbol": symbol, "status": "up_to_date",
                 "rows_added": 0, "total_rows": len(merged)}
 
     upload_parquet(drive, ohlcv_folder_id, filename, merged, existing_id)
-    return {"symbol": symbol, "status": "ok",
+    return {"symbol": symbol,
+            "status": "ok_rescaled" if rescaled else "ok",
             "rows_added": rows_added, "total_rows": len(merged)}
 
 

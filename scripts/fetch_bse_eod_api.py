@@ -191,7 +191,78 @@ def fetch_bar(row, max_stale_days: int) -> dict:
             "ason": ason, "bar": bar}
 
 
-def _merge_append(drive, folder_id, key, bar: dict, existing_id):
+# ---------- Split/bonus scale guard (BSE side) ---------------------------------
+# BSE serves RAW exchange prices and never restates history, so on a bonus/split
+# ex-date the appended bar is on the new scale while stored history keeps the old
+# one — a fake cliff (FREDUN 2:1 bonus 2026-07-16 -> fake -65%). Guard: when the
+# new bar jumps > JUMP_TOL vs the stored last close, confirm against BSE's
+# CorporateAction API; only an OFFICIAL Bonus/Sub-division record with a matching
+# ex-date triggers a rescale of stored history by the OFFICIAL factor (never a
+# price-implied one). Mirrors the NSE guard in ingest_ohlcv.py.
+
+JUMP_TOL = 0.20        # |1-day move| that triggers a corp-action lookup
+EXDATE_SLACK_DAYS = 5  # ex-date may differ from the jump bar by a few sessions
+JUNCTION_TOL = 0.25    # residual jump allowed after rescale (same as NSE side)
+
+CORP_URL = "https://api.bseindia.com/BseIndiaAPI/api/CorporateAction/w?scripcode={code}"
+
+
+def corp_action_factor(code: str, around: date) -> tuple[float, date] | None:
+    """Official split/bonus factor for a scrip with ex-date within
+    EXDATE_SLACK_DAYS of `around`. Returns (factor, ex_date) or None.
+    Bonus 'issue X:Y' -> (X+Y)/Y.  Sub-division 'from Rs A to Rs B' -> A/B."""
+    j = _get_json(CORP_URL.format(code=str(code).strip()))
+    if not j or not isinstance(j, dict):
+        return None
+    for row in (j.get("Table1") or []):
+        xtype = str(row.get("XTYPE", "")).lower()
+        val = str(row.get("VALUE", ""))
+        exd = None
+        m = re.match(r"(\d{1,2})\s+(\w{3})\s+(\d{4})", str(row.get("BCRD_FROM", "")))
+        if m:
+            try:
+                exd = datetime.strptime(m.group(0), "%d %b %Y").date()
+            except ValueError:
+                pass
+        if exd is None or abs((exd - around).days) > EXDATE_SLACK_DAYS:
+            continue
+        if "bonus" in xtype:
+            m = re.search(r"(\d+)\s*:\s*(\d+)", val)
+            if m:
+                x, y = int(m.group(1)), int(m.group(2))
+                if y > 0:
+                    return (x + y) / y, exd
+        elif "sub" in xtype or "split" in xtype:
+            m = re.search(r"(\d+(?:\.\d+)?)\D+(\d+(?:\.\d+)?)", val)
+            if m:
+                a, b = float(m.group(1)), float(m.group(2))
+                if b > 0 and a > b:
+                    return a / b, exd
+    return None
+
+
+def rescale_history(df: pd.DataFrame, ex_date, factor: float) -> pd.DataFrame:
+    """Divide OHLC of bars BEFORE ex_date by factor (volume multiplied)."""
+    out = df.copy()
+    mask = out["date"] < pd.Timestamp(ex_date)
+    for c in ("open", "high", "low", "close"):
+        if c in out.columns:
+            out.loc[mask, c] = out.loc[mask, c] / factor
+    if "volume" in out.columns:
+        out.loc[mask, "volume"] = (out.loc[mask, "volume"] * factor).round()
+    return out
+
+
+def junction_ok(df: pd.DataFrame, ex_date) -> bool:
+    s = df.sort_values("date").reset_index(drop=True)
+    idx = s.index[s["date"] >= pd.Timestamp(ex_date)]
+    if len(idx) == 0 or idx[0] == 0:
+        return True
+    a, b = s.loc[idx[0] - 1, "close"], s.loc[idx[0], "close"]
+    return not (a > 0 and abs(b / a - 1.0) > JUNCTION_TOL)
+
+
+def _merge_append(drive, folder_id, key, bar: dict, existing_id, bse_code: str = ""):
     """Append one bar to <key>.parquet on Drive (dedup on date). Creates if absent."""
     new = pd.DataFrame([bar])
     new["date"] = pd.to_datetime(new["date"])
@@ -199,6 +270,23 @@ def _merge_append(drive, folder_id, key, bar: dict, existing_id):
         try:
             old = pd.read_parquet(io.BytesIO(download_bytes(drive, existing_id)))
             old["date"] = pd.to_datetime(old["date"])
+            # Split/bonus guard: big jump vs stored last close -> confirm an
+            # official corp action and rescale stored history BEFORE appending.
+            prior = old[old["date"] < new["date"].iloc[0]].sort_values("date")
+            if bse_code and len(prior):
+                last = float(prior["close"].iloc[-1])
+                if last > 0 and abs(bar["close"] / last - 1.0) > JUMP_TOL:
+                    hit = corp_action_factor(bse_code, bar["date"].date())
+                    if hit:
+                        factor, exd = hit
+                        fixed = rescale_history(old, exd, factor)
+                        probe = (pd.concat([fixed, new], ignore_index=True)
+                                 .drop_duplicates(subset=["date"], keep="last")
+                                 .sort_values("date"))
+                        if junction_ok(probe, exd):
+                            old = fixed
+                            log(f"    {key}: rescaled history /{factor:g} "
+                                f"(official {exd} corp action)")
             merged = (pd.concat([old, new], ignore_index=True)
                       .drop_duplicates(subset=["date"], keep="last")
                       .sort_values("date").reset_index(drop=True))
@@ -248,7 +336,8 @@ def main() -> None:
         if not args.dry_run and res["status"] in ("ok", "no_volume"):
             try:
                 _merge_append(_thread_drive(), live_fid, res["key"], res["bar"],
-                              live_index.get(f"{res['key']}.parquet"))
+                              live_index.get(f"{res['key']}.parquet"),
+                              bse_code=res.get("bse_code", ""))
                 res["appended"] = True
             except Exception as e:
                 res["status"] = "error"
