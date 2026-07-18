@@ -130,6 +130,38 @@ def _eps_and_reported(results: pd.DataFrame) -> tuple[dict, dict, dict]:
     return eps_by, rep_by, slug_by
 
 
+def _pat_from_results(results: pd.DataFrame) -> dict[str, tuple[str, float | None]]:
+    """{isin: (latest_quarter, pat_yoy_pct)} from the freshest 'Net profit' row in
+    results.parquet. Screener leaves Net-profit yoy_pct blank, so compute it from
+    the latest/year-ago LEVELS — these keep decimals, so small-cap PAT isn't
+    distorted the way financials_3stmt's ₹-Cr integer rounding is.
+
+    Used to realign a surge row to the newest REPORTED quarter when
+    financials_derived (source of the pat_yoy_pct history) still lags a quarter
+    behind results/3stmt — otherwise the mail prints the prior quarter's PAT next
+    to this quarter's EPS + report timestamp (the Sangam 'Mar 2026' bug)."""
+    out: dict[str, tuple[str, float | None]] = {}
+    if results.empty:
+        return out
+    r = results[results["metric"].astype(str).str.strip().str.lower().str.contains(
+        "net prof")]
+    for iso, grp in r.groupby(r["isin"].astype(str).str.strip()):
+        if not iso:
+            continue
+        g = grp.copy()
+        g["_qd"] = pd.to_datetime(g["latest_q"], format="%b %Y", errors="coerce")
+        g = g.dropna(subset=["_qd"]).sort_values("_qd")
+        if g.empty:
+            continue
+        row = g.iloc[-1]
+        lv = pd.to_numeric(row.get("latest_val"), errors="coerce")
+        yv = pd.to_numeric(row.get("yearago_val"), errors="coerce")
+        yoy = (round((lv - yv) / yv * 100.0, 2)
+               if pd.notna(lv) and pd.notna(yv) and yv > 0 else None)
+        out[iso] = (str(row["latest_q"]), yoy)
+    return out
+
+
 def classify(yoy_series: list[float], base_yearago: float | None) -> tuple[str, int, int, str]:
     """(classification, n_surge_4q, streak_len, base_sign) for one company.
 
@@ -162,6 +194,7 @@ def build_rows(derived: pd.DataFrame, fin3: pd.DataFrame, results: pd.DataFrame,
     qoq_by = _series_by_isin(derived, "pat_qoq_pct")
     np_by = _np_series_by_isin(fin3)
     eps_by, rep_by, _slug = _eps_and_reported(results)
+    pat_by = _pat_from_results(results)          # freshest reported PAT per isin
     sym_by = {}
     if not derived.empty:
         for _, r in derived.drop_duplicates("isin").iterrows():
@@ -171,24 +204,44 @@ def build_rows(derived: pd.DataFrame, fin3: pd.DataFrame, results: pd.DataFrame,
     rows, n_stale = [], 0
     for iso, series in yoy_by.items():
         q0_period, q0_yoy = series[-1]
+        q0_date = pd.to_datetime(q0_period, format="%b %Y", errors="coerce")
+        yoy_vals = [v for _, v in series]
+        nps = np_by.get(iso, [])
+        aligned = False
+        # Realign to the freshest REPORTED quarter when results is ahead of the
+        # (lagging) financials_derived series — keeps quarter+PAT+EPS+timestamp on
+        # ONE quarter. Prefer the decimal-accurate results YoY; fall back to 3stmt
+        # levels only if results left the year-ago base blank/non-positive.
+        res_q, res_yoy = pat_by.get(iso, (None, None))
+        res_date = (pd.to_datetime(res_q, format="%b %Y", errors="coerce")
+                    if res_q else pd.NaT)
+        if pd.notna(res_date) and (pd.isna(q0_date) or res_date > q0_date):
+            fresh_yoy = res_yoy
+            if fresh_yoy is None and len(nps) >= 5 and nps[-5] > 0:
+                fresh_yoy = round((nps[-1] - nps[-5]) / nps[-5] * 100.0, 2)
+            if fresh_yoy is not None:
+                q0_period, q0_yoy, q0_date = res_q, fresh_yoy, res_date
+                yoy_vals = yoy_vals + [fresh_yoy]      # include fresh Q in the 4Q window
+                aligned = True
         if q0_yoy < EXPLOSIVE_THR:
             continue
-        q0_date = pd.to_datetime(q0_period, format="%b %Y", errors="coerce")
         if pd.isna(q0_date) or q0_date < qtr_cutoff:
             n_stale += 1     # data ends in an old quarter — not this results season
             continue
-        yoy_vals = [v for _, v in series]
-        nps = np_by.get(iso, [])
         base = nps[-5] if len(nps) >= 5 else None   # year-ago quarter level
         cls, n_surge, streak, base_sign = classify(yoy_vals, base)
         eps_yoy = eps_by.get(iso)
         qoq_series = qoq_by.get(iso, [])
+        # derived QoQ belongs to the derived (older) quarter — drop it when we
+        # realigned, rather than show a QoQ from a different quarter than the PAT.
+        pat_qoq = (None if aligned
+                   else (round(qoq_series[-1][1], 2) if qoq_series else None))
         rows.append({
             "isin": iso, "symbol": sym_by.get(iso, ""),
             "company_name": names.get(iso, ""),
             "quarter": q0_period,
             "pat_yoy_pct": round(q0_yoy, 2),
-            "pat_qoq_pct": round(qoq_series[-1][1], 2) if qoq_series else None,
+            "pat_qoq_pct": pat_qoq,
             "eps_yoy_pct": round(eps_yoy, 2) if eps_yoy is not None else None,
             "n_surge_4q": n_surge, "streak_len": streak,
             "base_yearago_sign": base_sign,
