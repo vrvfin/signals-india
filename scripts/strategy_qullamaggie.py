@@ -40,6 +40,20 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+# Written on zero-signal days so latest.csv stays fresh (healthcheck now treats a
+# stale strategy latest.csv as CRITICAL; the aggregator skips empty files).
+_EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
+                   "entry", "stop", "reason"]
+
+
+def _write_empty_latest(drive, folder_id, strat_name):
+    signals_id = get_or_create_subfolder(drive, folder_id, "signals")
+    per_strategy_id = get_or_create_subfolder(drive, signals_id, "per_strategy")
+    sub_id = get_or_create_subfolder(drive, per_strategy_id, strat_name)
+    upload_csv(drive, sub_id, "latest.csv",
+               pd.DataFrame(columns=_EMPTY_SIG_COLS),
+               find_file(drive, sub_id, "latest.csv"))
+
 # Strategy params
 MIN_RETURN_3M_PCT = 30
 MIN_ADR_PCT = 4
@@ -241,6 +255,7 @@ def main() -> None:
 
     if candidates.empty:
         print("No candidates after pre-filter.")
+        _write_empty_latest(drive, folder_id, "qullamaggie")
         return
 
     # OHLCV folder
@@ -273,6 +288,7 @@ def main() -> None:
 
     if not signals:
         print("\nNo Qullamaggie setups in current market.")
+        _write_empty_latest(drive, folder_id, "qullamaggie")
         return
 
     sig_df = pd.DataFrame(signals)

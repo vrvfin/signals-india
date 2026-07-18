@@ -42,6 +42,11 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+# Written on zero-signal days so latest.csv stays fresh (healthcheck treats a
+# stale latest.csv as CRITICAL; the aggregator skips empty files cleanly).
+_EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
+                   "entry", "stop", "reason"]
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -182,6 +187,12 @@ def main() -> None:
     sig_df = minervini_signals(features)
     if sig_df.empty:
         print("No stocks pass 6+ of Minervini's 8 trend-template rules.")
+        signals_id = get_or_create_subfolder(drive, folder_id, "signals")
+        per_strategy_id = get_or_create_subfolder(drive, signals_id, "per_strategy")
+        mv_id = get_or_create_subfolder(drive, per_strategy_id, "minervini")
+        upload_csv(drive, mv_id, "latest.csv",
+                   pd.DataFrame(columns=_EMPTY_SIG_COLS),
+                   find_file(drive, mv_id, "latest.csv"))
         return
 
     # Save

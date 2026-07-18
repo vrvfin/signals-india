@@ -37,6 +37,11 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 LOOKBACKS = ["1m", "2m", "3m", "6m", "12m"]
 
+# Written on zero-signal days so latest.csv stays fresh (healthcheck treats a
+# stale latest.csv as CRITICAL; the aggregator skips empty files cleanly).
+_EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
+                   "entry", "stop", "reason"]
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -186,6 +191,10 @@ def main() -> None:
         sig = momentum_signals(features, lb)
         if sig.empty:
             print(f"momentum_{lb:<8}      0     0     0  (no signals)")
+            sub_id = get_or_create_subfolder(drive, per_strategy_id, f"momentum_{lb}")
+            upload_csv(drive, sub_id, "latest.csv",
+                       pd.DataFrame(columns=_EMPTY_SIG_COLS),
+                       find_file(drive, sub_id, "latest.csv"))
             continue
 
         n_buy = (sig["zone_type"] == "buy").sum()

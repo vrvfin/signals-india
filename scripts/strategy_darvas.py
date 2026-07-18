@@ -48,6 +48,20 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+# Written on zero-signal days so latest.csv stays fresh (healthcheck now treats a
+# stale strategy latest.csv as CRITICAL; the aggregator skips empty files).
+_EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
+                   "entry", "stop", "reason"]
+
+
+def _write_empty_latest(drive, folder_id, strat_name):
+    signals_id = get_or_create_subfolder(drive, folder_id, "signals")
+    per_strategy_id = get_or_create_subfolder(drive, signals_id, "per_strategy")
+    sub_id = get_or_create_subfolder(drive, per_strategy_id, strat_name)
+    upload_csv(drive, sub_id, "latest.csv",
+               pd.DataFrame(columns=_EMPTY_SIG_COLS),
+               find_file(drive, sub_id, "latest.csv"))
+
 # Strategy params
 MAX_DIST_FROM_52W_HIGH_PCT = -5   # within 5% of 52w high
 MIN_ADR_PCT = 2
@@ -238,6 +252,7 @@ def main() -> None:
 
     if candidates.empty:
         print("No candidates after pre-filter.")
+        _write_empty_latest(drive, folder_id, "darvas")
         return
 
     data_id = get_or_create_subfolder(drive, folder_id, "data")
@@ -268,6 +283,7 @@ def main() -> None:
 
     if not signals:
         print("\nNo Darvas setups today.")
+        _write_empty_latest(drive, folder_id, "darvas")
         return
 
     sig_df = pd.DataFrame(signals).sort_values("score", ascending=False).reset_index(drop=True)

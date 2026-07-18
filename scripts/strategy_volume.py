@@ -247,6 +247,11 @@ STRATEGIES = [
     ("volume_vcp",      volume_vcp_signals),
 ]
 
+# Written on zero-signal days so latest.csv stays fresh (healthcheck treats a
+# stale latest.csv as CRITICAL; the aggregator skips empty files cleanly).
+_EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
+                   "entry", "stop", "reason"]
+
 
 # ---------- Main ----------
 
@@ -278,6 +283,10 @@ def main() -> None:
         sig = fn(features)
         if sig.empty:
             print(f"{name:<18}     0     0     0  (no signals)")
+            sub_id = get_or_create_subfolder(drive, per_strategy_id, name)
+            upload_csv(drive, sub_id, "latest.csv",
+                       pd.DataFrame(columns=_EMPTY_SIG_COLS),
+                       find_file(drive, sub_id, "latest.csv"))
             continue
 
         n_buy = int((sig["zone_type"] == "buy").sum())

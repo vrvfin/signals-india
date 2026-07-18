@@ -48,6 +48,11 @@ INSTANCES = [
     {"name": "ma_respect_50ema_60d", "ema": 50, "days": 60},
 ]
 
+# Written on zero-signal days so latest.csv stays fresh (healthcheck treats a
+# stale latest.csv as CRITICAL; the aggregator skips empty files cleanly).
+_EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
+                   "entry", "stop", "reason"]
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -175,6 +180,10 @@ def main() -> None:
         sig = ma_respect_signals(features, inst["ema"], inst["days"], inst["name"])
         if sig.empty:
             print(f"{inst['name']:<26}     0  (no signals)")
+            sub_id = get_or_create_subfolder(drive, per_strategy_id, inst["name"])
+            upload_csv(drive, sub_id, "latest.csv",
+                       pd.DataFrame(columns=_EMPTY_SIG_COLS),
+                       find_file(drive, sub_id, "latest.csv"))
             continue
 
         top3 = sig.nlargest(3, "score")[["symbol", "days_above_ema"]].values.tolist()

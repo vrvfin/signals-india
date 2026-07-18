@@ -42,7 +42,13 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 SAMPLE_SYMBOLS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "SBIN"]
-MIN_FEATURE_ROWS = 1500
+# Features row gate: dynamic — 68% of the current master_list (so it scales with
+# the universe instead of silently rotting like the old fixed 1500 did when the
+# universe doubled), with a hard floor. Live calibration 2026-07-18: features
+# = 4,086 rows vs master_list 5,616 (73%); 68% trips on a real regression while
+# clearing holiday-thinned days.
+MIN_FEATURE_ROWS_FLOOR = 3500
+MIN_FEATURE_ROWS_PCT = 0.68
 OHLCV_MAX_STALE_DAYS = 6   # 4 calendar days too tight for India's long holiday weekends
 FRESH_WINDOW_HOURS = 24
 
@@ -172,6 +178,30 @@ def main():
 
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
 
+    # Dynamic features-row threshold from the current universe size (68%,
+    # floored). Falls back to the floor if master_list is unreadable.
+    min_feature_rows = MIN_FEATURE_ROWS_FLOOR
+    try:
+        uni_id = find_subfolder(drive, folder_id, "universe")
+        if uni_id:
+            mid, _ = get_file_meta(drive, uni_id, "master_list.csv")
+            if mid:
+                req = drive.files().get_media(fileId=mid)
+                fh = io.BytesIO()
+                dl = MediaIoBaseDownload(fh, req)
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+                fh.seek(0)
+                n_uni = len(pd.read_csv(fh))
+                min_feature_rows = max(MIN_FEATURE_ROWS_FLOOR,
+                                       int(n_uni * MIN_FEATURE_ROWS_PCT))
+                log(f"features row gate: >={min_feature_rows} "
+                    f"(68% of universe {n_uni}, floor {MIN_FEATURE_ROWS_FLOOR})")
+    except Exception as e:
+        log(f"universe count unavailable ({str(e)[:60]}) — "
+            f"using floor {MIN_FEATURE_ROWS_FLOOR}")
+
     # --- features/latest.parquet ---
     feat_id = find_subfolder(drive, folder_id, "features")
     if not feat_id:
@@ -188,10 +218,10 @@ def main():
                 nrows = len(fdf)
             except Exception as e:
                 nrows = -1
-            ok = fresh and nrows >= MIN_FEATURE_ROWS
+            ok = fresh and nrows >= min_feature_rows
             record("features/latest.parquet", "CRITICAL", ok,
                    f"age {age_h:.1f}h, {nrows} rows "
-                   f"(need <{FRESH_WINDOW_HOURS}h & >={MIN_FEATURE_ROWS} rows)")
+                   f"(need <{FRESH_WINDOW_HOURS}h & >={min_feature_rows} rows)")
 
             # OHLCV freshness via feature 'date' column on sample symbols
             if nrows > 0 and "date" in fdf.columns:
@@ -214,7 +244,11 @@ def main():
                            f"latest bar {latest_date} "
                            f"({stale_days}d old, max {OHLCV_MAX_STALE_DAYS}d)")
 
-    # --- per-strategy signal freshness (WARNING level) ---
+    # --- per-strategy signal freshness (CRITICAL: a stale strategy would
+    # otherwise ship yesterday's signals as today's — the aggregator now skips
+    # them, and this gate turns the run RED so it cannot go unnoticed).
+    # Strategies write latest.csv even when they have zero signals, so a
+    # legitimately quiet day stays green. ---
     signals_id = find_subfolder(drive, folder_id, "signals")
     if signals_id:
         per_strat_id = find_subfolder(drive, signals_id, "per_strategy")
@@ -222,11 +256,11 @@ def main():
             for sub in list_subfolders(drive, per_strat_id):
                 _, mtime = get_file_meta(drive, sub["id"], "latest.csv")
                 if not mtime:
-                    record(f"strategy:{sub['name']}", "WARNING", False,
+                    record(f"strategy:{sub['name']}", "CRITICAL", False,
                            "latest.csv missing")
                 else:
                     age_h = hours_since(mtime)
-                    record(f"strategy:{sub['name']}", "WARNING",
+                    record(f"strategy:{sub['name']}", "CRITICAL",
                            age_h <= FRESH_WINDOW_HOURS,
                            f"latest.csv age {age_h:.1f}h")
 

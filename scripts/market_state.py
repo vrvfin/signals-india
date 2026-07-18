@@ -181,16 +181,23 @@ def score_breadth(features):
 
 
 def score_highs_lows(features):
-    """Component 3: count of new 52w highs minus new lows, normalized."""
+    """Component 3: new 52w highs minus new lows as a % OF THE UNIVERSE.
+    The old fixed ±50-count band was calibrated for a ~2.4k universe; at ~5.5k
+    names the raw diff saturated the band almost daily, pinning this component
+    at 0/100. Percent-based scaling survives universe growth: ±2% of the
+    universe maps to the full 0..100 range (2% of names at fresh 52w highs
+    with none at lows is an emphatically strong breadth day)."""
     highs = (features["dist_from_52w_high_pct"] >= -0.5).sum()  # within 0.5% counts
     lows = (features["dist_from_52w_low_pct"] <= 0.5).sum()
     diff = int(highs) - int(lows)
-    # Normalize -50..+50 → 0..100
-    score = max(0, min(100, (diff + 50)))
+    n = max(1, len(features))
+    diff_pct = diff / n * 100
+    score = max(0, min(100, 50 + diff_pct * 25))   # ±2% → full range
     return float(score), {
         "new_52w_highs": int(highs),
         "new_52w_lows": int(lows),
         "highs_minus_lows": diff,
+        "highs_minus_lows_pct_univ": round(diff_pct, 2),
     }
 
 

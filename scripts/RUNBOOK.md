@@ -1,7 +1,7 @@
 # Signals India — Runbook & FAQ
 
 **Single source of truth for operations, troubleshooting, and daily use.**
-Last updated: 2026-05-29
+Last updated: 2026-07-18
 
 ---
 
@@ -101,6 +101,34 @@ chains off pead, so it's late too. (ops digest still arrives at 7 PM via its own
 2. Open DevTools → Application → Cookies → copy `sessionid` value
 3. GitHub → repo → Settings → Secrets → `SCREENER_SESSION_COOKIE` → Update
 4. Re-run Phase 1 manually from GitHub Actions
+
+### A stock's chart has a fake cliff on a split/bonus day
+**Symptom:** a stock shows a huge one-day crash (e.g. −50%, −83%) on its ex-date that
+isn't real — the price just re-based on a split/bonus.
+**Cause:** the price feed appended the post-split bar onto un-restated history.
+**Auto-fix:** both feeds now self-heal on the NEXT nightly run (NSE via `ingest_ohlcv.py`,
+BSE via `fetch_bse_eod_api.py`). Usually no action needed.
+**Manual repair (immediate):**
+- NSE names: `python scripts/repair_split_history.py --symbols SYM1,SYM2` (dry-run report),
+  add `--live` to write. Bare `--live` sweeps the whole NSE universe.
+- BSE-only names: `python scripts/repair_bse_split_history.py --keys SYM --live`
+  (confirms against BSE's official corporate-action record before touching anything).
+- Chart reflects the fix after the next gallery rebuild.
+
+### A company's quarterly numbers are stuck several quarters back
+**Symptom:** chart's quarterly table (Sales/Profit/EPS) shows an old quarter even though
+results were declared (e.g. JUSTDIAL stuck at Mar-2024).
+**Cause:** the company stopped publishing *consolidated* results; Screener's consolidated
+page is frozen but still looks live. Fixed 2026-07-18 — `fetch_company` now falls back to
+the standalone page when consolidated is >270 days stale. If you still see it, the
+fundamentals refresh hasn't re-run for that name yet — dispatch `fundamentals.yml` manually
+or wait for the Monday full run.
+
+### Results declared mid-week not on the chart yet
+**Not a bug.** Full fundamentals refresh is weekly (Monday). Since 2026-07-18 a DAILY
+incremental (`fundamentals.yml` 14:30 UTC / 20:00 IST, `--recent-results-days 4`) refreshes
+only recent result-declarers, so a result reaches the chart the next evening. To force it now:
+GitHub → Actions → Fundamentals Refresh → Run workflow (does the full run).
 
 ### `get_latest_concall.bat` — "conda is not recognized" or "Python was not found"
 **Symptom:** Error about conda or Python not found when running bat from desktop/Explorer

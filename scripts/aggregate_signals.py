@@ -115,6 +115,17 @@ def download_csv(drive, file_id):
     return pd.read_csv(fh)
 
 
+def download_parquet(drive, file_id):
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    return pd.read_parquet(fh)
+
+
 def upload_csv(drive, folder_id, filename, df, existing_id=None):
     media = MediaIoBaseUpload(io.BytesIO(df.to_csv(index=False).encode()),
                               mimetype="text/csv", resumable=False)
@@ -127,25 +138,43 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
 
 # ---------- Core aggregation ----------
 
-def load_all_strategy_signals(drive, folder_id):
-    """Read every per_strategy/<NAME>/latest.csv and union into a single DataFrame."""
+def load_all_strategy_signals(drive, folder_id, ref_date=None):
+    """Read every per_strategy/<NAME>/latest.csv and union into a single DataFrame.
+
+    Ghost-signal guard: a strategy that crashed upstream leaves YESTERDAY's
+    latest.csv behind, which would silently be aggregated as today's signals.
+    Any file whose newest signal date is older than `ref_date` (the features
+    bar date this run is built on) is skipped, loudly."""
     signals_id = get_or_create_subfolder(drive, folder_id, "signals")
     per_strategy_id = get_or_create_subfolder(drive, signals_id, "per_strategy")
     subfolders = list_subfolders(drive, per_strategy_id)
     log(f"Found {len(subfolders)} strategy folders")
 
-    frames = []
+    frames, skipped = [], []
     for sub in subfolders:
         files = list_files_in_folder(drive, sub["id"])
         latest_id = files.get("latest.csv")
         if not latest_id:
             continue
         df = download_csv(drive, latest_id)
+        if df.empty:
+            log(f"  {sub['name']:<28}      0 signals (empty — ok)")
+            continue
+        if ref_date is not None and "date" in df.columns:
+            sig_date = pd.to_datetime(df["date"], errors="coerce").max()
+            if pd.notna(sig_date) and sig_date < ref_date:
+                skipped.append(sub["name"])
+                log(f"  {sub['name']:<28}  SKIPPED — stale "
+                    f"(signals dated {sig_date.date()}, features at "
+                    f"{pd.Timestamp(ref_date).date()})")
+                continue
         df["strategy_group"] = sub["name"]
         if "strategy" not in df.columns:
             df["strategy"] = sub["name"]
         frames.append(df)
         log(f"  {sub['name']:<28}  {len(df):>5} signals")
+    if skipped:
+        log(f"STALE strategies excluded from today's aggregation: {skipped}")
 
     if not frames:
         return pd.DataFrame()
@@ -154,10 +183,18 @@ def load_all_strategy_signals(drive, folder_id):
 
 
 def compute_unified(signals: pd.DataFrame) -> pd.DataFrame:
-    """One row per (symbol, zone_type) with composite score + agreeing strategies."""
+    """One row per (symbol, zone_type) with composite score + agreeing strategies.
+
+    Scores are percentile-normalized WITHIN each strategy first (0-100): raw
+    score units differ wildly per strategy (RS rank 0-100, streak DAYS, raw 3m
+    return %, distance-to-high...) so a raw mean is dominated by whichever
+    strategy uses big numbers. After normalization, 90 means "top decile of
+    that strategy's signals today" for every strategy alike."""
     keep_cols = ["symbol", "zone_type", "score", "entry", "stop", "strategy", "reason"]
     keep = [c for c in keep_cols if c in signals.columns]
     df = signals[keep].copy()
+    df["score_norm"] = (df.groupby("strategy")["score"]
+                          .rank(pct=True) * 100).round(1)
 
     grouped = df.groupby(["symbol", "zone_type"], dropna=False)
     rows = []
@@ -165,10 +202,13 @@ def compute_unified(signals: pd.DataFrame) -> pd.DataFrame:
         rows.append({
             "symbol": sym,
             "zone_type": zone,
-            "n_strategies": len(g),
+            # unique strategies, not rows — duplicate rows from one strategy
+            # must not masquerade as multi-strategy agreement
+            "n_strategies": int(g["strategy"].nunique()),
             "strategies": ", ".join(sorted(g["strategy"].unique())),
-            "composite_score": float(g["score"].mean()),
-            "max_score": float(g["score"].max()),
+            "composite_score": float(g["score_norm"].mean()),
+            "max_score": float(g["score_norm"].max()),
+            "composite_score_raw": float(g["score"].mean()),
             "entry_median": float(g["entry"].median()) if "entry" in g.columns else None,
             "stop_median": float(g["stop"].median()) if "stop" in g.columns else None,
             "reasons": " || ".join(
@@ -248,8 +288,22 @@ def main():
     drive = get_drive()
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
 
+    # Reference date = the bar date this run's features were computed on.
+    # Strategy files older than this are yesterday's leftovers (ghost signals).
+    ref_date = None
+    feat_id = get_or_create_subfolder(drive, folder_id, "features")
+    latest_feat = find_file(drive, feat_id, "latest.parquet")
+    if latest_feat:
+        try:
+            fdf = download_parquet(drive, latest_feat)
+            ref_date = pd.to_datetime(fdf["date"], errors="coerce").max()
+            log(f"Reference signal date (features): {ref_date.date()}")
+        except Exception as e:
+            log(f"WARNING: could not read features date ({str(e)[:60]}) — "
+                f"stale-strategy guard disabled this run")
+
     # 1. Load all strategy signals
-    signals = load_all_strategy_signals(drive, folder_id)
+    signals = load_all_strategy_signals(drive, folder_id, ref_date=ref_date)
     if signals.empty:
         print("No signals found. Run strategy scripts first.")
         return

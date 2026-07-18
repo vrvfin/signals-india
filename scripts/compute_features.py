@@ -253,11 +253,30 @@ def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
 
 def add_relative_strength(feat_df: pd.DataFrame, nifty500_df: pd.DataFrame | None) -> pd.DataFrame:
     """Add cross-sectional RS rank columns (percentile rank within today's universe)
-    and excess return vs Nifty 500 for each return lookback (if Nifty 500 available)."""
-    # Cross-sectional rank
+    and excess return vs Nifty 500 for each return lookback (if Nifty 500 available).
+
+    Staleness guard: rank only rows within RS_RANK_MAX_STALE_DAYS calendar days
+    of the frame's NEWEST bar (i.e. today's cohort plus the previous trading
+    session, which can be up to ~4 calendar days back across a holiday weekend).
+    A symbol whose feed lagged longer keeps NaN ranks — ranking a week-old return
+    against today's universe skews every percentile. The window is measured off
+    the frame's own max date (not the wall clock), so ranks stay internally
+    consistent even on a day the whole feed is a little behind; absolute
+    staleness is the health-check's job, not this function's."""
+    RS_RANK_MAX_STALE_DAYS = 4
+    dates = pd.to_datetime(feat_df["date"], errors="coerce")
+    ref = dates.max()
+    eligible = dates.notna() & ((ref - dates).dt.days <= RS_RANK_MAX_STALE_DAYS)
+    n_stale = int((~eligible).sum())
+    if n_stale:
+        log(f"RS ranks: {n_stale} rows >{RS_RANK_MAX_STALE_DAYS}d behind the "
+            f"newest bar ({pd.Timestamp(ref).date()}) excluded from ranking "
+            f"(kept in file, ranks NaN)")
+    # Cross-sectional rank (eligible rows only; others stay NaN)
     for label in RETURN_LOOKBACKS:
         col = f"return_{label}_pct"
-        feat_df[f"rs_rank_{label}"] = feat_df[col].rank(pct=True) * 100
+        feat_df[f"rs_rank_{label}"] = (
+            feat_df.loc[eligible, col].rank(pct=True) * 100)
 
     # Excess return vs Nifty 500
     if nifty500_df is not None and len(nifty500_df) > 252:
@@ -360,13 +379,14 @@ def main() -> None:
     feat_df = pd.DataFrame(rows)
     log(f"Computed features for {len(feat_df)} symbols. Missing: {len(missing)}")
 
-    # Add RS rank + excess returns
-    feat_df = add_relative_strength(feat_df, nifty500_df)
-
-    # Penny-stock filter — drop sub-₹10 names (untradeable noise)
+    # Penny-stock filter FIRST — sub-₹10 names must not shape the RS
+    # percentiles they are about to be dropped from.
     before = len(feat_df)
     feat_df = feat_df[feat_df["close"] >= 10].reset_index(drop=True)
     log(f"Penny-stock filter: {before} -> {len(feat_df)} (dropped close < ₹10)")
+
+    # Add RS rank + excess returns (ranks only current/previous trading date)
+    feat_df = add_relative_strength(feat_df, nifty500_df)
 
     # Output
     features_folder_id = get_or_create_subfolder(drive, folder_id, "features")

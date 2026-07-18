@@ -289,7 +289,9 @@ def main():
                        f"{days}d into drift, {pead['drift_pct']:+.1f}% since"),
         })
 
-    sig_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    sig_df = pd.DataFrame(rows)
+    if not sig_df.empty:
+        sig_df = sig_df.sort_values("score", ascending=False).reset_index(drop=True)
     log(f"PEAD signals: {len(sig_df)}")
 
     signals_id = get_or_create_subfolder(drive, folder_id, "signals")

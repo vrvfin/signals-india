@@ -182,7 +182,9 @@ def main():
             "reason": f"CANSLIM {passed}/7" + (
                 f" — missing: {', '.join(failed)}" if failed else ""),
         })
-    sig_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    sig_df = pd.DataFrame(rows)
+    if not sig_df.empty:
+        sig_df = sig_df.sort_values("score", ascending=False).reset_index(drop=True)
     log(f"CANSLIM signals: {len(sig_df)} (BUY={(sig_df['zone_type']=='buy').sum()})")
 
     # Save
