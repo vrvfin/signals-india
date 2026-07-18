@@ -234,8 +234,8 @@ def build_html(rows: list[dict], today: str) -> str:
         sym = esc(r["symbol"], 14)
         link = f"https://www.screener.in/company/{sym}/"
         pf_badge = "💼 " if r["in_pf"] else ""
-        yoy_bg = G.TIER_COLOR.get(G.grade_growth(r["pat_yoy_pct"]), "")
-        guid_bg = G.TIER_COLOR.get(r["guidance_tier"], "")
+        yoy_css = G.cell_css(G.grade_growth(r["pat_yoy_pct"]))
+        guid_css = G.cell_css(r["guidance_tier"])
         surge_txt = f" · {r['surge_class']}" if r["surge_class"] else ""
         qtr_txt = f" ({esc(r.get('pat_qtr') or '', 10)})" if r.get("pat_qtr") else ""
         gsrc = str(r.get("guid_from") or "").strip()
@@ -254,8 +254,8 @@ def build_html(rows: list[dict], today: str) -> str:
             f"<td style='{td}'><b>{r['rank_score']:.0f}</b></td>"
             f"<td style='{td}'>{r['n_strategies']} strat · "
             f"{r['composite_score']:.0f}</td>"
-            f"<td style='{td}background:{yoy_bg};'>{yoy_txt}{surge_txt}</td>"
-            f"<td style='{td}background:{guid_bg};'>{cagr_txt}{gsrc_txt}</td>"
+            f"<td style='{td}{yoy_css}'>{yoy_txt}{surge_txt}</td>"
+            f"<td style='{td}{guid_css}'>{cagr_txt}{gsrc_txt}</td>"
             f"<td style='{td}'>{cred_txt}</td>"
             "</tr>")
     out.append("</table>"

@@ -24,6 +24,21 @@ TIER_COLOR = {
 TIER_RANK = {"exceptional": 5, "great": 4, "good": 3, "ok": 2, "decent": 1,
              "poor": 0, "na": -1}
 
+# Text colour per tier — the light-amber/green/red backgrounds read fine with
+# near-black text, but "exceptional" (#1a7a3a, dark green) needs white or the
+# cell is black-on-dark and unreadable in email clients.
+TIER_TEXT = {"exceptional": "#ffffff"}     # all others default to near-black below
+
+
+def cell_css(tier: str) -> str:
+    """Return 'background:..;color:..;' for a graded cell, or '' when the tier
+    has no colour (na/unknown -> caller's default styling). One source of truth
+    so every mail/heatmap cell stays legible."""
+    bg = TIER_COLOR.get(tier)
+    if not bg:
+        return ""
+    return f"background:{bg};color:{TIER_TEXT.get(tier, '#1a1a1a')};"
+
 
 def _num(v):
     try:

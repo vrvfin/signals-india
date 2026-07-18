@@ -236,8 +236,8 @@ def build_html(rows: list[dict], since: datetime, hours: float) -> str:
                                        -(r["pat_yoy_pct"] or 0)))
     for i, r in enumerate(rows, 1):
         chip_bg, chip_fg = CLASS_CHIP.get(r["classification"], ("#eee", "#333"))
-        yoy_bg = G.TIER_COLOR.get(G.grade_growth(r["pat_yoy_pct"]), "")
-        qoq_bg = G.TIER_COLOR.get(G.grade_growth(r["pat_qoq_pct"]), "")
+        yoy_css = G.cell_css(G.grade_growth(r["pat_yoy_pct"]))
+        qoq_css = G.cell_css(G.grade_growth(r["pat_qoq_pct"]))
         sym = esc(r["symbol"] or r["isin"], 14)
         link = f"https://www.screener.in/company/{sym}/" if r["symbol"] else "#"
         pf_badge = "💼 " if r["in_pf"] else ""
@@ -248,8 +248,8 @@ def build_html(rows: list[dict], since: datetime, hours: float) -> str:
             f"<td style='{td}'>{pf_badge}<a href='{link}' style='color:#1a237e'>"
             f"<b>{sym}</b></a> · {esc(r['company_name'], 34)}</td>"
             f"<td style='{td}'>{esc(r['quarter'], 10)}</td>"
-            f"<td style='{td}background:{yoy_bg};'><b>{_fmt_pct(r['pat_yoy_pct'])}</b></td>"
-            f"<td style='{td}background:{qoq_bg};'>{_fmt_pct(r['pat_qoq_pct'])}</td>"
+            f"<td style='{td}{yoy_css}'><b>{_fmt_pct(r['pat_yoy_pct'])}</b></td>"
+            f"<td style='{td}{qoq_css}'>{_fmt_pct(r['pat_qoq_pct'])}</td>"
             f"<td style='{td}'>{eps_txt}</td>"
             f"<td style='{td}'>{r['n_surge_4q']}/4</td>"
             f"<td style='{td}'><span style='background:{chip_bg};color:{chip_fg};"
