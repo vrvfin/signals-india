@@ -10,7 +10,11 @@ name: Fundamentals Refresh
 
 on:
   schedule:
-    - cron: "0 1 * * 1"     # 01:00 UTC Monday = 06:30 IST Monday
+    - cron: "0 1 * * 1"     # 01:00 UTC Monday = 06:30 IST Monday (FULL universe)
+    - cron: "30 14 * * *"   # 14:30 UTC daily = 20:00 IST (INCREMENTAL: only
+                            # companies whose results hit the feed in the last
+                            # 4 days — ~90 names/day in results season, ~0 off-
+                            # season, so it exits in seconds most of the year)
   workflow_dispatch:
 
 # Serialize: a new trigger waits for any run still in progress.
@@ -61,12 +65,24 @@ jobs:
 
       # Full universe (NSE symbol + BSE bse_code). Writes summary + per_symbol +
       # statements. SCREENER_SESSION_COOKIE is read from .env by the script.
+      # Which mode runs depends on which cron fired: the Monday 01:00 slot (and
+      # manual dispatch) does the FULL universe; the daily 14:30 slot refreshes
+      # only companies whose results appeared in the feed in the last 4 days.
       - name: Fundamentals (full universe + statements)
+        if: github.event.schedule != '30 14 * * *'
         env:
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: python scripts/ingest_fundamentals.py
         continue-on-error: true
 
+      - name: Fundamentals (incremental — recent result declarers)
+        if: github.event.schedule == '30 14 * * *'
+        env:
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: python scripts/ingest_fundamentals.py --recent-results-days 4
+        continue-on-error: true
+
       - name: Enrich market cap (NSE via yfinance)
+        if: github.event.schedule != '30 14 * * *'   # weekly full run only
         run: python scripts/enrich_market_cap.py
         continue-on-error: true

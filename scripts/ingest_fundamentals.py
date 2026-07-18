@@ -23,7 +23,7 @@ import argparse
 import io
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -105,6 +105,17 @@ def download_csv(drive, file_id):
     return pd.read_csv(fh)
 
 
+def download_parquet(drive, file_id):
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    d = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = d.next_chunk()
+    fh.seek(0)
+    return pd.read_parquet(fh)
+
+
 def upload_parquet(drive, folder_id, filename, df, existing_id=None):
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
@@ -126,6 +137,12 @@ def main():
                         help="Seconds between screener requests (default 1.0)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip symbols already in per_symbol/")
+    parser.add_argument("--recent-results-days", type=int, default=None,
+                        help="INCREMENTAL results-season mode: refresh ONLY "
+                             "companies whose results first appeared in "
+                             "_index/results.parquet within the last N days. "
+                             "summary.parquet is upserted (not replaced). "
+                             "~90 names/day in peak season, ~0 off-season.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch + log only; no Drive write.")
     args = parser.parse_args()
@@ -157,6 +174,29 @@ def main():
         return str(row["symbol"])
 
     work = [(str(r["symbol"]), _token(r)) for _, r in universe.iterrows()]
+
+    # Results-season incremental mode: shrink work to companies whose results
+    # just hit the scraped feed — so quarterly tables update the NEXT morning
+    # instead of waiting for the Monday full run.
+    if args.recent_results_days:
+        repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
+        idx_id = get_or_create_subfolder(drive, repo_id, "_index")
+        res_fid = find_file(drive, idx_id, "results.parquet")
+        if not res_fid:
+            log("No results.parquet — nothing to refresh incrementally.")
+            return
+        res = download_parquet(drive, res_fid)
+        fs = pd.to_datetime(res.get("first_seen_at"), errors="coerce")
+        cutoff = datetime.now() - timedelta(days=args.recent_results_days)
+        recent_isins = set(res.loc[fs >= cutoff, "isin"].astype(str))
+        want = set(universe.loc[universe["isin"].astype(str).isin(recent_isins),
+                                "symbol"].astype(str))
+        work = [(s, t) for (s, t) in work if s in want]
+        log(f"Incremental mode: {len(work)} companies with results in the "
+            f"last {args.recent_results_days}d")
+        if not work:
+            log("Nothing to refresh — done.")
+            return
 
     fund_id = get_or_create_subfolder(drive, folder_id, "fundamentals")
     per_sym_id = get_or_create_subfolder(drive, fund_id, "per_symbol")
@@ -227,8 +267,15 @@ def main():
 
     if rows and not args.dry_run:
         summary_df = pd.DataFrame(rows)
-        upload_parquet(drive, fund_id, "summary.parquet", summary_df,
-                       find_file(drive, fund_id, "summary.parquet"))
+        sum_fid = find_file(drive, fund_id, "summary.parquet")
+        if args.recent_results_days and sum_fid:
+            # Incremental: UPSERT into the full-universe summary (a plain write
+            # would shrink 5.5k rows down to today's delta).
+            full = download_parquet(drive, sum_fid)
+            full = full[~full["symbol"].astype(str).isin(
+                summary_df["symbol"].astype(str))]
+            summary_df = pd.concat([full, summary_df], ignore_index=True)
+        upload_parquet(drive, fund_id, "summary.parquet", summary_df, sum_fid)
         log(f"Wrote fundamentals/summary.parquet ({len(summary_df)} rows)")
     elif rows:
         log(f"[dry-run] would write fundamentals/summary.parquet ({len(rows)} rows) "
