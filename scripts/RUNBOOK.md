@@ -180,6 +180,18 @@ Evening mail batch — daily 19:00 IST (all 8 mails)
   01:00 IST). The guard job skips them once the 19:00 cron-job.org run has succeeded,
   so no duplicate mail. (deepdive 08:00 + ipo_drhp_watch 09:00 mails are separate.)
 
+  DATA-DEPENDENCY ORDER — do not reorder these (fixed 2026-07-18):
+    results.parquet (pead: scrape_results_table)
+      -> fundamentals/statements/  (t4: ingest_fundamentals --recent-results-days 4)
+      -> financials_derived        (t4: build_derived_from_statements)
+      -> screener_grades / scorecard / fraud_risk
+      -> combined-strength + surge mails
+  The incremental fundamentals step MUST stay inside t4 ahead of the derived build:
+  it needs results.parquet (so it cannot run before pead), and the derived build
+  needs its output (so it cannot run after). It used to sit on its own 14:30 UTC
+  cron — an hour AFTER the derived build — which left financials_derived, and every
+  consumer of it, one full cycle stale on the day a company reported.
+
 Streamlit app — reads Drive, 5-min cache
   Live at: [check share.streamlit.io for your app URL]
 ```

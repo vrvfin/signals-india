@@ -75,6 +75,7 @@ jobs:
           GMAIL_USER:              ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -83,6 +84,7 @@ jobs:
             echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
             echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
             # flatten multi-line secret (KEY_N=value lines) to one comma-joined line
             echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
             echo "FRAUD_API_KEY_1=$FRAUD_API_KEY_1"
@@ -106,6 +108,21 @@ jobs:
 
       - name: Valuation (segment + own-history P/E)
         run: python scripts/build_valuation.py
+        continue-on-error: true
+
+      # ORDERING FIX (user 2026-07-18): build_derived_from_statements reads
+      # fundamentals/statements/, which only gains today's quarter when the
+      # fundamentals INCREMENTAL runs. That was scheduled standalone at 14:30 UTC —
+      # ~1h AFTER this job — so financials_derived (and every consumer: screener
+      # grades, scorecard's 31.5%, fraud_risk, deep dive) was a full cycle stale on
+      # the day a company reported. It cannot simply be moved earlier: it needs
+      # results.parquet, which pead only refreshes at 13:30 UTC. So run it HERE,
+      # inside the chain: results (pead) -> statements -> derived -> grades -> mails.
+      # ~5 min in results season, seconds off-season (no recent declarers).
+      - name: Fundamentals incremental (today's reporters — MUST precede derived)
+        env:
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: python scripts/ingest_fundamentals.py --recent-results-days 4
         continue-on-error: true
 
       # Full-universe forensic metrics from fundamentals/statements/ -> lifts
