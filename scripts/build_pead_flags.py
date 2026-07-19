@@ -49,7 +49,11 @@ from _extractor_base import (get_drive, get_or_create_subfolder,
 PEAD_COLS = ["isin", "symbol", "quarter", "metric", "guided_value",
              "actual_value", "delta_pct", "verdict", "as_of",
              "guidance_source",   # additive col (readers get None on old rows)
-             "kind"]              # additive: level (₹Cr) | growth (YoY %) | margin (pp)
+             "kind",              # additive: level (₹Cr) | growth (YoY %) | margin (pp)
+             # additive (user 2026-07-18): WHICH concall the guidance came from and
+             # its source doc, so the mail can date/attribute each line and rank by
+             # recency. `quarter` above is the TARGET horizon (FY26), not the source.
+             "guid_quarter", "source_doc_id"]
 OUT_NAME = "pead_flags.parquet"
 GVA_NAME = "guidance_vs_actual.parquet"   # unified view (user 2026-07-08)
 GUIDANCE_NAME = "guidance_tracker.parquet"
@@ -197,6 +201,8 @@ def compute_flags(g_df: pd.DataFrame, fin_df: pd.DataFrame, now: str) -> list[di
             "verdict": _verdict(delta), "as_of": now,
             "guidance_source": str(g.get("guidance_source") or "concall"),
             "kind": kind,
+            "guid_quarter": str(g.get("quarter") or ""),      # source concall quarter
+            "source_doc_id": str(g.get("source_doc_id") or ""),
         })
     return out
 

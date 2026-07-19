@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -42,6 +43,59 @@ from earnings_calendar import get_results_calendar, _html_table
 from mailer import send_email, load_mail_settings
 
 _VERDICT_COLOR = {"BEAT": "#27ae60", "MISS": "#e74c3c", "INLINE": "#777", "NA": "#aaa"}
+MAX_GUIDANCE_LINES = 4      # per company; the cell used to print ALL of them (max 34)
+_FY_RE = re.compile(r"FY\s*'?(\d{2,4})", re.I)
+_QTR_RE = re.compile(r"Q([1-4])\s*FY[\s'\-]*?(\d{2,4})", re.I)
+
+
+def _norm_fy(s) -> int | None:
+    """'FY2022' / 'FY22' / "FY'22" -> 22. Screener/Gemini emit both 2- and 4-digit
+    forms for the SAME year, which previously duplicated every such guidance row."""
+    m = _FY_RE.search(str(s or ""))
+    return int(m.group(1)) % 100 if m else None
+
+
+def _fy_of_quarter(q) -> int | None:
+    """'Jun 2026' -> 27 (Indian FY: Apr-Mar). The FY the reported quarter sits in."""
+    d = pd.to_datetime(q, format="%b %Y", errors="coerce")
+    if pd.isna(d):
+        return None
+    return (d.year + 1 if d.month >= 4 else d.year) % 100
+
+
+def _guid_qkey(q) -> int:
+    """'Q3 FY25' -> sortable int, for ranking guidance by how recently it was said."""
+    m = _QTR_RE.search(str(q or ""))
+    return (int(m.group(2)) % 100) * 4 + int(m.group(1)) if m else -1
+
+
+def _fmt_date(s) -> str:
+    try:
+        return pd.to_datetime(s).strftime("%d %b %Y")
+    except Exception:
+        return ""
+
+
+def _relevant_guidance(f: pd.DataFrame, reported_fy: int | None) -> tuple[pd.DataFrame, int]:
+    """Trim a company's guidance-vs-actual rows to what still matters.
+
+    Was: print EVERY row (mean 6.7/co, max 34, horizons back to FY19). Now:
+    drop horizons older than the just-reported FY, de-duplicate the 2-/4-digit
+    FY spellings, rank by the most RECENT concall, cap the list.
+    Returns (rows_to_show, n_hidden)."""
+    if f.empty:
+        return f, 0
+    d = f.copy()
+    d["_fy"] = d["quarter"].map(_norm_fy)
+    d["_said"] = d["guid_quarter"].map(_guid_qkey) if "guid_quarter" in d.columns else -1
+    if reported_fy is not None:
+        keep = d[d["_fy"].notna() & (d["_fy"] >= reported_fy)]
+        if keep.empty and d["_fy"].notna().any():
+            keep = d[d["_fy"] == d["_fy"].max()]   # nothing current -> newest available
+        d = keep if not keep.empty else d
+    d = d.drop_duplicates(subset=["_fy", "metric", "guided_value"])
+    d = d.sort_values(["_said", "_fy"], ascending=False)
+    return d.head(MAX_GUIDANCE_LINES), max(0, len(d) - MAX_GUIDANCE_LINES)
 
 
 def _load_results(drive, index_id) -> pd.DataFrame:
@@ -106,7 +160,11 @@ def _fmt_val(v) -> str:
 
 
 def _actual_cell(comp_rows: pd.DataFrame, *terms: str) -> str:
-    """'12,345 (+8%)' for the first metric row containing any term (YoY colored)."""
+    """'12,345 (+8%)' for the first metric row containing any term (YoY colored).
+
+    Screener leaves yoy_pct blank on ~16% of rows (nearly always Net profit), so
+    fall back to computing it from the latest/year-ago LEVELS — otherwise the
+    headline PAT column showed a bare number with no growth (user 2026-07-18)."""
     for t in terms:
         hit = comp_rows[comp_rows["metric"].astype(str).str.lower()
                         .str.contains(t, na=False)]
@@ -114,6 +172,11 @@ def _actual_cell(comp_rows: pd.DataFrame, *terms: str) -> str:
             r0 = hit.iloc[0]
             cell = _fmt_val(r0.get("latest_val"))
             yoy = pd.to_numeric(r0.get("yoy_pct"), errors="coerce")
+            if pd.isna(yoy):
+                lv = pd.to_numeric(r0.get("latest_val"), errors="coerce")
+                yv = pd.to_numeric(r0.get("yearago_val"), errors="coerce")
+                if pd.notna(lv) and pd.notna(yv) and yv > 0:
+                    yoy = (lv - yv) / yv * 100.0
             if pd.notna(yoy):
                 color = "#27ae60" if yoy >= 0 else "#e74c3c"
                 cell += f' <span style="color:{color}">({yoy:+.0f}%)</span>'
@@ -125,7 +188,7 @@ _SRC_LABEL = {"concall": "concall", "presentation": "investor presentation",
               "annual_report": "annual report"}
 
 
-def _verdict_sentence(fr, v: str, color: str) -> str:
+def _verdict_sentence(fr, v: str, color: str, doc_by: dict | None = None) -> str:
     """Self-explanatory guidance-vs-actual line (user 2026-07-12), e.g.
     'Revenue growth guided ~15% for FY26 (concall) → actual +21% YoY →
     BEAT by +6.2pp'. kind decides the units: growth/margin compare in
@@ -135,6 +198,12 @@ def _verdict_sentence(fr, v: str, color: str) -> str:
               "Opm": "OPM"}.get(metric, metric)
     fy = str(fr.get("quarter", "") or "")
     src = _SRC_LABEL.get(str(fr.get("guidance_source") or ""), "concall")
+    # WHERE/WHEN it was said: source concall quarter + that filing's date
+    said_q = str(fr.get("guid_quarter") or "").strip()
+    doc = (doc_by or {}).get(str(fr.get("source_doc_id") or ""), {})
+    said_dt = _fmt_date(doc.get("date"))
+    prov = ", ".join(x for x in (said_q, said_dt) if x)
+    src = f"{src} {prov}" if prov else src
     kind = str(fr.get("kind") or "")
     gv, av = fr.get("guided_value"), fr.get("actual_value")
     d = pd.to_numeric(fr.get("delta_pct"), errors="coerce")
@@ -154,7 +223,8 @@ def _verdict_sentence(fr, v: str, color: str) -> str:
 
 
 def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
-                  pead: pd.DataFrame, sym_map: dict) -> str | None:
+                  pead: pd.DataFrame, sym_map: dict,
+                  doc_by: dict | None = None) -> str | None:
     if reporters.empty:
         return None
     rows_html = []
@@ -175,11 +245,17 @@ def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
             verdict_cell = ("<i style='color:#999'>no quantified guidance on "
                             "record for this company</i>")
         else:
+            # only guidance for the reported FY onward, deduped, newest concall
+            # first, capped — was printing every historical row (up to 34).
+            f, n_hidden = _relevant_guidance(f, _fy_of_quarter(qtr))
             bits = []
             for _, fr in f.iterrows():
                 v = str(fr.get("verdict", "NA"))
                 color = _VERDICT_COLOR.get(v, "#777")
-                bits.append(_verdict_sentence(fr, v, color))
+                bits.append(_verdict_sentence(fr, v, color, doc_by))
+            if n_hidden:
+                bits.append(f"<span style='color:#999;font-size:11px'>"
+                            f"…{n_hidden} older guidance line(s) hidden</span>")
             verdict_cell = "<br>".join(bits)
         rows_html.append(
             f"<tr><td><b>{sym}</b></td><td>{comp[:34]}</td><td>{qtr}</td>"
@@ -193,11 +269,14 @@ def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
             f"<th>Guidance vs Actual</th></tr>{''.join(rows_html)}</table>"
             f"<p style='font-size:11px;color:#999'><b>How to read the guidance "
             f"column:</b> 'guided' = what management publicly committed to (in the "
-            f"named concall / presentation / annual report) for that fiscal year; "
+            f"named source, with the concall quarter + filing date it was said in) "
+            f"for that fiscal year; "
             f"'actual' = the reported number from Screener's financials. "
             f"<b>BEAT</b> = actual exceeded guidance by more than 2 "
             f"(percentage-points for growth/margin guidance, % for ₹Cr levels); "
             f"<b>MISS</b> = fell short by more than 2; <b>INLINE</b> = within ±2. "
+            f"Only guidance for the reported fiscal year onward is shown, newest "
+            f"concall first (max {MAX_GUIDANCE_LINES}); older horizons are hidden. "
             f"Result date = first seen on Screener's latest-results feed. "
             f"Sales = Revenue for banks/financials.</p>")
 
@@ -219,7 +298,15 @@ def main() -> None:
     reporters = _recent_reporters(res)
     pead = load_parquet(drive, index_id, "pead_flags.parquet", PEAD_COLS)
     sym_map = _isin_symbol_map(drive, index_id) if not reporters.empty else {}
-    html_b = _email_b_html(reporters, res, pead, sym_map)
+    # source document behind each guidance line (date + filing), via source_doc_id
+    doc_by = {}
+    if not reporters.empty:
+        from _extractor_base import QUEUE_COLS
+        q = load_parquet(drive, index_id, "processing_queue.parquet", QUEUE_COLS)
+        if not q.empty:
+            doc_by = {str(d): {"date": a} for d, a in
+                      zip(q["doc_id"], q["announcement_date"])}
+    html_b = _email_b_html(reporters, res, pead, sym_map, doc_by)
 
     # ---- Email A: tomorrow's announcers ----
     events = get_results_calendar(args.days_ahead)
