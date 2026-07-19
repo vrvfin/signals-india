@@ -69,8 +69,10 @@ HIST_COLS = ["isin", "symbol", "company_name", "as_of",
              "guidance_cagr", "guidance_tier", "guid_from", "cred_score",
              "rank_score", "in_pf",
              # guidance provenance (user 2026-07-18): latest-quarter guidance from
-             # GF1/GF2, timestamped + freshness. Additive -> old rows read as None.
-             "guid_metric", "guid_qtrs_old", "guid_stmt", "guid_track"]
+             # GF1/GF2, timestamped + freshness + the source document it was pulled
+             # from. Additive -> old rows read as None.
+             "guid_metric", "guid_qtrs_old", "guid_stmt", "guid_track",
+             "guid_src_date", "guid_src_type", "guid_src_title"]
 
 SURGE_COLS = ["isin", "symbol", "company_name", "quarter",
               "pat_yoy_pct", "pat_qoq_pct", "eps_yoy_pct",
@@ -139,13 +141,24 @@ def _cur_fy_qkey(d: date) -> int:
     return (fy % 100) * 4 + q
 
 
+def _fmt_date(s) -> str:
+    """'2026-05-23' -> '23 May 2026' (blank when unparseable)."""
+    try:
+        return pd.to_datetime(s).strftime("%d %b %Y")
+    except Exception:
+        return str(s or "")[:10]
+
+
 def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
-                     cur_key: int) -> dict | None:
+                     cur_key: int, doc_by: dict | None = None) -> dict | None:
     """Most-RECENT quantified growth guidance (revenue/EBITDA/PAT) for one company.
     Replaces the old 'max cagr over ALL history' (which surfaced 5-year-old Q2 FY21
     numbers and single 200% misparses). Representative value = median of the newest
     quarter's revenue rows (else EBITDA, else PAT); attaches the verbatim GF1
-    statement and how many quarters old it is. None if no clean growth guidance."""
+    statement, how many quarters old it is, and the SOURCE DOCUMENT (date + type
+    + title, resolved source_doc_id -> processing_queue). None if no clean
+    growth guidance."""
+    doc_by = doc_by or {}
     if gt_iso is None or gt_iso.empty:
         return None
     g = gt_iso.copy()
@@ -159,10 +172,13 @@ def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
     latest_qk = int(g["qk"].max())
     qrows = g[g["qk"] == latest_qk]
     metric = cagr = None
+    src_id = ""
     for m in GROWTH_METRICS:                     # prefer revenue, then EBITDA, then PAT
         sub = qrows[qrows["metric_l"] == m]
         if not sub.empty:
             metric, cagr = m, round(float(sub["cagr"].median()), 1)
+            if "source_doc_id" in sub.columns:
+                src_id = str(sub["source_doc_id"].iloc[0] or "")
             break
     quarter = str(qrows["quarter"].iloc[0])
     stmt = tf = ""
@@ -175,8 +191,14 @@ def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
             row = (pref if not pref.empty else pick).iloc[0]
             stmt = str(row.get("exact_statement") or "").strip().strip('"')
             tf = str(row.get("timeframe") or "").strip()
+            gid = str(row.get("source_doc_id") or "")
+            if gid:
+                src_id = gid              # the quote's own document wins
+    doc = doc_by.get(src_id, {})
     return {"quarter": quarter, "cagr": cagr, "metric": metric,
-            "qtrs_old": max(0, cur_key - latest_qk), "statement": stmt, "timeframe": tf}
+            "qtrs_old": max(0, cur_key - latest_qk), "statement": stmt, "timeframe": tf,
+            "src_date": _fmt_date(doc.get("date")) if doc.get("date") else "",
+            "src_type": doc.get("type", ""), "src_title": doc.get("title", "")}
 
 
 def _gf2_track(gf2_iso: pd.DataFrame) -> str:
@@ -204,7 +226,8 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
                pat_qtr_by: dict | None = None,
                pat_fresh_by: dict | None = None,
                gt_by: dict | None = None, gf1_by: dict | None = None,
-               gf2_by: dict | None = None, cur_key: int = 0) -> tuple[list[dict], int]:
+               gf2_by: dict | None = None, cur_key: int = 0,
+               doc_by: dict | None = None) -> tuple[list[dict], int]:
     """Intersect the three axes. Returns (rows, n_unmapped_tech_symbols).
     pat_qtr_by:   isin -> quarter label the PAT YoY belongs to (financials_derived).
     pat_fresh_by: isin -> (quarter, yoy) from the freshest results.parquet row, used
@@ -217,6 +240,7 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
     gt_by = gt_by or {}
     gf1_by = gf1_by or {}
     gf2_by = gf2_by or {}
+    doc_by = doc_by or {}
     # --- axis 1: technical (symbol-keyed) ---
     tech: dict[str, dict] = {}
     if not conv.empty:
@@ -270,7 +294,7 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
         # strong guidance? — from the company's LATEST concall quarter (GF1/tracker),
         # not the biggest number ever parsed. Stale guidance (older than
         # GUID_STALE_MAX_Q) does not qualify.
-        gl = _latest_guidance(gt_by.get(iso), gf1_by.get(iso), cur_key)
+        gl = _latest_guidance(gt_by.get(iso), gf1_by.get(iso), cur_key, doc_by)
         guid_cagr = gl["cagr"] if gl else None
         guid_tier = G.grade_growth(guid_cagr) if guid_cagr is not None else "na"
         fresh = gl is not None and gl["qtrs_old"] <= GUID_STALE_MAX_Q
@@ -310,6 +334,8 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
             "guidance_cagr": guid_cagr, "guidance_tier": guid_tier,
             "guid_from": gl["quarter"], "guid_metric": gl["metric"],
             "guid_qtrs_old": gl["qtrs_old"], "guid_stmt": gl["statement"],
+            "guid_src_date": gl["src_date"], "guid_src_type": gl["src_type"],
+            "guid_src_title": gl["src_title"],
             "guid_track": _gf2_track(gf2_by.get(iso)),
             "cred_score": cred_by.get(iso),
             "rank_score": rank, "in_pf": iso in pf,
@@ -359,11 +385,19 @@ def build_html(rows: list[dict], today: str) -> str:
         gmet = str(r.get("guid_metric") or "").upper()[:3]
         cagr_txt = (f"{gmet} +{r['guidance_cagr']:.0f}%"
                     if r["guidance_cagr"] is not None else r["guidance_tier"])
+        sdate = str(r.get("guid_src_date") or "").strip()
+        date_txt = f" · {esc(sdate, 12)}" if sdate else ""
         gsub = (f"<br><span style='font-size:11px;color:#555'>{esc(gq, 10)}"
-                f"{fresh_tag}</span>") if gq else ""
+                f"{date_txt}{fresh_tag}</span>") if gq else ""
         stmt = str(r.get("guid_stmt") or "").strip()
         gstmt = (f"<br><span style='font-size:10px;color:#888'>“{esc(stmt, 90)}”</span>"
                  if stmt else "")
+        # where it was pulled from: doc type + the filing title
+        stype = str(r.get("guid_src_type") or "").strip()
+        stitle = str(r.get("guid_src_title") or "").strip()
+        src_bits = " · ".join(x for x in (stype, stitle) if x)
+        gsrc = (f"<br><span style='font-size:10px;color:#999'>src: {esc(src_bits, 70)}"
+                f"</span>" if src_bits else "")
         trk = str(r.get("guid_track") or "").strip()
         gtrk = (f"<br><span style='font-size:10px;color:"
                 f"{'#1a7a3a' if trk == 'delivers' else '#c0392b'}'>mgmt {trk}</span>"
@@ -380,7 +414,7 @@ def build_html(rows: list[dict], today: str) -> str:
             f"<td style='{td}'>{r['n_strategies']} strat · "
             f"{r['composite_score']:.0f}</td>"
             f"<td style='{td}{yoy_css}'>{yoy_txt}{surge_txt}</td>"
-            f"<td style='{td}{guid_css}'>{cagr_txt}{gsub}{gstmt}{gtrk}</td>"
+            f"<td style='{td}{guid_css}'>{cagr_txt}{gsub}{gstmt}{gsrc}{gtrk}</td>"
             f"<td style='{td}'>{cred_txt}</td>"
             "</tr>")
     out.append("</table>"
@@ -392,10 +426,12 @@ def build_html(rows: list[dict], today: str) -> str:
                "quarter in brackets, realigned to the latest REPORTED quarter "
                "(Screener financials). <b>Guidance</b> = the growth management "
                "committed to in its <b>most recent concall</b> (revenue &gt; EBITDA &gt; "
-               "PAT), NOT the biggest number ever said. The line under it is the "
-               f"concall quarter + freshness (✓ latest / ⚠ N quarters old; older than "
-               f"{GUID_STALE_MAX_Q}q doesn't qualify), the verbatim GF1 statement, and "
-               "the GF2 delivery record (‘mgmt delivers/has missed’). <b>Cred</b> = "
+               "PAT), NOT the biggest number ever said. Under it: the concall "
+               "<b>quarter + the filing date</b> it was pulled from, freshness "
+               f"(✓ latest / ⚠ N quarters old; older than {GUID_STALE_MAX_Q}q doesn't "
+               "qualify), the verbatim GF1 statement, <b>src:</b> the exact source "
+               "document, and the GF2 delivery record (‘mgmt delivers/has missed’). "
+               "<b>Cred</b> = "
                "GF_TRACK mgmt credibility (5=delivers). <b>Tech</b> = strategies "
                "agreeing · composite. Weekly/quarterly lists live on Drive under "
                "signals/combined_strength/. Toggle this mail in the app sidebar "
@@ -466,12 +502,22 @@ def main() -> None:
     # guidance now comes from the LATEST concall quarter (GF1/tracker), not the
     # max cagr ever parsed — per-isin slices of guidance_tracker / GF1 / GF2.
     gt = load_parquet(drive, index_id, "guidance_tracker.parquet",
-                      ["isin", "symbol", "quarter", "metric", "cagr_pct"])
+                      ["isin", "symbol", "quarter", "metric", "cagr_pct",
+                       "source_doc_id"])
     gf1 = load_parquet(drive, index_id, "gf1_guidance_statements.parquet",
                        ["isin", "quarter", "metric_type", "timeframe",
-                        "quantifiable", "exact_statement"])
+                        "quantifiable", "exact_statement", "source_doc_id"])
     gf2 = load_parquet(drive, index_id, "gf2_historical_guidance.parquet",
                        ["isin", "quarter", "management_self_assessment"])
+    # source document behind each guidance row (user 2026-07-18: show the DATE and
+    # the SOURCE it was pulled from). source_doc_id -> processing_queue resolves
+    # 100% for both tracker and GF1.
+    queue = load_parquet(drive, index_id, "processing_queue.parquet",
+                         ["doc_id", "doc_type", "announcement_date", "title"])
+    doc_by = ({str(d): {"date": a, "type": str(t or ""), "title": str(ti or "")}
+               for d, t, a, ti in zip(queue["doc_id"], queue["doc_type"],
+                                      queue["announcement_date"], queue["title"])}
+              if not queue.empty else {})
 
     def _by_isin(df):
         if df is None or df.empty:
@@ -481,13 +527,13 @@ def main() -> None:
     gt_by, gf1_by, gf2_by = _by_isin(gt), _by_isin(gf1), _by_isin(gf2)
     cur_key = _cur_fy_qkey(date.today())
     log(f"guidance inputs: tracker={len(gt)} gf1={len(gf1)} gf2={len(gf2)} "
-        f"(cur FY-quarter key {cur_key})")
+        f"queue-docs={len(doc_by)} (cur FY-quarter key {cur_key})")
 
     today = date.today().isoformat()
     rows, unmapped = build_list(conv, surge, grades, gva,
                                 sym_to_isin, names, pf, today,
                                 pat_qtr_by, pat_fresh_by,
-                                gt_by, gf1_by, gf2_by, cur_key)
+                                gt_by, gf1_by, gf2_by, cur_key, doc_by)
     if unmapped:
         log(f"tech symbols with no isin mapping (skipped): {len(unmapped)} "
             f"e.g. {', '.join(sorted(unmapped)[:8])}")
