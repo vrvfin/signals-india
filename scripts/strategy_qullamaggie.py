@@ -146,19 +146,26 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
 
 def find_consolidation(ohlcv: pd.DataFrame) -> dict | None:
     """Find the longest recent consolidation window meeting our tightness criterion.
-    Returns dict with pivot info, or None."""
-    if len(ohlcv) < CONSOLIDATION_MIN_DAYS:
+    Returns dict with pivot info, or None.
+
+    The base is measured EXCLUDING the current (last) bar, so the pivot high is
+    the resistance BUILT BEFORE today. Otherwise pivot_high = highs[-n:].max()
+    would include today's own high, making `close > pivot_high` impossible and
+    the breakout ("add") zone permanently dead (audit #31)."""
+    if len(ohlcv) < CONSOLIDATION_MIN_DAYS + 1:   # +1 base bars beyond today's bar
         return None
     highs = ohlcv["high"].astype(float).values
     lows = ohlcv["low"].astype(float).values
     closes = ohlcv["close"].astype(float).values
 
-    # Try longest first so we surface the widest stable base.
-    for n in range(min(CONSOLIDATION_MAX_DAYS, len(ohlcv)),
+    # Try longest first so we surface the widest stable base. Each window ENDS at
+    # the prior bar ([-(n+1):-1]) — today's bar is the breakout candidate, not
+    # part of the base.
+    for n in range(min(CONSOLIDATION_MAX_DAYS, len(ohlcv) - 1),
                    CONSOLIDATION_MIN_DAYS - 1, -1):
-        h = highs[-n:].max()
-        l = lows[-n:].min()
-        avg = closes[-n:].mean()
+        h = highs[-(n + 1):-1].max()
+        l = lows[-(n + 1):-1].min()
+        avg = closes[-(n + 1):-1].mean()
         if avg <= 0:
             continue
         range_pct = (h - l) / avg * 100

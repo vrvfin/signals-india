@@ -154,17 +154,24 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
 
 def find_darvas_box(ohlcv: pd.DataFrame) -> dict | None:
     """Find the longest recent window where range/mean ≤ BOX_MAX_RANGE_PCT.
-    Returns dict with box info, or None."""
-    if len(ohlcv) < BOX_MIN_DAYS:
+    Returns dict with box info, or None.
+
+    The box is measured EXCLUDING the current (last) bar, so box_top is the
+    resistance BUILT BEFORE today. Otherwise box_top = highs[-n:].max() would
+    include today's own high, making `close > box_top` impossible and the
+    breakout ("add") zone permanently dead (audit #32)."""
+    if len(ohlcv) < BOX_MIN_DAYS + 1:   # +1 box bars beyond today's bar
         return None
     highs = ohlcv["high"].astype(float).values
     lows = ohlcv["low"].astype(float).values
     closes = ohlcv["close"].astype(float).values
 
-    for n in range(min(BOX_MAX_DAYS, len(ohlcv)), BOX_MIN_DAYS - 1, -1):
-        h = highs[-n:].max()
-        l = lows[-n:].min()
-        avg = closes[-n:].mean()
+    # Each window ENDS at the prior bar ([-(n+1):-1]) — today's bar is the
+    # breakout candidate, not part of the box.
+    for n in range(min(BOX_MAX_DAYS, len(ohlcv) - 1), BOX_MIN_DAYS - 1, -1):
+        h = highs[-(n + 1):-1].max()
+        l = lows[-(n + 1):-1].min()
+        avg = closes[-(n + 1):-1].mean()
         if avg <= 0:
             continue
         range_pct = (h - l) / avg * 100

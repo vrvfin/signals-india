@@ -118,6 +118,17 @@ jobs:
         run: python scripts/compute_features.py
         continue-on-error: true
 
+      # Market state runs BEFORE the strategies: it depends only on features +
+      # indices + macro (all ready above), and CANSLIM's "M" rule reads
+      # data/market_state/latest.parquet. Running it after the strategies (the
+      # old order) fed CANSLIM YESTERDAY's health score — which on 2026-07-21
+      # sat on the opposite side of the 40 threshold from today's actual (42.2
+      # stale vs 39.9 fresh), flipping the M rule. (audit #25)
+      - name: Market state
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/market_state.py
+        continue-on-error: true
+
       # ---- Strategies (each isolated; one failing won't stop the rest) ----
       - name: Strategy - Momentum
         if: steps.fresh.outputs.skip != 'true'
@@ -175,11 +186,6 @@ jobs:
       - name: Signal membership
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/build_signal_membership.py
-        continue-on-error: true
-
-      - name: Market state
-        if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/market_state.py
         continue-on-error: true
 
       # ---- BSE announcements -> LLM summary (independent of Phase 2) ----
