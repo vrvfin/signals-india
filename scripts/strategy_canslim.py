@@ -183,7 +183,13 @@ def main():
                 f" — missing: {', '.join(failed)}" if failed else ""),
         })
     sig_df = pd.DataFrame(rows)
-    if not sig_df.empty:
+    if sig_df.empty:
+        # Zero-signal day: still write a HEADER so latest.csv is parseable.
+        # A column-less pd.DataFrame([]) writes a 1-byte file that crashes every
+        # reader (build_gallery._load_signals, aggregate_signals) with EmptyDataError.
+        sig_df = pd.DataFrame(columns=["symbol", "date", "strategy", "zone_type",
+                                       "score", "entry", "stop", "reason"])
+    else:
         sig_df = sig_df.sort_values("score", ascending=False).reset_index(drop=True)
     log(f"CANSLIM signals: {len(sig_df)} (BUY={(sig_df['zone_type']=='buy').sum()})")
 

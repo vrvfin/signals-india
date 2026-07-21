@@ -96,7 +96,10 @@ def _load_signals(drive):
         files = _list_folder(drive, s["id"])
         fid = files.get("latest.csv")
         if fid:
-            df = pd.read_csv(io.BytesIO(download_bytes(drive, fid)))
+            try:
+                df = pd.read_csv(io.BytesIO(download_bytes(drive, fid)))
+            except pd.errors.EmptyDataError:
+                continue  # zero-signal / empty latest.csv — skip, don't crash the gallery
             df["strategy_group"] = s["name"]
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else _EMPTY

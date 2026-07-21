@@ -156,7 +156,11 @@ def load_all_strategy_signals(drive, folder_id, ref_date=None):
         latest_id = files.get("latest.csv")
         if not latest_id:
             continue
-        df = download_csv(drive, latest_id)
+        try:
+            df = download_csv(drive, latest_id)
+        except pd.errors.EmptyDataError:
+            log(f"  {sub['name']:<28}  SKIPPED — empty/corrupt latest.csv")
+            continue
         if df.empty:
             log(f"  {sub['name']:<28}      0 signals (empty — ok)")
             continue
