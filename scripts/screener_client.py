@@ -261,6 +261,36 @@ class ScreenerClient:
                     })
         return out
 
+    def parse_promoter_holding(self, soup: BeautifulSoup) -> float | None:
+        """Latest promoter holding % from the #shareholding section.
+
+        Screener does NOT expose promoter holding in the top-ratios strip
+        (it carries Market Cap / P/E / ROCE / ROE / …), so the old
+        top.get("Promoter holding") was ALWAYS None — leaving CANSLIM's "S"
+        rule permanently unsatisfiable (audit #30). The figure lives in the
+        #shareholding section's first (quarterly) table, "Promoters" row,
+        most-recent column."""
+        sec = soup.find(id="shareholding")
+        if not sec:
+            return None
+        tables = sec.find_all("table")
+        if not tables:
+            return None
+        body = tables[0].find("tbody")   # first table = quarterly (latest = last col)
+        if not body:
+            return None
+        for tr in body.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            if not cells:
+                continue
+            if cells[0].get_text(strip=True).lower().startswith("promoter"):
+                raw = cells[-1].get_text(strip=True).replace("%", "").replace(",", "")
+                try:
+                    return float(raw)
+                except ValueError:
+                    return None
+        return None
+
     def extract_summary(self, symbol: str, soup: BeautifulSoup) -> dict:
         """One-row summary with key numbers used by CANSLIM + PEAD."""
         top = self.parse_top_ratios(soup)
@@ -307,7 +337,7 @@ class ScreenerClient:
             "roe_pct": top.get("ROE"),
             "debt_to_equity": top.get("Debt to equity") or top.get("Debt / Equity"),
             "dividend_yield_pct": top.get("Dividend Yield"),
-            "promoter_holding_pct": top.get("Promoter holding"),
+            "promoter_holding_pct": self.parse_promoter_holding(soup),
             "latest_quarter_label": qtr["headers"][-1] if qtr["headers"] else None,
             "latest_quarter_eps": latest_q_eps,
             "q_eps_yoy_pct": q_eps_yoy_pct,
