@@ -136,6 +136,10 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 <div class="card"><table>__IDXTABLE__</table></div>
 <h2>Sector rotation (vs Nifty 500)</h2>
 <div class="card"><table>__SECTABLE__</table></div>
+<h2>Breadth by market-cap segment</h2>
+<div class="card"><table>__SEGBREADTH__</table></div>
+<h2>Breadth by sector</h2>
+<div class="card"><table>__SECBREADTH__</table></div>
 </div>
 <script>
 const S=__PAYLOAD__;
@@ -272,6 +276,55 @@ def main():
     else:
         sectable = "<tr><td>no sector data</td></tr>"
 
+    # ---- breadth by mcap-segment and by sector (#29 extension) ----
+    # Join today's features (above_50/200SMA) to the classification (segment,
+    # sector), both keyed by symbol — data we already store.
+    feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+    cls = _read_parquet(drive, _folder(drive, "company_repo/_index"),
+                        "company_classification.parquet")
+    segbreadth = secbreadth = "<tr><td>no breadth data</td></tr>"
+    if not feats.empty and {"symbol", "above_50sma", "above_200sma"} <= set(feats.columns):
+        f = feats[["symbol", "above_50sma", "above_200sma"]].copy()
+        f["symbol"] = f["symbol"].astype(str).str.upper()
+        f["above_50sma"] = f["above_50sma"].astype(bool)
+        f["above_200sma"] = f["above_200sma"].astype(bool)
+        if not cls.empty and "symbol" in cls.columns:
+            cmap = cls.copy()
+            cmap["symbol"] = cmap["symbol"].astype(str).str.upper()
+            f = f.merge(cmap[["symbol", "segment", "sector"]].drop_duplicates("symbol"),
+                        on="symbol", how="left")
+        else:
+            f["segment"] = f["sector"] = None
+
+        def _breadth(col, lbl, min_n=5, order=None):
+            d = f.dropna(subset=[col])
+            d = d[d[col].astype(str).str.lower() != "unknown"]
+            if d.empty:
+                return f"<tr><td>no {lbl.lower()} data</td></tr>"
+            rows = []
+            for name, g in d.groupby(col):
+                if len(g) < min_n:
+                    continue
+                rows.append((str(name), len(g), 100 * g["above_50sma"].mean(),
+                             100 * g["above_200sma"].mean()))
+            if order:
+                rows.sort(key=lambda x: order.index(x[0]) if x[0] in order else 99)
+            else:
+                rows.sort(key=lambda x: -x[3])          # by % >200SMA
+
+            def pc(p):
+                col_ = "#1a7a3a" if p >= 50 else ("#a66300" if p >= 35 else "#c0392b")
+                return f'<td style="text-align:right;font-weight:700;color:{col_}">{p:.0f}%</td>'
+            hdr = (f"<tr><td>{lbl}</td><th>Names</th>"
+                   f"<th>% &gt;50SMA</th><th>% &gt;200SMA</th></tr>")
+            return hdr + "".join(
+                f"<tr><td>{nm}</td><td style='text-align:right'>{c}</td>"
+                f"{pc(p50)}{pc(p200)}</tr>" for nm, c, p50, p200 in rows)
+
+        segbreadth = _breadth("segment", "Segment",
+                              order=["Largecap", "Midcap", "Smallcap", "Microcap"])
+        secbreadth = _breadth("sector", "Sector")
+
     if args.dry_run:
         log(f"DRY-RUN — {len(chart_ids)} trend charts, "
             f"{len(body)} indices, {len(sect)} sectors; no file written.")
@@ -281,6 +334,7 @@ def main():
                 .replace("__HEADLINE__", headline).replace("__SUB__", sub)
                 .replace("__TILES__", tiles).replace("__CHARTS__", charts_html)
                 .replace("__IDXTABLE__", idxtable).replace("__SECTABLE__", sectable)
+                .replace("__SEGBREADTH__", segbreadth).replace("__SECBREADTH__", secbreadth)
                 .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
                 .replace("__DRAW__", draw))
     out = os.path.join(os.path.dirname(_SD), args.out)

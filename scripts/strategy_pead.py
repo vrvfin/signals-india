@@ -47,6 +47,11 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 MIN_GAP_PCT = 5.0
 MIN_VOL_MULT = 2.0
+# #33 tightening — only fresh/live results, anchored to the ACTUAL result date
+# (results.parquet first_seen_at) instead of a heuristic 60-day volume-spike hunt.
+RECENT_RESULT_DAYS = 35   # only names whose result first appeared this recently
+MAX_DRIFT_DAYS = 20       # short drift window (was 60); drop the stale hold tail
+ANCHOR_SLACK_DAYS = 6     # gap may land a few sessions around the result date
 
 
 def log(msg):
@@ -125,6 +130,17 @@ def download_parquet(drive, file_id):
     return pd.read_parquet(fh)
 
 
+def download_csv(drive, file_id):
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    d = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = d.next_chunk()
+    fh.seek(0)
+    return pd.read_csv(fh)
+
+
 def upload_csv(drive, folder_id, filename, df, existing_id=None):
     media = MediaIoBaseUpload(io.BytesIO(df.to_csv(index=False).encode()),
                               mimetype="text/csv", resumable=False)
@@ -151,6 +167,46 @@ def parse_quarter_label(label) -> pd.Timestamp | None:
         return None
     # End-of-quarter month. Most results are announced 30-60 days later.
     return pd.Timestamp(year=yr, month=_MONTHS[mon], day=28)
+
+
+def detect_pead_at(symbol, ohlcv, result_dt, today_dt):
+    """#33 — anchor the earnings gap to the ACTUAL result date (results.parquet
+    first_seen_at), not a heuristic post-quarter search. Take the biggest-gap
+    session within +/- ANCHOR_SLACK_DAYS of the result date that also clears the
+    volume bar, and only if it's within MAX_DRIFT_DAYS (fresh/live)."""
+    df = ohlcv.sort_values("date").reset_index(drop=True).copy()
+    df["date"] = pd.to_datetime(df["date"])
+    if len(df) < 2:
+        return None
+    df["prev_close"] = df["close"].shift()
+    df["gap_pct"] = (df["open"] / df["prev_close"] - 1) * 100
+    df["vol_20avg"] = df["volume"].rolling(20, min_periods=5).mean()
+    df["vol_mult"] = df["volume"] / df["vol_20avg"]
+    lo = result_dt - pd.Timedelta(days=ANCHOR_SLACK_DAYS)
+    hi = result_dt + pd.Timedelta(days=ANCHOR_SLACK_DAYS)
+    win = df[(df["date"] >= lo) & (df["date"] <= hi)
+             & (df["gap_pct"].abs() >= MIN_GAP_PCT)
+             & (df["vol_mult"] >= MIN_VOL_MULT)]
+    if win.empty:
+        return None
+    er = win.loc[win["gap_pct"].idxmax()]           # biggest gap near the result
+    er_date = pd.to_datetime(er["date"])
+    days_since = (today_dt - er_date).days
+    if days_since < 0 or days_since > MAX_DRIFT_DAYS:
+        return None
+    today_close = float(df["close"].iloc[-1])
+    er_close = float(er["close"])
+    if er["gap_pct"] > 0 and today_close < er_close:
+        return None                                  # gave back the gap — skip
+    return {
+        "earnings_date": er_date.date(),
+        "earnings_gap_pct": float(er["gap_pct"]),
+        "earnings_vol_mult": float(er["vol_mult"]),
+        "earnings_close": er_close,
+        "today_close": today_close,
+        "days_since_er": days_since,
+        "drift_pct": (today_close / er_close - 1) * 100,
+    }
 
 
 def detect_pead(symbol, ohlcv, qtr_end_dt, today_dt):
@@ -222,30 +278,65 @@ def main():
 
     today_dt = pd.Timestamp(datetime.now().date())
 
-    # Cheap pre-filter (no Drive I/O): only names with a quarter-end in the last
-    # 90 days AND an OHLCV parquet on Drive. The download (the cost) happens only
-    # for these, parallelized below.
+    # #33 — anchor to the ACTUAL result date from the results feed, CURRENT
+    # quarter only, fresh (declared within RECENT_RESULT_DAYS). Build
+    # symbol -> real result date via results.parquet(isin, first_seen_at) +
+    # master_list(isin -> symbol).
+    resdate = {}
+    cur_q = None
+    repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
+    idx_id = get_or_create_subfolder(drive, repo_id, "_index")
+    res_fid = find_file(drive, idx_id, "results.parquet")
+    uni_id = get_or_create_subfolder(drive, folder_id, "universe")
+    ml_fid = find_file(drive, uni_id, "master_list.csv")
+    if res_fid and ml_fid:
+        res = download_parquet(drive, res_fid)
+        ml = download_csv(drive, ml_fid)
+        i2s = dict(zip(ml["isin"].astype(str), ml["symbol"].astype(str)))
+        res["fs"] = pd.to_datetime(res.get("first_seen_at"), errors="coerce")
+        res["lq"] = pd.to_datetime(res.get("latest_q"), errors="coerce")
+        cur_q = res["lq"].max()
+        cutoff = today_dt - pd.Timedelta(days=RECENT_RESULT_DAYS)
+        rr = res[(res["lq"] == cur_q) & (res["fs"] >= cutoff)]
+        for isin, fs in rr.groupby("isin")["fs"].min().items():
+            sym = i2s.get(str(isin))
+            if sym:
+                resdate[sym] = fs
+        log(f"#33: {len(resdate)} names declared results in the current quarter "
+            f"({str(cur_q.date()) if pd.notna(cur_q) else '?'}) within "
+            f"{RECENT_RESULT_DAYS}d")
+
+    use_anchor = len(resdate) > 0
     work = []
-    for _, r in fund.iterrows():
-        sym = r["symbol"]
-        qtr_end = parse_quarter_label(r.get("latest_quarter_label"))
-        if qtr_end is None or (today_dt - qtr_end).days > 90:
-            continue
-        fid = ohlcv_files.get(f"{sym}.parquet")
-        if fid:
-            work.append((sym, qtr_end, fid))
+    if use_anchor:
+        for sym, rdt in resdate.items():
+            fid = ohlcv_files.get(f"{sym}.parquet")
+            if fid:
+                work.append((sym, rdt, fid))
+    else:
+        # Fallback: results feed unavailable -> old quarter-end heuristic so PEAD
+        # never goes blind. Uses detect_pead (the 60-day search).
+        log("#33: results feed empty — falling back to quarter-end heuristic")
+        for _, r in fund.iterrows():
+            qtr_end = parse_quarter_label(r.get("latest_quarter_label"))
+            if qtr_end is None or (today_dt - qtr_end).days > 90:
+                continue
+            fid = ohlcv_files.get(f"{r['symbol']}.parquet")
+            if fid:
+                work.append((r["symbol"], qtr_end, fid))
 
     workers = max(1, args.workers)
-    log(f"PEAD candidates (recent quarter + OHLCV): {len(work)} | workers: {workers}")
+    log(f"PEAD candidates: {len(work)} | anchored={use_anchor} | workers: {workers}")
 
     def _scan(item):
-        sym, qtr_end, fid = item
+        sym, anchor_dt, fid = item
         d = drive if workers == 1 else _thread_drive()
         try:
             ohlcv = download_parquet(d, fid)
-            return sym, qtr_end, detect_pead(sym, ohlcv, qtr_end, today_dt)
+            fn = detect_pead_at if use_anchor else detect_pead
+            return sym, anchor_dt, fn(sym, ohlcv, anchor_dt, today_dt)
         except Exception:
-            return sym, qtr_end, None
+            return sym, anchor_dt, None
 
     if workers == 1:
         scanned = [_scan(it) for it in work]
@@ -254,17 +345,17 @@ def main():
             scanned = [f.result() for f in as_completed([pool.submit(_scan, it) for it in work])]
 
     rows = []
-    for sym, qtr_end, pead in scanned:
+    for sym, anchor_dt, pead in scanned:
         if pead is None:
             continue
 
         days = pead["days_since_er"]
         if days <= 5:
             zone = "add"
-        elif days <= 30:
+        elif days <= MAX_DRIFT_DAYS:
             zone = "buy"
         else:
-            zone = "hold"
+            continue          # #33: no stale 31-60d hold tail — fresh/live only
 
         if pead["earnings_gap_pct"] < 0:
             continue  # only long-side PEAD for v1

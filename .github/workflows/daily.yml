@@ -160,6 +160,11 @@ jobs:
         run: python scripts/strategy_volume.py
         continue-on-error: true
 
+      - name: Strategy - Pullback
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/strategy_pullback.py
+        continue-on-error: true
+
       # ---- Fundamentals-dependent strategies ----
       # Fundamentals + market cap ingestion moved to its own weekly workflow
       # (fundamentals.yml): the full-universe Screener pull + statement history

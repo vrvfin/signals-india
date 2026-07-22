@@ -41,6 +41,13 @@ DEFAULT_BATCH_SIZE = 25
 DEFAULT_INCREMENTAL_PERIOD = "3mo"
 BACKFILL_PERIOD = "10y"
 
+# #6 — Yahoo `<sym>.NS` TICKER COLLISIONS: these short SME/Emerge symbols resolve
+# on Yahoo to a DIFFERENT (mainboard) company, so pulling them would append the
+# wrong company's prices. Verified 2026-07-22 (stored vs Yahoo close mismatch,
+# different listed name). Skip them entirely — they have no correct Yahoo feed
+# and belong in the accepted no-price gap. NOT FOCUS (that one matches Yahoo).
+COLLISION_SKIP = {"KEL", "KALYANI", "MAL", "SEL", "ZEAL", "GSTL"}
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -372,6 +379,12 @@ def main():
             log(f"NSE filter: {len(universe_df)}/{before} rows (BSE-only handled "
                 f"by fetch_bse_only_ohlcv.py)")
     symbols = universe_df["symbol"].astype(str).tolist()
+    # #6 — drop Yahoo ticker-collision symbols (would import the wrong company).
+    _before_col = len(symbols)
+    symbols = [s for s in symbols if s.upper() not in COLLISION_SKIP]
+    if len(symbols) != _before_col:
+        log(f"Collision skip: dropped {_before_col - len(symbols)} symbol(s) "
+            f"{sorted(COLLISION_SKIP)} — no correct Yahoo feed")
     if args.pilot:
         symbols = symbols[:args.limit]
         log(f"PILOT MODE: {len(symbols)} symbols")

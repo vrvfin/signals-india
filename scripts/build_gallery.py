@@ -643,16 +643,19 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         c, v, e20, e50 = (_ohlc_arrays(omap.get(s, _EMPTY), days, resample=resample)
                           if s else ([], [], [], []))
 
-        # Unresolved / not-in-universe holding -> name-only card, nothing dropped
-        if not s or not c:
-            label = pfname or s or "(unknown)"
+        # Truly unresolved (no symbol at all) -> name-only card, nothing dropped.
+        if not s:
+            label = pfname or "(unknown)"
             card_html.append(
                 f'<div class="card"><div class="hd">{j + 1}. <b>{label}</b></div>'
                 f'<div style="font-size:12px;color:#999;padding:8px 2px">'
-                f'No chart/price data — not in the tracked universe '
-                f'(delisted / suspended / non-equity).</div></div>')
+                f'Not in the tracked universe (delisted / suspended / non-equity).'
+                f'</div></div>')
             continue
 
+        # Symbol resolved: build the fundamentals panels REGARDLESS of candle
+        # data (#4 — a name with no OHLCV, e.g. an SME with no Yahoo feed, still
+        # shows its grades/quarterly/guidance instead of being blanked out).
         nmj = cards.name_by.get(s.upper(), "") or pfname
         meta = "".join(x for x in [
             f'<div class="hd">{j + 1}. <b>{s}</b>'
@@ -664,6 +667,14 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
             cards.llm_summary(s), cards.research_card(s, nmj),
         ] if x)
+        if not c:
+            # Fundamentals present but no price series — panels + a small note,
+            # no chart div.
+            card_html.append(
+                f'<div class="card">{meta}'
+                f'<div style="font-size:11px;color:#999;padding:6px 2px">'
+                f'No chart/price data for this name (no OHLCV feed).</div></div>')
+            continue
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
         card_html.append(f'<div class="card">{meta}<div class="chart" id="ch{j}"></div></div>')
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
