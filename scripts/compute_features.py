@@ -229,6 +229,10 @@ def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
     turnover20 = (volume * close).rolling(20).mean()
     feat["avg_turnover_20d_cr"] = (turnover20.iloc[-1] / 1e7
                                    if pd.notna(turnover20.iloc[-1]) else np.nan)
+    # 30-day avg ₹ turnover — the gallery's display liquidity floor (₹1cr/day).
+    turnover30 = (volume * close).rolling(30).mean()
+    feat["avg_turnover_30d_cr"] = (turnover30.iloc[-1] / 1e7
+                                   if pd.notna(turnover30.iloc[-1]) else np.nan)
 
     # Trend flags
     feat["above_50sma"]  = bool(close.iloc[-1] > smas[50].iloc[-1]) if pd.notna(smas[50].iloc[-1]) else False

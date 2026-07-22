@@ -656,7 +656,9 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         nmj = cards.name_by.get(s.upper(), "") or pfname
         meta = "".join(x for x in [
             f'<div class="hd">{j + 1}. <b>{s}</b>'
-            + (f' <span class="nm">{nmj}</span>' if nmj else "") + "</div>",
+            + (f' <span class="nm">{nmj}</span>' if nmj else "")
+            + _decision_chip(rr.get("decision"), rr.get("n_buy"), rr.get("n_vote"))
+            + "</div>",
             annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
@@ -745,10 +747,42 @@ def guidance_scores(guid, base_rev, base_pat,
     return out
 
 
+def _consensus_decision(sig: pd.DataFrame) -> pd.DataFrame:
+    """#22 — per-symbol consensus across ALL strategies that flagged it (every
+    zone, before the buy/add view filter). A strategy 'votes buy' if any of its
+    rows for the symbol is buy/add, else it votes hold. decision = BUY if >=80%
+    of the voting strategies say buy, HOLD if 50-80%, else WATCH.
+    Returns [symbol, n_buy, n_vote, buy_share, decision]."""
+    d = sig.copy()
+    d["_buy"] = d["zone_type"].astype(str).str.lower().isin(["buy", "add"])
+    per = d.groupby(["symbol", "strategy_group"])["_buy"].max().reset_index()
+    agg = (per.groupby("symbol")["_buy"]
+           .agg(n_buy="sum", n_vote="count").reset_index())
+    agg["buy_share"] = agg["n_buy"] / agg["n_vote"].clip(lower=1)
+    agg["decision"] = agg["buy_share"].map(
+        lambda x: "BUY" if x >= 0.8 else ("HOLD" if x >= 0.5 else "WATCH"))
+    return agg
+
+
+def _decision_chip(dec, nb, nv) -> str:
+    """#22 consensus chip for the card header. BUY green / HOLD amber / WATCH grey."""
+    if not dec or (isinstance(dec, float) and pd.isna(dec)):
+        return ""
+    color = {"BUY": "#1a7a3a", "HOLD": "#a66300", "WATCH": "#7f8c8d"}.get(str(dec), "#7f8c8d")
+    try:
+        frac = f" · {int(nb)}/{int(nv)}"
+    except (TypeError, ValueError):
+        frac = ""
+    return (f'<span style="background:{color};color:#fff;padding:2px 10px;'
+            f'border-radius:6px;font-weight:800;font-size:13px;margin-left:8px">'
+            f'{dec}{frac} strat</span>')
+
+
 def _select_signals(drive, args, exch):
     sig = _load_signals(drive)
     if sig.empty:
         return pd.DataFrame()
+    dec = _consensus_decision(sig)          # ALL zones, before the view filter
     if args.zones.strip():
         sig = sig[sig["zone_type"].isin([z.strip() for z in args.zones.split(",")])]
     conv = (sig.groupby("symbol")["strategy_group"].nunique()
@@ -756,11 +790,14 @@ def _select_signals(drive, args, exch):
     conv = conv[conv["n_strategies"] >= args.min_strats]
     best = sig.groupby("symbol")["score"].max().reset_index(name="best_score")
     conv = conv.merge(best, on="symbol", how="left")
+    conv = conv.merge(dec, on="symbol", how="left")
     log(f"  {len(conv)} names with >={args.min_strats} strategies")
     if args.turnover > 0:
         feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
         if not feats.empty and "symbol" in feats.columns:
-            if "avg_turnover_20d_cr" in feats.columns:
+            if "avg_turnover_30d_cr" in feats.columns:      # #24: 30-day floor
+                turn = pd.to_numeric(feats["avg_turnover_30d_cr"], errors="coerce")
+            elif "avg_turnover_20d_cr" in feats.columns:     # fallback until recompute
                 turn = pd.to_numeric(feats["avg_turnover_20d_cr"], errors="coerce")
             elif {"vol_20d_avg", "close"} <= set(feats.columns):
                 turn = (pd.to_numeric(feats["vol_20d_avg"], errors="coerce")

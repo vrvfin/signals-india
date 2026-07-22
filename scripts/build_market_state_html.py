@@ -1,0 +1,295 @@
+r"""
+build_market_state_html.py — a market-state DASHBOARD (not per-stock), rendered
+locally like build_gallery.py. Shows the current market health PLUS daily trend
+charts of every indicator we already store, across daily/short/mid/long horizons.
+
+Inputs (all already produced by the daily pipeline — READ ONLY):
+  data/market_state/latest.parquet          today's health snapshot + components
+  data/market_state/history.csv             daily history (health, breadth, VIX,
+                                             FII, A/D, 52w H/L, component scores)
+  data/market_state/sector_rotation_latest.csv
+  data/indices/<INDEX>.parquet              daily OHLC (Nifty50/500/midcap/small/
+                                             9 sectors/VIX) — for return dashboard
+                                             + Nifty-vs-200SMA trend
+  data/macro/FII_DII.csv                    daily FII vs DII net flows
+
+Output:  market_state.html  (opens in browser unless --no-open)
+
+Usage:
+    python scripts/build_market_state_html.py            # build + open
+    python scripts/build_market_state_html.py --no-open
+    python scripts/build_market_state_html.py --dry-run  # counts only, no file
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import sys
+import webbrowser
+from datetime import datetime
+
+import pandas as pd
+from dotenv import load_dotenv
+
+_SD = os.path.dirname(os.path.abspath(__file__))
+if _SD not in sys.path:
+    sys.path.insert(0, _SD)
+load_dotenv(os.path.join(os.path.dirname(_SD), ".env"))
+
+from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
+                             download_bytes, log)
+
+# Index → label + horizon bucket, for the returns dashboard.
+INDICES = [
+    ("NIFTY_50", "Nifty 50"), ("NIFTY_500", "Nifty 500"),
+    ("NIFTY_MIDCAP_100", "Midcap 100"), ("NIFTY_SMALLCAP_100", "Smallcap 100"),
+    ("NIFTY_BANK", "Bank"), ("NIFTY_IT", "IT"), ("NIFTY_AUTO", "Auto"),
+    ("NIFTY_PHARMA", "Pharma"), ("NIFTY_FMCG", "FMCG"), ("NIFTY_METAL", "Metal"),
+    ("NIFTY_ENERGY", "Energy"), ("NIFTY_REALTY", "Realty"), ("NIFTY_INFRA", "Infra"),
+]
+RET_WINDOWS = [("1D", 1), ("1W", 5), ("1M", 21), ("3M", 63), ("6M", 126), ("12M", 252)]
+
+
+def _folder(drive, parts):
+    fid = os.environ["GDRIVE_FOLDER_ID"]
+    for p in parts.split("/"):
+        fid = get_or_create_subfolder(drive, fid, p)
+    return fid
+
+
+def _read_csv(drive, folder, name):
+    fid = find_file(drive, folder, name)
+    return pd.read_csv(io.BytesIO(download_bytes(drive, fid))) if fid else pd.DataFrame()
+
+
+def _read_parquet(drive, folder, name):
+    fid = find_file(drive, folder, name)
+    return pd.read_parquet(io.BytesIO(download_bytes(drive, fid))) if fid else pd.DataFrame()
+
+
+def _series(df, val_col, date_col="date", tail=None):
+    """[{time, value}] for lightweight-charts from a date+value frame."""
+    if df.empty or val_col not in df.columns or date_col not in df.columns:
+        return []
+    d = df[[date_col, val_col]].copy()
+    d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+    d[val_col] = pd.to_numeric(d[val_col], errors="coerce")
+    d = d.dropna().sort_values(date_col)
+    if tail:
+        d = d.tail(tail)
+    return [{"time": t.strftime("%Y-%m-%d"), "value": round(float(v), 2)}
+            for t, v in zip(d[date_col], d[val_col])]
+
+
+def _ret(close: pd.Series, n: int):
+    if len(close) > n and close.iloc[-1 - n] > 0:
+        return (close.iloc[-1] / close.iloc[-1 - n] - 1) * 100
+    return None
+
+
+def _ret_cell(v):
+    if v is None:
+        return '<td style="text-align:right;color:#bbb">—</td>'
+    col = "#1a7a3a" if v >= 0 else "#c0392b"
+    return (f'<td style="text-align:right;font-weight:700;color:{col}">'
+            f'{v:+.1f}%</td>')
+
+
+def _tile(label, score, extra=""):
+    v = None if score is None or pd.isna(score) else float(score)
+    col = "#c0392b" if (v is None or v < 40) else ("#a66300" if v < 60 else "#1a7a3a")
+    disp = "—" if v is None else f"{v:.0f}"
+    return (f'<div style="flex:1;min-width:120px;background:#fff;border:1px solid #e3e7ee;'
+            f'border-radius:8px;padding:8px 10px;text-align:center">'
+            f'<div style="font-size:11px;color:#666">{label}</div>'
+            f'<div style="font-size:22px;font-weight:800;color:{col}">{disp}</div>'
+            f'<div style="font-size:10px;color:#999">{extra}</div></div>')
+
+
+_TPL = """<!doctype html><html><head><meta charset="utf-8">
+<title>Market State __DATE__</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;margin:0;padding:14px;color:#222}
+ h1{font-size:20px;margin:4px 6px}
+ h2{font-size:14px;margin:18px 6px 6px;color:#1a3d6e}
+ .wrap{max-width:1180px;margin:0 auto}
+ .tiles{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+ .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+ .card{background:#fff;border:1px solid #e3e7ee;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+ .card h3{font-size:12px;margin:2px 0 6px;color:#555;font-weight:600}
+ .chart{height:200px}
+ table{border-collapse:collapse;width:100%;font-size:12px}
+ th,td{padding:3px 6px;border-bottom:1px solid #eee}
+ th{text-align:right;color:#666;font-weight:600}
+ th:first-child,td:first-child{text-align:left}
+ @media(max-width:820px){.charts{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<h1>__HEADLINE__</h1>
+<div style="font-size:11px;color:#888;margin:-2px 6px 8px">__SUB__</div>
+<div class="tiles">__TILES__</div>
+<h2>Trends (daily)</h2>
+<div class="charts">__CHARTS__</div>
+<h2>Index dashboard — returns by horizon</h2>
+<div class="card"><table>__IDXTABLE__</table></div>
+<h2>Sector rotation (vs Nifty 500)</h2>
+<div class="card"><table>__SECTABLE__</table></div>
+</div>
+<script>
+const S=__PAYLOAD__;
+function line(id,color,area){
+ const el=document.getElementById(id); if(!el)return;
+ const ch=LightweightCharts.createChart(el,{height:200,layout:{textColor:'#333',background:{color:'#fff'}},
+   rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},
+   grid:{horzLines:{color:'#f3f3f3'},vertLines:{color:'#fafafa'}}});
+ (S[id]||[]).forEach(function(s){
+   let ser = s.type==='hist'? ch.addHistogramSeries({color:s.color||color})
+           : ch.addLineSeries({color:s.color||color,lineWidth:2,priceLineVisible:false});
+   ser.setData(s.data||[]);
+ });
+ ch.timeScale().fitContent();
+}
+__DRAW__
+</script></body></html>"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--out", default="market_state.html")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    drive = get_drive()
+    ms = _folder(drive, "data/market_state")
+    idx = _folder(drive, "data/indices")
+    mac = _folder(drive, "data/macro")
+
+    latest = _read_parquet(drive, ms, "latest.parquet")
+    hist = _read_csv(drive, ms, "history.csv")
+    sect = _read_csv(drive, ms, "sector_rotation_latest.csv")
+    fd = _read_csv(drive, mac, "FII_DII.csv")
+    if latest.empty:
+        log("market_state/latest.parquet missing — run market_state.py first.")
+        return
+    row = latest.iloc[0].to_dict()
+    log(f"health={row.get('health_score')} regime={row.get('regime')} "
+        f"| history rows={len(hist)} | sectors={len(sect)}")
+
+    # ---- headline + component tiles ----
+    regime = str(row.get("regime", "?"))
+    rcol = {"RISK_ON": "#1a7a3a", "NEUTRAL": "#a66300", "RISK_OFF": "#c0392b"}.get(regime, "#555")
+    headline = (f'Market Health <b style="color:{rcol}">{row.get("health_score","?")}</b>/100 '
+                f'&nbsp;·&nbsp; <b style="color:{rcol}">{regime}</b>')
+    sub = (f'Nifty50 {row.get("nifty50_close","?")} (200SMA {row.get("nifty50_sma200","?")}, '
+           f'{"above" if row.get("nifty50_above_200sma") else "below"}) · '
+           f'VIX {row.get("india_vix","?")} · FII 5d ₹{row.get("fii_5d_net_cr","?")}cr · '
+           f'{row.get("new_52w_highs","?")} new highs / {row.get("new_52w_lows","?")} lows · '
+           f'as of {row.get("date","?")}')
+    tiles = "".join([
+        _tile("Nifty vs 200SMA", row.get("nifty50_trend_score"), "trend"),
+        _tile("Breadth >50SMA", row.get("breadth_50sma_score"),
+              f'{row.get("pct_above_50sma","?")}% above'),
+        _tile("Highs−Lows", row.get("highs_lows_score"),
+              f'{row.get("new_52w_highs","?")}H / {row.get("new_52w_lows","?")}L'),
+        _tile("VIX", row.get("vix_score"), f'{row.get("india_vix","?")}'),
+        _tile("FII flow", row.get("fii_score"), f'₹{row.get("fii_5d_net_cr","?")}cr 5d'),
+        _tile("Adv/Decl", row.get("ad_ratio_score"),
+              f'{row.get("advances","?")}/{row.get("declines","?")}'),
+    ])
+
+    # ---- trend charts (daily) ----
+    payload, chart_ids = {}, []
+
+    def add_chart(cid, human, series):
+        chart_ids.append((cid, human))
+        payload[cid] = series
+
+    n50 = _read_parquet(drive, idx, "NIFTY_50.parquet")
+    if not n50.empty:
+        n50 = n50.sort_values("date")
+        n50["sma200"] = pd.to_numeric(n50["close"], errors="coerce").rolling(200).mean()
+        add_chart("nifty", "Nifty 50 vs 200-SMA (1y)", [
+            {"type": "line", "color": "#1a3d6e", "data": _series(n50, "close", tail=252)},
+            {"type": "line", "color": "#e67e22", "data": _series(n50, "sma200", tail=252)},
+        ])
+    add_chart("health", "Market Health Score", [
+        {"type": "line", "color": "#8e44ad", "data": _series(hist, "health_score")}])
+    add_chart("breadth", "% above 50-SMA", [
+        {"type": "line", "color": "#16a085", "data": _series(hist, "pct_above_50sma")}])
+    vix = _read_parquet(drive, idx, "INDIA_VIX.parquet")
+    add_chart("vix", "India VIX (6m)", [
+        {"type": "line", "color": "#c0392b", "data": _series(vix, "close", tail=126)}])
+    # highs vs lows (two lines)
+    add_chart("hl", "New 52w Highs vs Lows", [
+        {"type": "line", "color": "#1a7a3a", "data": _series(hist, "new_52w_highs")},
+        {"type": "line", "color": "#c0392b", "data": _series(hist, "new_52w_lows")}])
+    # FII vs DII daily net (histograms)
+    if not fd.empty and {"category", "net", "date"} <= set(fd.columns):
+        fd["date"] = pd.to_datetime(fd["date"], errors="coerce")
+        fii = fd[fd["category"].astype(str).str.contains("FII", na=False)].sort_values("date").tail(40)
+        dii = fd[fd["category"].astype(str).str.contains("DII", na=False)].sort_values("date").tail(40)
+
+        def _hist(d):
+            return [{"time": t.strftime("%Y-%m-%d"),
+                     "value": round(float(v), 1),
+                     "color": "#1a7a3a" if v >= 0 else "#c0392b"}
+                    for t, v in zip(d["date"], pd.to_numeric(d["net"], errors="coerce"))
+                    if pd.notna(v)]
+        add_chart("fii", "FII net (₹cr, 40d)", [{"type": "hist", "data": _hist(fii)}])
+        add_chart("dii", "DII net (₹cr, 40d)", [{"type": "hist", "data": _hist(dii)}])
+
+    charts_html = "".join(
+        f'<div class="card"><h3>{human}</h3><div class="chart" id="{cid}"></div></div>'
+        for cid, human in chart_ids)
+    draw = "\n".join(f'line("{cid}","#1a3d6e");' for cid, _ in chart_ids)
+
+    # ---- index returns dashboard ----
+    hdr = "<tr><th>Index</th>" + "".join(f"<th>{lbl}</th>" for lbl, _ in RET_WINDOWS) + "</tr>"
+    body = []
+    for key, lbl in INDICES:
+        df = _read_parquet(drive, idx, f"{key}.parquet")
+        if df.empty:
+            continue
+        c = pd.to_numeric(df.sort_values("date")["close"], errors="coerce").dropna()
+        cells = "".join(_ret_cell(_ret(c, n)) for _, n in RET_WINDOWS)
+        body.append(f"<tr><td>{lbl}</td>{cells}</tr>")
+    idxtable = hdr + "".join(body)
+
+    # ---- sector rotation table ----
+    if not sect.empty:
+        sect = sect.sort_values("vs_nifty500_3m_pct", ascending=False)
+        sh = ("<tr><td>Sector</td><th>1M</th><th>vs500 1M</th>"
+              "<th>3M</th><th>vs500 3M</th></tr>")
+        sb = "".join(
+            f'<tr><td>{r["sector"].replace("NIFTY_","")}</td>'
+            f'{_ret_cell(r.get("return_1m_pct"))}{_ret_cell(r.get("vs_nifty500_1m_pct"))}'
+            f'{_ret_cell(r.get("return_3m_pct"))}{_ret_cell(r.get("vs_nifty500_3m_pct"))}</tr>'
+            for _, r in sect.iterrows())
+        sectable = sh + sb
+    else:
+        sectable = "<tr><td>no sector data</td></tr>"
+
+    if args.dry_run:
+        log(f"DRY-RUN — {len(chart_ids)} trend charts, "
+            f"{len(body)} indices, {len(sect)} sectors; no file written.")
+        return
+
+    html = (_TPL.replace("__DATE__", str(row.get("date", "")))
+                .replace("__HEADLINE__", headline).replace("__SUB__", sub)
+                .replace("__TILES__", tiles).replace("__CHARTS__", charts_html)
+                .replace("__IDXTABLE__", idxtable).replace("__SECTABLE__", sectable)
+                .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
+                .replace("__DRAW__", draw))
+    out = os.path.join(os.path.dirname(_SD), args.out)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    log(f"wrote {out}  ({len(html)/1e6:.1f} MB, {len(chart_ids)} charts)")
+    if not args.no_open:
+        webbrowser.open("file://" + os.path.abspath(out))
+
+
+if __name__ == "__main__":
+    main()
