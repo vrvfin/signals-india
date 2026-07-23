@@ -112,6 +112,10 @@ MAX_DOC_TEXT_CHARS  = 80_000             # cap text extracted from html / per ch
 # 6k truncated ~2/3 of docs (Fredun: 21/31 sidecars were >6k, up to 12k). 20k feeds a
 # typical AR/concall summary IN FULL. Env-overridable for very large companies.
 MAX_DOC_SUMMARY_CHARS = int(os.environ.get("DEEPDIVE_DOC_CHARS", "20000"))
+# Total doc-context budget for the FINAL synthesis. Under this -> single pass with full
+# per-doc summaries. Over this (large companies) -> grouped multi-pass reduce (condense
+# each theme group) so no doc is truncated and attention stays focused (~80k tokens).
+MAX_SYNTH_DOC_CHARS = int(os.environ.get("DEEPDIVE_SYNTH_CHARS", "320000"))
 DO_BACKFILL         = True               # pull full Screener doc history before a dive
 # Completeness (user 2026-06-22): a `done` AR/concall whose stored extraction
 # (response_chars in quarterly_facts) is below these is a partial/thin read — the deep
@@ -1105,7 +1109,7 @@ def _sweep_partials(svc, root, isin, row):
         pass
 
 def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
-                           partial_cache=None, deadline_ts=None) -> str | None:
+                           partial_cache=None, deadline_ts=None, meta_out=None) -> str | None:
     """Summarise a PDF completely. Short docs -> single pass. Long docs -> split
     into CHUNK_PAGES page-range chunks, summarise each, then merge.
 
@@ -1122,11 +1126,17 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
     import fitz
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     n = src.page_count
+    if meta_out is not None:
+        meta_out.update({"pages": n, "chunks_total": 0, "chunks_ok": 0,
+                         "chunks_scanned": 0, "mode": "pdf"})
     # short enough -> one pass
     if n <= CHUNK_TRIGGER_PAGES and len(pdf_bytes) <= MAX_INLINE_PDF and not prefer_text:
         src.close()
         try:
-            return pool.call_pdf(pdf_bytes, prompt)[0]
+            out = pool.call_pdf(pdf_bytes, prompt)[0]
+            if meta_out is not None:
+                meta_out.update({"chunks_total": 1, "chunks_ok": 1})
+            return out
         except FatalCallError as e:
             print(f"      {label}: FATAL ({str(e)[:70]}) — skip"); return None
 
@@ -1136,6 +1146,9 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
 
     # In text mode, summarise larger page windows per call (text is cheap).
     step = (CHUNK_PAGES * 2) if prefer_text else CHUNK_PAGES
+    if meta_out is not None:
+        meta_out["mode"] = "text" if prefer_text else "pdf"
+        meta_out["chunks_total"] = (n + step - 1) // step
     partials = []
     for start in range(0, n, step):
         end = min(start + step, n)
@@ -1147,6 +1160,8 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
                 cached = cb.decode("utf-8", "ignore")
         if cached is not None:
             partials.append(cached)
+            if meta_out is not None:
+                meta_out["chunks_ok"] += 1
             print(f"      {label}: chunk pages {start+1}-{end}/{n} cached")
             continue
         # Not cached — this chunk costs Gemini calls, so enforce the deadline here.
@@ -1162,7 +1177,9 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
                 page_text = "\n".join(src[p].get_text()
                                       for p in range(start, end))[:MAX_DOC_TEXT_CHARS]
                 if len(page_text.strip()) < 100:
-                    continue                      # scanned/empty page range
+                    if meta_out is not None:      # scanned/empty range → not read (needs OCR)
+                        meta_out["chunks_scanned"] += 1
+                    continue
                 txt, _ = pool.call_text(cprompt + "\n\n=== TEXT ===\n" + page_text)
             else:
                 sub = fitz.open(); sub.insert_pdf(src, from_page=start, to_page=end - 1)
@@ -1175,6 +1192,8 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
                     txt, _ = pool.call_text(cprompt + "\n\n=== TEXT ===\n" + page_text)
             part = f"--- pages {start+1}-{end} ---\n{txt.strip()}"
             partials.append(part)
+            if meta_out is not None:
+                meta_out["chunks_ok"] += 1
             if partial_cache:                     # persist so next run resumes here
                 try:
                     drive_upload(svc, f"{pfx}_{start+1}-{end}.md", root,
@@ -1202,7 +1221,7 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
         # merge failed — return the concatenated partials rather than nothing
         return "\n\n".join(partials)[:MAX_DOC_TEXT_CHARS]
 
-def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
+def summarise_doc(svc, root, pool, isin, row, deadline_ts=None, meta_out=None) -> str | None:
     """Return a per-doc summary. Reuse cached sidecar if present, else fetch the
     raw file (PDF or extracted-HTML text) and run its doc-type prompt. Caches the
     result as a sidecar so future dives reuse it for free. Long PDFs additionally
@@ -1212,6 +1231,8 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
     sidecar = _sidecar_path(isin, row)
     cached = drive_download(svc, sidecar, root)
     if cached:
+        if meta_out is not None:
+            meta_out.update({"status": "cached", "chars": len(cached)})
         return cached.decode("utf-8", "ignore")
 
     fid = str(row.get("drive_file_id") or "").strip()
@@ -1228,18 +1249,29 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
     label = f"{doc_type} {str(row['announcement_date'])[:10]}"
     pfx = _partial_prefix(isin, row)
     is_pdf = data[:5].startswith(b"%PDF")
+    _cmeta = {}
     if is_pdf:
         # complete-read with page-range chunking for long reports; partials cached
         # on Drive so a stopped run resumes here rather than restarting the doc.
         summ = _summarise_pdf_chunked(pool, prompt, data, label,
                                       partial_cache=(svc, root, pfx),
-                                      deadline_ts=deadline_ts)
+                                      deadline_ts=deadline_ts, meta_out=_cmeta)
         if not summ:
             return None
+        if meta_out is not None:
+            partial = _cmeta.get("chunks_scanned", 0) > 0
+            meta_out.update({"status": "partial(scanned)" if partial else "full",
+                             "pages": _cmeta.get("pages"),
+                             "chunks_ok": _cmeta.get("chunks_ok"),
+                             "chunks_total": _cmeta.get("chunks_total"),
+                             "chunks_scanned": _cmeta.get("chunks_scanned"),
+                             "chars": len(summ)})
     else:
         text = data.decode("utf-8", "ignore")[:MAX_DOC_TEXT_CHARS]
         if len(text.strip()) < 100:
             print(f"      {label}: no extractable text — skip (needs OCR?)")
+            if meta_out is not None:
+                meta_out.update({"status": "no_text(needs OCR)", "pages": None})
             return None
         try:
             summ, _ = pool.call_text(
@@ -1247,6 +1279,8 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
         except FatalCallError as e:
             print(f"      {label}: FATAL ({str(e)[:80]}) — skip")
             return None
+        if meta_out is not None:
+            meta_out.update({"status": "full", "mode": "html/text", "chars": len(summ)})
 
     try:
         drive_upload(svc, sidecar, root, summ.encode("utf-8"), "text/markdown")
@@ -1258,7 +1292,7 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None) -> str | None:
         pass
     return summ
 
-def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str, list[dict]]:
+def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[list[dict], list[dict]]:
     """Summarise every actual document for this ISIN (reuse-or-generate) and
     return (combined_block, used_docs). Docs already folded into company_page.md
     (status=done) are skipped — the COMPANY_PAGE_BRIEF already carries them.
@@ -1269,11 +1303,11 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str
     next time from the sidecars written so far."""
     q = _read_parquet(svc, DRIVE["proc_queue"], root)
     if q.empty or "isin" not in q.columns:
-        return "DATA_MISSING (no document index).", []
+        return [], []
     rows = q[(q["isin"].astype(str) == isin) &
              (q["status"].astype(str) != "download_failed")]
     if rows.empty:
-        return "DATA_MISSING (no documents ingested for this company).", []
+        return [], []
 
     # Thin AR/concall (partial reads) are re-summarised IN FULL even though they are
     # `done` — so the deep dive never trusts a thin company_page section (user 2026-06-22).
@@ -1282,31 +1316,124 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[str
     for _, r in rows.sort_values("announcement_date").iterrows():
         is_thin = str(r["doc_id"]) in thin
         if str(r.get("status")) == "done" and not is_thin:
-            continue                       # rich done doc — already in COMPANY_PAGE_BRIEF
+            # rich done doc — already in COMPANY_PAGE_BRIEF; record it for the read
+            # confirmation so the table lists EVERY document, not just fresh ones.
+            used.append({"doc_type": str(r["doc_type"]),
+                         "date": str(r["announcement_date"])[:10],
+                         "title": str(r.get("title", ""))[:90],
+                         "doc_id": str(r["doc_id"]), "read_status": "in_brief"})
+            continue
         # Reuse-or-generate. A cached summary returns instantly; a fresh one costs
         # Gemini calls, so only THEN enforce the deadline (let cached docs through).
         if deadline_ts and time.monotonic() >= deadline_ts \
                 and not _doc_sidecar_cached(svc, root, isin, r):
             raise DeadlineReached(f"{isin}: doc budget exhausted")
-        summ = summarise_doc(svc, root, pool, isin, r, deadline_ts=deadline_ts)
+        d = str(r["announcement_date"])[:10]
+        title = str(r.get("title", ""))[:90]
+        meta = {}
+        summ = summarise_doc(svc, root, pool, isin, r, deadline_ts=deadline_ts, meta_out=meta)
         if not summ:
+            # record unreadable docs too, so the read-confirmation table is honest
+            used.append({"doc_type": str(r["doc_type"]), "date": d, "title": title,
+                         "doc_id": str(r["doc_id"]),
+                         "read_status": meta.get("status", "unreadable"),
+                         "pages": meta.get("pages")})
             continue
         if is_thin and str(r.get("status")) == "done":
             n_thin += 1
-            # Persist the richer read back into company_page.md's section (7C, best-effort,
-            # replace-only + lock-guarded). The report already has it via the block above.
             _writeback_thin_section(svc, root, isin, r, summ)
-        d = str(r["announcement_date"])[:10]
-        title = str(r.get("title", ""))[:90]
-        blocks.append(f"### [{r['doc_type']} | {d} | {title}]\n"
-                      f"{summ.strip()[:MAX_DOC_SUMMARY_CHARS]}")
-        used.append({"doc_type": str(r["doc_type"]), "date": d,
-                     "title": title, "doc_id": str(r["doc_id"])})
+        blocks.append({"doc_type": str(r["doc_type"]), "date": d, "title": title,
+                       "doc_id": str(r["doc_id"]), "summary": summ.strip()})
+        used.append({"doc_type": str(r["doc_type"]), "date": d, "title": title,
+                     "doc_id": str(r["doc_id"]),
+                     "read_status": meta.get("status", "full"),
+                     "pages": meta.get("pages"),
+                     "chunks_ok": meta.get("chunks_ok"),
+                     "chunks_total": meta.get("chunks_total")})
     if n_thin:
         print(f"    completeness: re-summarised {n_thin} thin AR/concall doc(s) in full")
+    return blocks, used
+
+def _doc_block_str(b) -> str:
+    return (f"### [{b['doc_type']} | {b['date']} | {b['title']}]\n"
+            f"{b['summary'][:MAX_DOC_SUMMARY_CHARS]}")
+
+# Thematic groups for the multi-pass reduce (only used when over budget).
+_DOC_GROUPS = [
+    ("Financial History (Annual Reports & Results)", {"annual_report", "results"}),
+    ("Management & Operations (Concalls & Presentations)", {"concall", "presentation"}),
+    ("External & Risk (Ratings, Announcements, Prospectus)", {"rating", "announcement", "drhp"}),
+]
+
+def _fit_doc_context(pool, blocks, budget=MAX_SYNTH_DOC_CHARS, deadline_ts=None) -> str:
+    """Build the DOCUMENT_SUMMARIES fed to the final synthesis. Fits within `budget`:
+    - total <= budget  -> join FULL per-doc summaries (single pass, no truncation).
+    - total  > budget  -> group docs by theme and CONDENSE each over-share group via one
+      Gemini call (multi-pass reduce), so every doc still contributes and no blunt cut."""
     if not blocks:
-        return "DATA_MISSING (documents present but none summarisable).", []
-    return "\n\n".join(blocks), used
+        return "DATA_MISSING (no documents summarisable)."
+    total = sum(len(_doc_block_str(b)) for b in blocks)
+    if total <= budget:
+        return "\n\n".join(_doc_block_str(b) for b in blocks)     # full fidelity
+    print(f"    synthesis: doc context {total:,} > budget {budget:,} — grouped multi-pass reduce")
+    grouped = {name: [] for name, _ in _DOC_GROUPS}
+    other = []
+    for b in blocks:
+        for name, types in _DOC_GROUPS:
+            if b["doc_type"] in types:
+                grouped[name].append(b); break
+        else:
+            other.append(b)
+    active = [n for n in grouped if grouped[n]] + (["_other"] if other else [])
+    share = max(30000, budget // max(1, len(active)))
+    out = []
+    for name, _ in _DOC_GROUPS:
+        grp = grouped[name]
+        if not grp:
+            continue
+        gtext = "\n\n".join(_doc_block_str(b) for b in grp)
+        if len(gtext) <= share:
+            out.append(f"## {name}\n{gtext}")
+            continue
+        prompt = ("Condense the per-document summaries below (ALL for ONE company) into a "
+                  f"single faithful digest under ~{share // 5} words. PRESERVE every material "
+                  "figure, multi-year trend, segment / capacity / raw-material detail, "
+                  "guidance, related-party item, litigation and risk; keep the "
+                  "[doc_type | date] tags. Invent nothing.\n\n" + gtext[:budget])
+        try:
+            digest, _ = pool.call_text(prompt)
+            out.append(f"## {name} (condensed from {len(grp)} documents)\n{digest.strip()}")
+        except FatalCallError:
+            out.append(f"## {name}\n{gtext[:share]}")
+    for b in other:
+        out.append(_doc_block_str(b))
+    return "\n\n".join(out)
+
+def _read_confirmation_table(used) -> str:
+    """Deterministic read-confirmation appendix computed from the ACTUAL per-doc read
+    metadata (not model-generated) — proves each document was read in full and flags any
+    partial/scanned doc that needs OCR."""
+    if not used:
+        return ""
+    def _is_partial(u):
+        return str(u.get("read_status", "")).startswith(("partial", "no_text", "unreadable"))
+    full = sum(1 for u in used if u.get("read_status") == "full")
+    cached = sum(1 for u in used if u.get("read_status") == "cached")
+    brief = sum(1 for u in used if u.get("read_status") == "in_brief")
+    partial = sum(1 for u in used if _is_partial(u))
+    lines = ["\n\n---\n## Document Read Confirmation",
+             f"*{len(used)} documents · {full} read in full this run · {cached} reused "
+             f"(read previously) · {brief} already in company brief · {partial} "
+             f"partial/unreadable (need OCR)*\n",
+             "| Document | Date | Pages | Read status |",
+             "| --- | ---- | ----- | ----------- |"]
+    for u in sorted(used, key=lambda x: str(x.get("date", "")), reverse=True):
+        pg = u.get("pages")
+        cok, ctot = u.get("chunks_ok"), u.get("chunks_total")
+        pages = (f"{pg}" if pg else "-") + (f" ({cok}/{ctot} chunks)" if cok and ctot else "")
+        lines.append(f"| {u.get('doc_type')} | {u.get('date')} | {pages} | "
+                     f"{u.get('read_status', '?')} |")
+    return "\n".join(lines)
 
 # ---- prompt assembly ------------------------------------------------------
 def _fmt(v, spec="{:.0f}"):
@@ -1570,9 +1697,15 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
 
     # Phase 2 — summarise every actual document (reuse cached sidecar, else
     # run the doc-type prompt) into a provenance-tagged block.
-    doc_block, used_docs = assemble_doc_summaries(svc, root, pool, isin,
-                                                  deadline_ts=deadline_ts)
-    print(f"    documents: {len(used_docs)} summarised/reused")
+    doc_blocks, used_docs = assemble_doc_summaries(svc, root, pool, isin,
+                                                   deadline_ts=deadline_ts)
+    # Fit the per-doc summaries to the synthesis budget: full single-pass when they fit,
+    # grouped multi-pass reduce when a large company would overflow (no doc truncated).
+    doc_block = _fit_doc_context(pool, doc_blocks, MAX_SYNTH_DOC_CHARS, deadline_ts)
+    _readable = [u for u in used_docs if u.get("read_status") not in
+                 ("unreadable", "no_text(needs OCR)", None)]
+    print(f"    documents: {len(doc_blocks)} summarised/reused "
+          f"({len(used_docs)-len(_readable)} unreadable)")
 
     # Phase 3 nightly tables — pre-computed scorecard/fraud/credibility/guidance
     # facts the report must reconcile against (no extra Gemini calls).
@@ -1626,13 +1759,21 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
 
     stamp = dt.datetime.now().strftime("%d%b%y")
     out_path = f"{DRIVE['company_page']}/{isin}/company_deepdive_{stamp}.md"
-    prov = ", ".join(f"{u['doc_type']}:{u['date']}" for u in used_docs) or "none"
+    prov = ", ".join(f"{b['doc_type']}:{b['date']}" for b in doc_blocks) or "none"
+    _full = sum(1 for u in used_docs if u.get("read_status") == "full")
+    _cached = sum(1 for u in used_docs if u.get("read_status") == "cached")
+    _brief = sum(1 for u in used_docs if u.get("read_status") == "in_brief")
+    _partial = sum(1 for u in used_docs if str(u.get("read_status", "")).startswith(
+        ("partial", "no_text", "unreadable")))
     header = (f"# Deep Dive — {name} ({symbol} / {isin})\n"
               f"*Generated {dt.datetime.now():%Y-%m-%d %H:%M} · "
               f"coverage: AR{cov['ar_years']} concalls~{cov['n_concall']} "
-              f"research~{cov['n_research']} · docs used: {len(used_docs)}*\n\n"
-              f"*Documents fed: {prov}*\n\n---\n\n")
-    full_md = header + report
+              f"research~{cov['n_research']} · {len(used_docs)} documents "
+              f"(read: {_full} full · {_cached} cached · {_brief} in brief · "
+              f"{_partial} partial)*\n\n"
+              f"*Documents fed fresh to synthesis: {prov}*\n\n---\n\n")
+    # Deterministic read-confirmation appendix (computed, not model-written).
+    full_md = header + report + _read_confirmation_table(used_docs)
     drive_upload(svc, out_path, root, full_md.encode("utf-8"), "text/markdown")
     print(f"    wrote {out_path}")
 
@@ -1709,6 +1850,16 @@ def open_report_local(report_md: str, slug: str,
         with open(obs_path, "w", encoding="utf-8") as f:
             f.write(report_md)
         print(f"    saved to Obsidian: {obs_path}")
+        # actually OPEN the note in Obsidian (registered obsidian:// handler). Best-effort:
+        # a headless/CI run or a machine without Obsidian just skips this silently.
+        try:
+            import urllib.parse
+            os.startfile("obsidian://open?path=" + urllib.parse.quote(obs_path))  # noqa (win)
+        except Exception:
+            try:
+                os.startfile(obs_path)          # fall back to the OS default for .md
+            except Exception:
+                pass
         return
     except Exception:
         pass
