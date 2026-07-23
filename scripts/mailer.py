@@ -45,6 +45,7 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "growth_surge":    "Results surge: >100% PAT YoY, consistent vs one-off (last 24h)",
     "combined_strength": "Combined strength: strong tech + results + guidance",
     "pf_docs_digest":  "PF new documents: AR/concall/presn/rating/announcement + summary",
+    "pf_decision":     "PF decision scorecard: index + movers + buy/sell/hold verdicts + sold relook",
     "infra_health":    "Infra code-red: broken keys/cookies + fix steps (CRIT bypasses this)",
 }
 
