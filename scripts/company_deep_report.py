@@ -107,7 +107,11 @@ DOC_PROMPTS = {
 }
 MAX_INLINE_PDF      = 18 * 1024 * 1024   # Gemini inline-data ceiling (~20MB)
 MAX_DOC_TEXT_CHARS  = 80_000             # cap text extracted from html / per chunk
-MAX_DOC_SUMMARY_CHARS = 6_000            # cap each per-doc summary fed to deep dive
+# Per-doc summary length fed into the FINAL synthesis. Each file is already read in
+# full (chunked) into its sidecar; this only bounds how much of that reaches the report.
+# 6k truncated ~2/3 of docs (Fredun: 21/31 sidecars were >6k, up to 12k). 20k feeds a
+# typical AR/concall summary IN FULL. Env-overridable for very large companies.
+MAX_DOC_SUMMARY_CHARS = int(os.environ.get("DEEPDIVE_DOC_CHARS", "20000"))
 DO_BACKFILL         = True               # pull full Screener doc history before a dive
 # Completeness (user 2026-06-22): a `done` AR/concall whose stored extraction
 # (response_chars in quarterly_facts) is below these is a partial/thin read — the deep
