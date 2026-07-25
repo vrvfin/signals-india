@@ -79,6 +79,16 @@ LOOKBACK_DAYS = 30     # Ingest anything on page 1 dated within this many days.
                        # dedup is by (doc_id, announcement_date), so anything
                        # already ingested is skipped as 'dup'.
 
+# Same-document re-list guard. The (doc_id, announcement_date) dedup key treats a
+# re-listed PDF as new whenever its labelled date shifts. Screener relabels the
+# SAME PDF's date across runs (shown as "Today" on one scrape, "Yesterday"/an
+# absolute date on a later one), so the identical file (same doc_id / URL) gets
+# re-queued and re-summarised. Guard: if the SAME doc_id was already discovered
+# within this many hours, skip it regardless of the labelled date.
+# 24h covers the full daily run span (a doc first seen in the ~06:00 IST run and
+# re-listed in the ~20:00 IST run is caught; 12h missed those >12h-apart pairs).
+RECENT_DEDUP_HOURS = 24
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
@@ -189,6 +199,24 @@ def fetch_feed_page(session, cfg, page) -> str:
         log(f"  HTTP {r.status_code} for {url} page {page}")
         return ""
     return r.text
+
+
+def _parse_ts(s) -> datetime | None:
+    """Parse a stored discovered_at ISO string to a naive UTC datetime.
+    discovered_at is written with datetime.now() which is UTC on CI runners, so
+    values compare correctly against datetime.utcnow(). Bad/empty -> None."""
+    try:
+        return datetime.fromisoformat(str(s)[:19])
+    except (ValueError, TypeError):
+        return None
+
+
+def is_recent_same_doc(doc_id: str, recent_map: dict, now_utc: datetime,
+                       hours: int = RECENT_DEDUP_HOURS) -> bool:
+    """True if this exact doc_id was already discovered < `hours` ago.
+    Guards against the same PDF being re-queued under a shifted date label."""
+    prev = recent_map.get(str(doc_id))
+    return prev is not None and (now_utc - prev) < timedelta(hours=hours)
 
 
 def label_to_date(label: str, run_date: date) -> date:
@@ -401,6 +429,17 @@ def main() -> None:
         )
     else:
         known_keys = set()
+
+    # Same-document re-list guard: map each doc_id -> its most recent
+    # discovered_at, so a PDF re-listed under a shifted date within
+    # RECENT_DEDUP_HOURS is skipped even though its (doc_id, date) key is "new".
+    recent_map: dict[str, datetime] = {}
+    if not queue.empty:
+        for _did, _ts in zip(queue["doc_id"].astype(str), queue["discovered_at"]):
+            _p = _parse_ts(_ts)
+            if _p is not None and (_did not in recent_map or _p > recent_map[_did]):
+                recent_map[_did] = _p
+    now_utc = datetime.utcnow()
     sym2isin = load_symbol_isin_map(drive, index_id)
     # T12: extract_results/rating/presentation/annual_report process PORTFOLIO
     # companies only; extract_concall processes ALL companies. So we ingest those
@@ -415,7 +454,8 @@ def main() -> None:
     session = screener_session()
     new_rows = []
     counts = {"seen": 0, "new": 0, "downloaded": 0, "skipped_old": 0,
-              "dup": 0, "download_fail": 0, "ingest_error": 0, "skipped_nonpf": 0}
+              "dup": 0, "dup_recent": 0, "download_fail": 0, "ingest_error": 0,
+              "skipped_nonpf": 0}
 
     for feed_name, cfg in feeds.items():
         src = cfg.get("path") or f"filter {cfg.get('filter_id')}"
@@ -441,6 +481,13 @@ def main() -> None:
                 dedup_key = f"{a['doc_id']}__{str(a['announcement_date'])[:10]}"
                 if dedup_key in known_keys:
                     counts["dup"] += 1
+                    continue
+
+                # Same-document re-list guard (see RECENT_DEDUP_HOURS): the same
+                # PDF re-listed under a shifted date within the window is skipped
+                # so it is not re-downloaded / re-summarised as a "new" document.
+                if is_recent_same_doc(a["doc_id"], recent_map, now_utc):
+                    counts["dup_recent"] += 1
                     continue
 
                 isin = sym2isin.get(a["symbol"], "")
@@ -485,6 +532,7 @@ def main() -> None:
                     continue
 
                 known_keys.add(dedup_key)
+                recent_map[str(a["doc_id"])] = now_utc   # guard future re-lists
                 new_rows.append({
                     "doc_id": a["doc_id"], "key": key, "isin": isin,
                     "symbol": a["symbol"], "company_name": a["company_name"],
@@ -509,6 +557,7 @@ def main() -> None:
     print("-" * 56)
     print(f"Announcements seen     : {counts['seen']}")
     print(f"Already in queue (dup) : {counts['dup']}")
+    print(f"Same doc <{RECENT_DEDUP_HOURS}h (re-list): {counts['dup_recent']}  (skipped — date-shift guard)")
     print(f"Outside lookback window: {counts['skipped_old']}")
     print(f"Non-PF (non-concall)   : {counts['skipped_nonpf']}  (skipped — extractor is PF-only)")
     print(f"New documents queued   : {counts['new']}")
