@@ -75,10 +75,25 @@ MOVER_COLS = ["symbol", "isin", "name", "weight_pct",
               "return_6m_pct", "return_12m_pct",
               "leader_windows", "laggard_windows", "tag"]
 
+HOLD_COLS  = ["symbol", "isin", "name", "weight_pct", "first_seen", "days_held",
+              "buy_date_known", "basis", "anchor_ret_pct", "ret_since_held_pct",
+              "return_1m_pct", "return_2m_pct", "return_3m_pct", "return_6m_pct",
+              "return_12m_pct", "vs_median_pp", "flat_days", "neg_windows",
+              "below_med_windows", "stagnant", "rank"]
+
 # ADD/TRIM band: a weight change counts as a real trade only if it exceeds the
 # drift-implied weight by BOTH an absolute (pp) and a relative margin.
 ADD_TRIM_ABS_PP  = 0.5
 ADD_TRIM_REL     = 0.20
+
+# Calendar length of each return window — used to GATE windows longer than a
+# stock has actually been held (a 6M number is meaningless a week after you buy).
+WINDOW_DAYS = {1: 30, 2: 61, 3: 91, 6: 182, 12: 365}
+MIN_ANNUALISE_DAYS = 91          # don't annualise anything shorter than a quarter
+STAGNANT_BAND = 0.05             # ±5% band for the "days not moving" streak
+STAG_3M_PP, STAG_6M_PP = 10.0, 15.0   # stagnant = |3M| <= 10% AND |6M| <= 15%
+REVIEW_MIN_DAYS    = 10   # a decision must be this old before REVIEW-NOW judges it
+REVIEW_MIN_MOVE_PP = 3.0  # ...and have moved this much; kills ~0% quartile noise
 
 
 # ── Drive navigation ─────────────────────────────────────────────────────────
@@ -214,6 +229,68 @@ def fwd_return(ser: pd.Series | None, start, end) -> float | None:
     return float((p1 / p0 - 1.0) * 100.0)
 
 
+# ── Return maths: CAGR, XIRR, flat-streak ────────────────────────────────────
+
+def cagr_pct(total_ret_pct, days) -> float | None:
+    """Constant annual rate that turns start into end over `days`.
+        CAGR = (End/Start)^(365/days) - 1
+    Only meaningful for periods >= ~a quarter; annualising a week of noise is
+    misleading, so short windows return None by design."""
+    if total_ret_pct is None or not days or days < MIN_ANNUALISE_DAYS:
+        return None
+    try:
+        return float(((1.0 + total_ret_pct / 100.0) ** (365.0 / days) - 1.0) * 100.0)
+    except Exception:
+        return None
+
+
+def xirr_pct(flows) -> float | None:
+    """Money-weighted annual rate: the r solving  Σ CFi / (1+r)^(daysi/365) = 0.
+    No closed form — solved by bisection. flows = [(date, amount)], negatives are
+    money in. NOTE: with a weightage-only export the only visible flows are
+    (-100 at inception, +level today), so this necessarily equals since-inception
+    CAGR; it diverges only once real dated contributions exist."""
+    flows = [(pd.Timestamp(d), float(a)) for d, a in flows if a is not None]
+    if len(flows) < 2 or not (any(a < 0 for _, a in flows) and any(a > 0 for _, a in flows)):
+        return None
+    t0 = min(d for d, _ in flows)
+
+    def npv(r):
+        return sum(a / ((1.0 + r) ** ((d - t0).days / 365.0)) for d, a in flows)
+
+    lo, hi = -0.9999, 10.0
+    f_lo, f_hi = npv(lo), npv(hi)
+    if f_lo * f_hi > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        f_mid = npv(mid)
+        if abs(f_mid) < 1e-10:
+            return float(mid * 100.0)
+        if f_lo * f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return float((lo + hi) / 2.0 * 100.0)
+
+
+def flat_days(ser: pd.Series | None, band: float = STAGNANT_BAND) -> int | None:
+    """Consecutive trading days, counting back from the latest bar, that the close
+    stayed inside ±band of today's close — i.e. 'how long has this gone nowhere'."""
+    if ser is None or len(ser) < 2:
+        return None
+    last = float(ser.iloc[-1])
+    if last == 0:
+        return None
+    n = 0
+    for v in ser.iloc[::-1]:
+        if abs(float(v) / last - 1.0) <= band:
+            n += 1
+        else:
+            break
+    return n
+
+
 # ── Snapshot + decision ledgers ──────────────────────────────────────────────
 
 def append_snapshot(drive, out_id, snaps: pd.DataFrame, pf: pd.DataFrame,
@@ -329,7 +406,9 @@ def compute_index(snaps: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
     # Trailing view: extend back up to 12M before the first snapshot using the
     # earliest snapshot's weights (active_weights() falls back to it), so the index
     # is useful from day 1 and becomes fully real as snapshots accrue.
-    start = min(pd.Timestamp(snaps["snapshot_date"].min()), end - relativedelta(months=12))
+    # 13 months, not 12, so the trailing 12M window is fully covered (a 12M base
+    # that predates the series by even a day would blank the 12M column).
+    start = min(pd.Timestamp(snaps["snapshot_date"].min()), end - relativedelta(months=13))
     close = pd.DataFrame(series).sort_index()
     close = close.loc[(close.index >= start) & (close.index <= end)]
     if len(close) < 2:
@@ -374,19 +453,44 @@ def compute_index(snaps: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
     return idx, contrib
 
 
+PERIOD_OFFSETS = {"1D": relativedelta(days=1), "1W": relativedelta(weeks=1),
+                  "1M": relativedelta(months=1), "2M": relativedelta(months=2),
+                  "3M": relativedelta(months=3), "6M": relativedelta(months=6),
+                  "12M": relativedelta(months=12)}
+
+
 def index_period_returns(idx: pd.DataFrame) -> dict:
-    """1D/1W/1M/3M/6M/12M PF return read off the index level series."""
+    """Total return per horizon off the index level series, plus the annualised
+    (CAGR) view and since-inception XIRR. Returns {'ret':{}, 'cagr':{}, ...}."""
     if idx.empty:
         return {}
     s = idx.set_index(pd.to_datetime(idx["date"]))["pf_index"].sort_index()
-    last = s.iloc[-1]; end = s.index[-1]
-    out = {"level": float(last)}
-    for lbl, off in {"1D": relativedelta(days=1), "1W": relativedelta(weeks=1),
-                     "1M": relativedelta(months=1), "3M": relativedelta(months=3),
-                     "6M": relativedelta(months=6), "12M": relativedelta(months=12)}.items():
-        base = s.asof(end - off)
-        out[lbl] = float((last / base - 1) * 100) if pd.notna(base) and base else None
-    return out
+    last = float(s.iloc[-1]); end = s.index[-1]
+    start_ts, start_lvl = s.index[0], float(s.iloc[0])
+
+    ret, cagr, days = {}, {}, {}
+    for lbl, off in PERIOD_OFFSETS.items():
+        base_ts = end - off
+        base = s.asof(base_ts)
+        if pd.notna(base) and base:
+            ret[lbl] = float((last / base - 1) * 100)
+            days[lbl] = (end - max(base_ts, start_ts)).days
+            cagr[lbl] = cagr_pct(ret[lbl], days[lbl])
+        else:
+            ret[lbl] = cagr[lbl] = days[lbl] = None
+
+    si_days = (end - start_ts).days
+    ret["SI"] = float((last / start_lvl - 1) * 100) if start_lvl else None
+    days["SI"] = si_days
+    cagr["SI"] = cagr_pct(ret["SI"], si_days)
+    return {
+        "level": last, "start_level": start_lvl,
+        "start_date": start_ts.strftime("%Y-%m-%d"), "end_date": end.strftime("%Y-%m-%d"),
+        "si_days": si_days, "ret": ret, "cagr": cagr, "days": days,
+        # Only visible cashflows in a weightage-only book: money in at inception,
+        # value out today. (Equals SI CAGR until real dated contributions exist.)
+        "xirr": xirr_pct([(start_ts, -start_lvl), (end, last)]),
+    }
 
 
 # ── Movers (as-of-today trailing, from features) ─────────────────────────────
@@ -415,6 +519,75 @@ def compute_movers(drive, root_id, pf: pd.DataFrame) -> pd.DataFrame:
     m["tag"] = np.where(lead >= 3, "consistent leader",
                         np.where(lag >= 3, "consistent laggard", ""))
     return m[MOVER_COLS]
+
+
+def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
+                          asof: date) -> pd.DataFrame:
+    """Per-holding comparison table, anchored on when you first held the stock.
+
+    first_seen = earliest snapshot the ISIN appears in. For holdings that were
+    already in the book when tracking began, that date is a LOWER BOUND, not a
+    purchase date — those are marked buy_date_known=False ('pre-tracking') and
+    judged on trailing windows, since their real cost date is unknowable here.
+    For anything bought after tracking began, windows LONGER than the holding
+    period are blanked — a 6M return means nothing a week after you buy."""
+    if pf.empty:
+        return pd.DataFrame(columns=HOLD_COLS)
+    ret_cols = list(FEAT_RET_COLS.values())
+    v = pf[["symbol", "isin", "name", "weight_pct"]].merge(
+        movers[["isin"] + ret_cols], on="isin", how="left")
+
+    tracking_start = snaps["snapshot_date"].min() if not snaps.empty else str(asof)
+    first_map = (snaps.groupby("isin")["snapshot_date"].min().to_dict()
+                 if not snaps.empty else {})
+
+    rows = []
+    for r in v.itertuples():
+        first_seen = first_map.get(r.isin, str(asof))
+        known = str(first_seen) > str(tracking_start)      # bought after tracking began
+        days_held = (pd.Timestamp(asof) - pd.Timestamp(first_seen)).days
+        ser = load_close_series(drive, ohlcv_id, r.symbol, price_cache)
+        since = fwd_return(ser, pd.Timestamp(first_seen), pd.Timestamp(asof))
+
+        wins = {}
+        for m_, col in FEAT_RET_COLS.items():
+            val = getattr(r, col, np.nan)
+            # Gate windows the stock hasn't actually been held through.
+            if known and days_held < WINDOW_DAYS[m_]:
+                val = np.nan
+            wins[col] = float(val) if pd.notna(val) else np.nan
+
+        if known:
+            basis, anchor = f"since buy ({days_held}d)", since
+        else:
+            anchor = next((wins[FEAT_RET_COLS[m_]] for m_ in (12, 6, 3, 2, 1)
+                           if pd.notna(wins[FEAT_RET_COLS[m_]])), np.nan)
+            basis = "12M trailing (pre-tracking)"
+
+        r3, r6 = wins["return_3m_pct"], wins["return_6m_pct"]
+        stagnant = bool(pd.notna(r3) and pd.notna(r6)
+                        and abs(r3) <= STAG_3M_PP and abs(r6) <= STAG_6M_PP)
+        rows.append(dict(
+            symbol=r.symbol, isin=r.isin, name=r.name, weight_pct=r.weight_pct,
+            first_seen=str(first_seen), days_held=days_held, buy_date_known=known,
+            basis=basis, anchor_ret_pct=anchor, ret_since_held_pct=since,
+            flat_days=flat_days(ser), stagnant=stagnant, **wins))
+
+    h = pd.DataFrame(rows)
+    # Count fails per stock against the BOOK MEDIAN of each window (own-book yardstick).
+    neg = pd.Series(0, index=h.index); below = pd.Series(0, index=h.index)
+    for col in ret_cols:
+        c = h[col]
+        neg += (c <= 0).fillna(False).astype(int)
+        if c.notna().sum() >= 4:
+            below += (c < c.median()).fillna(False).astype(int)
+    h["neg_windows"], h["below_med_windows"] = neg, below
+
+    med_anchor = h["anchor_ret_pct"].median()
+    h["vs_median_pp"] = h["anchor_ret_pct"] - med_anchor
+    h = h.sort_values("anchor_ret_pct", ascending=False, na_position="last").reset_index(drop=True)
+    h["rank"] = np.arange(1, len(h) + 1)
+    return h[HOLD_COLS]
 
 
 # ── Decision scorecard (vs own-book median/quartiles) ────────────────────────
@@ -519,7 +692,8 @@ def _pct(v, signed=True):
     return f"<span style='color:{col}'>{v:+.1f}%</span>" if signed else f"{v:.1f}%"
 
 
-def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs):
+def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,
+               hold=None):
     H = []
     H.append(f"<h2 style='margin:0'>PF Decision Tracker — {asof}</h2>")
     H.append(f"<p style='color:#666;margin:2px 0 14px'>{len(pf)} holdings · "
@@ -527,36 +701,155 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
              f"detailed tables in the attached Excel</p>")
 
     # REVIEW NOW — recent buys sinking / recent sells that ran up (short horizon).
-    warn = []
+    warn, seen = [], set()
     if not score.empty:
+        elapsed = (pd.Timestamp(asof) - pd.to_datetime(score["event_date"])).dt.days
         recent = pd.to_datetime(score["event_date"]) >= (pd.Timestamp(asof) - relativedelta(months=3))
-        sub = score[recent & score["horizon_m"].isin([1, 2])]
-        for r in sub.itertuples():
+        # A decision needs to have BREATHED before we judge it: at least
+        # REVIEW_MIN_DAYS elapsed and a move big enough to mean something.
+        # Without this, a trim made yesterday lands in a quartile on a ~0% move.
+        sub = score[recent & score["horizon_m"].isin([1, 2])
+                    & (elapsed >= REVIEW_MIN_DAYS)
+                    & (score["fwd_ret_pct"].abs() >= REVIEW_MIN_MOVE_PP)]
+        for r in sub.sort_values("horizon_m").itertuples():
+            key = (r.symbol, r.action)
+            if key in seen:
+                continue                      # one line per decision, not per horizon
             if r.action in ("BUY", "ADD") and r.quartile == 4:
+                seen.add(key)
                 warn.append(f"⚠️ <b>{esc(r.symbol)}</b> buy is bottom-quartile at {r.horizon_m}M "
                             f"({_pct(r.fwd_ret_pct)} vs book {_pct(r.book_median_pct)})")
             if r.action in ("SELL", "TRIM") and r.quartile == 1:
-                warn.append(f"↗️ <b>{esc(r.symbol)}</b> sold but ran up at {r.horizon_m}M "
-                            f"({_pct(r.fwd_ret_pct)}) — reconsider")
+                seen.add(key)
+                warn.append(f"↗️ <b>{esc(r.symbol)}</b> {'sold' if r.action == 'SELL' else 'trimmed'} "
+                            f"but ran up at {r.horizon_m}M ({_pct(r.fwd_ret_pct)}) — reconsider")
     if warn:
         H.append("<div style='background:#fff7e6;border:1px solid #ffd591;border-radius:6px;"
                  "padding:10px 12px;margin:8px 0'><b>REVIEW NOW</b><ul style='margin:6px 0'>"
                  + "".join(f"<li>{w}</li>" for w in dict.fromkeys(warn)) + "</ul></div>")
 
-    # 1) PF index
+    # 1) PF index — level, horizon ladder, CAGR, XIRR
     if periods:
-        cells = "".join(f"<td style='padding:4px 10px'>{k}<br><b>{_pct(periods.get(k))}</b></td>"
-                        for k in ["1D", "1W", "1M", "3M", "6M", "12M"])
-        H.append(f"<h3>1 · How the PF is moving</h3>"
-                 f"<p>Index level <b>{periods.get('level', 100):.1f}</b> (base 100)</p>"
-                 f"<table style='border-collapse:collapse'><tr>{cells}</tr></table>"
-                 f"<p style='color:#888;font-size:12px'>Weighted-return index. Before tracking "
-                 f"began it assumes your current weights (a constant-weight trailing view); it "
-                 f"becomes fully real as daily snapshots accrue.</p>")
+        ret, cg = periods["ret"], periods["cagr"]
+        order = ["1D", "1W", "1M", "2M", "3M", "6M", "12M", "SI"]
+        head = "".join(f"<th style='padding:3px 10px;text-align:center'>{k}</th>" for k in order)
+        rrow = "".join(f"<td align='center' style='padding:3px 10px'>{_pct(ret.get(k))}</td>"
+                       for k in order)
+        crow = "".join(f"<td align='center' style='padding:3px 10px;color:#555'>"
+                       f"{_pct(cg.get(k)) if cg.get(k) is not None else '<span style=color:#bbb>—</span>'}"
+                       f"</td>" for k in order)
+        H.append(
+            f"<h3>1 · How the PF is doing</h3>"
+            f"<p style='margin:4px 0'>Started at <b>100.0</b> on <b>{periods['start_date']}</b> "
+            f"→ <b>{periods['level']:.1f}</b> today "
+            f"(<b>{_pct(ret.get('SI'))}</b> over {periods['si_days']} days)</p>"
+            f"<table style='border-collapse:collapse;font-size:13px'>"
+            f"<tr><th align='left' style='padding:3px 8px'></th>{head}</tr>"
+            f"<tr><td align='left' style='padding:3px 8px'><b>Return</b></td>{rrow}</tr>"
+            f"<tr><td align='left' style='padding:3px 8px'>CAGR (annualised)</td>{crow}</tr>"
+            f"</table>"
+            f"<p style='margin:6px 0'><b>XIRR (since inception): {_pct(periods.get('xirr'))}</b></p>")
+        H.append(
+            "<div style='background:#f6f8fa;border-left:3px solid #ccc;padding:8px 12px;"
+            "margin:8px 0;font-size:12px;color:#555'>"
+            "<b>How these are calculated</b><br>"
+            "• <b>Return</b> — plain change in the weighted index over the window "
+            "(each stock moves the index in proportion to its <i>Portfolio Weight</i>).<br>"
+            "• <b>CAGR</b> = (End ÷ Start)<sup>365/days</sup> − 1 — the steady yearly rate that "
+            "produces the same result. Blank for windows under a quarter: annualising a few "
+            "weeks of noise produces silly numbers.<br>"
+            "• <b>XIRR</b> — the annual rate r solving Σ CF ÷ (1+r)<sup>days/365</sup> = 0 over "
+            "dated cashflows. Your export carries weights only (no rupee amounts), so the only "
+            "visible flows are 100 in at inception and today's value out — which makes XIRR "
+            "equal to since-inception CAGR until an export with actual amounts exists.</div>")
         if contrib:
             up = contrib[0]; dn = contrib[-1]
             H.append(f"<p style='color:#666'>Today's biggest lift: <b>{esc(up[0])}</b> "
                      f"({_pct(up[1])} of PF) · biggest drag: <b>{esc(dn[0])}</b> ({_pct(dn[1])})</p>")
+        H.append("<p style='color:#888;font-size:12px'>Weighted-return index. Before tracking "
+                 "began it assumes your current weights (a constant-weight trailing view); it "
+                 "becomes fully real as daily snapshots accrue.</p>")
+
+    # 2) Every holding, ranked — the compare-them-all table
+    if hold is not None and not hold.empty:
+        H.append("<h3>2 · Every holding, ranked</h3>")
+        n_known = int(hold["buy_date_known"].sum())
+        H.append(f"<p style='color:#888;font-size:12px'>Ranked by return on its "
+                 f"<b>basis</b> — since you bought it where that date is known "
+                 f"({n_known} of {len(hold)}), else 12M trailing for holdings that pre-date "
+                 f"tracking (their true buy date isn't in the data). "
+                 f"“Flat days” = trading days the price has stayed within ±5% of today's close. "
+                 f"Compare within the same basis.</p>")
+        H.append("<table style='border-collapse:collapse;font-size:12px'>"
+                 "<tr><th style='padding:2px 6px'>#</th><th align='left'>Symbol</th>"
+                 "<th style='padding:2px 6px'>Wt%</th><th style='padding:2px 6px'>Basis</th>"
+                 "<th style='padding:2px 6px'>Return</th><th style='padding:2px 6px'>vs median</th>"
+                 "<th style='padding:2px 6px'>1M</th><th style='padding:2px 6px'>3M</th>"
+                 "<th style='padding:2px 6px'>12M</th><th style='padding:2px 6px'>Flat days</th>"
+                 "<th align='left' style='padding:2px 6px'>Flags</th></tr>")
+        for r in hold.itertuples():
+            flags = []
+            if r.stagnant:
+                flags.append("<span style='color:#a60'>stagnant</span>")
+            if r.neg_windows >= 5:
+                flags.append("<span style='color:#c0392b'>negative in ALL</span>")
+            elif r.neg_windows >= 3:
+                flags.append(f"<span style='color:#c0392b'>negative in {r.neg_windows}</span>")
+            if r.below_med_windows >= 5:
+                flags.append("below median in ALL")
+            fd = "—" if r.flat_days is None or pd.isna(r.flat_days) else f"{int(r.flat_days)}"
+            H.append(
+                f"<tr><td align='center' style='padding:2px 6px'>{r.rank}</td>"
+                f"<td>{esc(r.symbol)}</td>"
+                f"<td align='right' style='padding:2px 6px'>"
+                f"{'' if pd.isna(r.weight_pct) else format(r.weight_pct, '.1f')}</td>"
+                f"<td style='padding:2px 6px;color:#777'>{esc(r.basis, 40)}</td>"
+                f"<td align='right' style='padding:2px 6px'><b>{_pct(r.anchor_ret_pct)}</b></td>"
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.vs_median_pp)}</td>"
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.return_1m_pct)}</td>"
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.return_3m_pct)}</td>"
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.return_12m_pct)}</td>"
+                f"<td align='right' style='padding:2px 6px'>{fd}</td>"
+                f"<td style='padding:2px 6px'>{' · '.join(flags)}</td></tr>")
+        H.append("</table>")
+
+    # 3) Problem stocks — compact matrix (fails in >=3 of 5 windows, or stagnant)
+    if hold is not None and not hold.empty:
+        bad = hold[(hold["neg_windows"] >= 3) | (hold["below_med_windows"] >= 3)
+                   | (hold["stagnant"])].copy()
+        H.append("<h3>3 · Problem stocks</h3>")
+        if bad.empty:
+            H.append("<p style='color:#888'>Nothing failing in 3+ windows and nothing stagnant.</p>")
+        else:
+            bad = bad.sort_values(["neg_windows", "below_med_windows"], ascending=False)
+            rc = list(FEAT_RET_COLS.values())
+            H.append(f"<p style='color:#888;font-size:12px'>{len(bad)} holding(s) that are "
+                     f"negative or below your book's median in at least 3 of the 5 windows, "
+                     f"or flat (|3M| ≤ {STAG_3M_PP:.0f}% and |6M| ≤ {STAG_6M_PP:.0f}%).</p>")
+            H.append("<table style='border-collapse:collapse;font-size:12px'>"
+                     "<tr><th align='left'>Symbol</th>"
+                     + "".join(f"<th style='padding:2px 8px'>{c.replace('return_','').replace('_pct','').upper()}</th>"
+                               for c in rc)
+                     + "<th style='padding:2px 8px'>Neg</th><th style='padding:2px 8px'>&lt;Med</th>"
+                       "<th style='padding:2px 8px'>Flat days</th><th align='left'>Verdict</th></tr>")
+            for r in bad.itertuples():
+                tds = "".join(f"<td align='right' style='padding:2px 8px'>"
+                              f"{_pct(getattr(r, c))}</td>" for c in rc)
+                if r.neg_windows >= 5:
+                    verdict = "losing money in every window"
+                elif r.stagnant and r.neg_windows < 3:
+                    verdict = "dead money — going nowhere"
+                elif r.below_med_windows >= 5:
+                    verdict = "consistently behind your book"
+                else:
+                    verdict = "weak in most windows"
+                fd = "—" if r.flat_days is None or pd.isna(r.flat_days) else f"{int(r.flat_days)}"
+                H.append(f"<tr><td>{esc(r.symbol)}</td>{tds}"
+                         f"<td align='center' style='padding:2px 8px'>{r.neg_windows}/5</td>"
+                         f"<td align='center' style='padding:2px 8px'>{r.below_med_windows}/5</td>"
+                         f"<td align='center' style='padding:2px 8px'>{fd}</td>"
+                         f"<td style='padding:2px 8px;color:#a60'>{verdict}</td></tr>")
+            H.append("</table>")
 
     # 2) Movers
     def mover_table(df, cols, title):
@@ -578,13 +871,13 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
         # feature row must not masquerade as the 'bottom' movers).
         ranked = movers.dropna(subset=["return_3m_pct"]).sort_values(
             "return_3m_pct", ascending=False)
-        H.append("<h3>2 · Movers (trailing, as of today)</h3>")
+        H.append("<h3>4 · Movers (trailing, as of today)</h3>")
         H.append(mover_table(ranked.head(5), rc, "Top 5 by 3M"))
         H.append(mover_table(ranked.tail(5).iloc[::-1], rc, "Bottom 5 by 3M"))
 
     # 3) Decision correctness (matured hit-rates)
     if not score.empty:
-        H.append("<h3>3 · Are my decisions correct? (vs own-book median)</h3>")
+        H.append("<h3>5 · Are my decisions correct? (vs own-book median)</h3>")
         body = []
         for act, label in [("BUY", "Buys correct"), ("SELL", "Sells correct"),
                            ("ADD", "Adds correct"), ("TRIM", "Trims correct")]:
@@ -612,7 +905,7 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
 
     # 4) Sold-stock relook
     if not relook.empty:
-        H.append("<h3>4 · Relook: stocks you sold</h3>"
+        H.append("<h3>6 · Relook: stocks you sold</h3>"
                  "<table style='border-collapse:collapse;font-size:13px'>"
                  "<tr><th align='left'>Sold</th><th>On</th><th>Since sell</th>"
                  "<th>Latest YoY</th><th>Verdict</th></tr>")
@@ -628,12 +921,17 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
     return "".join(H)
 
 
-def build_excel_bytes(pf, idx, movers, score, relook, decs) -> bytes:
+def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None) -> bytes:
     """Detailed tables as a multi-sheet .xlsx (the email is the summary; this is the
     drill-down). One sheet per view; header frozen + light auto-width."""
     holdings = pf[["isin", "symbol", "name", "weight_pct"]].copy()
+    hold = hold if hold is not None else pd.DataFrame(columns=HOLD_COLS)
+    problems = (hold[(hold["neg_windows"] >= 3) | (hold["below_med_windows"] >= 3)
+                     | (hold["stagnant"])] if not hold.empty else hold)
     sheets = {
         "Holdings Today":     holdings,
+        "Ranked Holdings":    hold,
+        "Problem Stocks":     problems,
         "Movers":             movers,
         "Decision Scorecard": score,
         "Sold Relook":        relook,
@@ -706,6 +1004,7 @@ def main() -> None:
     idx, contrib = compute_index(snaps, price_cache, drive, ohlcv_id, asof)
     periods = index_period_returns(idx)
     movers = compute_movers(drive, root_id, pf)
+    hold = compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id, asof)
     score = score_decisions(decs, snaps, price_cache, drive, ohlcv_id, asof)
     results = _read_drive_parquet(drive, index_id, "results.parquet")
     relook = sold_relook(decs, price_cache, drive, ohlcv_id, results, asof)
@@ -715,12 +1014,19 @@ def main() -> None:
         save_parquet(drive, out_id, "pf_index.parquet", idx)
         save_parquet(drive, out_id, "pf_decision_scorecard.parquet", score)
         save_parquet(drive, out_id, "pf_movers.parquet", movers)
-        log("  Wrote pf_index / pf_decision_scorecard / pf_movers.")
+        save_parquet(drive, out_id, "pf_holdings_view.parquet", hold)
+        log("  Wrote pf_index / pf_decision_scorecard / pf_movers / pf_holdings_view.")
 
     # 6. Digest (HTML findings) + Excel workbook (detailed tables).
-    html = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs)
-    subject = f"PF Decision Tracker — {asof} ({len(pf)} holdings)"
-    xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs)
+    html = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook,
+                      decs, hold)
+    si = (periods.get("ret") or {}).get("SI") if periods else None
+    if periods and si is not None:
+        subject = (f"PF Tracker — {asof} · index {periods['level']:.1f} "
+                   f"({si:+.1f}% since {periods['start_date']}) · {len(pf)} holdings")
+    else:
+        subject = f"PF Tracker — {asof} ({len(pf)} holdings)"
+    xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold)
     xlsx_name = f"pf_tracker_{asof}.xlsx"
     XLSX_MIME = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
