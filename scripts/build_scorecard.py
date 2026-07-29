@@ -201,7 +201,12 @@ def score_guidance(gf4_rows) -> float | None:
     if gf4_rows is None or gf4_rows.empty or "flag_type" not in gf4_rows.columns:
         return None
     net = 0
-    for flag in gf4_rows["flag_type"].astype(str).str.lower():
+    for flag in gf4_rows["flag_type"].tolist():
+        # coerce per element: .astype(str).str.lower() can still yield a non-string
+        # (NaN/NA survives .str accessors on some dtypes), and `p in <float>` raised
+        # TypeError — which killed this step and SKIPPED everything after it,
+        # including the combined-strength and catalyst mails (2026-07-29).
+        flag = str(flag).lower()
         if any(p in flag for p in _GF4_POSITIVE):
             net += 1
         elif any(ng in flag for ng in _GF4_NEGATIVE):

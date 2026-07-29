@@ -79,6 +79,15 @@ jobs:
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          # ALSO write the token to tk.json. _extractor_base.get_drive() is happy
+          # with CLIENT_SECRET_PATH pointing at a token (it detects refresh_token
+          # and uses it directly) — do NOT repoint it, that would break every t4
+          # script. But ingest_fundamentals runs its own auth: it checks
+          # GDRIVE_OAUTH_TOKEN_PATH first and only falls back to the client-secret
+          # OAuth flow, which rejected the token file with "Client secrets must be
+          # for a web or installed app" and killed the step in 0.6s behind
+          # continue-on-error. Writing tk.json lets it find a valid token.
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/tk.json
           {
             echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
             echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
