@@ -62,7 +62,8 @@ BAND = 2.0   # ±2 (% for abs, pp for growth/margin) — matches GF_TRACK
 
 GUIDANCE_COLS = ["isin", "symbol", "company_name", "quarter", "metric",
                  "guidance_type", "horizon_fy", "value", "unit", "cagr_pct",
-                 "notes", "processed_at", "source_doc_id"]
+                 "notes", "processed_at", "source_doc_id",
+                 "value_type", "value_num", "value_unit"]   # typed parse (2026-07-18)
 PPT_G_COLS = ["isin", "symbol", "company_name", "quarter", "metric",
               "guidance_type", "horizon", "value", "unit", "notes",
               "processed_at", "source_doc_id"]
@@ -173,9 +174,24 @@ def compute_flags(g_df: pd.DataFrame, fin_df: pd.DataFrame, now: str) -> list[di
         gval = _to_float(g.get("value"))
         if not period or gval is None:
             continue
+        # How to compare guided vs actual. Prefer the TYPED parse
+        # (guidance_value.py, 2026-07-18): value_type says exactly what the number
+        # is, so we no longer infer it from a `unit` string. Rows written before
+        # the typed parse have no value_type — those keep the old inference
+        # ("%"-unit on a level metric = a growth guidance) so historical behaviour
+        # is unchanged until sanitize_guidance_tracker.py backfills them.
+        vtype = str(g.get("value_type") or "").strip()
         unit = str(g.get("unit") or "").strip()
-        # A %-unit guidance on a level metric = a GROWTH guidance.
-        if kind == "level" and "%" in unit:
+        if vtype:
+            if vtype == "growth_pct":
+                kind = "growth"
+            elif vtype in ("margin_pct", "level_pct", "utilisation_pct", "capacity_pct"):
+                kind = "margin"          # a LEVEL in %, compared in pp
+            elif vtype == "absolute_inr":
+                kind = "level"           # Rs cr, compared as a level
+            else:
+                continue                 # units / multiples / prose — not comparable
+        elif kind == "level" and "%" in unit:
             kind = "growth"
         sub = ann[(ann["isin"].astype(str) == isin)
                   & (ann["line_item"] == li)

@@ -29,6 +29,7 @@ WHAT IT DOES
     utilisation_pct   explicit utilisation/run-rate wording-> level, unit "%"
     capacity_pct      any capacity % (addition OR utilisation — the tables do not
                       distinguish them, so it never feeds growth)   unit "%"
+    level_pct         a % in an FY-headed column = a LEVEL target for that FY
     absolute_inr      "INR530 crores", "26,000 million"    -> Rs cr, unit "INR_cr"
     absolute_units    "115,000 MTPA", "60k sites"          -> qty,   unit as written
     multiple          "double", "3x (Tripling)"            -> 2.0/3.0, unit "x"
@@ -234,9 +235,10 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "") -> dict:
             return _result("capacity_pct", pct, "%", None, text,
                            "capacity % — addition or utilisation, not disambiguated")
         if not from_growth_col:
-            # FY-headed column: a % here is a level target (e.g. FY27 margin)
-            return _result("margin_pct" if metric in LEVEL_METRICS else "utilisation_pct",
-                           pct, "%", None, text, "FY-column level")
+            # FY-headed columns hold LEVEL targets for that fiscal year ("FY27:
+            # EBITDA 23.5%"), not growth rates. Neutral tag — calling a revenue %
+            # here "utilisation" would be nonsense.
+            return _result("level_pct", pct, "%", None, text, "FY-column level")
         return _result("growth_pct", pct, "%", pct, text, "")
 
     # 5) bare number — no unit at all: meaning comes from the column
@@ -286,6 +288,8 @@ def describe(parsed: dict) -> str:
         return f"{n:.1f}% level"
     if t == "capacity_pct":
         return f"{n:.1f}% capacity"
+    if t == "level_pct":
+        return f"{n:.1f}% (FY target)"
     if t == "absolute_inr":
         return f"Rs {n:,.0f}cr target"
     if t == "absolute_units":
