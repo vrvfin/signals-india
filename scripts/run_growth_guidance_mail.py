@@ -150,7 +150,10 @@ def find_high_growth_table_a(gt: pd.DataFrame, queue: pd.DataFrame,
     g = g[pct_like]
     if g.empty:
         return []
-    g["_pct"] = [_to_pct(v, c) for v, c in zip(g["value"], g["cagr_pct"])]
+    # pass metric + horizon so the typed parser can tell a margin/capacity LEVEL
+    # from a growth rate (2026-07-18); cagr_pct alone is already growth-only.
+    g["_pct"] = [_to_pct(v, c, m, h) for v, c, m, h in
+                 zip(g["value"], g["cagr_pct"], g["metric"], g["horizon_fy"])]
     g = g.dropna(subset=["_pct"])
     return _flag_companies(g, min_growth, "Table_A", lambda r: {
         "metric": str(r.get("metric", "")),

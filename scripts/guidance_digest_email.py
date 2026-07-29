@@ -37,10 +37,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _extractor_base import (get_drive, get_or_create_subfolder,  # noqa: E402
                              load_parquet, log)
 from mailer import send_email, load_mail_settings  # noqa: E402
+from guidance_value import parse_guidance_value, describe  # noqa: E402
 
 GUIDANCE_COLS = ["isin", "symbol", "company_name", "quarter", "metric",
                  "guidance_type", "horizon_fy", "value", "unit", "cagr_pct",
-                 "notes", "processed_at", "source_doc_id"]
+                 "notes", "processed_at", "source_doc_id",
+                 "value_type", "value_num", "value_unit"]   # typed parse 2026-07-18
 QUEUE_COLS = ["doc_id", "source"]
 
 # Metrics in the email, in column order (margin deliberately excluded).
@@ -54,21 +56,20 @@ HORIZON_LABEL = {"NEXT_QTR": "next qtr", "1Y": "1yr", "2Y": "2yr",
 GREEN, ORANGE, YELLOW = "#c8f0c8", "#ffd9a8", "#fdf6b2"
 
 
-def _to_pct(raw, cagr) -> float | None:
-    """Best-effort numeric % from a guidance cell. Ranges use the midpoint."""
+def _to_pct(raw, cagr, metric: str = "", horizon: str = "") -> float | None:
+    """GROWTH % for a guidance cell, or None when the cell is not a growth rate.
+
+    Was: `cagr if present else float(strip(raw))` — the fallback re-parsed the raw
+    string and so re-introduced exactly what the typed parse removed (capacity
+    "178,000" -> 178000%, a Rs-cr target -> a percentage). Since 2026-07-18
+    `cagr_pct` is populated ONLY for a genuine growth rate, so it is authoritative;
+    when it is absent we ask guidance_value (not a bare float) and accept a number
+    only if it types as growth.
+    """
     if cagr is not None and not pd.isna(cagr):
         return float(cagr)
-    s = str(raw or "").strip()
-    if not s or s.upper() == "NA":
-        return None
-    s = re.sub(r"[,%₹$]", "", s).replace("–", "-")
-    m = re.match(r"^\+?(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)$", s)
-    if m:
-        return (float(m.group(1)) + float(m.group(2))) / 2
-    try:
-        return float(s.lstrip("+"))
-    except ValueError:
-        return None
+    p = parse_guidance_value(raw, metric, horizon)
+    return p["growth_pct"]
 
 
 def _cell_color(pct: float | None) -> str:
@@ -84,34 +85,54 @@ def _cell_color(pct: float | None) -> str:
 
 
 def build_rows(g: pd.DataFrame) -> list[dict]:
-    """One dict per company: best guidance per metric + row-max sort key."""
+    """One dict per company: best guidance per metric + row-max sort key.
+
+    A cell is ranked/coloured ONLY on a genuine growth rate. Non-growth guidance
+    (Rs-cr targets, margin/utilisation levels) is still shown — labelled with what
+    it is — but never drives the row max or the rocket, which is what previously
+    let a misparsed absolute rank first (user 2026-07-18).
+    """
     rows = []
     for (isin, symbol), grp in g.groupby(["isin", "symbol"]):
         cells: dict[str, dict] = {}
         for metric in METRICS:
             mg = grp[grp["metric"] == metric]
             best_pct, best_disp = None, ""
+            alt_disp = ""                      # best non-growth fallback
             for _, r in mg.iterrows():
-                pct = _to_pct(r["value"], r["cagr_pct"])
+                hz = HORIZON_LABEL.get(str(r["horizon_fy"]), str(r["horizon_fy"]))
+                pct = _to_pct(r["value"], r.get("cagr_pct"),
+                              str(r.get("metric") or ""), str(r.get("horizon_fy") or ""))
                 if pct is None:
+                    if not alt_disp:           # keep the target visible, typed
+                        vt = str(r.get("value_type") or "")
+                        if vt and vt not in ("unparsed", "qualitative"):
+                            lbl = describe({"value_type": vt,
+                                            "value_num": r.get("value_num"),
+                                            "value_unit": r.get("value_unit"),
+                                            "raw": r.get("value")})
+                            alt_disp = f"{lbl} ({hz})"
                     continue
                 if best_pct is None or pct > best_pct:
-                    hz = HORIZON_LABEL.get(str(r["horizon_fy"]), str(r["horizon_fy"]))
                     disp = str(r["value"]).strip()
-                    if not disp.endswith("%"):
+                    # add "%" only to a bare number. Appending blindly produced
+                    # "66.8% (Derived)%" and "1.75x industry growth%".
+                    if "%" not in disp and re.fullmatch(r"[-+]?[\d.,\s–-]+", disp):
                         disp += "%"
                     best_pct, best_disp = pct, f"{disp} ({hz})"
             if best_pct is not None:
                 cells[metric] = {"pct": best_pct, "disp": best_disp}
-        if not cells:
-            continue  # no quantified guidance on the 5 metrics — skip company
-        row_max = max(c["pct"] for c in cells.values())
+            elif alt_disp:
+                cells[metric] = {"pct": None, "disp": alt_disp}
+        growth = [c["pct"] for c in cells.values() if c["pct"] is not None]
+        if not growth:
+            continue  # nothing quantified as GROWTH on the 5 metrics — skip company
         rows.append({
             "symbol": symbol,
             "company_name": str(grp["company_name"].iloc[0]),
             "quarter": str(grp["quarter"].iloc[0]),
             "cells": cells,
-            "row_max": row_max,
+            "row_max": max(growth),
         })
     rows.sort(key=lambda r: r["row_max"], reverse=True)
     return rows
@@ -133,7 +154,11 @@ def build_html(rows: list[dict], since: datetime,
         f"<span style='background:{ORANGE}'>&gt;20%</span> · "
         f"<span style='background:{YELLOW}'>&gt;0%</span>. "
         f"🚀 = guides &gt;{HIGH_GROWTH_PCT:.0f}% growth. "
-        f"Sorted by best guidance in the row.</p>",
+        f"Sorted by best guidance in the row.<br>"
+        f"<span style='color:#777'>Coloured cells are GROWTH rates. "
+        f"<i>Grey italic</i> cells are not growth — an absolute target "
+        f"(₹ cr / units) or a level (margin, utilisation) — shown for context but "
+        f"never ranked or 🚀-flagged.</span></p>",
         "<table style='border-collapse:collapse'>",
         "<tr>" + "".join(
             f"<th style='{th}'>{c}</th>"
@@ -147,8 +172,16 @@ def build_html(rows: list[dict], since: datetime,
                f"<td style='{td}'>{r['quarter']}</td>"]
         for m in METRICS:
             c = r["cells"].get(m)
-            bg = f"background:{_cell_color(c['pct'])};" if c else ""
-            tds.append(f"<td style='{td}{bg}'>{c['disp'] if c else ''}</td>")
+            # colour ONLY growth cells; a level/target is shown in muted grey so it
+            # is never mistaken for growth
+            if not c:
+                tds.append(f"<td style='{td}'></td>")
+            elif c["pct"] is None:
+                tds.append(f"<td style='{td}color:#777;font-style:italic'>"
+                           f"{c['disp']}</td>")
+            else:
+                tds.append(f"<td style='{td}background:{_cell_color(c['pct'])};'>"
+                           f"{c['disp']}</td>")
         out.append("<tr>" + "".join(tds) + "</tr>")
     out.append("</table>")
     if gf1_extras:
