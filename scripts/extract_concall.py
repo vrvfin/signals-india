@@ -56,6 +56,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
+from guidance_value import parse_guidance_value   # typed guidance parse (2026-07-18)
 from gemini_pool import (BucketPool, AllBucketsExhausted, FatalCallError,
                          load_keys, load_keys_multi)
 from _extractor_base import (P1_MODELS,   # lite chain — backfill-only fallback
@@ -291,6 +292,14 @@ GUIDANCE_COLS = [
     "isin", "symbol", "company_name", "quarter", "metric",
     "guidance_type", "horizon_fy", "value", "unit", "cagr_pct", "notes",
     "processed_at", "source_doc_id",
+    # Typed parse of `value` (user 2026-07-18, guidance_value.py). ADDITIVE —
+    # old rows read back as None until sanitize_guidance_tracker.py backfills them.
+    # value_type: growth_pct | margin_pct | capacity_pct | utilisation_pct |
+    #             absolute_inr | absolute_units | multiple | qualitative |
+    #             ambiguous_absolute | unparsed
+    # cagr_pct is now populated ONLY when value_type == growth_pct, so a consumer
+    # ranking "growth" can no longer pick up a margin level or a Rs-cr target.
+    "value_type", "value_num", "value_unit",
 ]
 
 # GF1 — Raw forward-looking statements (exact text from transcript)
@@ -1266,13 +1275,17 @@ def parse_gemini_response(
 
         for fy, col in fy_explicit.items():
             if col < len(cells):
+                _raw = _clean_val(cells[col])
+                _p = parse_guidance_value(_raw, metric, fy)
                 guidance_rows.append({
                     "isin": isin, "symbol": symbol, "company_name": company_name,
                     "quarter": quarter_name, "metric": metric,
                     "guidance_type": "explicit", "horizon_fy": fy,
-                    "value": _clean_val(cells[col]), "unit": "",
-                    "cagr_pct": None, "notes": "",
+                    "value": _raw, "unit": _p["value_unit"],
+                    "cagr_pct": _p["growth_pct"], "notes": "",
                     "processed_at": now_str, "source_doc_id": source_doc_id,
+                    "value_type": _p["value_type"], "value_num": _p["value_num"],
+                    "value_unit": _p["value_unit"],
                 })
 
         # Horizon growth-guidance columns (current format). Only rows with an
@@ -1285,14 +1298,23 @@ def parse_gemini_response(
                 raw = _clean_val(cells[col])
                 if raw == "NA":
                     continue
+                # These columns are headed "... growth guidance %", but the model
+                # also parks Rs-cr targets, unit counts and margin LEVELS here. The
+                # old code forced unit="%" + float(raw), which both fabricated
+                # growth (capacity "178,000" -> 178000%) and dropped real guidance
+                # (float fails on "19% - 26%"). parse_guidance_value types the cell
+                # and only fills cagr_pct for a genuine growth rate.
+                _p = parse_guidance_value(raw, metric, hz)
                 guidance_rows.append({
                     "isin": isin, "symbol": symbol, "company_name": company_name,
                     "quarter": quarter_name, "metric": metric,
                     "guidance_type": _gtype if _gtype not in ("", "na") else "explicit",
                     "horizon_fy": hz,
-                    "value": raw, "unit": "%",
-                    "cagr_pct": _try_float(raw), "notes": "",
+                    "value": raw, "unit": _p["value_unit"] or "%",
+                    "cagr_pct": _p["growth_pct"], "notes": "",
                     "processed_at": now_str, "source_doc_id": source_doc_id,
+                    "value_type": _p["value_type"], "value_num": _p["value_num"],
+                    "value_unit": _p["value_unit"],
                 })
 
     # ---- Table 2: derived CAGR guidance ----
@@ -1316,13 +1338,18 @@ def parse_gemini_response(
             for fy, col in fy_derived.items():
                 if col < len(cells):
                     raw = _clean_val(cells[col])
+                    # Table 2 is the DERIVED-CAGR table, so a growth reading is the
+                    # intent — pass a growth horizon so a bare "18.5" types as a %.
+                    _p = parse_guidance_value(raw, metric, "3Y")
                     guidance_rows.append({
                         "isin": isin, "symbol": symbol, "company_name": company_name,
                         "quarter": quarter_name, "metric": metric,
                         "guidance_type": "derived", "horizon_fy": fy,
-                        "value": raw, "unit": "%",
-                        "cagr_pct": _try_float(raw), "notes": "",
+                        "value": raw, "unit": _p["value_unit"] or "%",
+                        "cagr_pct": _p["growth_pct"], "notes": "",
                         "processed_at": now_str, "source_doc_id": source_doc_id,
+                        "value_type": _p["value_type"], "value_num": _p["value_num"],
+                        "value_unit": _p["value_unit"],
                     })
 
     return facts, guidance_rows
