@@ -556,13 +556,17 @@ class Cards:
             mcol = {"high": "#c0392b", "med": "#a66300"}.get(mat, "#7f8c8d")
             s = _highlight_numbers(str(r.get("summary", "")).strip()[:320])
             lines.append(
-                f'<div style="margin:3px 0">{dot} <b style="color:{mcol}">{adate}'
+                f'<div style="margin:3px 0">{dot} {_fresh_badge(adate)}'
+                f'<b style="color:{mcol}">{adate}'
                 f' · {str(r.get("event_type", r.get("category", "")) or "").replace("_", " ")}'
-                f'{" · " + mat.upper() if mat else ""}:</b> {s}</div>')
+                f'{" · " + mat.upper() if mat else ""}:</b> {s}'
+                f'{_ann_pdf_link(r.get("attachment"))}</div>')
         more = f' <span style="color:#888">(+{n - max_items} more)</span>' if n > max_items else ""
 
+        newest_ann = str(d["ann_date"].max())[:10] if "ann_date" in d.columns else ""
         return (f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
+                f'{_fresh_badge(newest_ann)}'
                 f'🧠 <b style="font-size:13px;color:#8a6d00">Exchange filings</b> '
                 f'<span style="color:#666">— {n} in {days}d{more}</span>'
                 + (f'<div style="margin:3px 0">{" ".join(chips)}</div>' if chips else "")
@@ -594,17 +598,18 @@ class Cards:
         # the newest item on top within each relevance tier.
         items.sort(key=lambda x: x[1], reverse=True)      # date desc
         items.sort(key=lambda x: x[0], reverse=True)      # score desc (stable)
-        n_direct = sum(1 for s, _, _ in items if s > 0)
+        n_direct = sum(1 for s, _, _ in items if s >= _NEWS_DIRECT_MIN)
         lines = []
         for score, dt_s, head in items[:max_items]:
-            tag = ("" if score > 0 else
+            tag = ("" if score >= _NEWS_DIRECT_MIN else
                    ' <span style="background:#b0bec5;color:#fff;padding:0 5px;'
-                   'border-radius:4px;font-size:10px">roundup</span>')
-            lines.append(f'<div style="margin:2px 0"><b style="color:#00695c">{dt_s}</b>'
+                   'border-radius:4px;font-size:10px">unverified</span>')
+            lines.append(f'<div style="margin:2px 0">{_fresh_badge(dt_s)}'
+                         f'<b style="color:#00695c">{dt_s}</b>'
                          f' · {_highlight_numbers(head)}{tag}</div>')
         newest = max((d for _, d, _ in items), default="")
         cnt = (f'<span style="color:#666"> — {n_direct} direct'
-               f'{f", {len(items) - n_direct} roundup" if len(items) > n_direct else ""}'
+               f'{f", {len(items) - n_direct} unverified" if len(items) > n_direct else ""}'
                f'</span>')
         return (f'<div style="background:#e0f2f1;border-left:3px solid #00897b;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
@@ -637,15 +642,29 @@ class Cards:
             snip = _research_snip(r.get("summary_md"), name, sym)
             if not snip:
                 continue
-            lines.append(f'<b style="color:#4a148c">{str(r.get("doc_date",""))[:10]}'
-                         f' · {str(r.get("source",""))[:40]}:</b> {snip}')
+            # Context so the snippet isn't a naked number: WHAT kind of document
+            # this is, and the theme/sector it was filed under. Without these the
+            # line reads as figures with no provenance.
+            dtype = str(r.get("doc_type", "") or "").replace("_", " ").title()
+            theme = str(r.get("themes", "") or "").strip()
+            theme = theme.split(",")[0].strip()[:40] if theme and theme.lower() != "nan" else ""
+            ddate = str(r.get("doc_date", ""))[:10]
+            tags = " · ".join(x for x in [dtype, theme] if x)
+            lines.append(
+                f'<div style="margin:3px 0">{_fresh_badge(ddate)}'
+                f'<b style="color:#4a148c">{ddate} · {str(r.get("source", ""))[:40]}</b>'
+                + (f' <span style="background:#ede7f6;color:#4a148c;padding:0 5px;'
+                   f'border-radius:4px;font-size:10.5px">{tags}</span>' if tags else "")
+                + f'<br>{_highlight_numbers(snip)}</div>')
         if not lines:
             return ""
         newest = str(sub["doc_date"].iloc[0])[:10] if "doc_date" in sub.columns else ""
         return (f'<div style="background:#f3e5f5;border-left:3px solid #7b1fa2;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-                f'{_fresh_badge(newest)}📄 <b style="font-size:13px">Research</b><br>'
-                + "<br>".join(lines) + "</div>")
+                f'{_fresh_badge(newest)}📄 <b style="font-size:13px">Research</b>'
+                f'<span style="color:#666"> — {len(lines)} note'
+                f'{"s" if len(lines) != 1 else ""} in {days}d</span>'
+                + "".join(lines) + "</div>")
 
 
 # NOTE: alternation is first-match-wins, so the LONGER unit spellings must come
@@ -655,6 +674,24 @@ _NUM_PAT = re.compile(
     rf"(?:(?:₹|Rs\.?|INR)\s?[\d,]+(?:\.\d+)?\s?{_UNITS}?"
     rf"|[\d,]+(?:\.\d+)?\s?{_UNITS}\b"
     r"|[+-]?\d+(?:\.\d+)?\s?%)", re.I)
+
+
+# BSE serves filing PDFs from these hosts (same pair ingest_announcements uses).
+# AttachLive holds recent filings; AttachHis the archive. We link Live — for an
+# older filing BSE redirects/404s, which is why this is a "verify" link, not a
+# promise the PDF is still hot.
+_BSE_ATTACH = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+
+
+def _ann_pdf_link(attachment) -> str:
+    """One-word link to the original exchange filing PDF, so any summary can be
+    cross-checked against the source document."""
+    a = str(attachment or "").strip()
+    if not a or a.lower() in ("nan", "none"):
+        return ""
+    return (f' <a href="{_BSE_ATTACH}{a}" target="_blank" rel="noopener" '
+            f'style="color:#0b5394;font-weight:700;text-decoration:none;'
+            f'font-size:11px">[PDF]</a>')
 
 
 def _extract_numbers(text: str, limit: int = 12) -> list:
@@ -682,6 +719,11 @@ def _highlight_numbers(text: str) -> str:
 # Listicle / roundup patterns: the headline mentions the stock only as one of
 # many (Google News matches these on the ticker), so they are demoted — not
 # dropped, since a portfolio-action roundup can still be worth a glance.
+# A headline counts as DIRECT company news at this score or above (see
+# _news_relevance): full-name match (+4) or name+ticker clears it; a lone
+# first-word hit (+1, e.g. "Rishab Pant...") or a bare fragment does not.
+_NEWS_DIRECT_MIN = 3
+
 _LISTICLE_PAT = re.compile(
     r"(\b\d+\s+(?:stocks?|shares?|picks?|multibagger|smallcap|midcap|largecap)"
     r"|\bstocks? to (?:buy|watch|sell)|\btop \d+|\bportfolio\b|\bbuy or sell\b"
@@ -691,29 +733,41 @@ _LISTICLE_PAT = re.compile(
 
 def _news_relevance(headline: str, name: str, symbol: str) -> int:
     """Rank a headline's relevance to THIS company (higher = more relevant).
-      +3 company name appears in the headline (direct company news)
+      +4 the FULL distinctive company name appears ("rishab instruments")
+      +1 only the first word matches ("Rishab ..." — could be a person's name,
+         so this alone is NOT treated as direct company news)
       +1 ticker appears as a standalone word
-      -3 listicle/roundup phrasing (mentions the stock among many)
-    Nothing is dropped on score alone; the caller sorts by score then recency, so
-    direct company news floats above 'N stocks to buy' style roundups."""
+      -3 listicle/roundup phrasing (the stock is one of many)
+      -2 headline too short to say anything (bare "Cummins India" fragments)
+    A headline is DIRECT only at >=3, so a lone first-word hit stays demoted.
+    Nothing is dropped on score alone — the caller sorts by score then recency."""
     h = str(headline).lower()
     score = 0
     nm = str(name or "").lower().strip()
+    core_words = []
     if nm:
-        # match on the distinctive part of the name (drop Ltd/Limited/India etc.)
-        core = re.sub(r"\b(ltd|limited|india|industries|enterprises|corp|"
-                      r"corporation|company|and|&|the)\b", " ", nm)
-        core = " ".join(w for w in core.split() if len(w) > 2)
-        first = core.split()[0] if core.split() else ""
+        # strip corporate boilerplate so "Rishab Instruments Limited" -> "rishab instruments"
+        core = re.sub(r"\b(ltd|limited|india|indian|industries|enterprises|corp|"
+                      r"corporation|company|holdings?|group|technologies|"
+                      r"international|and|&|the)\b", " ", nm)
+        core_words = [w for w in core.split() if len(w) > 2]
+        core = " ".join(core_words)
         if core and core in h:
-            score += 3
-        elif first and re.search(rf"\b{re.escape(first)}", h):
-            score += 3
+            score += 4                     # full distinctive name — unambiguous
+        elif len(core_words) >= 2 and all(
+                re.search(rf"\b{re.escape(w)}", h) for w in core_words[:2]):
+            score += 4                     # both distinctive tokens present
+        elif core_words and re.search(rf"\b{re.escape(core_words[0])}\b", h):
+            score += 1                     # first word only — weak (person/brand)
     sym = str(symbol or "").lower().strip()
     if len(sym) > 2 and re.search(rf"\b{re.escape(sym)}\b", h):
         score += 1
     if _LISTICLE_PAT.search(h):
         score -= 3
+    # A headline needs enough words to carry an explanation; bare name fragments
+    # ("Cummins India", "Cummins India share price") say nothing actionable.
+    if len(re.findall(r"[a-z0-9]+", h)) < 5:
+        score -= 2
     return score
 
 
@@ -875,7 +929,14 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
                 f'No chart/price data for this name (no OHLCV feed).</div></div>')
             continue
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
-        card_html.append(f'<div class="card">{meta}<div class="chart" id="ch{j}"></div></div>')
+        # Per-chart legend — the page-level note scrolls away on a long gallery,
+        # so each chart says what its two lines are.
+        legend = ('<div style="font-size:10.5px;color:#777;margin:2px 0 0">'
+                  'Candles + volume · <b style="color:#2962FF">━ EMA20</b> '
+                  '(short-term trend) · <b style="color:#FF6D00">━ EMA50</b> '
+                  '(medium-term trend)</div>')
+        card_html.append(f'<div class="card">{meta}{legend}'
+                         f'<div class="chart" id="ch{j}"></div></div>')
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
                 .replace("__CARDS__", "".join(card_html))
                 .replace("__N__", str(len(card_html)))

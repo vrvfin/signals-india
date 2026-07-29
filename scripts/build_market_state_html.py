@@ -42,12 +42,13 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, log)
 
 # Index → label + horizon bucket, for the returns dashboard.
+# BROAD-MARKET indices only. The 9 sector indices are NOT repeated here — they
+# get their own table below with the vs-Nifty500 comparison (they used to appear
+# in both, which read as duplication).
 INDICES = [
     ("NIFTY_50", "Nifty 50"), ("NIFTY_500", "Nifty 500"),
     ("NIFTY_MIDCAP_100", "Midcap 100"), ("NIFTY_SMALLCAP_100", "Smallcap 100"),
-    ("NIFTY_BANK", "Bank"), ("NIFTY_IT", "IT"), ("NIFTY_AUTO", "Auto"),
-    ("NIFTY_PHARMA", "Pharma"), ("NIFTY_FMCG", "FMCG"), ("NIFTY_METAL", "Metal"),
-    ("NIFTY_ENERGY", "Energy"), ("NIFTY_REALTY", "Realty"), ("NIFTY_INFRA", "Infra"),
+    ("INDIA_VIX", "India VIX"),
 ]
 RET_WINDOWS = [("1D", 1), ("1W", 5), ("1M", 21), ("3M", 63), ("6M", 126), ("12M", 252)]
 
