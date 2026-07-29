@@ -39,15 +39,44 @@ Table_A
 | company | Current Qtr | metric | Guidance type | current quarter growth (%) | next quarter growth guidance % | 1yr forward growth guidance % | 2yr forward growth guidance % | 3 yr growth guidance % | >3 yr growth guidance % |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 
+[MANDATORY CELL FORMAT — applies to EVERY growth-guidance column in Table_A]
+Each populated cell MUST declare what kind of number it is. Use exactly one of the
+three forms below. NEVER write a bare number.
+
+1. GROWTH RATE — a percentage CHANGE. This is the default for these columns.
+   Write with an explicit % sign:      15%        15-20%        -8%
+   Keep a range as a range; do NOT pre-average it.
+
+2. ABSOLUTE TARGET — a level, not a change (rupee target, physical capacity, unit
+   count). Prefix with "ABS:" and ALWAYS state the unit:
+        ABS: INR 530 cr        ABS: 178000 MT        ABS: 60000 sites
+   NEVER place a bare absolute number in a growth column.
+
+3. LEVEL PERCENTAGE — a % that is a STATE, not a change (utilisation, margin,
+   occupancy, market share). Prefix with "LVL:":
+        LVL: 75% (utilisation)         LVL: 23.5% (EBITDA margin)
+   A margin or utilisation figure is a LEVEL, never a growth rate.
+
+CAPACITY is the most-confused metric — decide explicitly which of the three it is:
+   - "capacity will rise from 125,000 to 147,000 tons"  ->  ABS: 147000 MT
+   - "we expect to reach 75% utilisation"               ->  LVL: 75% (utilisation)
+   - "we will add 40% more capacity"                    ->  40%
+If the transcript does not make it clear, write NA rather than guessing.
+
+CONVERTING an absolute target into a growth rate is allowed ONLY when the
+transcript also states the base. Then show both:
+        25% (derived: 400 -> 500 cr)
+If the base is absent, use ABS: and leave the growth cell NA.
+
 [STRICT GUIDANCE CAPTURE RULES]
 - Guidance Type MUST be strictly categorized as either 'Explicit' or 'Derived'.
-- 'Explicit' Classification: Captures exact single-point figures stated by management, or the raw verbal phrasing used (e.g., "mid-teens growth"). If management provides a tight range (e.g., 15-20%), take the exact mathematical midpoint (17.5%) and classify it as 'Explicit'.
+- 'Explicit' Classification: Captures exact single-point figures stated by management, or the raw verbal phrasing used (e.g., "mid-teens growth"). If management provides a range (e.g., 15-20%), write the range exactly as stated ("15-20%") and classify it as 'Explicit'. Do NOT pre-average it — the downstream parser takes the midpoint and needs both bounds.
 - 'Derived' Classification: Applied ONLY when calculating longer-term horizons based on macro-statements (e.g., if management says "we will double revenue in 5 years", calculate the required conservative linear or CAGR rate, place that figure in the '>3 yr' column, and label the row as 'Derived').
 - You must always state your reasoning in the "Calculation Methodology & Footnotes" section if a row uses 'Derived' or includes a calculated midpoint range.
 
 [DERIVED GUIDANCE CALCULATION PROTOCOL]
 - Derive projections in the (Derived) columns ONLY from explicitly stated guidance figures, growth rates, or historical baselines mentioned in the transcript.
-- If management provides a CAGR range, use the exact midpoint unless the transcript explicitly prioritizes one end.
+- If management provides a CAGR range, write the range as stated (e.g. "19-26%") unless the transcript explicitly prioritizes one end; the downstream parser takes the midpoint.
 - If only partial-year data exists, annualize mathematically and explicitly state your formula/assumptions below the table.
 - Maintain strict mathematical consistency across all projected years.
 - NEVER fabricate missing base numbers. If calculations cannot be performed reliably with the data provided, populate the cell with "NA".

@@ -170,6 +170,45 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "") -> dict:
     if not text or text.upper() in ("NA", "N/A", "NONE", "-", "--"):
         return _result("unparsed", None, "", None, text, "empty")
 
+    # --- explicit prefixes (concall_prompt "[MANDATORY CELL FORMAT]") ------------
+    # When the model declares the kind we take it at its word — no inference. These
+    # are the ONLY fully reliable signals; everything below is best-effort typing of
+    # legacy/untagged cells. Handled here so the parser is ready BEFORE the prompt
+    # change ships (an untagged cell simply falls through to the old logic).
+    m_pref = re.match(r"^\s*(ABS|LVL)\s*:\s*(.+)$", text, re.I)
+    if m_pref:
+        kind, body = m_pref.group(1).upper(), m_pref.group(2).strip()
+        if kind == "ABS":
+            if _RE_CURRENCY.search(body):
+                nums = _numbers(body)
+                if nums:
+                    scale = 1.0
+                    for rx, mult in _CUR_SCALE:
+                        if rx.search(body):
+                            scale = mult
+                            break
+                    return _result("absolute_inr", round(nums[0] * scale, 4),
+                                   "INR_cr", None, text, "declared ABS")
+            phys_m = _RE_PHYS.search(body)
+            nums = _numbers(body)
+            return _result("absolute_units", round(nums[0], 4) if nums else None,
+                           phys_m.group(1).upper() if phys_m else "", None, text,
+                           "declared ABS")
+        # LVL: a percentage that is a STATE, never a growth rate
+        pct = _pct_from_text(body) if _RE_PCT_TOKEN.search(body) else None
+        if pct is None:
+            nums = _numbers(body)
+            pct = nums[0] if nums else None
+        if metric in LEVEL_METRICS or re.search(r"margin", body, re.I):
+            vt = "margin_pct"
+        elif _RE_UTILISATION.search(body):
+            vt = "utilisation_pct"
+        elif metric == "capacity":
+            vt = "capacity_pct"
+        else:
+            vt = "level_pct"
+        return _result(vt, pct, "%", None, text, "declared LVL")
+
     from_growth_col = horizon in GROWTH_HORIZONS
     has_pct = bool(_RE_PCT_TOKEN.search(text))
     has_cur = bool(_RE_CURRENCY.search(text))
