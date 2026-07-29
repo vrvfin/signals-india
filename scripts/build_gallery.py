@@ -233,7 +233,8 @@ def _research_snip(md, name, symbol="", maxlen=300):
 class Cards:
     """Holds the loaded lookups and builds each card's HTML + chart data."""
 
-    def __init__(self, grades, statements_map, guidance, gf1, ann, research=None):
+    def __init__(self, grades, statements_map, guidance, gf1, ann, research=None,
+                 news=None):
         self.grades_by = self._group(grades)
         self.stmts = statements_map
         self.guid_by = {k: g for k, g in
@@ -242,6 +243,7 @@ class Cards:
         self.gf1_by = self._group(gf1)
         self.ann_by = self._group(ann)
         self.research = research if research is not None else _EMPTY
+        self.news = news or {}                     # symbol.upper() -> news text
         self.name_by = {}
         if not grades.empty and {"symbol", "company_name"} <= set(grades.columns):
             for _, r in grades.iterrows():
@@ -494,20 +496,104 @@ class Cards:
                 f'📋 <b style="font-size:13px">Guidance / outlook</b>{src}<br>'
                 + "<br>".join(lines[:7]) + "</div>")
 
-    def llm_summary(self, sym):
+    def llm_summary(self, sym, days=90, max_items=6):
+        """Exchange-filing panel: EVERY recent announcement (not just the last),
+        ordered by materiality then recency, with an actionable roll-up header —
+        event-type mix, bull/bear direction tally, and the ₹/% figures pulled out
+        of the summaries so growth / guidance / risk numbers are scannable."""
         a = self.ann_by.get(sym.upper(), _EMPTY)
         if a is None or a.empty or "summary" not in a.columns:
             return ""
-        a2 = a.sort_values("ann_date") if "ann_date" in a.columns else a
-        row = a2.iloc[-1]
-        s = str(row.get("summary", "") or "").strip()
-        if not s or s.lower() == "nan":
+        d = a.copy()
+        if "ann_date" in d.columns:
+            d["_dt"] = pd.to_datetime(d["ann_date"], errors="coerce")
+            cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=days)
+            recent = d[d["_dt"] >= cut]
+            d = recent if not recent.empty else d          # never render empty
+            d = d.sort_values("_dt", ascending=False)
+        d = d[d["summary"].astype(str).str.strip().str.lower().ne("nan")]
+        d = d[d["summary"].astype(str).str.strip() != ""]
+        if d.empty:
             return ""
-        adate = str(row.get("ann_date", ""))[:10]
+
+        # ---- roll-up header: what happened, how material, which way ----
+        n = len(d)
+        ev = (d["event_type"].dropna().astype(str).value_counts().to_dict()
+              if "event_type" in d.columns else {})
+        ev_txt = " · ".join(f"{k.replace('_', ' ')} ×{v}" if v > 1 else k.replace("_", " ")
+                            for k, v in list(ev.items())[:4])
+        bulls = int((d.get("direction") == "bull").sum()) if "direction" in d else 0
+        bears = int((d.get("direction") == "bear").sum()) if "direction" in d else 0
+        highs = int((d.get("materiality") == "high").sum()) if "materiality" in d else 0
+        chips = []
+        if highs:
+            chips.append(f'<span style="background:#c0392b;color:#fff;padding:0 6px;'
+                         f'border-radius:4px;font-weight:700">{highs} high-impact</span>')
+        if bulls:
+            chips.append(f'<span style="background:#1a7a3a;color:#fff;padding:0 6px;'
+                         f'border-radius:4px;font-weight:700">▲ {bulls} bullish</span>')
+        if bears:
+            chips.append(f'<span style="background:#c0392b;color:#fff;padding:0 6px;'
+                         f'border-radius:4px;font-weight:700">▼ {bears} bearish</span>')
+        # numbers across ALL filings in the window (growth / guidance / risk figures)
+        nums = _extract_numbers(" ".join(d["summary"].astype(str).tolist()))
+        if nums:
+            chips.append('<span style="background:#0b5394;color:#fff;padding:0 6px;'
+                         'border-radius:4px;font-weight:700">' +
+                         " · ".join(nums[:6]) + "</span>")
+
+        # ---- per-filing lines, most material first ----
+        mrank = {"high": 0, "med": 1, "low": 2}
+        if "materiality" in d.columns:
+            d = d.assign(_m=d["materiality"].map(lambda x: mrank.get(str(x), 3))) \
+                 .sort_values(["_m", "_dt"], ascending=[True, False])
+        lines = []
+        for _, r in d.head(max_items).iterrows():
+            adate = str(r.get("ann_date", ""))[:10]
+            mat = str(r.get("materiality", "") or "")
+            dirn = str(r.get("direction", "") or "")
+            dot = {"bull": "🟢", "bear": "🔴"}.get(dirn, "⚪")
+            mcol = {"high": "#c0392b", "med": "#a66300"}.get(mat, "#7f8c8d")
+            s = _highlight_numbers(str(r.get("summary", "")).strip()[:320])
+            lines.append(
+                f'<div style="margin:3px 0">{dot} <b style="color:{mcol}">{adate}'
+                f' · {str(r.get("event_type", r.get("category", "")) or "").replace("_", " ")}'
+                f'{" · " + mat.upper() if mat else ""}:</b> {s}</div>')
+        more = f' <span style="color:#888">(+{n - max_items} more)</span>' if n > max_items else ""
+
         return (f'<div style="background:#fffde7;border-left:3px solid #f9a825;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-                f'{_fresh_badge(adate)}🧠 <b style="color:#8a6d00">{adate} · '
-                f'{row.get("category","")}:</b> {s[:400]}</div>')
+                f'🧠 <b style="font-size:13px;color:#8a6d00">Exchange filings</b> '
+                f'<span style="color:#666">— {n} in {days}d{more}</span>'
+                + (f'<div style="margin:3px 0">{" ".join(chips)}</div>' if chips else "")
+                + (f'<div style="color:#555;font-size:11.5px;margin-bottom:2px">{ev_txt}</div>'
+                   if ev_txt else "")
+                + "".join(lines) + "</div>")
+
+    def news_card(self, sym, max_items=5):
+        """Recent company news headlines (Google News RSS, reputable sources only)
+        pre-fetched into self.news by _fetch_news_map. Numbers in headlines are
+        highlighted so order wins / results / guidance figures stand out."""
+        txt = (self.news or {}).get(sym.upper(), "")
+        if not txt or txt.startswith("DATA_MISSING") or txt.startswith("No recent news"):
+            return ""
+        lines = []
+        for ln in str(txt).splitlines():
+            ln = ln.strip().lstrip("- ").strip()
+            if not ln or "|" not in ln:
+                continue
+            date_part, rest = ln.split("|", 1)
+            lines.append(f'<div style="margin:2px 0"><b style="color:#00695c">'
+                         f'{date_part.strip()[:10]}</b> · {_highlight_numbers(rest.strip())}</div>')
+            if len(lines) >= max_items:
+                break
+        if not lines:
+            return ""
+        newest = lines and str(txt).splitlines()[0].strip().lstrip("- ")[:10] or ""
+        return (f'<div style="background:#e0f2f1;border-left:3px solid #00897b;'
+                f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
+                f'{_fresh_badge(newest)}📰 <b style="font-size:13px;color:#00695c">News</b>'
+                + "".join(lines) + "</div>")
 
     def research_card(self, sym, name, isin="", days=45, max_items=3):
         """Recent research (research_index) mentioning this company — same matching
@@ -544,6 +630,64 @@ class Cards:
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
                 f'{_fresh_badge(newest)}📄 <b style="font-size:13px">Research</b><br>'
                 + "<br>".join(lines) + "</div>")
+
+
+# NOTE: alternation is first-match-wins, so the LONGER unit spellings must come
+# first (crores|crore|cr), else "Rs 450 crore" truncates to "Rs 450 cr" + "ore".
+_UNITS = r"(?:crores|crore|cr|billion|bn|million|mn|lakhs|lakh)"
+_NUM_PAT = re.compile(
+    rf"(?:(?:₹|Rs\.?|INR)\s?[\d,]+(?:\.\d+)?\s?{_UNITS}?"
+    rf"|[\d,]+(?:\.\d+)?\s?{_UNITS}\b"
+    r"|[+-]?\d+(?:\.\d+)?\s?%)", re.I)
+
+
+def _extract_numbers(text: str, limit: int = 12) -> list:
+    """Distinct ₹-amounts and percentages mentioned across filing summaries —
+    the growth / guidance / order-size / margin figures worth scanning."""
+    out, seen = [], set()
+    for m in _NUM_PAT.findall(str(text)):
+        v = " ".join(m.split())
+        k = v.lower().replace(" ", "")
+        if k in seen or k in {"0%", "100%"}:
+            continue
+        seen.add(k)
+        out.append(v)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _highlight_numbers(text: str) -> str:
+    """Bold the ₹/% figures inside a filing summary so numbers pop out."""
+    return _NUM_PAT.sub(
+        lambda m: f'<b style="color:#0b5394">{m.group(0)}</b>', str(text))
+
+
+def _fetch_news_map(syms, name_by, days=30, workers=8):
+    """symbol.upper() -> news text, fetched in parallel via alt_sources.news_block
+    (Google News RSS, reputable-source whitelist — same feed daily_brief uses).
+    Network-bound and best-effort: any failure yields an empty entry, never raises."""
+    try:
+        from alt_sources import news_block
+    except Exception as e:
+        log(f"  news: alt_sources unavailable ({type(e).__name__}) — skipped")
+        return {}
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    out = {}
+
+    def one(s):
+        try:
+            return s, news_block(name_by.get(s.upper(), s), s, limit=8, days=days)
+        except Exception:
+            return s, ""
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for f in as_completed([pool.submit(one, s) for s in syms]):
+            s, txt = f.result()
+            out[s.upper()] = txt
+    hit = sum(1 for v in out.values()
+              if v and not v.startswith(("DATA_MISSING", "No recent news")))
+    log(f"  news: {hit}/{len(syms)} names with headlines ({days}d window)")
+    return out
 
 
 def _resample_ohlc(d, rule):
@@ -665,7 +809,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
-            cards.llm_summary(s), cards.research_card(s, nmj),
+            cards.llm_summary(s), cards.news_card(s), cards.research_card(s, nmj),
         ] if x)
         if not c:
             # Fundamentals present but no price series — panels + a small note,
@@ -936,6 +1080,13 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-macro", action="store_true",
+                    help="consumed by the .bat wrapper (skips the market_state "
+                         "dashboard step); ignored here so pass-through never breaks")
+    ap.add_argument("--no-news", action="store_true",
+                    help="skip the Google-News headline pass (network-bound)")
+    ap.add_argument("--news-days", type=int, default=30,
+                    help="news lookback window in days (default 30)")
     args = ap.parse_args()
 
     drive = get_drive()
@@ -1083,7 +1234,14 @@ def main():
     log("downloading statements…")
     stmts = _bulk_parquet(drive, _folder(drive, "fundamentals/statements"), syms)
 
-    cards = Cards(grades, stmts, guidance, gf1, ann, research=res_idx)
+    _name_by = {}
+    if not grades.empty and {"symbol", "company_name"} <= set(grades.columns):
+        _name_by = {str(r["symbol"]).upper(): str(r.get("company_name", "") or "")
+                    for _, r in grades.iterrows()}
+    news_map = ({} if args.no_news
+                else _fetch_news_map(syms, _name_by, days=args.news_days))
+
+    cards = Cards(grades, stmts, guidance, gf1, ann, research=res_idx, news=news_map)
     log("assembling HTML…")
     html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
                       title=title, annot=annot, resample=resample)
