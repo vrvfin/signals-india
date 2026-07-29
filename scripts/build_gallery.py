@@ -570,29 +570,45 @@ class Cards:
                    if ev_txt else "")
                 + "".join(lines) + "</div>")
 
-    def news_card(self, sym, max_items=5):
+    def news_card(self, sym, name="", max_items=5):
         """Recent company news headlines (Google News RSS, reputable sources only)
-        pre-fetched into self.news by _fetch_news_map. Numbers in headlines are
-        highlighted so order wins / results / guidance figures stand out."""
+        pre-fetched into self.news by _fetch_news_map, RANKED BY RELEVANCE to this
+        company: direct company news first, generic 'N stocks to buy' roundups
+        demoted and marked. Numbers in headlines are highlighted."""
         txt = (self.news or {}).get(sym.upper(), "")
         if not txt or txt.startswith("DATA_MISSING") or txt.startswith("No recent news"):
             return ""
-        lines = []
+        nm = name or self.name_by.get(sym.upper(), "")
+        items = []
         for ln in str(txt).splitlines():
             ln = ln.strip().lstrip("- ").strip()
             if not ln or "|" not in ln:
                 continue
             date_part, rest = ln.split("|", 1)
-            lines.append(f'<div style="margin:2px 0"><b style="color:#00695c">'
-                         f'{date_part.strip()[:10]}</b> · {_highlight_numbers(rest.strip())}</div>')
-            if len(lines) >= max_items:
-                break
-        if not lines:
+            head = rest.strip()
+            items.append((_news_relevance(head, nm, sym), date_part.strip()[:10], head))
+        if not items:
             return ""
-        newest = lines and str(txt).splitlines()[0].strip().lstrip("- ")[:10] or ""
+        # relevance first, then recency — nothing dropped, only ordered.
+        # Python's sort is stable, so sorting by date first then by score keeps
+        # the newest item on top within each relevance tier.
+        items.sort(key=lambda x: x[1], reverse=True)      # date desc
+        items.sort(key=lambda x: x[0], reverse=True)      # score desc (stable)
+        n_direct = sum(1 for s, _, _ in items if s > 0)
+        lines = []
+        for score, dt_s, head in items[:max_items]:
+            tag = ("" if score > 0 else
+                   ' <span style="background:#b0bec5;color:#fff;padding:0 5px;'
+                   'border-radius:4px;font-size:10px">roundup</span>')
+            lines.append(f'<div style="margin:2px 0"><b style="color:#00695c">{dt_s}</b>'
+                         f' · {_highlight_numbers(head)}{tag}</div>')
+        newest = max((d for _, d, _ in items), default="")
+        cnt = (f'<span style="color:#666"> — {n_direct} direct'
+               f'{f", {len(items) - n_direct} roundup" if len(items) > n_direct else ""}'
+               f'</span>')
         return (f'<div style="background:#e0f2f1;border-left:3px solid #00897b;'
                 f'padding:6px 10px;font-size:12.5px;color:#222;margin:3px 0;line-height:1.55">'
-                f'{_fresh_badge(newest)}📰 <b style="font-size:13px;color:#00695c">News</b>'
+                f'{_fresh_badge(newest)}📰 <b style="font-size:13px;color:#00695c">News</b>{cnt}'
                 + "".join(lines) + "</div>")
 
     def research_card(self, sym, name, isin="", days=45, max_items=3):
@@ -661,6 +677,44 @@ def _highlight_numbers(text: str) -> str:
     """Bold the ₹/% figures inside a filing summary so numbers pop out."""
     return _NUM_PAT.sub(
         lambda m: f'<b style="color:#0b5394">{m.group(0)}</b>', str(text))
+
+
+# Listicle / roundup patterns: the headline mentions the stock only as one of
+# many (Google News matches these on the ticker), so they are demoted — not
+# dropped, since a portfolio-action roundup can still be worth a glance.
+_LISTICLE_PAT = re.compile(
+    r"(\b\d+\s+(?:stocks?|shares?|picks?|multibagger|smallcap|midcap|largecap)"
+    r"|\bstocks? to (?:buy|watch|sell)|\btop \d+|\bportfolio\b|\bbuy or sell\b"
+    r"|\bmultibagger|\bbrokerage (?:radar|calls)|\bmarket (?:wrap|roundup)"
+    r"|\bnifty (?:today|outlook)|\bsensex\b|\bf&o (?:ban|cues)|\bstocks in news)", re.I)
+
+
+def _news_relevance(headline: str, name: str, symbol: str) -> int:
+    """Rank a headline's relevance to THIS company (higher = more relevant).
+      +3 company name appears in the headline (direct company news)
+      +1 ticker appears as a standalone word
+      -3 listicle/roundup phrasing (mentions the stock among many)
+    Nothing is dropped on score alone; the caller sorts by score then recency, so
+    direct company news floats above 'N stocks to buy' style roundups."""
+    h = str(headline).lower()
+    score = 0
+    nm = str(name or "").lower().strip()
+    if nm:
+        # match on the distinctive part of the name (drop Ltd/Limited/India etc.)
+        core = re.sub(r"\b(ltd|limited|india|industries|enterprises|corp|"
+                      r"corporation|company|and|&|the)\b", " ", nm)
+        core = " ".join(w for w in core.split() if len(w) > 2)
+        first = core.split()[0] if core.split() else ""
+        if core and core in h:
+            score += 3
+        elif first and re.search(rf"\b{re.escape(first)}", h):
+            score += 3
+    sym = str(symbol or "").lower().strip()
+    if len(sym) > 2 and re.search(rf"\b{re.escape(sym)}\b", h):
+        score += 1
+    if _LISTICLE_PAT.search(h):
+        score -= 3
+    return score
 
 
 def _fetch_news_map(syms, name_by, days=30, workers=8):
@@ -809,7 +863,8 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
             cards.quarterly(s), cards.growth_blob(s), cards.guidance_panel(s),
-            cards.llm_summary(s), cards.news_card(s), cards.research_card(s, nmj),
+            cards.llm_summary(s), cards.news_card(s, nmj),
+            cards.research_card(s, nmj),
         ] if x)
         if not c:
             # Fundamentals present but no price series — panels + a small note,
