@@ -152,13 +152,19 @@ def _result(value_type: str, value_num: float | None, value_unit: str,
             "raw": raw, "note": note}
 
 
-def parse_guidance_value(raw, metric: str = "", horizon: str = "") -> dict:
+def parse_guidance_value(raw, metric: str = "", horizon: str = "",
+                         typed_prompt: bool = False) -> dict:
     """Classify one guidance cell.
 
     raw      : the cell text as extracted ("19% - 26% (CAGR)", "INR530 crores").
     metric   : canonical metric (revenue/ebitda/pat/margin/volume/capacity).
     horizon  : horizon_fy tag — a GROWTH_HORIZONS value means the cell came from a
                growth-% column; an "FY26"-style tag means an absolute LEVEL column.
+    typed_prompt : True when the row was produced by the concall prompt that
+               REQUIRES an "LVL:" prefix on any level percentage (2026-07-18).
+               Then an unprefixed capacity % can be trusted as genuine capacity
+               GROWTH — the model would have written LVL: if it were utilisation.
+               Left False for legacy rows, where capacity % stays ambiguous.
 
     Returns dict(value_type, value_num, value_unit, growth_pct, raw, note).
     `growth_pct` is non-None ONLY for a genuine growth rate — that is the single
@@ -271,6 +277,11 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "") -> dict:
         # feeds growth math; a consumer that wants it must ask for it. (The word
         # is in GF1's exact_statement if a caller needs to disambiguate.)
         if metric == "capacity":
+            # Under the typed prompt an unprefixed capacity % is a CHANGE (a level
+            # would carry "LVL:"), e.g. an airline guiding ASK capacity +10-15%.
+            if typed_prompt and from_growth_col:
+                return _result("growth_pct", pct, "%", pct, text,
+                               "capacity growth (typed prompt, no LVL: marker)")
             return _result("capacity_pct", pct, "%", None, text,
                            "capacity % — addition or utilisation, not disambiguated")
         if not from_growth_col:

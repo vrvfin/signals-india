@@ -1276,7 +1276,9 @@ def parse_gemini_response(
         for fy, col in fy_explicit.items():
             if col < len(cells):
                 _raw = _clean_val(cells[col])
-                _p = parse_guidance_value(_raw, metric, fy)
+                # typed_prompt=True: concall_prompt.txt requires an explicit "LVL:"
+                # on any level %, so an unprefixed capacity % is genuine growth.
+                _p = parse_guidance_value(_raw, metric, fy, typed_prompt=True)
                 guidance_rows.append({
                     "isin": isin, "symbol": symbol, "company_name": company_name,
                     "quarter": quarter_name, "metric": metric,
@@ -1304,7 +1306,7 @@ def parse_gemini_response(
                 # growth (capacity "178,000" -> 178000%) and dropped real guidance
                 # (float fails on "19% - 26%"). parse_guidance_value types the cell
                 # and only fills cagr_pct for a genuine growth rate.
-                _p = parse_guidance_value(raw, metric, hz)
+                _p = parse_guidance_value(raw, metric, hz, typed_prompt=True)
                 guidance_rows.append({
                     "isin": isin, "symbol": symbol, "company_name": company_name,
                     "quarter": quarter_name, "metric": metric,
@@ -1340,7 +1342,7 @@ def parse_gemini_response(
                     raw = _clean_val(cells[col])
                     # Table 2 is the DERIVED-CAGR table, so a growth reading is the
                     # intent — pass a growth horizon so a bare "18.5" types as a %.
-                    _p = parse_guidance_value(raw, metric, "3Y")
+                    _p = parse_guidance_value(raw, metric, "3Y", typed_prompt=True)
                     guidance_rows.append({
                         "isin": isin, "symbol": symbol, "company_name": company_name,
                         "quarter": quarter_name, "metric": metric,
