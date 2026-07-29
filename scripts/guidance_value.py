@@ -54,8 +54,12 @@ import re
 # guidance %" headers) vs FY-headed columns, which hold absolute LEVEL targets.
 GROWTH_HORIZONS = frozenset({"NEXT_QTR", "1Y", "2Y", "3Y", "3Y+"})
 
-# Metrics whose % is a LEVEL, not a growth rate.
-LEVEL_METRICS = frozenset({"margin"})
+# Metrics whose % is a LEVEL, not a growth rate. Beyond margin these are the BFSI
+# and IT ratios (2026-07-29): a 3.5% NIM, a 2.1% GNPA, an 18% ROA or 82% headcount
+# utilisation are STATES — reading them as growth would put bank spreads straight
+# into the growth rankings, the same class of bug the typed parse removed.
+LEVEL_METRICS = frozenset({"margin", "nim", "npa", "credit_cost", "returns",
+                           "utilisation"})
 
 # A bare number this large in a growth column is not a growth rate — it is an
 # absolute target/count the model parked in the wrong column (verified: every
@@ -205,8 +209,10 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
         if pct is None:
             nums = _numbers(body)
             pct = nums[0] if nums else None
-        if metric in LEVEL_METRICS or re.search(r"margin", body, re.I):
+        if metric == "margin" or re.search(r"margin", body, re.I):
             vt = "margin_pct"
+        elif metric in LEVEL_METRICS:
+            vt = "level_pct"
         elif _RE_UTILISATION.search(body):
             vt = "utilisation_pct"
         elif metric == "capacity":
@@ -266,7 +272,9 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
         if pct is None:
             return _result("qualitative", None, "", None, text, "% with no number")
         if metric in LEVEL_METRICS:
-            return _result("margin_pct", pct, "%", None, text, "margin LEVEL")
+            # margin keeps its own tag; NIM / NPA / ROA / utilisation are levels too
+            return _result("margin_pct" if metric == "margin" else "level_pct",
+                           pct, "%", None, text, f"{metric} LEVEL")
         if _RE_UTILISATION.search(text):
             return _result("utilisation_pct", pct, "%", None, text, "level, not growth")
         # CAPACITY is irreducibly ambiguous from the number alone: the same "75%"
@@ -298,7 +306,8 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
         if val is None:
             return _result("unparsed", None, "", None, text, "")
         if metric in LEVEL_METRICS:
-            return _result("margin_pct", val, "%", None, text, "margin LEVEL")
+            return _result("margin_pct" if metric == "margin" else "level_pct",
+                           val, "%", None, text, f"{metric} LEVEL")
         if not from_growth_col:
             return _result("ambiguous_absolute", val, "", None, text,
                            "FY-column bare number")
@@ -339,7 +348,7 @@ def describe(parsed: dict) -> str:
     if t == "capacity_pct":
         return f"{n:.1f}% capacity"
     if t == "level_pct":
-        return f"{n:.1f}% (FY target)"
+        return f"{n:.1f}% level"
     if t == "absolute_inr":
         return f"Rs {n:,.0f}cr target"
     if t == "absolute_units":

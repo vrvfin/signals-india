@@ -45,10 +45,16 @@ GUIDANCE_COLS = ["isin", "symbol", "company_name", "quarter", "metric",
                  "value_type", "value_num", "value_unit"]   # typed parse 2026-07-18
 QUEUE_COLS = ["doc_id", "source"]
 
-# Metrics in the email, in column order (margin deliberately excluded).
-METRICS = ["revenue", "ebitda", "pat", "volume", "capacity"]
+# Metrics in the email, in column order (margin deliberately excluded — it is a
+# LEVEL). Since 2026-07-29 the BFSI and IT rows are captured too, so banks/NBFCs
+# and IT names appear here; all-empty columns are dropped per mail so a
+# manufacturing-only day stays narrow.
+METRICS = ["revenue", "ebitda", "pat", "volume", "capacity",
+           "loan_aum", "deposits", "order_book"]
 METRIC_LABEL = {"revenue": "Revenue", "ebitda": "EBITDA", "pat": "PAT",
-                "volume": "Volume", "capacity": "Capacity"}
+                "volume": "Volume", "capacity": "Capacity",
+                "loan_aum": "Loan/AUM", "deposits": "Deposits",
+                "order_book": "Order book"}
 HORIZON_LABEL = {"NEXT_QTR": "next qtr", "1Y": "1yr", "2Y": "2yr",
                  "3Y": "3yr", "3Y+": ">3yr"}
 
@@ -160,17 +166,21 @@ def build_html(rows: list[dict], since: datetime,
         f"(₹ cr / units) or a level (margin, utilisation) — shown for context but "
         f"never ranked or 🚀-flagged.</span></p>",
         "<table style='border-collapse:collapse'>",
-        "<tr>" + "".join(
-            f"<th style='{th}'>{c}</th>"
-            for c in ["#", "Company", "Qtr"] + [METRIC_LABEL[m] for m in METRICS]
-        ) + "</tr>",
     ]
+    # only render metric columns that at least one company populated — otherwise a
+    # manufacturing-only day would carry empty Loan/AUM + Deposits columns (and a
+    # BFSI-only day empty Capacity/Volume ones).
+    cols = [m for m in METRICS if any(m in r["cells"] for r in rows)] or METRICS
+    out.append("<tr>" + "".join(
+        f"<th style='{th}'>{c}</th>"
+        for c in ["#", "Company", "Qtr"] + [METRIC_LABEL[m] for m in cols]
+    ) + "</tr>")
     for i, r in enumerate(rows, 1):
         rocket = "🚀 " if r["row_max"] > HIGH_GROWTH_PCT else ""
         tds = [f"<td style='{td}'>{i}</td>",
                f"<td style='{td}'>{rocket}<b>{r['symbol']}</b> · {r['company_name']}</td>",
                f"<td style='{td}'>{r['quarter']}</td>"]
-        for m in METRICS:
+        for m in cols:
             c = r["cells"].get(m)
             # colour ONLY growth cells; a level/target is shown in muted grey so it
             # is never mistaken for growth

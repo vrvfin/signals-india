@@ -873,8 +873,40 @@ def _try_float(s: str):
         return None
 
 
-# Maps row label tokens → canonical metric name
+# Short/ambiguous tokens need a WORD BOUNDARY — a bare "roa" substring would match
+# "broad", "aum" would match inside other words. Checked BEFORE the substring list.
+_METRIC_RE_ALIASES: list[tuple[str, str]] = [
+    (r"\bnims?\b",                       "nim"),
+    (r"\b[gn]?npa\b|\basset quality\b",  "npa"),
+    (r"\baums?\b",                       "loan_aum"),
+    (r"\bro[ae]\b|\breturn on ",         "returns"),
+    (r"\btcv\b",                         "order_book"),
+]
+
+# Maps row label tokens → canonical metric name. ORDER MATTERS (first match wins):
+# the more specific phrase must precede the generic one, e.g. "net interest margin"
+# before "margin", and "utilisation" before "capacity" so "Capacity Utilization"
+# types as a LEVEL rather than as capacity.
 _METRIC_ALIASES: list[tuple[str, str]] = [
+    # --- BFSI (prompt's segment 2) --------------------------------------------
+    ("net interest margin", "nim"),
+    ("credit cost",     "credit_cost"),
+    ("cost of credit",  "credit_cost"),
+    ("gross npa",       "npa"),
+    ("slippage",        "npa"),
+    ("net profit",      "pat"),        # BEFORE any generic profit token
+    ("loan",            "loan_aum"),
+    ("advances",        "loan_aum"),
+    ("disbursement",    "loan_aum"),
+    ("deposit",         "deposits"),
+    # --- IT / services (prompt's segment 3) -----------------------------------
+    ("order book",      "order_book"),
+    ("order intake",    "order_book"),
+    ("order inflow",    "order_book"),
+    ("utilization",     "utilisation"),   # BEFORE capacity
+    ("utilisation",     "utilisation"),
+    ("headcount",       "utilisation"),
+    # --- manufacturing / generic (original set) --------------------------------
     ("revenue", "revenue"),
     ("ebidta", "ebitda"),
     ("ebitda", "ebitda"),
@@ -888,7 +920,18 @@ _METRIC_ALIASES: list[tuple[str, str]] = [
 
 
 def _identify_metric(label: str) -> str | None:
+    """Canonical metric for a Table_A row label, across ALL industry segments.
+
+    The prompt emits different rows per segment (manufacturing / BFSI / IT). Until
+    2026-07-29 only the manufacturing six were recognised, so every BFSI row
+    (Loan-AUM, NIM, NPA, Deposits) and the IT-specific rows (Order Book-TCV,
+    Headcount-Utilization) returned None and were DROPPED at extraction — banks and
+    NBFCs ended up with no structured guidance at all, even though GF1 captured it.
+    """
     low = label.lower().strip()
+    for pattern, name in _METRIC_RE_ALIASES:
+        if re.search(pattern, low):
+            return name
     for token, name in _METRIC_ALIASES:
         if token in low:
             return name

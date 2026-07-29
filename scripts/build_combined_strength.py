@@ -55,8 +55,10 @@ MAX_GUIDANCE_CAGR = 200.0       # above this the "CAGR" is a misparsed absolute
                                 # (e.g. "1,000 Cr" -> 1000) — not trustworthy
 GUID_STALE_MAX_Q = 4            # latest guidance older than this many quarters =
                                 # not "current" -> doesn't qualify (user 2026-07-18)
-GROWTH_METRICS = ("revenue", "ebitda", "pat")   # % growth metrics only (exclude
-                                # margin/capacity/utilisation LEVELS which aren't growth)
+GROWTH_METRICS = ("revenue", "ebitda", "pat",   # % growth metrics only (exclude
+                  "loan_aum", "deposits")       # margin/NIM/NPA/capacity LEVELS).
+                                # BFSI growth metrics added 2026-07-29 so a bank
+                                # guiding 25% AUM growth qualifies like any other.
 TECH_ZONES = ("buy", "add")     # conviction zones that count as strong technical
 SURGE_STRONG = ("CONSISTENT", "EMERGING")
 MAIL_TOP_N = 30                 # mail shows the top N; full list lives on Drive
