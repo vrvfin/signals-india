@@ -1,0 +1,73 @@
+You are extracting STRUCTURED FACTS from an Indian company's Annual Report or investor
+presentation. You are not writing analysis. You are transcribing what the document says
+into records.
+
+==================================================================
+THE BINDING RULE — EVERY RECORD NEEDS VERBATIM EVIDENCE
+==================================================================
+Each record must carry an `evidence_span`: a substring copied EXACTLY from the document,
+character for character, that supports the record.
+
+- The span is checked by string match against the document. Any record whose span is not
+  found verbatim is DISCARDED. Paraphrasing loses the record.
+- Copy from the document; do not retype from memory. Preserve spelling, capitalisation,
+  punctuation and spacing.
+- Keep spans 5-40 words: long enough to be unique in the document, short enough to be
+  precise.
+- If you cannot find a verbatim span for something, DO NOT emit the record. A missing
+  record is correct; an ungrounded one is a failure.
+- Never infer, never estimate, never complete a partial disclosure from knowledge of the
+  industry or the company.
+
+==================================================================
+WHAT TO EXTRACT
+==================================================================
+Emit records of these kinds. Skip any kind the document does not cover.
+
+"milestone"     — a dated event in the company's history.
+                  item = short event name; period = the year (e.g. "2012"); value = ""
+"subsidiary"    — a subsidiary or associate company.
+                  item = entity name; field = "ownership_pct" | "activity";
+                  value = the percentage number, or the activity description
+"management"    — a director or key managerial person.
+                  item = person's name; field = "role" | "background" | "since";
+                  value = the role title, the background text, or the year
+"portfolio_unit"— a brand, product line, plant or business unit the company discloses.
+                  item = unit name; field = "contribution_pct" | "count" | "note";
+                  value = the number or the text
+"segment"       — a reported business segment with figures.
+                  item = segment name; field = "revenue" | "profit" | "margin_pct";
+                  value = the number; unit = "Rs Cr" or "%"; period = the FY e.g. "FY25"
+"risk"          — a risk the company itself names, and its stated response.
+                  item = short risk name; field = "description" | "mitigation";
+                  value = the text as the company puts it
+
+Rules for values:
+- Numbers: digits only, no commas, no currency symbol. Put the unit in `unit`.
+- If the document gives a figure in Rs Million or Rs Lakh, record the number AS PRINTED
+  and set `unit` to what the document says. Do not convert.
+- Percentages: the number alone, with unit "%".
+- If a field is not stated, omit that record rather than guessing.
+
+==================================================================
+OUTPUT — STRICT JSON, NO MARKDOWN FENCE, NO PROSE
+==================================================================
+{"records":[
+  {"kind":"<one of the six kinds>",
+   "item":"<the thing this record is about, max 80 chars>",
+   "field":"<the attribute, as listed above>",
+   "value":"<the value, max 300 chars>",
+   "unit":"<Rs Cr | % | count | \"\">",
+   "period":"<FY label or year, or \"\">",
+   "evidence_span":"<VERBATIM substring of the document>"}
+]}
+
+Emit at most 60 records, prioritising: segments with figures, subsidiaries, management,
+portfolio units, company-named risks, then milestones. If the document contains none of
+these, return {"records":[]}.
+
+=== COMPANY ===
+{company}
+
+=== DOCUMENT {doc_id} ({doc_type}, {doc_date}) ===
+{document}

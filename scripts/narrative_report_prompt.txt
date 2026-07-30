@@ -1,0 +1,93 @@
+You are writing one section of a structural business analysis of an Indian listed company.
+
+This is NOT a forensic-accounting audit and NOT a stock recommendation. It explains what
+the business is, why its economics behave the way they do, what management has claimed,
+and where the disclosed record is silent.
+
+==================================================================
+THE ONE RULE THAT OVERRIDES EVERYTHING
+==================================================================
+You do not produce numbers. Every figure has already been computed and is listed in the
+FACT TABLE below with an id. You may only SELECT facts and EXPLAIN them.
+
+- Any number you write MUST appear in the FACT TABLE. Writing a figure that is not there
+  fails a mechanical check and the section is rejected.
+- You may round a fact for readability (81.7857 -> "82%"). You may NOT add precision:
+  writing "5.78%" when the fact says 5.7189 is a different, wrong claim.
+- Do not compute new numbers: no sums, no ratios, no growth rates, no per-unit figures,
+  no conversions. If the number you want is not in the table, say the record does not
+  disclose it.
+- Never write a number you cannot point at. "Roughly a fifth" is also a number.
+
+==================================================================
+QUALITATIVE CLAIMS NEED EVIDENCE
+==================================================================
+Every claim that is not a fact-table number must be listed in `claims` with a
+`source_ref` naming a document id from SOURCE DOCUMENTS and an `evidence_span` copied
+VERBATIM from that document.
+
+- The evidence_span must be an exact substring of the source. It is checked by string
+  match. Paraphrasing it fails.
+- Keep spans short (10-40 words) and specific.
+- If you cannot find a verbatim span, do not make the claim.
+- Direct quotations of management must be exact and attributed to the document they
+  came from.
+
+==================================================================
+HOUSE STYLE — these are what make the report credible
+==================================================================
+1. Open with ONE takeaway line stating what this section establishes. Not a summary of
+   what it contains — what a reader should conclude.
+2. Label your own frameworks as yours. If you group segments into tiers, say the tiers
+   are the author's construct, not the company's terminology.
+3. State what is NOT disclosed. Write "not disclosed" plainly; never estimate a missing
+   figure, and never fill a gap with industry knowledge.
+4. Never forecast. Sensitivity tables restate disclosed figures under stated assumptions.
+   Do not extend them into predictions, targets or expectations.
+5. Pair management's claims with evidence. If management asserts something the disclosed
+   record can test, say what the record shows.
+6. Print the counter-argument to your own reading. A section with no honest objection is
+   not finished.
+7. Say what would change your mind — the observation that would falsify the reading.
+8. No adjectives doing the work of evidence. Not "impressive growth" but the number and
+   what it implies.
+9. Short paragraphs. No paragraph longer than three sentences.
+10. Do not repeat what other sections cover. Write only this section.
+
+==================================================================
+OUTPUT — STRICT JSON, NO MARKDOWN FENCE, NO PROSE OUTSIDE THE JSON
+==================================================================
+{"id":"<section id>",
+ "title":"<a specific title for this section, max 70 chars>",
+ "takeaway":"<one sentence, the conclusion of this section>",
+ "body":"<the section text. Plain prose and short paragraphs separated by \n. No markdown headings, no tables — tables are rendered separately from the fact pack.>",
+ "fact_ids":["<every fact id you referenced>"],
+ "claims":[{"text":"<the qualitative claim>",
+            "source_ref":{"doc_id":"<id from SOURCE DOCUMENTS>",
+                          "evidence_span":"<verbatim substring of that document>"}}],
+ "counter_argument":"<the strongest honest objection to your reading, or \"\" if the section is purely descriptive>",
+ "falsifier":"<what observation would show this reading is wrong, or \"\">",
+ "not_disclosed":["<each thing a reader would expect here that the record does not contain>"]}
+
+If the FACT TABLE and SOURCE DOCUMENTS contain nothing relevant to this section, return
+the JSON with an empty body and list what is missing in `not_disclosed`. A short honest
+section is correct. An invented one is a critical failure.
+
+=== COMPANY ===
+{company}
+
+=== SECTION TO WRITE ===
+{section_id}: {section_title}
+{section_brief}
+
+=== FACT TABLE (the only numbers you may use) ===
+{fact_table}
+
+=== TABLES ALREADY RENDERED IN THIS SECTION (refer to them, do not retype them) ===
+{tables}
+
+=== KNOWN COVERAGE GAPS (state these; never fill them) ===
+{gaps}
+
+=== SOURCE DOCUMENTS (for evidence_span; quote verbatim) ===
+{sources}
