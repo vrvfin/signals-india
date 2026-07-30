@@ -136,6 +136,14 @@ def main() -> None:
         log("universe missing.")
         return
     sym_col = "nse_symbol" if "nse_symbol" in uni.columns else "symbol"
+    # BSE-only names have an isin + bse_code + bse_symbol but NO nse_symbol, so keying
+    # solely on nse_symbol silently dropped 2,667 of 5,631 universe rows — company_facts
+    # covered 53% of the universe while claiming the whole of it. Measured 2026-07-30:
+    # 2,604 of those 2,667 already have a fundamentals/summary.parquet row and 2,378
+    # already have a fundamentals/statements/ file, so the data was present and merely
+    # unjoined. Falling back to bse_symbol takes coverage to ~99%.
+    # Existing NSE rows are unaffected: nse_symbol still wins whenever it is present.
+    alt_sym_col = "bse_symbol" if "bse_symbol" in uni.columns else None
 
     summ = _read(drive, root, ["fundamentals", "summary.parquet"])
     summ_by_sym = ({str(r["symbol"]).upper(): r for _, r in summ.iterrows()}
@@ -150,9 +158,15 @@ def main() -> None:
                    if cls is not None else {})
 
     rows = []
+    n_alt = 0
     for _, u in uni.iterrows():
         isin = str(u.get("isin", "")).strip()
         sym = str(u.get(sym_col, "")).strip().upper()
+        listing = "nse"
+        if sym in ("", "NAN") and alt_sym_col:
+            alt = str(u.get(alt_sym_col, "")).strip().upper()
+            if alt not in ("", "NAN"):
+                sym, listing, n_alt = alt, "bse", n_alt + 1
         if not isin or sym in ("", "NAN"):
             continue
         s = summ_by_sym.get(sym, {})
@@ -197,14 +211,19 @@ def main() -> None:
             "pat_ttm": _ttm(sg(s, "q_netprofit_last_4q")),
             "eps_ttm": _ttm(sg(s, "q_eps_last_4q")),
             "latest_q": rq.get("latest_q") or str(sg(s, "latest_quarter_label") or ""),
-            "source": src,
+            # `source` records which parquets fed the row; the listing tag records WHICH
+            # symbol namespace the row was keyed on, so a consumer can tell an NSE row
+            # from a BSE-only one without re-deriving it from the universe.
+            "source": (src + "|bse") if listing == "bse" else src,
             "updated_at": today,
         })
 
     df = pd.DataFrame(rows, columns=FACT_COLS)
     cov = {c: int(df[c].notna().sum()) for c in
            ["mcap_cr", "pe", "ret_12m_pct", "rev_q_yoy", "pat_q_yoy", "rev_ttm"]}
-    log(f"company_facts: {len(df)} rows. coverage {cov}")
+    log(f"company_facts: {len(df)} rows "
+        f"({len(df) - n_alt} keyed on {sym_col}, {n_alt} on {alt_sym_col or 'n/a'}). "
+        f"coverage {cov}")
 
     # ---- peer/segment median aggregates ----
     agg_rows = []
