@@ -90,13 +90,23 @@ _CUR_SCALE = (
     (re.compile(r"\bmillions?\b|\bmn\b", re.I), 0.1),
     (re.compile(r"\bthousand\b|\bk\b", re.I), 0.0001),
 )
-_RE_CURRENCY = re.compile(r"₹|\brs\.?\b|\binr\b|\$|\busd\b|\bcrores?\b|\bcr\b|"
-                          r"\blakhs?\b|\bbillions?\b|\bbn\b|\bmillions?\b|\bmn\b", re.I)
+# HARD currency markers — these unambiguously mean money.
+_RE_CURRENCY_HARD = re.compile(r"₹|\brs\.?\b|\binr\b|\$|\busd\b|\bcrores?\b|\bcr\b", re.I)
+# Magnitude words. "lakh"/"million" are SCALE, not currency: "5.25 lakh units" and
+# "3.5-4 lakh cases/month" are quantities, not rupees. They only imply money when a
+# hard marker is present, so they must never by themselves force absolute_inr.
+_RE_CURRENCY_SCALE = re.compile(r"\blakhs?\b|\bbillions?\b|\bbn\b|\bmillions?\b|\bmn\b",
+                                re.I)
+_RE_CURRENCY = re.compile(_RE_CURRENCY_HARD.pattern + "|" + _RE_CURRENCY_SCALE.pattern,
+                          re.I)
 # physical / count units (captured so we can report what was written)
 _RE_PHYS = re.compile(
-    r"\b(mtpa|mmtpa|mt|tonnes?|tons?|kt|mw|gw|kwh|kl|klpd|sq\.?\s?ft|sqft|acres?|"
-    r"units?|seats?|stores?|outlets?|rooms?|beds?|sites?|branches?|vehicles?|"
-    r"pieces?|nos\.?|customers?|subscribers?)\b", re.I)
+    r"\b(mtpa|mmtpa|mt|tonnes?|tons?|kt|tpd|mtpd|mw|gw|kwh|kl|klpd|litres?|liters?|"
+    r"sq\.?\s?ft|sqft|sqm|msf|acres?|"
+    r"units?|cases?|boxes|bottles?|pieces?|pcs|nos\.?|panels?|modules?|cells?|"
+    r"seats?|stores?|outlets?|rooms?|beds?|keys|sites?|branches?|centres?|centers?|"
+    r"vehicles?|trucks?|wagons?|coaches?|"
+    r"customers?|subscribers?|members?)\b", re.I)
 # "double" = 2x, but "double digit" means 10-99% — never a multiple, so exclude it
 _RE_MULTIPLE = re.compile(
     r"(\d+(?:\.\d+)?)\s*x\b|\b(double|doubling|two-?fold|2x)\b(?![-\s]*digits?)|"
@@ -189,7 +199,11 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
     if m_pref:
         kind, body = m_pref.group(1).upper(), m_pref.group(2).strip()
         if kind == "ABS":
-            if _RE_CURRENCY.search(body):
+            # same rule as below: a physical unit beats a bare scale word, so
+            # "ABS: 5.25 lakh units" is a QUANTITY, not rupees
+            _body_phys = _RE_PHYS.search(body)
+            if _RE_CURRENCY_HARD.search(body) or (
+                    _RE_CURRENCY_SCALE.search(body) and not _body_phys):
                 nums = _numbers(body)
                 if nums:
                     scale = 1.0
@@ -223,8 +237,12 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
 
     from_growth_col = horizon in GROWTH_HORIZONS
     has_pct = bool(_RE_PCT_TOKEN.search(text))
-    has_cur = bool(_RE_CURRENCY.search(text))
     phys = _RE_PHYS.search(text)
+    # Money only when a HARD marker is present. A bare scale word ("5.25 lakh
+    # units", "3.5-4 lakh cases/month") is a quantity — and an explicit physical
+    # unit always wins over a scale word, so those stay absolute_units.
+    has_cur = bool(_RE_CURRENCY_HARD.search(text)) or (
+        bool(_RE_CURRENCY_SCALE.search(text)) and not phys)
 
     # 1) explicit currency -> absolute rupee target (normalise to Rs crore).
     #    Checked before '%' so "INR978.75 crores (Derived)" is not read as a rate.
