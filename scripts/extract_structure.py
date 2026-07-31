@@ -184,7 +184,10 @@ def save(store: Store, rows: pd.DataFrame, dry_run: bool) -> str:
                 f"({len(rows)} for this run, {len(kept_other)} preserved)")
     buf = io.BytesIO()
     merged.to_parquet(buf, index=False)
-    upload_bytes(drive, fid_folder, STRUCT_FILE, buf.getvalue(), fid)
+    # signature is (drive, folder_id, filename, data, mimetype, existing_id) — see the
+    # same bug fixed in extract_mgmt_quotes.py.
+    upload_bytes(drive, fid_folder, STRUCT_FILE, buf.getvalue(),
+                 "application/octet-stream", existing_id=fid)
     return f"wrote {STRUCT_FILE}: {len(merged)} rows total, {len(rows)} from this run"
 
 

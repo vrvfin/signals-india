@@ -54,19 +54,15 @@ FUND = "fundamentals"
 
 # Sections that require extraction this repo does not yet perform. Listed so the pack
 # reports its own blind spots instead of leaving them silently absent.
+# Sections with no data source at all. Everything else is populated from Drive; a
+# section that HAS a source but no rows for this company reports a coverage gap instead,
+# so "we cannot do this yet" stays distinct from "this company has none".
 UNCOVERED = {
-    1: "history timeline — needs AR/DRHP milestone extraction (N7)",
-    3: "legal entity map — needs AR subsidiary-schedule extraction (N7)",
-    4: "management bench — needs AR KMP/board extraction (N7)",
-    9: "portfolio table — needs AR/presentation extraction (N7)",
     10: "tier framework — derived by Layer B from section 9",
-    11: "mix shift — needs two years of section 9",
-    12: "per-unit deep dives — needs AR segment extraction (N7)",
-    16: "alt-data claim test — needs the sector alt-data registry (N9)",
-    17: "alt-data scorecard — needs the sector alt-data registry (N9)",
-    20: "verbatim quote spine — needs mgmt_quotes.parquet (N8)",
-    23: "structural risk register — needs AR/concall risk extraction (N7)",
-    25: "policy backdrop — needs the alt-data registry (N9)",
+    16: "alt-data claim test — no automatable feed; Vahan connection-resets and "
+        "analytics.parivahan returns 403 (probed 2026-07-30). Drop a CSV in the "
+        "alt-data intake to populate this.",
+    17: "alt-data scorecard — same as section 16",
 }
 
 
@@ -546,6 +542,253 @@ def sec21_peers(pack: Pack, store: Store):
                  "set is Indian listed names only")
 
 
+# ---------------------------------------------------- extracted structure ----
+def _struct(store: Store, isin: str, symbol: str, kind: str) -> pd.DataFrame:
+    df = store.by_isin("company_structure.parquet", isin, symbol)
+    if df.empty or "kind" not in df.columns:
+        return pd.DataFrame()
+    return df[df["kind"].astype(str) == kind]
+
+
+def _src_doc(row) -> dict:
+    """Provenance for an extracted record: the document it came from, plus the verbatim
+    span that survived the extractor's containment check."""
+    return {"kind": "document", "doc_type": str(row.get("source_doc_id", "")).split("_")[0],
+            "date": str(row.get("doc_date", "")), "title": str(row.get("source_doc_id", "")),
+            "evidence_span": str(row.get("evidence_span", ""))[:300]}
+
+
+def _pivot_struct(rows: pd.DataFrame) -> list[dict]:
+    """kind rows (item/field/value) -> one dict per item with its fields as columns."""
+    out: dict[str, dict] = {}
+    for _, r in rows.iterrows():
+        item = str(r.get("item", "")).strip()
+        if not item:
+            continue
+        rec = out.setdefault(item, {"item": item})
+        f = str(r.get("field", "")).strip() or "value"
+        val = str(r.get("value", "")).strip()
+        unit = str(r.get("unit", "")).strip()
+        rec[f] = f"{val} {unit}".strip() if unit and unit != "%" else (
+            f"{val}%" if unit == "%" else val)
+        if str(r.get("period", "")).strip():
+            rec["period"] = str(r.get("period")).strip()
+        rec.setdefault("_src", str(r.get("source_doc_id", "")))
+    return list(out.values())
+
+
+def sec1_history(pack: Pack, store: Store):
+    rows = _struct(store, pack.isin, pack.symbol, "milestone")
+    if rows.empty:
+        pack.gap(1, "no milestones extracted — run extract_structure.py, and check the "
+                    "company has an annual_report in the queue")
+        return
+    recs = []
+    for _, r in rows.iterrows():
+        yr = str(r.get("period") or r.get("value") or "").strip()
+        recs.append({"year": yr, "event": str(r.get("item", "")),
+                     "source": str(r.get("source_doc_id", ""))})
+    recs.sort(key=lambda x: (x["year"] or "9999"))
+    pack.table("tbl.milestones", "Dated milestones, as disclosed", 1,
+               ["year", "event", "source"], recs,
+               _src_doc(rows.iloc[0]),
+               note="Every row carries a verbatim span from the filing it was taken "
+                    "from; records whose span could not be found were discarded at "
+                    "extraction.")
+    pack.add("hist.n_milestones", "Milestones on record", len(recs), "count",
+             "extracted", 1, _src_doc(rows.iloc[0]))
+
+
+def sec3_entity_map(pack: Pack, store: Store):
+    rows = _struct(store, pack.isin, pack.symbol, "subsidiary")
+    if rows.empty:
+        pack.gap(3, "no subsidiaries extracted from the annual report")
+        return
+    recs = _pivot_struct(rows)
+    pack.table("tbl.subsidiaries", "Subsidiaries and associates, as disclosed", 3,
+               ["item", "ownership_pct", "activity"], recs, _src_doc(rows.iloc[0]))
+    pack.add("entity.n_subsidiaries", "Entities disclosed", len(recs), "count",
+             "extracted", 3, _src_doc(rows.iloc[0]))
+    wholly = [r for r in recs if str(r.get("ownership_pct", "")).startswith("100")]
+    if wholly:
+        pack.add("entity.n_wholly_owned", "Wholly owned (100%)", len(wholly), "count",
+                 "extracted", 3, _src_doc(rows.iloc[0]))
+
+
+def sec4_management(pack: Pack, store: Store):
+    rows = _struct(store, pack.isin, pack.symbol, "management")
+    if rows.empty:
+        pack.gap(4, "no management records extracted from the annual report")
+        return
+    recs = _pivot_struct(rows)
+    pack.table("tbl.management", "Board and key management, as disclosed", 4,
+               ["item", "role", "since", "background"], recs, _src_doc(rows.iloc[0]),
+               note="Extracted from the annual report; roles and tenures are as the "
+                    "filing states them.")
+    pack.add("mgmt.n_people", "People on record", len(recs), "count", "extracted", 4,
+             _src_doc(rows.iloc[0]))
+
+
+def sec6_segment_economics(pack: Pack, store: Store):
+    """The deck's central chart: revenue share against profit share. Where one segment
+    books most of the revenue and another earns most of the profit, that asymmetry IS
+    the business model."""
+    rows = _struct(store, pack.isin, pack.symbol, "segment")
+    if rows.empty:
+        pack.gap(6, "no segment disclosures extracted — the AR may not report segments")
+        return
+    recs = _pivot_struct(rows)
+    pack.table("tbl.segments", "Segment economics, as disclosed", 6,
+               ["item", "period", "revenue", "profit", "margin_pct"], recs,
+               _src_doc(rows.iloc[0]),
+               note="Figures are reproduced in the unit the filing printed them in "
+                    "(often Rs Million) and are NOT converted.")
+
+    # Revenue share vs profit share, computed only where both legs are present for the
+    # same period and unit — a share computed across mixed units would be nonsense.
+    def _n(v):
+        try:
+            return float(str(v).split()[0].replace(",", ""))
+        except (ValueError, IndexError):
+            return None
+
+    per = {}
+    for _, r in rows.iterrows():
+        p = str(r.get("period", "")).strip()
+        f = str(r.get("field", "")).strip()
+        if f in ("revenue", "profit"):
+            per.setdefault(p, {}).setdefault(f, {})[str(r.get("item"))] = (
+                _n(r.get("value")), str(r.get("unit", "")))
+    for p, legs in sorted(per.items()):
+        rev, pro = legs.get("revenue", {}), legs.get("profit", {})
+        if len(rev) < 2 or len(pro) < 2:
+            continue
+        units = {u for _, u in list(rev.values()) + list(pro.values())}
+        if len(units) > 1:
+            pack.gap(6, f"{p}: segment figures mix units {units} — share not computed")
+            continue
+        tr = sum(v for v, _ in rev.values() if v)
+        tp = sum(v for v, _ in pro.values() if v)
+        if not tr or not tp:
+            continue
+        share = []
+        for name in sorted(set(rev) | set(pro)):
+            rv = (rev.get(name) or (None, ""))[0]
+            pv = (pro.get(name) or (None, ""))[0]
+            share.append({"segment": name,
+                          "revenue_share_pct": round(100.0 * rv / tr, 1) if rv else None,
+                          "profit_share_pct": round(100.0 * pv / tp, 1) if pv else None})
+        pack.table(f"tbl.segment_share_{p}",
+                   f"Revenue share vs profit share, {p}", 6,
+                   ["segment", "revenue_share_pct", "profit_share_pct"], share,
+                   _src_computed(f"each segment over the disclosed {p} total"),
+                   note="Computed from the disclosed segment figures above. Where a "
+                        "segment's profit share exceeds its revenue share, it earns "
+                        "more than it books.")
+
+
+def sec9_portfolio(pack: Pack, store: Store):
+    rows = _struct(store, pack.isin, pack.symbol, "portfolio_unit")
+    if rows.empty:
+        pack.gap(9, "no portfolio units extracted")
+        return
+    recs = _pivot_struct(rows)
+    pack.table("tbl.portfolio", "Brands, products and units, as disclosed", 9,
+               ["item", "contribution_pct", "count", "note"], recs,
+               _src_doc(rows.iloc[0]))
+    pack.add("port.n_units", "Units disclosed", len(recs), "count", "extracted", 9,
+             _src_doc(rows.iloc[0]))
+
+
+def sec12_unit_deepdives(pack: Pack, store: Store):
+    seg = _struct(store, pack.isin, pack.symbol, "segment")
+    if seg.empty:
+        pack.gap(12, "per-unit detail needs segment disclosures, which were not found")
+        return
+    pack.add("unit.n_segments", "Segments with disclosed figures",
+             int(seg["item"].nunique()), "count", "extracted", 12, _src_doc(seg.iloc[0]))
+
+
+def sec23_structural_risks(pack: Pack, store: Store):
+    """The deck's risk register: the company's OWN named risk, its OWN stated
+    mitigation, side by side."""
+    rows = _struct(store, pack.isin, pack.symbol, "risk")
+    if rows.empty:
+        pack.gap(23, "no company-named risks extracted from the annual report")
+        return
+    recs = _pivot_struct(rows)
+    for r in recs:
+        r["status"] = "STATED" if r.get("mitigation") else "NO STATED MITIGATION"
+    pack.table("tbl.structural_risks",
+               "Risks the company names, and its stated response", 23,
+               ["item", "description", "mitigation", "status"], recs,
+               _src_doc(rows.iloc[0]),
+               note="Both the risk and the response are the company's own words, from "
+                    "its annual report. A row marked NO STATED MITIGATION is one the "
+                    "filing raises without answering.")
+    pack.add("risk.n_named", "Risks the company names", len(recs), "count",
+             "extracted", 23, _src_doc(rows.iloc[0]))
+    unmitigated = [r for r in recs if not r.get("mitigation")]
+    if unmitigated:
+        pack.add("risk.n_unmitigated", "Named without a stated mitigation",
+                 len(unmitigated), "count", "extracted", 23, _src_doc(rows.iloc[0]))
+
+
+def sec20_quote_spine(pack: Pack, store: Store):
+    """Management's own words across consecutive calls, set against the said-vs-delivered
+    record. Every quote was string-matched to its transcript before storage."""
+    q = store.by_isin("mgmt_quotes.parquet", pack.isin, pack.symbol)
+    if q.empty:
+        pack.gap(20, "no management quotes — run extract_mgmt_quotes.py; the section "
+                     "wants 4+ concalls for a claim-across-calls spine")
+    else:
+        q = q.sort_values("call_date", ascending=False)
+        recs = [{"quarter": str(r.get("quarter", "")), "date": str(r.get("call_date", ""))[:10],
+                 "speaker": str(r.get("speaker", "")), "topic": str(r.get("topic", "")),
+                 "quote": str(r.get("quote", "")), "commitment": str(r.get("commitment", ""))}
+                for _, r in q.iterrows()]
+        pack.table("tbl.quotes", "What management said, verbatim", 20,
+                   ["quarter", "date", "speaker", "topic", "quote", "commitment"], recs,
+                   {"kind": "document", "doc_type": "concall",
+                    "title": ", ".join(sorted(q["source_doc_id"].astype(str).unique()))},
+                   note="Every quote was verified to appear verbatim in its transcript "
+                        "before being stored; any that did not was discarded.")
+        pack.add("quote.n", "Quotes on record", len(recs), "count", "extracted", 20,
+                 _src_parquet(f"{IDX}/mgmt_quotes.parquet"))
+        nq = int(q["quarter"].nunique())
+        pack.add("quote.n_quarters", "Quarters covered", nq, "count", "extracted", 20,
+                 _src_parquet(f"{IDX}/mgmt_quotes.parquet"))
+        if nq < 4:
+            pack.gap(20, f"quotes span {nq} quarter(s); a said-vs-delivered spine across "
+                         f"calls wants 4+. Run backfill_company_docs.py for more concalls.")
+        commitments = [r for r in recs if r["commitment"]]
+        if commitments:
+            pack.add("quote.n_commitments", "Checkable commitments made",
+                     len(commitments), "count", "extracted", 20,
+                     _src_parquet(f"{IDX}/mgmt_quotes.parquet"))
+
+    # said-vs-delivered, from the pipelines that already compute it
+    pead = store.by_isin("pead_flags.parquet", pack.isin, pack.symbol)
+    if not pead.empty:
+        rows = pead.sort_values("as_of").tail(10)
+        pack.table("tbl.said_vs_delivered", "Guided versus actual", 20,
+                   ["quarter", "metric", "guided_value", "actual_value", "verdict"],
+                   [{"quarter": str(r.get("quarter")), "metric": str(r.get("metric")),
+                     "guided_value": r.get("guided_value"),
+                     "actual_value": r.get("actual_value"),
+                     "verdict": str(r.get("verdict"))} for _, r in rows.iterrows()],
+                   _src_parquet(f"{IDX}/pead_flags.parquet"))
+    else:
+        pack.gap(20, "no guided-vs-actual rows (pead_flags) for this company")
+    mc = store.by_isin("mgmt_credibility.parquet", pack.isin, pack.symbol)
+    if not mc.empty and "cred_score" in mc.columns:
+        r = mc.sort_values("quarter").iloc[-1]
+        pack.add("quote.cred_score", f"Management credibility score ({r.get('quarter')})",
+                 pd.to_numeric(r.get("cred_score"), errors="coerce"), "/100", "computed",
+                 20, _src_parquet(f"{IDX}/mgmt_credibility.parquet",
+                                  f"pattern={r.get('pattern')}"))
+
+
 def sec24_risk_register(pack: Pack, store: Store):
     """Section 24 — the financial/execution risk register, from computed trackers."""
     ft = store.by_isin("fraud_tracker.parquet", pack.isin, pack.symbol)
@@ -616,8 +859,116 @@ def sec24_risk_register(pack: Pack, store: Store):
                                   f"period={r.get('period')}"))
 
 
+# ------------------------------------------------- exchange + rating feeds ---
+def _bse_code(store: Store, isin: str) -> str:
+    """bse_code from the universe — the key the BSE announcement API needs."""
+    try:
+        fid = find_file(store.drive, store.folder(IDX), "company_universe.csv")
+        if not fid:
+            return ""
+        u = pd.read_csv(io.BytesIO(download_bytes(store.drive, fid)))
+        m = u[u["isin"].astype(str) == str(isin)]
+        if m.empty:
+            return ""
+        v = pd.to_numeric(m.iloc[0].get("bse_code"), errors="coerce")
+        return "" if pd.isna(v) else str(int(v))
+    except Exception:
+        return ""
+
+
+def sec27_exchange_filings(pack: Pack, store: Store, live: bool = True):
+    """Section 27 — recent BSE/NSE filings. This is the live exchange feed: orders,
+    board actions, ratings, capacity. Reuses the fetchers already in
+    company_deep_report.py rather than writing new API calls (CLAUDE.md rule 4)."""
+    if not live:
+        pack.gap(27, "exchange feed skipped (--no-live)")
+        return
+    recs = []
+    code = _bse_code(store, pack.isin)
+    try:
+        from company_deep_report import bse_announcements, nse_announcements
+    except Exception as e:
+        pack.gap(27, f"exchange fetchers unavailable: {str(e)[:80]}")
+        return
+
+    def _parse_feed(blob, exchange: str) -> list[dict]:
+        """Both fetchers return a FORMATTED STRING of "- YYYY-MM-DD | subject [cat]"
+        lines (or a "DATA_MISSING ..." sentinel), not structured rows. Parse rather
+        than re-implement the API call — the fetchers already carry the BSE header
+        dance and NSE's cookie bootstrap."""
+        out = []
+        if not blob or not isinstance(blob, str):
+            return out
+        if blob.startswith("DATA_MISSING") or blob.startswith("No announcements"):
+            pack.gap(27, f"{exchange}: {blob[:120]}")
+            return out
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line.startswith("- "):
+                continue
+            body = line[2:]
+            date, _, rest = body.partition(" | ")
+            cat = ""
+            if rest.endswith("]") and " [" in rest:
+                rest, _, cat = rest.rpartition(" [")
+                cat = cat.rstrip("]")
+            # BSE emits ISO (2026-05-30); NSE emits DD-MMM-YYYY (30-May-2026).
+            # Truncating to 10 chars chopped NSE's year, and sorting two formats
+            # together is meaningless — normalise to ISO and keep what fails as-is.
+            raw = date.strip()
+            iso = pd.to_datetime(raw, errors="coerce", dayfirst=True)
+            out.append({"exchange": exchange,
+                        "date": raw if pd.isna(iso) else iso.strftime("%Y-%m-%d"),
+                        "category": cat[:60], "headline": rest.strip()[:220]})
+        return out
+
+    if code:
+        try:
+            recs += _parse_feed(bse_announcements(code, limit=25), "BSE")
+        except Exception as e:
+            pack.gap(27, f"BSE announcement fetch failed: {str(e)[:90]}")
+    else:
+        pack.gap(27, "no bse_code in the universe for this company — BSE feed skipped")
+    try:
+        recs += _parse_feed(nse_announcements(pack.symbol, limit=15), "NSE")
+    except Exception as e:
+        pack.gap(27, f"NSE announcement fetch failed: {str(e)[:90]}")
+
+    if not recs:
+        pack.gap(27, "no exchange filings returned")
+        return
+    recs.sort(key=lambda r: r["date"], reverse=True)
+    pack.table("tbl.filings", "Recent exchange filings", 27,
+               ["date", "exchange", "category", "headline"], recs,
+               {"kind": "api", "table": "BSE Direct / NSE corporate announcements",
+                "note": f"fetched live {datetime.now(timezone.utc).date()}"},
+               note="Filed events only, as published by the exchange. Headlines are "
+                    "not interpreted here.")
+    pack.add("filings.n_recent", "Filings retrieved", len(recs), "count", "reported",
+             27, {"kind": "api", "table": "BSE Direct / NSE"})
+
+
+def sec7_ratings(pack: Pack, store: Store):
+    """Credit-rating actions — the agencies' own view, which is independent of the
+    company's framing."""
+    r = store.by_isin("ratings.parquet", pack.isin, pack.symbol)
+    if r.empty:
+        pack.gap(7, "no credit-rating rows; CRISIL/ICRA/CARE rationales may still be in "
+                    "the source bundle for the auditor even when not tabulated here")
+        return
+    cols = [c for c in ("agency", "rating", "outlook", "action", "instrument",
+                        "rated_amount", "date", "fy_year") if c in r.columns]
+    rows = r.sort_values(cols[-1] if cols else r.columns[0],
+                         ascending=False).head(12)
+    pack.table("tbl.ratings", "Credit-rating actions", 7, cols,
+               [{c: str(x.get(c, "")) for c in cols} for _, x in rows.iterrows()],
+               _src_parquet(f"{IDX}/ratings.parquet"))
+    pack.add("rating.n", "Rating records", len(r), "count", "extracted", 7,
+             _src_parquet(f"{IDX}/ratings.parquet"))
+
+
 # --------------------------------------------------------------------- main ---
-def build(store: Store, token: str) -> Pack | None:
+def build(store: Store, token: str, live: bool = True) -> Pack | None:
     r = resolve(store, token)
     if r is None:
         log(f"  could not resolve '{token}' to a company")
@@ -629,6 +980,7 @@ def build(store: Store, token: str) -> Pack | None:
     if st.empty:
         log(f"  WARNING: no fundamentals/statements/{symbol}.parquet — the financial "
             f"sections will be empty")
+    # deterministic core (statements + computed tables)
     sec2_one_pager(pack, store)
     sec18_financials(pack, store, st)
     sec5_scale_history(pack, store, st)
@@ -637,6 +989,18 @@ def build(store: Store, token: str) -> Pack | None:
     sec22_sensitivity_grid(pack, store, st, lev)
     sec21_peers(pack, store)
     sec24_risk_register(pack, store)
+    # extracted from filings (N7/N8)
+    sec1_history(pack, store)
+    sec3_entity_map(pack, store)
+    sec4_management(pack, store)
+    sec6_segment_economics(pack, store)
+    sec7_ratings(pack, store)
+    sec9_portfolio(pack, store)
+    sec12_unit_deepdives(pack, store)
+    sec20_quote_spine(pack, store)
+    sec23_structural_risks(pack, store)
+    # live exchange feed
+    sec27_exchange_filings(pack, store, live=live)
     return pack
 
 
@@ -671,6 +1035,8 @@ def main():
                                               "or to <out>/<symbol>.json (several)")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and report coverage, write nothing")
+    ap.add_argument("--no-live", action="store_true",
+                    help="skip the live BSE/NSE announcement fetch")
     a = ap.parse_args()
 
     tokens = list(a.names) + list(a.isin)
@@ -681,7 +1047,7 @@ def main():
     packs = []
     for t in tokens:
         log(f"resolving '{t}'")
-        p = build(store, t)
+        p = build(store, t, live=not a.no_live)
         if p:
             packs.append(p)
     if not packs:

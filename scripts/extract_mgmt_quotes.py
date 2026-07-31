@@ -212,7 +212,11 @@ def save(store: Store, rows: pd.DataFrame, dry_run: bool) -> str:
                 f"({len(rows)} this run, {len(other)} preserved)")
     buf = io.BytesIO()
     merged.to_parquet(buf, index=False)
-    upload_bytes(drive, folder, QUOTES_FILE, buf.getvalue(), fid)
+    # signature is (drive, folder_id, filename, data, mimetype, existing_id) — passing
+    # the file id positionally put it in the mimetype slot and crashed the upload AFTER
+    # the extraction had already been paid for.
+    upload_bytes(drive, folder, QUOTES_FILE, buf.getvalue(),
+                 "application/octet-stream", existing_id=fid)
     return f"wrote {QUOTES_FILE}: {len(merged)} rows total, {len(rows)} from this run"
 
 

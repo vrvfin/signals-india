@@ -63,9 +63,10 @@ SECTION_BRIEFS: dict[int, tuple[str, str]] = {
     6: ("Segment economics",
         "Which part of the business earns the money, versus which part books the "
         "revenue. The asymmetry between revenue share and profit share is the point."),
-    7: ("Accounting basis",
-        "Which basis the headline figures are stated on, and where reported and "
-        "underlying diverge."),
+    7: ("Accounting basis and credit ratings",
+        "Which basis the headline figures are stated on, and what the credit-rating "
+        "agencies concluded — an independent read on the balance sheet that does not "
+        "come from the company."),
     8: ("The steadiest series",
         "The most stable disclosed series, the band it has held, and over which years. "
         "Do not claim stability across loss-making years."),
@@ -109,6 +110,11 @@ SECTION_BRIEFS: dict[int, tuple[str, str]] = {
     26: ("Findings",
          "The numbered findings this report establishes, each pointing at the section "
          "that supports it. Introduce no new facts."),
+    27: ("Recent exchange filings",
+         "A dated digest of what the company has filed with BSE/NSE recently: orders, "
+         "board actions, capacity, ratings. Say what was filed, not what it implies "
+         "beyond the filing. Flag any filing that corroborates or contradicts a claim "
+         "made elsewhere in this report."),
 }
 
 

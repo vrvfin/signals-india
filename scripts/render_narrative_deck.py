@@ -37,7 +37,7 @@ SECTIONS: list[tuple[int, str]] = [
     (4, "A founder-led business with a professional operating layer"),
     (5, "How the business was built — and what it cost"),
     (6, "Segment economics — revenue share vs profit share"),
-    (7, "The accounting basis, and where it forks"),
+    (7, "The accounting basis, and what the rating agencies say"),
     (8, "The quiet compounder — the steadiest series"),
     (9, "The portfolio, as disclosed"),
     (10, "A more useful way to read the portfolio"),
@@ -54,6 +54,7 @@ SECTIONS: list[tuple[int, str]] = [
     (24, "Financial, policy and execution risks"),
     (25, "The policy backdrop"),
     (26, "Findings"),
+    (27, "Recent exchange filings"),
 ]
 
 DISCLAIMER = (
