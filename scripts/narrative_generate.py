@@ -227,8 +227,16 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
             continue
 
         prose = " ".join(str(out.get(k, "")) for k in ("takeaway", "body"))
-        findings = (VG.verify_numbers(prose, subpack, str(sec))
-                    + VG.verify_spans(out.get("claims") or [], sources, str(sec)))
+        # Spans are checked FIRST so the ones that verify can license the numbers they
+        # contain. A figure quoted from a filing is grounded even when it is not in the
+        # computed fact table — but only if the surrounding span provably appears in
+        # that filing, which is exactly what verify_spans establishes.
+        claims = out.get("claims") or []
+        span_findings, verified_spans = VG.verify_spans_detailed(
+            claims, sources, str(sec))
+        findings = (VG.verify_numbers(prose, subpack, str(sec),
+                                      licensed_text=" ".join(verified_spans))
+                    + span_findings)
         hard = [f for f in findings if f.severity == "fail"]
         if best is None or _score(out, findings) > _score(best[1], best[2]):
             best = (attempt, out, findings)

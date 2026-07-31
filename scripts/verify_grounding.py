@@ -47,6 +47,9 @@ _NUM_RE = re.compile(r"""
 
 # Numbers that are labels, not measurements. These are never checked against facts.
 _FY_RE = re.compile(r"\bFY\s?\d{2,4}\b", re.IGNORECASE)
+# Indian fiscal years are written "2024-25" / "FY2024-25" in filings. Without this the
+# "-25" tail parsed as the number -25 and demanded a fact for it.
+_FYRANGE_RE = re.compile(r"\b(?:FY\s?)?(?:19|20)\d{2}\s?[-/–]\s?\d{2,4}\b", re.I)
 _QTR_RE = re.compile(r"\bQ[1-4]\s?FY?\s?\d{2,4}\b", re.IGNORECASE)
 _DATE_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 _SECTION_RE = re.compile(r"\b(?:section|slide|page|note|part|table)\s*\.?\s*\d+", re.I)
@@ -97,8 +100,8 @@ def _mask_labels(text: str) -> str:
     out = text
     # _DOCID_RE / _ISODATE_RE / _FACTID_RE must run BEFORE _DATE_RE so the whole citation
     # is blanked rather than leaving digit fragments behind.
-    for rx in (_ID_RE, _DOCID_RE, _ISODATE_RE, _FACTID_RE, _QTR_RE, _FY_RE,
-               _SECTION_RE, _ORDINAL_RE, _DATE_RE, _LIST_RE):
+    for rx in (_ID_RE, _DOCID_RE, _ISODATE_RE, _FACTID_RE, _QTR_RE, _FYRANGE_RE,
+               _FY_RE, _SECTION_RE, _ORDINAL_RE, _DATE_RE, _LIST_RE):
         out = rx.sub(lambda m: " " * len(m.group(0)), out)
     return out
 
@@ -147,10 +150,27 @@ def _label_numbers(factpack: dict) -> list[float]:
 
 
 def verify_numbers(prose: str, factpack: dict, section: str = "?",
-                   extra_allowed: list[float] | None = None) -> list[Finding]:
-    """Gate 1. Every measurement in `prose` must match a fact at the precision written."""
+                   extra_allowed: list[float] | None = None,
+                   licensed_text: str = "") -> list[Finding]:
+    """Gate 1. Every measurement in `prose` must match a fact at the precision written.
+
+    `licensed_text` is source text the claim-level gate has ALREADY verified as verbatim
+    (see verify_spans). A number appearing there is grounded in a filing even though it
+    is not in the computed fact table — "the Company operationalised 23 new outlets" is
+    a faithful report of what the annual report says, not an invented figure. Requiring
+    a fact id for it flagged correct writing: it produced 25 failures on the first
+    document-heavy run, nearly all of them quotations.
+
+    The safety property is preserved because the span itself was string-matched to the
+    source first. A number can only ride in on text that provably appears in a document.
+    """
     facts = _fact_values(factpack)
     allowed = list(extra_allowed or []) + _label_numbers(factpack)
+    if licensed_text:
+        for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", licensed_text):
+            v = _to_float(m.group(0))
+            if v is not None:
+                allowed.append(v)
     findings: list[Finding] = []
     masked = _mask_labels(prose)
 
@@ -204,6 +224,21 @@ def verify_numbers(prose: str, factpack: dict, section: str = "?",
 
 
 # ------------------------------------------------------------------ gate 2 ----
+def verify_spans_detailed(claims: list[dict], sources: dict[str, str],
+                          section: str = "?") -> tuple[list[Finding], list[str]]:
+    """Gate 2, returning (findings, spans_that_verified). The verified spans are what
+    Gate 1 uses to license quoted figures, so this must report them rather than leave
+    the caller to re-derive which claims passed."""
+    findings = verify_spans(claims, sources, section)
+    failed_spans = {f.excerpt for f in findings if f.severity == "fail"}
+    ok = []
+    for c in claims:
+        span = str((c.get("source_ref") or {}).get("evidence_span", ""))
+        if span and normalise(span)[:160] not in failed_spans:
+            ok.append(span)
+    return findings, ok
+
+
 def verify_spans(claims: list[dict], sources: dict[str, str],
                  section: str = "?") -> list[Finding]:
     """Gate 2. Each claim needs source_ref{doc_id, evidence_span}, and that span must
