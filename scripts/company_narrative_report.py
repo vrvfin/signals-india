@@ -116,6 +116,51 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             "publish anyway (the failure is recorded on the report).")
         return None
 
+    # ---- auto-fetch what Drive is missing ---------------------------------
+    # The report should not simply REPORT a gap it can close. Preflight already knows
+    # which sections are FETCHABLE (the pipeline can get the documents, this company
+    # just has too few), so close those before building rather than rendering
+    # DATA_MISSING and telling the user to run a command themselves.
+    if args.fetch_missing:
+        fetchable = [r for r in rep["readiness"] if r["state"] == "FETCHABLE"]
+        if not fetchable:
+            log("[1b] auto-fetch: nothing fetchable — Drive already has what it can")
+        else:
+            log(f"[1b] auto-fetch: {len(fetchable)} section(s) short of documents "
+                f"— pulling from Screener/BSE/NSE")
+            for r in fetchable[:1]:      # one backfill call covers all doc types
+                log(f"     {r['remedy']}")
+            try:
+                import backfill_company_docs as BF
+                rc = BF.main_for(co["name"]) if hasattr(BF, "main_for") else None
+                if rc is None:
+                    import subprocess
+                    cmd = [sys.executable, str(Path(_HERE) / "backfill_company_docs.py"),
+                           "--names", co["name"]]
+                    subprocess.run(cmd, check=False, timeout=1800)
+                log("     backfill done — re-running preflight")
+            except Exception as e:
+                log(f"     backfill failed ({str(e)[:120]}) — continuing with what exists")
+            # New documents are useless until they are extracted, so run the two
+            # extractors that feed the document-backed sections.
+            for mod, label in (("extract_structure", "structure (s1/3/4/6/9/23)"),
+                               ("extract_mgmt_quotes", "quotes (s20)")):
+                try:
+                    import subprocess
+                    log(f"     extracting {label}")
+                    subprocess.run([sys.executable, str(Path(_HERE) / f"{mod}.py"),
+                                    "--names", token, "--cache",
+                                    str(Path(args.cache or (Path(args.outdir) /
+                                        f"_src_{co['symbol']}")))],
+                                   check=False, timeout=2400)
+                except Exception as e:
+                    log(f"     {mod} failed ({str(e)[:110]})")
+            store._files.clear()          # drop cached parquets so the new rows are seen
+            rep = PRE.run(store, token) or rep
+            rc = rep["readiness_counts"]
+            log(f"     after fetch: {rc['READY']} ready / {rc['FETCHABLE']} fetchable / "
+                f"{rc['BLOCKED']} blocked")
+
     # ---- Layer A ----------------------------------------------------------
     log("[2/6] fact pack")
     pack = FP.build(store, token)
@@ -213,7 +258,8 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     html_p = outdir / f"company_narrative_{co['symbol']}_{stamp}.html"
     md = RENDER.render_markdown(d, nar, audit)
     md_p.write_text(md, encoding="utf-8")
-    html_p.write_text(RENDER.render_html(d, nar, audit), encoding="utf-8")
+    html_doc = RENDER.render_html(d, nar, audit)
+    html_p.write_text(html_doc, encoding="utf-8")
     log(f"  {md_p.name} ({len(md):,} chars)")
     log(f"  {html_p.name}")
 
@@ -222,8 +268,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         try:
             folder = store.folder(f"company_repo/{co['isin']}")
             fid = find_file(store.drive, folder, md_p.name)
-            upload_bytes(store.drive, folder, md_p.name,
-                         md.encode("utf-8"), fid)
+            # (drive, folder_id, filename, data, mimetype, existing_id) — the id is the
+            # SIXTH arg; passing it fifth silently lands it in `mimetype`.
+            upload_bytes(store.drive, folder, md_p.name, md.encode("utf-8"),
+                         "text/markdown", existing_id=fid)
             asum = (audit or {}).get("summary", {})
             log("  uploaded; " + update_index(store, {
                 "isin": co["isin"], "symbol": co["symbol"],
@@ -241,6 +289,57 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             log(f"  upload FAILED: {str(e)[:160]} (local files are intact)")
     else:
         log("  --upload not set; nothing written to Drive")
+
+    # ---- local copies (same destinations as run_deepdive.bat) --------------
+    # CI has no Obsidian vault, so this is opt-in rather than automatic; the mail
+    # below is what makes a CI run reach the user.
+    if args.local_render:
+        for env_key, default in (("OBSIDIAN_VAULT", r"D:\EMA_Screener\Obsidian"),
+                                 ("REPORTS_DIR",
+                                  r"D:\EMA_Screener\Reports\signals-india")):
+            dest = Path(os.environ.get(env_key, default))
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / md_p.name).write_text(md, encoding="utf-8")
+                (dest / html_p.name).write_text(html_doc, encoding="utf-8")
+                log(f"  local copy -> {dest / md_p.name}")
+            except Exception as e:
+                log(f"  local copy to {dest} failed: {str(e)[:110]}")
+
+    # ---- mail --------------------------------------------------------------
+    if args.mail:
+        try:
+            from mailer import send_email
+            asum = (audit or {}).get("summary", {})
+            ran = (audit or {}).get("ran", True)
+            audit_line = ("<b style='color:#c33'>AUDIT DID NOT RUN</b> — no claim was "
+                          "independently checked."
+                          if audit and not ran else
+                          f"Audit: <b>{asum.get('verified', 0)}/{asum.get('total', 0)}"
+                          f"</b> claims verified · {asum.get('unsupported', 0)} "
+                          f"unsupported · {asum.get('contradicted', 0)} contradicted"
+                          if audit else "Audit: not run for this copy.")
+            body = (
+                f"<h2>{co['name']} — narrative report</h2>"
+                f"<p>{co['symbol']} · {co['isin']} · data current to "
+                f"{d['as_of_utc'][:10]}</p>"
+                f"<p>{audit_line}</p>"
+                f"<p>{len(d['facts'])} facts · {len(d['tables'])} tables · "
+                f"{len(nar['sections'])} sections · {flagged} section(s) with "
+                f"unresolved grounding flags</p>"
+                f"<p>Full report attached (.md and .html). Open the .html for the "
+                f"charts and source footers.</p>"
+                f"<hr><pre style='white-space:pre-wrap;font-size:12px'>"
+                f"{md[:4000].replace('<', '&lt;')}…</pre>")
+            ok = send_email(
+                f"Narrative report — {co['name']} ({co['symbol']})",
+                body,
+                attachments=[(md_p.name, md.encode("utf-8"), "octet-stream"),
+                             (html_p.name, html_doc.encode("utf-8"), "octet-stream")])
+            log("  mailed" if ok else "  mail SKIPPED (GMAIL_USER / "
+                                      "GMAIL_APP_PASSWORD not set)")
+        except Exception as e:
+            log(f"  mail FAILED: {str(e)[:160]}")
 
     if args.open:
         webbrowser.open(html_p.resolve().as_uri())
@@ -272,6 +371,15 @@ def main():
     ap.add_argument("--upload", action="store_true", help="upload md + index to Drive")
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--fetch-missing", action="store_true",
+                    help="before building, pull any documents Drive is missing "
+                         "(Screener/BSE/NSE via backfill_company_docs) and extract them")
+    ap.add_argument("--mail", action="store_true",
+                    help="email the report (HTML inline + .md and .html attached) to "
+                         "NOTIFY_EMAIL — works identically local or in CI")
+    ap.add_argument("--local-render", action="store_true",
+                    help="also write the report to the Obsidian vault and Reports dir, "
+                         "the same places run_deepdive.bat puts a deep dive")
     a = ap.parse_args()
 
     store = FP.Store()

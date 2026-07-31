@@ -24,6 +24,16 @@ on:
         required: false
         type: boolean
         default: false
+      mail:
+        description: "Email the report (md + html attached) to NOTIFY_EMAIL"
+        required: false
+        type: boolean
+        default: true
+      fetch_missing:
+        description: "Pull missing filings from Screener/BSE/NSE before building"
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   report:
@@ -70,12 +80,21 @@ jobs:
           # Without these the audit degrades to Gemini and says so on the report.
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Mail is how a CI run reaches the user — a runner has no Obsidian vault and
+          # nobody watches the Actions log. Without these three the send silently skips.
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          # Screener session — needed by --fetch-missing to pull absent filings.
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
           python scripts/company_narrative_report.py \
             --names ${{ inputs.names }} \
             --outdir ./_narrative \
             --upload \
+            ${{ inputs.mail && '--mail' || '' }} \
+            ${{ inputs.fetch_missing && '--fetch-missing' || '' }} \
             ${{ inputs.sections != '' && format('--sections {0}', inputs.sections) || '' }} \
             ${{ inputs.skip_audit && '--skip-audit' || '' }} \
             ${{ inputs.ignore_preflight && '--ignore-preflight' || '' }}
