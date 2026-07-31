@@ -32,6 +32,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -916,7 +917,11 @@ def sec27_exchange_filings(pack: Pack, store: Store, live: bool = True):
             # Truncating to 10 chars chopped NSE's year, and sorting two formats
             # together is meaningless — normalise to ISO and keep what fails as-is.
             raw = date.strip()
-            iso = pd.to_datetime(raw, errors="coerce", dayfirst=True)
+            # BSE is already ISO; only NSE's DD-MMM-YYYY needs dayfirst. Passing
+            # dayfirst on an ISO string is ambiguous and warns on every row.
+            iso = pd.to_datetime(
+                raw, errors="coerce",
+                dayfirst=not re.match(r"^\d{4}-\d{2}-\d{2}", raw))
             out.append({"exchange": exchange,
                         "date": raw if pd.isna(iso) else iso.strftime("%Y-%m-%d"),
                         "category": cat[:60], "headline": rest.strip()[:220]})

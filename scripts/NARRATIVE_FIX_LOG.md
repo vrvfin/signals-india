@@ -153,6 +153,28 @@ which.
 | **Root cause** | Windows consoles default to cp1252, which has no rupee sign. Printing an audited claim containing ₹ killed the process *after* every API call had been paid for |
 | **Fix** | `_safe()` re-encodes with `errors="replace"` for console output only; the JSON on disk keeps the real characters |
 
+## 16 · Extracted data was written to Drive and never read back
+
+| | |
+|---|---|
+| **Detected by** | The user asking "what data sources is it using" — I checked instead of answering from memory |
+| **Evidence** | `company_structure.parquet` (233 rows) and `mgmt_quotes.parquet` (12 rows) existed on Drive, but `grep company_structure narrative_factpack.py` returned nothing. Sections 1/3/4/6/9/12/20/23 were still hard-coded in `UNCOVERED` |
+| **Root cause** | N7 and N8 built the extractors and wrote the tables; nothing consumed them. The report kept rendering DATA_MISSING for sections whose data had already been extracted and paid for |
+| **Fix** | Section builders `sec1_history`, `sec3_entity_map`, `sec4_management`, `sec6_segment_economics`, `sec7_ratings`, `sec9_portfolio`, `sec12_unit_deepdives`, `sec20_quote_spine`, `sec23_structural_risks`. `UNCOVERED` now holds only 10 (narrative-derived) and 16/17 (no feed exists) |
+| **Verified** | LANDMARK 8 → 17 populated sections, 141 → 154 facts, 4 → 12 tables |
+| **Lesson** | "Extractor built" is not "feature delivered". The pipeline had a silent seam between producing data and consuming it, and only an end-to-end check across that seam would have caught it |
+
+## 17 · Two API contracts assumed rather than read
+
+| | |
+|---|---|
+| **Detected by** | Running it — both crashed on first contact |
+| **Bug A** | `upload_bytes(drive, folder, name, data, fid)` — the real signature is `(drive, folder_id, filename, data, mimetype, existing_id)`. The file id landed in `mimetype`, so `MediaIoBaseUpload` got `None` and raised `AttributeError: 'NoneType' object has no attribute 'split'` — **after** the extraction LLM calls had been paid for |
+| **Bug B** | `bse_announcements()` / `nse_announcements()` return a FORMATTED STRING of `"- date \| subject [cat]"` lines, not a list of dicts. `'str' object has no attribute 'get'` |
+| **Fix** | A: pass `"application/octet-stream"` with `existing_id=fid`, matching `build_derived_from_statements.py`. B: parse the string rather than re-implement the call, so the BSE header dance and NSE cookie bootstrap stay in one place |
+| **Follow-on** | BSE emits ISO dates, NSE emits `DD-MMM-YYYY`. Truncating to 10 chars chopped NSE's year (`30-May-202`), and sorting two formats together is meaningless — both are normalised to ISO now, and `dayfirst` is applied only to the non-ISO form so pandas stops warning on every row |
+| **Verified** | 40 filings retrieved, correctly dated and sorted |
+
 ---
 
 ## Operational findings (the pipeline's data, not this code)
