@@ -349,11 +349,77 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             "audit": (audit or {}).get("summary")}
 
 
+# ── narrative_queue: same principle as deep_dive_queue ─────────────────────────
+# A scheduled run has no --names, so it DRAINS this queue — exactly how
+# company_deep_report.py works with no args. The queue is a separate report-request
+# ledger (like deep_dive_queue, the one allowed non-document queue), NOT the global
+# document queue. Dedup-on-write is the correctness guarantee; a token already pending
+# or done is never added twice.
+NQUEUE = "company_repo/_index/narrative_queue.parquet"
+NQUEUE_COLS = ["token", "status", "added_at", "done_at", "error"]
+
+
+def _load_nqueue(store: FP.Store) -> pd.DataFrame:
+    fid = find_file(store.drive, store.folder(FP.IDX), "narrative_queue.parquet")
+    if not fid:
+        return pd.DataFrame(columns=NQUEUE_COLS)
+    try:
+        df = pd.read_parquet(io.BytesIO(download_bytes(store.drive, fid)))
+        for c in NQUEUE_COLS:
+            if c not in df.columns:
+                df[c] = None
+        return df
+    except Exception as e:
+        log(f"  WARNING: narrative_queue unreadable ({str(e)[:70]}) — treating empty")
+        return pd.DataFrame(columns=NQUEUE_COLS)
+
+
+def _save_nqueue(store: FP.Store, df: pd.DataFrame):
+    fid = find_file(store.drive, store.folder(FP.IDX), "narrative_queue.parquet")
+    buf = io.BytesIO()
+    df[NQUEUE_COLS].to_parquet(buf, index=False)
+    upload_bytes(store.drive, store.folder(FP.IDX), "narrative_queue.parquet",
+                 buf.getvalue(), "application/octet-stream", existing_id=fid)
+
+
+def enqueue_narrative(store: FP.Store, tokens: list[str]) -> int:
+    """Add pending rows, skipping any token already pending or done. Returns count added."""
+    df = _load_nqueue(store)
+    seen = (set(df[df["status"].astype(str).isin(["pending", "done"])]["token"].astype(str))
+            if not df.empty else set())
+    toks = [t.strip() for t in dict.fromkeys(tokens) if t.strip() and t.strip() not in seen]
+    if not toks:
+        return 0
+    new = pd.DataFrame([{"token": t, "status": "pending",
+                         "added_at": datetime.now().isoformat(timespec="seconds")}
+                        for t in toks])
+    _save_nqueue(store, pd.concat([df, new], ignore_index=True))
+    return len(toks)
+
+
+def _mark_nqueue(store: FP.Store, token: str, status: str, error: str = ""):
+    df = _load_nqueue(store)
+    if df.empty:
+        return
+    m = df["token"].astype(str) == str(token)
+    if not m.any():
+        return
+    df.loc[m, "status"] = status
+    df.loc[m, "done_at"] = datetime.now().isoformat(timespec="seconds")
+    if error:
+        df.loc[m, "error"] = error[:200]
+    _save_nqueue(store, df)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--names", nargs="+", required=True,
-                    help="ISIN / symbol / name fragment")
+    # Not required: no --names DRAINS narrative_queue.parquet, mirroring how
+    # company_deep_report.py runs with no args on a scheduled CI pass.
+    ap.add_argument("--names", nargs="*", default=None,
+                    help="ISIN / symbol / name fragment. Omit to drain the queue.")
+    ap.add_argument("--add", nargs="+", default=None,
+                    help="enqueue these tokens for the next scheduled run, then exit")
     ap.add_argument("--outdir", default="./_narrative")
     ap.add_argument("--cache", default="")
     ap.add_argument("--sections", nargs="*", type=int, default=None)
@@ -399,8 +465,32 @@ def main():
                 log("         NOTIFY_EMAIL is also unset — there is no recipient.")
 
     store = FP.Store()
+
+    # --add: enqueue and exit (the scheduled run will pick these up).
+    if a.add:
+        n = enqueue_narrative(store, a.add)
+        log(f"enqueued {n} token(s) to narrative_queue "
+            f"({len(a.add) - n} already pending/done)")
+        return 0
+
+    # No --names -> DRAIN the queue, same as company_deep_report.py with no args.
+    draining = not a.names
+    if draining:
+        q = _load_nqueue(store)
+        pending = (q[q["status"].astype(str) == "pending"]["token"].astype(str).tolist()
+                   if not q.empty else [])
+        if not pending:
+            log("narrative_queue is empty — nothing to do. Add companies with "
+                "`--add TOKEN` or pass --names for an ad-hoc run.")
+            return 0
+        log(f"draining narrative_queue: {len(pending)} pending "
+            f"({', '.join(pending[:8])}{'...' if len(pending) > 8 else ''})")
+        tokens = pending
+    else:
+        tokens = a.names
+
     results, failures = [], 0
-    for token in a.names:
+    for token in tokens:
         try:
             r = run_one(store, token, a)
         except Exception as e:
@@ -410,8 +500,12 @@ def main():
             r = None
         if r is None:
             failures += 1
+            if draining:
+                _mark_nqueue(store, token, "error", "run_one returned None or raised")
         else:
             results.append(r)
+            if draining:
+                _mark_nqueue(store, token, "done")
 
     log(f"\n{'=' * 74}")
     for r in results:

@@ -4,11 +4,16 @@ name: narrative-report
 # a full run is ~25-34 LLM calls, and free-tier quota is per (Cloud project, model, day)
 # — a scheduled fan-out would starve the Phase-2 extractors that share it.
 on:
+  # DAILY at 18:00 IST — drains narrative_queue.parquet, exactly as deepdive.yml drains
+  # deep_dive_queue. Add companies with:  run_report.bat  (CI option) or
+  #   python scripts/company_narrative_report.py --add "TCS"
+  schedule:
+    - cron: "30 12 * * *"        # 12:30 UTC = 18:00 IST, once a day
   workflow_dispatch:
     inputs:
       names:
-        description: "Company token(s) — ISIN, NSE symbol, or name fragment (space separated)"
-        required: true
+        description: "Company token(s), space separated. LEAVE BLANK to drain the queue."
+        required: false
         type: string
       sections:
         description: "Optional: only these section numbers (space separated, blank = all)"
@@ -88,15 +93,19 @@ jobs:
           # Screener session — needed by --fetch-missing to pull absent filings.
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
+          # On a SCHEDULE event `inputs.*` are all empty, so:
+          #  - `--names` (empty) -> the script drains narrative_queue.parquet
+          #  - `!= 'false'` keeps mail + fetch ON for scheduled runs while still letting
+          #    a manual dispatch turn them off (mail=false).
           python scripts/company_narrative_report.py \
-            --names ${{ inputs.names }} \
+            ${{ inputs.names != '' && format('--names {0}', inputs.names) || '' }} \
             --outdir ./_narrative \
             --upload \
-            ${{ inputs.mail && '--mail' || '' }} \
-            ${{ inputs.fetch_missing && '--fetch-missing' || '' }} \
+            ${{ inputs.mail != 'false' && '--mail' || '' }} \
+            ${{ inputs.fetch_missing != 'false' && '--fetch-missing' || '' }} \
             ${{ inputs.sections != '' && format('--sections {0}', inputs.sections) || '' }} \
-            ${{ inputs.skip_audit && '--skip-audit' || '' }} \
-            ${{ inputs.ignore_preflight && '--ignore-preflight' || '' }}
+            ${{ inputs.skip_audit == 'true' && '--skip-audit' || '' }} \
+            ${{ inputs.ignore_preflight == 'true' && '--ignore-preflight' || '' }}
 
       - name: Retention — no raw PDF survives the run
         # CLAUDE.md global rule 1: no raw PDF persists more than 2 days after processing.
