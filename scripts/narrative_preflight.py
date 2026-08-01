@@ -52,43 +52,53 @@ STALE_DAYS = {"statements": 14, "summary": 14, "company_facts": 5}
 # Minimum documents a section needs to be worth rendering at all.
 MIN_DOCS = {"concall": 4, "annual_report": 3}
 
-BACKFILL_CMD = "python scripts/backfill_company_docs.py --names \"{name}\""
+# backfill_company_docs takes --token (name / NSE symbol / BSE code / ISIN) and
+# resolves it through the universe. NOT --names, which it rejects.
+BACKFILL_CMD = "python scripts/backfill_company_docs.py --token \"{name}\""
 
 # section -> (title, kind, requirement)
 #   kind "data"     : satisfied from parquets already on Drive
 #   kind "docs"     : needs N documents of a doc_type in processing_queue
 #   kind "blocked"  : needs an unbuilt phase
+# N7/N8 ARE built, so sections that depend on extracted filings are now "docs": they
+# need an annual report (or concall) in the queue AND the extractor to have run. A
+# company without the document is FETCHABLE — a command fixes it — not BLOCKED.
 REQUIREMENTS: list[tuple[int, str, str, dict]] = [
-    (1,  "History timeline",              "blocked", {"phase": "N7"}),
+    (1,  "History timeline",              "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
     (2,  "The company on one page",       "data",    {"tables": ["company_facts", "summary"]}),
-    (3,  "Legal entity map",              "blocked", {"phase": "N7"}),
-    (4,  "Management bench",              "blocked", {"phase": "N7"}),
-    (5,  "Scale history",                 "data",    {"tables": ["statements"],
-                                                      "partial": "capacity/outlet counts need N7"}),
-    (6,  "Segment economics",             "blocked", {"phase": "N7"}),
-    (7,  "Accounting basis",              "data",    {"tables": ["ar_red_flags"],
-                                                      "partial": "the basis bridge needs N7"}),
+    (3,  "Legal entity map",              "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
+    (4,  "Management bench",              "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
+    (5,  "Scale history",                 "data",    {"tables": ["statements"]}),
+    (6,  "Segment economics",             "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
+    (7,  "Accounting basis & ratings",    "data",    {"tables": ["ar_red_flags"]}),
     (8,  "The steadiest series",          "data",    {"tables": ["statements"]}),
-    (9,  "Portfolio table",               "blocked", {"phase": "N7"}),
-    (10, "Tier framework",                "blocked", {"phase": "N7"}),
-    (11, "Mix shift",                     "blocked", {"phase": "N7"}),
-    (12, "Unit deep dives",               "blocked", {"phase": "N7"}),
-    (16, "Alt-data claim test",           "blocked", {"phase": "N9"}),
-    (17, "Alt-data scorecard",            "blocked", {"phase": "N9"}),
+    (9,  "Portfolio table",               "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
+    (10, "Tier framework",                "blocked", {"phase": "Layer B (derived from s9)"}),
+    (11, "Mix shift",                     "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
+    (12, "Unit deep dives",               "docs",    {"doc_type": "annual_report",
+                                                      "also": ["company_structure"]}),
+    (16, "Alt-data claim test",           "blocked", {"phase": "no automatable feed"}),
+    (17, "Alt-data scorecard",            "blocked", {"phase": "no automatable feed"}),
     (18, "Full financial record",         "data",    {"tables": ["statements"]}),
     (19, "Operating leverage",            "data",    {"tables": ["statements"]}),
-    (20, "Management's claim tested",     "docs",    {"doc_type": "concall", "phase": "N8",
-                                                      "also": ["guidance_tracker"]}),
+    (20, "Management's claim tested",     "docs",    {"doc_type": "concall",
+                                                      "also": ["mgmt_quotes"]}),
     (21, "Peer set",                      "data",    {"tables": ["company_facts",
                                                                  "peer_aggregates"]}),
     (22, "Sensitivity grid",              "data",    {"tables": ["statements",
                                                                  "company_facts"]}),
     (23, "Structural risks",              "docs",    {"doc_type": "annual_report",
-                                                      "phase": "N7",
-                                                      "also": ["ar_red_flags"]}),
+                                                      "also": ["company_structure"]}),
     (24, "Financial & execution risks",   "data",    {"tables": ["fraud_tracker"]}),
-    (25, "Policy backdrop",               "blocked", {"phase": "N9"}),
+    (25, "Policy backdrop",               "data",    {"tables": []}),
     (26, "Findings",                      "data",    {"tables": []}),
+    (27, "Recent exchange filings",       "data",    {"tables": []}),
 ]
 
 
@@ -118,6 +128,11 @@ def readiness(store: Store, isin: str, symbol: str, name: str) -> list[dict]:
         "ar_red_flags": not store.by_isin("ar_red_flags.parquet", isin, symbol).empty,
         "guidance_tracker": not store.by_isin("guidance_tracker.parquet", isin,
                                               symbol).empty,
+        # The N7/N8 outputs — present only once the extractors have run for THIS
+        # company, which is what separates "we cannot do this" from "not done yet".
+        "company_structure": not store.by_isin("company_structure.parquet", isin,
+                                               symbol).empty,
+        "mgmt_quotes": not store.by_isin("mgmt_quotes.parquet", isin, symbol).empty,
     }
     s = store.parquet(FUND, "summary.parquet")
     avail["summary"] = (not s.empty and

@@ -208,6 +208,11 @@ def main() -> None:
         log("company_universe.csv missing — cannot build.")
         return
     sym_col = "nse_symbol" if "nse_symbol" in uni.columns else "symbol"
+    # Same NSE-only ceiling that capped company_facts: 2,667 universe rows are BSE-only
+    # (isin + bse_code + bse_symbol, no nse_symbol) and were skipped, so those companies
+    # ended up with NO segment/sector/peer_group. That in turn made the peer-set section
+    # of any report unusable for them, since peer_aggregates drops blank groups.
+    alt_sym_col = "bse_symbol" if "bse_symbol" in uni.columns else None
 
     # segment from market_cap.csv (symbol-keyed)
     seg = {}
@@ -230,9 +235,14 @@ def main() -> None:
         return "" if s.lower() in ("nan", "none") else s
 
     rows = []
+    n_alt = 0
     for _, r in uni.iterrows():
         isin = str(r.get("isin", "")).strip()
         sym = str(r.get(sym_col, "")).strip().upper()
+        if (not sym or sym == "NAN") and alt_sym_col:
+            alt = str(r.get(alt_sym_col, "")).strip().upper()
+            if alt and alt != "NAN":
+                sym, n_alt = alt, n_alt + 1
         if not isin or not sym or sym == "NAN":
             continue
         pv = prev_by_isin.get(isin, {})
@@ -254,7 +264,8 @@ def main() -> None:
     df = pd.DataFrame(rows, columns=CLASS_COLS)
     n_macro = int((df["macro_sector"].astype(str).str.len() > 0).sum())
     n_peer = int((df["peer_group"].astype(str).str.len() > 0).sum())
-    log(f"universe {len(df)}: macro_sector {n_macro}, peer_group {n_peer}, "
+    log(f"universe {len(df)} ({len(df)-n_alt} nse / {n_alt} bse-only): "
+        f"macro_sector {n_macro}, peer_group {n_peer}, "
         f"segment {int((df['segment'].astype(str).str.len()>0).sum())}")
 
     if args.with_gemini:

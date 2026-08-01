@@ -131,13 +131,13 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             for r in fetchable[:1]:      # one backfill call covers all doc types
                 log(f"     {r['remedy']}")
             try:
-                import backfill_company_docs as BF
-                rc = BF.main_for(co["name"]) if hasattr(BF, "main_for") else None
-                if rc is None:
-                    import subprocess
-                    cmd = [sys.executable, str(Path(_HERE) / "backfill_company_docs.py"),
-                           "--names", co["name"]]
-                    subprocess.run(cmd, check=False, timeout=1800)
+                import subprocess
+                # backfill_company_docs takes --token (name / NSE / BSE / ISIN), NOT
+                # --names. It already resolves ANY company through the universe, so
+                # nothing here is company-specific.
+                subprocess.run([sys.executable,
+                                str(Path(_HERE) / "backfill_company_docs.py"),
+                                "--token", token], check=False, timeout=1800)
                 log("     backfill done — re-running preflight")
             except Exception as e:
                 log(f"     backfill failed ({str(e)[:120]}) — continuing with what exists")
