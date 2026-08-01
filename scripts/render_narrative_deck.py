@@ -43,6 +43,8 @@ SECTIONS: list[tuple[int, str]] = [
     (10, "A more useful way to read the portfolio"),
     (11, "What moved this year"),
     (12, "Unit deep dives"),
+    (14, "Independent research — coverage of this company"),
+    (15, "Independent research — the sector view"),
     (16, "Testing a management claim against independent data"),
     (17, "Independent data scorecard — and its limits"),
     (18, "The full financial record"),

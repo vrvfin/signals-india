@@ -1022,6 +1022,104 @@ def sec27_exchange_filings(pack: Pack, store: Store, live: bool = True):
              27, {"kind": "api", "table": "BSE Direct / NSE"})
 
 
+def sec14_15_research(pack: Pack, store: Store):
+    """Sections 14 and 15 — independent broker research, from research_map.parquet.
+
+    Two passes, in the order the user asked for: first what has been written about THIS
+    company, then what has been written about its SECTOR. The sector is taken from the
+    company's own classification, so the sector view is the one its peers sit in.
+    """
+    rm = store.parquet(IDX, "research_map.parquet")
+    if rm.empty:
+        pack.gap(14, "research_map.parquet not built — run build_research_map.py "
+                     "(it also runs at the end of run_daily_research.bat)")
+        pack.gap(15, "research_map.parquet not built")
+        return
+
+    # ---- 14: company coverage -------------------------------------------------
+    mine = rm[(rm["scope"] == "company") &
+              (rm["isin"].astype(str) == str(pack.isin))]
+    if mine.empty:
+        pack.gap(14, "no broker research maps to this company. Coverage may exist "
+                     "under a brand name — research_lookup.py --alias searches those.")
+    else:
+        mine = mine.sort_values("doc_date", ascending=False)
+        rows = [{"date": str(r.get("doc_date", ""))[:10],
+                 "source": str(r.get("source", ""))[:60],
+                 "doc_kind": str(r.get("doc_kind", "")),
+                 "named_as": str(r.get("matched_name_raw", ""))[:60],
+                 "matched_by": str(r.get("match_key", ""))}
+                for _, r in mine.head(25).iterrows()]
+        pack.table("tbl.research_company", "Broker research naming this company", 14,
+                   ["date", "source", "doc_kind", "named_as", "matched_by"], rows,
+                   _src_parquet(f"{IDX}/research_map.parquet"),
+                   note="`matched_by` shows which key linked the document to this "
+                        "company — isin and symbol are exact; name_partial is a "
+                        "looser brand/name match and is worth eyeballing.")
+        pack.add("research.n_docs", "Research documents naming this company",
+                 int(mine["research_n"].nunique()), "count", "extracted", 14,
+                 _src_parquet(f"{IDX}/research_map.parquet"))
+        notes = mine[mine["doc_kind"].isin(["analyst_note", "company_update"])]
+        if not notes.empty:
+            pack.add("research.n_company_notes", "Company-specific analyst notes",
+                     int(notes["research_n"].nunique()), "count", "extracted", 14,
+                     _src_parquet(f"{IDX}/research_map.parquet"))
+        srcs = mine["source"].astype(str).replace("", pd.NA).dropna().unique()
+        if len(srcs):
+            pack.add("research.n_houses", "Distinct research houses", len(srcs),
+                     "count", "extracted", 14,
+                     _src_parquet(f"{IDX}/research_map.parquet",
+                                  f"e.g. {', '.join(sorted(srcs)[:4])}"))
+
+    # ---- 15: the sector this company sits in ----------------------------------
+    facts = store.by_isin("company_facts.parquet", pack.isin, pack.symbol)
+    sector = ""
+    if not facts.empty:
+        r0 = facts.iloc[0]
+        sector = str(r0.get("macro_sector") or "").strip()
+        if not sector:
+            # macro_sector comes from the NSE index lists and covers only ~755
+            # companies, so most names would get no sector view at all. Fall back to
+            # the finer Gemini labels, mapped onto the SAME controlled vocabulary the
+            # research map uses — otherwise the two sides cannot be joined.
+            try:
+                import build_research_map as BRM
+                sector = BRM.guess_sector(r0.get("sector"), r0.get("subsector"),
+                                          r0.get("peer_group"))
+            except Exception:
+                sector = ""
+    if not sector:
+        pack.gap(15, "company has no sector that maps onto the research vocabulary "
+                     "(no macro_sector, and its sector/peer_group labels did not "
+                     "resolve), so sector research cannot be selected")
+        return
+    pack.add("research.sector", "Sector used for the research view", sector, "label",
+             "classification", 15, _src_parquet(f"{IDX}/company_facts.parquet"))
+    sec = rm[(rm["scope"].isin(["sector", "macro", "policy"])) &
+             (rm["sector"].astype(str) == sector)]
+    if sec.empty:
+        pack.gap(15, f"no sector/macro research mapped to '{sector}'. A document is "
+                     f"only labelled with a sector when the companies it names agree "
+                     f"on one — ambiguous notes are left unlabelled rather than guessed.")
+        return
+    sec = sec.sort_values("doc_date", ascending=False).drop_duplicates("research_n")
+    rows = [{"date": str(r.get("doc_date", ""))[:10],
+             "source": str(r.get("source", ""))[:60],
+             "scope": str(r.get("scope", "")),
+             "doc_kind": str(r.get("doc_kind", "")),
+             "title": str(r.get("file_name", ""))[:80]}
+            for _, r in sec.head(20).iterrows()]
+    pack.table("tbl.research_sector", f"Research on {sector}", 15,
+               ["date", "source", "scope", "doc_kind", "title"], rows,
+               _src_parquet(f"{IDX}/research_map.parquet"),
+               note="Sector, macro and policy notes covering this company's sector. "
+                    "The sector label is inferred from the companies a document names, "
+                    "not from its file name or publisher.")
+    pack.add("research.n_sector_docs", f"Research documents on {sector}",
+             int(sec["research_n"].nunique()), "count", "extracted", 15,
+             _src_parquet(f"{IDX}/research_map.parquet"))
+
+
 def sec7_ratings(pack: Pack, store: Store):
     """Credit-rating actions — the agencies' own view, which is independent of the
     company's framing."""
@@ -1071,6 +1169,7 @@ def build(store: Store, token: str, live: bool = True) -> Pack | None:
     sec7_ratings(pack, store)
     sec9_portfolio(pack, store)
     sec12_unit_deepdives(pack, store)
+    sec14_15_research(pack, store)
     sec20_quote_spine(pack, store)
     sec23_structural_risks(pack, store)
     # live exchange feed
