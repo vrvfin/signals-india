@@ -38,7 +38,20 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 RESULTS_URL = "https://www.screener.in/results/latest/"
-MAX_PAGES = 10
+# /results/latest/ IGNORES ?page=N. Probed 2026-08-01: pages 1, 2, 3, 5 and 10 each
+# returned 25 companies and the slug sets were IDENTICAL — the same 25 every time.
+# It is a fixed 25-item window on the newest declarations, not a paginated list.
+#
+# So this cap is NOT what limits coverage, and raising it buys nothing: the loop's
+# "all repeats — pagination exhausted" guard already stops at page 2. 3 is kept purely
+# as cheap insurance in case Screener ever makes paging real.
+#
+# The ACTUAL limit is the 25-item window: anything that scrolls out between two runs
+# is never seen again by this scraper. That is why 150 of the 819 Q1-FY27 reporters
+# are absent from results.parquet. Fixing it needs either more frequent runs during
+# results season, or a per-company fetch (backfill_results_3stmt.py reads a company's
+# own Screener page and does not depend on this window at all).
+MAX_PAGES = 3
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -260,6 +273,9 @@ def load_slug_isin_map(drive, index_id) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-pages", type=int, default=MAX_PAGES)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="scrape and report what WOULD change (new vs updated "
+                             "rows); no Drive write")
     args = parser.parse_args()
 
     print("Phase 2 / Stage A — Quarterly results table scrape")
@@ -337,13 +353,29 @@ def main() -> None:
                                          keep="last")
                 .reset_index(drop=True))
     combined = combined[OUT_COLS]
-    upload_parquet(drive, index_id, "results.parquet", combined)
+
+    # Split this run into genuinely NEW keys vs updates to keys already stored, so a
+    # deeper walk can be judged on what it actually contributes rather than on row
+    # counts (which the upsert keeps flat).
+    old_keys = set()
+    if old is not None and not old.empty:
+        old_keys = set(zip(old["slug"], old["metric"], old["latest_q"]))
+    fresh_keys = set(zip(fresh["slug"], fresh["metric"], fresh["latest_q"]))
+    n_new, n_upd = len(fresh_keys - old_keys), len(fresh_keys & old_keys)
 
     n_companies = fresh["slug"].nunique()
     print("-" * 56)
     print(f"Companies scraped this run : {n_companies}")
     print(f"Rows scraped this run      : {len(fresh)}")
-    print(f"results.parquet total rows : {len(combined)}")
+    print(f"  of which NEW keys        : {n_new}")
+    print(f"  of which updates         : {n_upd}  (upserted, not appended)")
+    print(f"results.parquet rows before: {0 if old is None else len(old)}")
+    print(f"results.parquet rows after : {len(combined)}")
+
+    if args.dry_run:
+        print("DRY RUN — nothing written to Drive.")
+        return
+    upload_parquet(drive, index_id, "results.parquet", combined)
     print("Output: company_repo/_index/results.parquet")
 
 
