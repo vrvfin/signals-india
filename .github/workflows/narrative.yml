@@ -56,22 +56,49 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # Use the SAME requirements.txt deepdive.yml installs. The hand-listed set
+          # here was missing google-genai (scripts/_extractor_base.py and gemini_pool.py
+          # do `from google import genai`, the NEW SDK — NOT google-generativeai), so the
+          # very first import failed with "cannot import name 'genai' from 'google'".
           python -m pip install --upgrade pip
-          pip install google-generativeai pandas pyarrow PyMuPDF pdfplumber requests \
-                      google-api-python-client google-auth google-auth-oauthlib python-dotenv
+          pip install -r scripts/requirements.txt
 
+      # Preflight only for an EXPLICIT company dispatch. A queue-drain run (blank
+      # names) has no single company to check here — company_narrative_report.py
+      # preflights each queued company itself in step [1/6] and skips any that FAILs
+      # unless --ignore-preflight, so the gate is enforced either way.
+      # Preflight only for an EXPLICIT company dispatch. A queue-drain run (blank
+      # names) has no single company to check here — company_narrative_report.py
+      # preflights each queued company itself in step [1/6] and skips any that FAILs
+      # unless --ignore-preflight, so the gate is enforced either way.
       - name: Preflight — is the data fit to publish?
         id: preflight
-        continue-on-error: true
+        if: inputs.names != ''
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
-        run: python scripts/narrative_preflight.py --names ${{ inputs.names }}
-
-      - name: Stop if preflight failed and the override was not set
-        if: steps.preflight.outcome == 'failure' && inputs.ignore_preflight != true
         run: |
-          echo "::error::Preflight reported a data-integrity FAIL. Read the step above."
+          # Capture the EXIT CODE, don't let the step's pass/fail conflate a crash with
+          # a data verdict. narrative_preflight returns 2 ONLY for an integrity FAIL;
+          # 1 is a crash (a missing dependency once landed here and looked like a data
+          # FAIL); 0 is clean. A crash must fail the job loudly, not be dressed up as
+          # "the data is bad".
+          set +e
+          python scripts/narrative_preflight.py --names ${{ inputs.names }}
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = "1" ]; then
+            echo "::error::Preflight CRASHED (exit 1) — this is a code/dependency bug, not a data problem."
+            exit 1
+          fi
+
+      - name: Stop if preflight found a data-integrity FAIL
+        if: >
+          steps.preflight.outputs.rc == '2' &&
+          inputs.ignore_preflight != 'true'
+        run: |
+          echo "::error::Preflight reported a data-integrity FAIL for ${{ inputs.names }}."
           echo "Re-dispatch with ignore_preflight=true to publish anyway."
           exit 1
 
