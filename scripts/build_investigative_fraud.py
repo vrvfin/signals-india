@@ -698,10 +698,22 @@ def main():
         log("No universe file (company_universe.csv / master_list.csv) — cannot grade.")
         return
     sym_col = "nse_symbol" if "nse_symbol" in cu.columns else "symbol"
+    # Third instance of the NSE-only ceiling (after company_facts and
+    # company_classification): 2,667 universe rows are BSE-only — isin + bse_code +
+    # bse_symbol, no nse_symbol — and were skipped entirely, so investigative_fraud
+    # covered 2,964 of 5,631 companies. Exchange surveillance (ASM/ESM/GSM/T2T) applies
+    # on BSE too, so those names were ungraded rather than legitimately excluded.
+    alt_sym_col = "bse_symbol" if "bse_symbol" in cu.columns else None
     universe = []
     seen = set()
+    alt_syms: set[str] = set()
     for _, r in cu.iterrows():
         sym = str(r.get(sym_col, "")).strip().upper()
+        if (not sym or sym == "NAN") and alt_sym_col:
+            alt = str(r.get(alt_sym_col, "")).strip().upper()
+            if alt and alt != "NAN":
+                sym = alt
+                alt_syms.add(sym)
         isin = str(r.get("isin", "")).strip().upper()
         if not sym or sym == "NAN" or sym in seen:
             continue
@@ -712,7 +724,12 @@ def main():
         universe = [u for u in universe if u[1] in wanted]
     if args.limit:
         universe = universe[:args.limit]
-    log(f"Universe: {len(universe)} companies to grade")
+    # Count against the FINAL list, after --names/--limit have been applied; counting
+    # the raw fallbacks produced a negative "via nse_symbol" figure on a limited run.
+    n_alt = sum(1 for _, s, _ in universe if s in alt_syms)
+    log(f"Universe: {len(universe)} companies to grade "
+        f"({len(universe) - n_alt} via {sym_col}, {n_alt} via "
+        f"{alt_sym_col or 'n/a'})")
     if not universe:
         return
 

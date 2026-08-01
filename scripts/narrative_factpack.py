@@ -559,6 +559,34 @@ def _src_doc(row) -> dict:
             "evidence_span": str(row.get("evidence_span", ""))[:300]}
 
 
+# Indian filings print figures in Rs Million / Lakh / Crore interchangeably, while every
+# computed figure in this pack is Rs Cr. Carrying both side by side without conversion
+# invites a reader (or a model) to compare 46,886 against 4,896 as if they were the same
+# scale. So: CONVERT to Rs Cr, keep the original, and mark every converted cell with *
+# so the appendix can show exactly what was transformed.
+_TO_CR = {"million": 0.1, "mn": 0.1, "rs million": 0.1, "rs mn": 0.1,
+          "lakh": 0.01, "lakhs": 0.01, "rs lakh": 0.01,
+          "billion": 100.0, "bn": 100.0,
+          "crore": 1.0, "cr": 1.0, "rs cr": 1.0, "rs crore": 1.0}
+
+
+def _to_crore(value: str, unit: str) -> tuple[float | None, float | None, str, bool]:
+    """-> (converted_cr, original_value, original_unit, was_converted).
+
+    Returns converted=None when the unit is not a currency scale (e.g. '%'), so the
+    caller leaves the cell untouched rather than silently scaling a percentage.
+    """
+    u = str(unit or "").strip().lower()
+    try:
+        raw = float(str(value).replace(",", "").split()[0])
+    except (ValueError, IndexError):
+        return None, None, unit, False
+    if u not in _TO_CR:
+        return None, raw, unit, False
+    factor = _TO_CR[u]
+    return round(raw * factor, 2), raw, unit, factor != 1.0
+
+
 def _pivot_struct(rows: pd.DataFrame) -> list[dict]:
     """kind rows (item/field/value) -> one dict per item with its fields as columns."""
     out: dict[str, dict] = {}
@@ -638,12 +666,53 @@ def sec6_segment_economics(pack: Pack, store: Store):
     if rows.empty:
         pack.gap(6, "no segment disclosures extracted — the AR may not report segments")
         return
-    recs = _pivot_struct(rows)
-    pack.table("tbl.segments", "Segment economics, as disclosed", 6,
+    # Convert money columns to Rs Cr so they are comparable with every other figure in
+    # the report; mark converted cells with * and record the original for the appendix.
+    recs, conversions = [], []
+    for _, r in rows.iterrows():
+        item, field = str(r.get("item", "")).strip(), str(r.get("field", "")).strip()
+        if not item:
+            continue
+        rec = next((x for x in recs if x["item"] == item and
+                    x.get("period") == str(r.get("period", "")).strip()), None)
+        if rec is None:
+            rec = {"item": item, "period": str(r.get("period", "")).strip()}
+            recs.append(rec)
+        cr, raw, unit, converted = _to_crore(r.get("value"), r.get("unit"))
+        if cr is not None:
+            rec[field] = f"{cr:,.2f}*" if converted else f"{cr:,.2f}"
+            if converted:
+                conversions.append({"item": item, "field": field,
+                                    "period": rec["period"],
+                                    "as_printed": f"{raw:,.2f}",
+                                    "printed_unit": unit,
+                                    "converted_to": f"{cr:,.2f}",
+                                    "converted_unit": "Rs Cr",
+                                    "factor": f"x{_TO_CR[str(unit).strip().lower()]}"})
+        else:
+            u = str(r.get("unit", "")).strip()
+            v = str(r.get("value", "")).strip()
+            rec[field] = f"{v}{u}" if u == "%" else (f"{v} {u}".strip())
+
+    pack.table("tbl.segments", "Segment economics, as disclosed (Rs Cr)", 6,
                ["item", "period", "revenue", "profit", "margin_pct"], recs,
                _src_doc(rows.iloc[0]),
-               note="Figures are reproduced in the unit the filing printed them in "
-                    "(often Rs Million) and are NOT converted.")
+               note="Money columns are shown in Rs Cr. A * marks a figure the filing "
+                    "printed in a DIFFERENT unit (usually Rs Million) that has been "
+                    "converted here — see the unit-conversion appendix for the "
+                    "as-printed value, the unit and the factor applied.")
+    if conversions:
+        pack.table("tbl.unit_conversions",
+                   "* Unit conversions applied to section 6", 28,
+                   ["item", "field", "period", "as_printed", "printed_unit",
+                    "converted_to", "converted_unit", "factor"], conversions,
+                   _src_computed("scale conversion to Rs Cr; no other transformation"),
+                   note="Every figure marked * in this report appears here with the "
+                        "value and unit exactly as the filing printed it. Nothing "
+                        "else about the number was changed.")
+        pack.add("units.n_converted", "Figures converted to Rs Cr", len(conversions),
+                 "count", "computed", 28,
+                 _src_computed("count of * cells across the report"))
 
     # Revenue share vs profit share, computed only where both legs are present for the
     # same period and unit — a share computed across mixed units would be nonsense.

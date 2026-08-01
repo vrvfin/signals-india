@@ -55,6 +55,7 @@ SECTIONS: list[tuple[int, str]] = [
     (25, "The policy backdrop"),
     (26, "Findings"),
     (27, "Recent exchange filings"),
+    (28, "Appendix — unit conversions (*)"),
 ]
 
 DISCLAIMER = (
