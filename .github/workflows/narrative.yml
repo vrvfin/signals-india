@@ -87,7 +87,6 @@ jobs:
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           # Screener session — needed by --fetch-missing to pull absent filings.
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
-          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
           python scripts/company_narrative_report.py \
             --names ${{ inputs.names }} \
