@@ -382,6 +382,22 @@ def main():
                          "the same places run_deepdive.bat puts a deep dive")
     a = ap.parse_args()
 
+    # Check delivery BEFORE a 20-30 minute run, not after it. mailer.send_email skips
+    # silently when the credentials are absent, so --mail would otherwise appear to
+    # work and quietly deliver nothing.
+    if a.mail:
+        missing = [k for k in ("GMAIL_USER", "GMAIL_APP_PASSWORD")
+                   if not os.environ.get(k)]
+        if missing:
+            log(f"WARNING: --mail was requested but {', '.join(missing)} "
+                f"{'is' if len(missing) == 1 else 'are'} not set in this environment.")
+            log("         The report will still be written locally, but NO EMAIL WILL "
+                "BE SENT.")
+            log("         Set them in .env for local runs; in CI they come from "
+                "repository secrets.")
+            if not os.environ.get("NOTIFY_EMAIL"):
+                log("         NOTIFY_EMAIL is also unset — there is no recipient.")
+
     store = FP.Store()
     results, failures = [], 0
     for token in a.names:
