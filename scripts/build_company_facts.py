@@ -97,6 +97,17 @@ def _ttm(arr):
         return None
 
 
+def _q_last(arr):
+    """Latest quarter from a Screener 4-quarter array. The array is oldest-first, so
+    the LAST element is the most recent quarter — verified against
+    summary.latest_quarter_eps, which equals q_eps_last_4q[-1]."""
+    try:
+        a = [float(x) for x in arr if str(x) not in ("nan", "None", "")]
+        return round(a[-1], 2) if a else None
+    except Exception:
+        return None
+
+
 def _pivot_results(res: pd.DataFrame) -> dict[str, dict]:
     """isin -> {rev_q, rev_q_yoy, rev_q_qoq, pat_*, eps_*, latest_q} from the
     explicit Screener results table (authoritative Q value + YoY + QoQ)."""
@@ -201,11 +212,21 @@ def main() -> None:
             "ret_12m_pct": _num(sg(f, "return_12m_pct")),
             "vol_20d_avg": _num(sg(f, "vol_20d_avg")),
             "vol_today_ratio": _num(sg(f, "vol_today_ratio")),
-            "rev_q": rq.get("rev_q"), "rev_q_yoy": rq.get("rev_q_yoy"),
+            # results.parquet is fed by Screener's /results/latest/ feed, which is a
+            # 25-item WINDOW — anything scrolling out between runs is never captured
+            # (160 of 819 Q1-FY27 reporters were absent on 2026-08-01). Those same
+            # quarters ARE present in summary.parquet's 4-quarter arrays, which are
+            # already loaded here, so fall back to the last array element rather than
+            # leaving the latest-quarter line blank. results.parquet still WINS when
+            # present: it carries YoY/QoQ that a 4-quarter array cannot express.
+            "rev_q": rq.get("rev_q", _q_last(sg(s, "q_sales_last_4q"))),
+            "rev_q_yoy": rq.get("rev_q_yoy"),
             "rev_q_qoq": rq.get("rev_q_qoq"),
-            "pat_q": rq.get("pat_q"), "pat_q_yoy": rq.get("pat_q_yoy"),
+            "pat_q": rq.get("pat_q", _q_last(sg(s, "q_netprofit_last_4q"))),
+            "pat_q_yoy": rq.get("pat_q_yoy"),
             "pat_q_qoq": rq.get("pat_q_qoq"),
-            "eps_q": rq.get("eps_q"), "eps_q_yoy": rq.get("eps_q_yoy"),
+            "eps_q": rq.get("eps_q", _q_last(sg(s, "q_eps_last_4q"))),
+            "eps_q_yoy": rq.get("eps_q_yoy", _num(sg(s, "q_eps_yoy_pct"))),
             "eps_q_qoq": rq.get("eps_q_qoq"),
             "rev_ttm": _ttm(sg(s, "q_sales_last_4q")),
             "pat_ttm": _ttm(sg(s, "q_netprofit_last_4q")),
