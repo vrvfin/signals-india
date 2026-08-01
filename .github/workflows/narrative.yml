@@ -63,10 +63,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
 
-      # Preflight only for an EXPLICIT company dispatch. A queue-drain run (blank
-      # names) has no single company to check here — company_narrative_report.py
-      # preflights each queued company itself in step [1/6] and skips any that FAILs
-      # unless --ignore-preflight, so the gate is enforced either way.
+      # get_drive() reads GDRIVE_OAUTH_CLIENT_SECRET_PATH — a FILE PATH, not inline JSON.
+      # Passing GDRIVE_OAUTH_TOKEN_JSON as a per-step env var (my earlier mistake) left
+      # that file-path var unset and every step crashed with
+      # KeyError: 'GDRIVE_OAUTH_CLIENT_SECRET_PATH'. This mirrors deepdive.yml: write the
+      # OAuth blob to a file and a `.env` the scripts load, so every later step inherits
+      # the credentials and there are no per-step env blocks to drift.
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          FREE_POOL:               ${{ secrets.FREE_POOL }}
+          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
+          CEREBRAS_API_KEY:        ${{ secrets.CEREBRAS_API_KEY }}
+          GROQ_API_KEY:            ${{ secrets.GROQ_API_KEY }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            # Multi-line key blobs -> one comma-joined line so dotenv keeps every key.
+            echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
+            echo "GEMINI_API_KEY=$(printf '%s' "$GEMINI_API_KEY" | tr '\r\n' ',,')"
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
+            echo "CEREBRAS_API_KEY=$(printf '%s' "$CEREBRAS_API_KEY" | tr '\r\n' ',,')"
+            echo "GROQ_API_KEY=$(printf '%s' "$GROQ_API_KEY" | tr '\r\n' ',,')"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+          } > .env
+          echo "wrote .env with $(grep -c = .env) vars (values not shown)"
+
       # Preflight only for an EXPLICIT company dispatch. A queue-drain run (blank
       # names) has no single company to check here — company_narrative_report.py
       # preflights each queued company itself in step [1/6] and skips any that FAILs
@@ -74,9 +109,6 @@ jobs:
       - name: Preflight — is the data fit to publish?
         id: preflight
         if: inputs.names != ''
-        env:
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
         run: |
           # Capture the EXIT CODE, don't let the step's pass/fail conflate a crash with
           # a data verdict. narrative_preflight returns 2 ONLY for an integrity FAIL;
@@ -103,22 +135,8 @@ jobs:
           exit 1
 
       - name: Generate narrative report
-        env:
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
-          # Generator pool (CLAUDE.md: FREE_POOL is the default for new programs)
-          FREE_POOL: ${{ secrets.FREE_POOL }}
-          # Independent adjudicator — a DIFFERENT model family from the generator.
-          # Without these the audit degrades to Gemini and says so on the report.
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          # Mail is how a CI run reaches the user — a runner has no Obsidian vault and
-          # nobody watches the Actions log. Without these three the send silently skips.
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-          # Screener session — needed by --fetch-missing to pull absent filings.
-          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        # Credentials come from the .env written above (scripts call load_dotenv), so no
+        # per-step env block — that duplication is exactly what drifted before.
         run: |
           # On a SCHEDULE event `inputs.*` are all empty, so:
           #  - `--names` (empty) -> the script drains narrative_queue.parquet
