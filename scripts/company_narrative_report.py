@@ -111,10 +111,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     for ch in rep["integrity"]:
         if ch["status"] in ("FAIL", "WARN"):
             log(f"    [{ch['status']}] {ch['name']}: {ch['detail'][:110]}")
-    if not rep["publishable"] and not args.ignore_preflight:
-        log("  ABORT: integrity FAIL. Fix the data or pass --ignore-preflight to "
-            "publish anyway (the failure is recorded on the report).")
-        return None
+    # NOTE: no abort here. The user's standing rule is check -> if missing, FETCH ->
+    # then judge. Aborting on the first preflight made the auto-fetch below unreachable
+    # for exactly the companies that needed it. The publishable verdict is taken AFTER
+    # the fetch pass re-runs preflight.
 
     # ---- auto-fetch what Drive is missing ---------------------------------
     # The report should not simply REPORT a gap it can close. Preflight already knows
@@ -166,6 +166,14 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             rc = rep["readiness_counts"]
             log(f"     after fetch: {rc['READY']} ready / {rc['FETCHABLE']} fetchable / "
                 f"{rc['BLOCKED']} blocked")
+
+    # ---- verdict, taken only AFTER fetching had its chance ------------------
+    if not rep["publishable"] and not args.ignore_preflight:
+        ic = rep["integrity_counts"]
+        log(f"  ABORT: integrity still FAILs after the fetch pass "
+            f"({ic['FAIL']} check(s)). Pass --ignore-preflight to publish anyway "
+            f"(the failure is recorded on the report).")
+        return None
 
     # ---- Layer A ----------------------------------------------------------
     log("[2/6] fact pack")

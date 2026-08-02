@@ -131,13 +131,19 @@ jobs:
             exit 1
           fi
 
+      # Only gate here when the run will NOT fetch. With fetch_missing on (the default),
+      # the generate step pulls whatever is missing and takes the publishable verdict
+      # itself AFTER re-running preflight — stopping the job here would abort exactly
+      # the companies whose gaps the run exists to close.
       - name: Stop if preflight found a data-integrity FAIL
         if: >
           steps.preflight.outputs.rc == '2' &&
+          inputs.fetch_missing == 'false' &&
           inputs.ignore_preflight != 'true'
         run: |
           echo "::error::Preflight reported a data-integrity FAIL for ${{ inputs.names }}."
-          echo "Re-dispatch with ignore_preflight=true to publish anyway."
+          echo "Re-dispatch with ignore_preflight=true, or leave fetch_missing on and"
+          echo "the run will pull the missing data itself."
           exit 1
 
       - name: Generate narrative report

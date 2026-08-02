@@ -28,28 +28,31 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-# Section titles follow the 26-section canonical spec. Sections with no content in this
-# pack render as an explicit gap card rather than being silently dropped.
+# Section titles must be NEUTRAL and DESCRIPTIVE. They were originally lifted verbatim
+# from the source deck's slide headlines, which are editorial claims about THAT company:
+# "Twenty-eight years, one decision at a time" appeared above a company incorporated in
+# 2015, and "The quiet compounder" asserted a conclusion the data had not established.
+# A section header names what the section CONTAINS; the narrative makes the argument.
 SECTIONS: list[tuple[int, str]] = [
-    (1, "Twenty-eight years, one decision at a time"),
+    (1, "History and milestones"),
     (2, "The company on one page"),
-    (3, "One listed parent, its subsidiaries"),
-    (4, "A founder-led business with a professional operating layer"),
-    (5, "How the business was built — and what it cost"),
+    (3, "Corporate structure and subsidiaries"),
+    (4, "Board and key management"),
+    (5, "Growth in scale versus growth in profit"),
     (6, "Segment economics — revenue share vs profit share"),
-    (7, "The accounting basis, and what the rating agencies say"),
-    (8, "The quiet compounder — the steadiest series"),
-    (9, "The portfolio, as disclosed"),
-    (10, "A more useful way to read the portfolio"),
-    (11, "What moved this year"),
-    (12, "Unit deep dives"),
+    (7, "Accounting basis and credit ratings"),
+    (8, "Margin stability over time"),
+    (9, "Portfolio, brands and units as disclosed"),
+    (10, "A framework over the portfolio"),
+    (11, "Year-on-year mix shift"),
+    (12, "Segment deep dives"),
     (14, "Independent research — coverage of this company"),
     (15, "Independent research — the sector view"),
-    (16, "Testing a management claim against independent data"),
-    (17, "Independent data scorecard — and its limits"),
+    (16, "Management claims tested against independent data"),
+    (17, "Independent data — scorecard and limits"),
     (18, "The full financial record"),
     (19, "Operating leverage, stated as arithmetic"),
-    (20, "Management's claim, tested across four calls"),
+    (20, "What management said, and what followed"),
     (21, "The peer set"),
     (22, "Implied multiples across revenue and margin"),
     (23, "Structural and counterparty risks"),
@@ -341,7 +344,6 @@ def render_markdown(pack: dict, narrative: dict | None = None,
 _TPL = """<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
  :root{--bg:#fff;--fg:#14161a;--mut:#5b6270;--line:#e4e7ec;--card:#fafbfc;--accent:#2c4bd8}
  @media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e8eaed;--mut:#9aa3b2;--line:#252a33;--card:#161920;--accent:#7d93ff}}
@@ -370,75 +372,108 @@ _TPL = """<meta charset="utf-8">
  .gap{font-size:12px;color:#b4531a;background:rgba(180,83,26,.08);border-radius:6px;padding:6px 9px;margin:5px 0}
  @media(prefers-color-scheme:dark){.gap{color:#f0a06a}}
  .src{font-size:11px;color:var(--mut);border-top:1px dashed var(--line);margin-top:14px;padding-top:8px;word-break:break-word}
- .chart{height:280px;margin:12px 0}
  .flag{font-size:12px;padding:4px 8px;border-radius:5px;margin:4px 0;background:rgba(200,60,60,.1);color:#c33}
  @media(prefers-color-scheme:dark){.flag{color:#ff8b8b}}
+ .chartwrap{margin:12px 0;overflow-x:auto}
+ .chartwrap svg{display:block;max-width:100%;height:auto}
+ .lgd{font-size:11px;color:var(--mut);margin-top:4px}
+ .lgd i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 12px;vertical-align:middle}
+ .lgd i:first-child{margin-left:0}
  footer{margin-top:32px;padding-top:14px;border-top:1px solid var(--line);font-size:11px;color:var(--mut)}
 </style>
-<div class="wrap">__BODY__</div>
-<script>
-const PAYLOAD = __PAYLOAD__;
-document.querySelectorAll('.chart').forEach(el=>{
-  const spec = PAYLOAD[el.id]; if(!spec) return;
-  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
-  const ch = LightweightCharts.createChart(el, {
-    height: el.clientHeight, autoSize: true,
-    layout:{background:{color:'transparent'},textColor:dark?'#9aa3b2':'#5b6270',fontSize:11},
-    grid:{vertLines:{visible:false},horzLines:{color:dark?'#252a33':'#eef0f3'}},
-    rightPriceScale:{borderVisible:false},
-    // The left scale is INVISIBLE by default in lightweight-charts v4 (default
-    // priceScale options carry visible:false). Without this the margin line draws
-    // against an unlabelled axis and cannot be read off the chart.
-    leftPriceScale:{borderVisible:false, visible:true},
-    timeScale:{borderVisible:false},
-    handleScroll:false, handleScale:false,
-  });
-  (spec.series||[]).forEach(s=>{
-    const opts = Object.assign({priceScaleId: s.axis||'right'}, s.options||{});
-    const ser = s.type==='line' ? ch.addLineSeries(opts) : ch.addHistogramSeries(opts);
-    ser.setData(s.data);
-  });
-  ch.timeScale().fitContent();
-});
-</script>"""
+<div class="wrap">__BODY__</div>"""
+# NOTE: the template above contains NO <script> and NO external resource. It previously
+# pulled lightweight-charts from unpkg.com and executed it. An emailed HTML attachment
+# that fetches and runs remote JavaScript is exactly what mail scanners and antivirus
+# quarantine — the user's report was blocked as a virus. Charts are now inline SVG:
+# nothing executes, nothing is fetched, and the file renders identically in a browser,
+# in an email preview pane and offline.
 
 
-def _chart_payload(pack: dict) -> dict:
-    """Series for the section-18 chart: revenue + EBITDA bars, margin line.
-
-    lightweight-charts needs a time axis; FY labels are mapped to 1 Jan of the FY-end
-    calendar year purely as an ordering device.
-    """
+def _svg_financial_chart(pack: dict) -> str:
+    """Section-18 chart as static inline SVG: revenue bars, EBITDA line (both Rs Cr on
+    the left axis) and EBITDA margin % (right axis). Pure geometry, no JavaScript."""
     tbl = next((t for t in pack.get("tables", []) if t["id"] == "tbl.financials"), None)
-    if not tbl:
-        return {}
-    rev, eb, mar = [], [], []
-    for row in tbl["rows"]:
-        fy = str(row.get("FY", ""))
-        if not fy.startswith("FY"):
-            continue
-        t = f"20{fy[2:]}-01-01"
-        if row.get("revenue") is not None:
-            rev.append({"time": t, "value": float(row["revenue"])})
-        if row.get("ebitda_incl_oi") is not None:
-            eb.append({"time": t, "value": float(row["ebitda_incl_oi"])})
-        if row.get("margin") is not None:
-            mar.append({"time": t, "value": round(float(row["margin"]), 2)})
-    if not rev:
-        return {}
-    # Revenue as bars, EBITDA as a LINE — not a second histogram. EBITDA is ~6% of
-    # revenue for a distributor like this, so overlapping bars render it as a sliver
-    # hidden behind the revenue bar. A line stays legible at any ratio.
-    return {"ch_fin": {"series": [
-        {"type": "hist", "data": rev,
-         "options": {"color": "rgba(120,150,255,.45)",
-                     "priceFormat": {"type": "volume"}}},
-        {"type": "line", "data": eb,
-         "options": {"color": "#28a06e", "lineWidth": 2,
-                     "priceFormat": {"type": "volume"}}},
-        {"type": "line", "data": mar, "axis": "left",
-         "options": {"color": "#e8833a", "lineWidth": 2, "lineStyle": 2}},
-    ]}}
+    if not tbl or not tbl.get("rows"):
+        return ""
+    rows = [r for r in tbl["rows"] if str(r.get("FY", "")).startswith("FY")
+            and r.get("revenue") is not None]
+    if len(rows) < 2:
+        return ""
+
+    W, H = 900, 300
+    L, R, T, B = 64, 52, 18, 34            # margins: left/right axis + label gutters
+    pw, ph = W - L - R, H - T - B
+
+    fys = [str(r["FY"]) for r in rows]
+    rev = [float(r["revenue"]) for r in rows]
+    eb = [None if r.get("ebitda_incl_oi") is None else float(r["ebitda_incl_oi"])
+          for r in rows]
+    mar = [None if r.get("margin") is None else float(r["margin"]) for r in rows]
+
+    money = [v for v in rev + [x for x in eb if x is not None]]
+    ymax = max(money) * 1.12 or 1.0
+    ymin = min(0.0, min(money))
+    mvals = [m for m in mar if m is not None]
+    mmax = (max(mvals) * 1.25) if mvals else 1.0
+    mmin = min(0.0, min(mvals)) if mvals else 0.0
+
+    def x(i):     return L + pw * (i + 0.5) / len(rows)
+    def y(v):     return T + ph * (1 - (v - ymin) / (ymax - ymin or 1))
+    def ym(v):    return T + ph * (1 - (v - mmin) / (mmax - mmin or 1))
+
+    p = [f'<svg viewBox="0 0 {W} {H}" role="img" '
+         f'aria-label="Revenue, EBITDA and EBITDA margin by financial year" '
+         f'xmlns="http://www.w3.org/2000/svg">']
+    # horizontal gridlines + left (Rs Cr) axis labels
+    for k in range(5):
+        v = ymin + (ymax - ymin) * k / 4
+        yy = y(v)
+        p.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" '
+                 f'stroke="currentColor" stroke-opacity=".12"/>')
+        p.append(f'<text x="{L-8}" y="{yy+4:.1f}" text-anchor="end" font-size="10" '
+                 f'fill="currentColor" fill-opacity=".55">{v:,.0f}</text>')
+    # right (%) axis labels
+    if mvals:
+        for k in range(5):
+            v = mmin + (mmax - mmin) * k / 4
+            p.append(f'<text x="{W-R+8}" y="{ym(v)+4:.1f}" font-size="10" '
+                     f'fill="#e8833a" fill-opacity=".85">{v:.1f}%</text>')
+    # revenue bars
+    bw = max(6.0, pw / len(rows) * 0.5)
+    for i, v in enumerate(rev):
+        top, base = y(v), y(max(0.0, ymin))
+        p.append(f'<rect x="{x(i)-bw/2:.1f}" y="{top:.1f}" width="{bw:.1f}" '
+                 f'height="{max(0.0, base-top):.1f}" fill="#7896ff" fill-opacity=".45" '
+                 f'rx="2"><title>{fys[i]} revenue {v:,.0f}</title></rect>')
+    # EBITDA line (same money axis)
+    def polyline(vals, mapper, color, dash=""):
+        pts = [f"{x(i):.1f},{mapper(v):.1f}"
+               for i, v in enumerate(vals) if v is not None]
+        if len(pts) < 2:
+            return
+        d = f' stroke-dasharray="{dash}"' if dash else ""
+        p.append(f'<polyline fill="none" stroke="{color}" stroke-width="2"{d} '
+                 f'points="{" ".join(pts)}"/>')
+        for i, v in enumerate(vals):
+            if v is None:
+                continue
+            p.append(f'<circle cx="{x(i):.1f}" cy="{mapper(v):.1f}" r="2.6" '
+                     f'fill="{color}"><title>{fys[i]}: {v:,.2f}</title></circle>')
+    polyline(eb, y, "#28a06e")
+    polyline(mar, ym, "#e8833a", dash="4 3")
+    # FY labels
+    for i, fy in enumerate(fys):
+        p.append(f'<text x="{x(i):.1f}" y="{H-12}" text-anchor="middle" font-size="10" '
+                 f'fill="currentColor" fill-opacity=".65">{fy}</text>')
+    p.append("</svg>")
+
+    legend = ('<div class="lgd">'
+              '<i style="background:#7896ff;opacity:.45"></i>Revenue (Rs Cr, left)'
+              '<i style="background:#28a06e"></i>EBITDA incl. other income (Rs Cr, left)'
+              '<i style="background:#e8833a"></i>EBITDA margin % (right)'
+              '</div>')
+    return f'<div class="chartwrap">{"".join(p)}</div>{legend}'
 
 
 def render_html(pack: dict, narrative: dict | None = None,
@@ -491,8 +526,10 @@ def render_html(pack: dict, narrative: dict | None = None,
                          f"<div class='b'>{e(str(f.get('basis', '')))}</div></div>")
             B.append("</div>")
 
-        if num == 18 and _chart_payload(pack):
-            B.append("<div class='chart' id='ch_fin'></div>")
+        if num == 18:
+            svg = _svg_financial_chart(pack)
+            if svg:
+                B.append(svg)
             B.append("<div class='note'>Bars: revenue (Rs Cr, right axis). "
                      "Solid line: EBITDA incl. other income (Rs Cr, right axis). "
                      "Dashed line: EBITDA margin % (left axis).</div>")
@@ -559,8 +596,7 @@ def render_html(pack: dict, narrative: dict | None = None,
     B.append(f"<footer>{e(DISCLAIMER)}</footer>")
 
     return (_TPL.replace("__TITLE__", e(f"{co['name']} — narrative report"))
-            .replace("__BODY__", "\n".join(B))
-            .replace("__PAYLOAD__", json.dumps(_chart_payload(pack))))
+            .replace("__BODY__", "\n".join(B)))
 
 
 # --------------------------------------------------------------------- main ---
