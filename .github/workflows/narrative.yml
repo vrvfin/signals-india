@@ -85,6 +85,12 @@ jobs:
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          # backfill_company_docs (invoked by --fetch-missing) authenticates via
+          # daily_research_summary.drive_service, which reads GDRIVE_OAUTH_TOKEN_PATH
+          # (tk.json) DIRECTLY rather than the refresh-token path get_drive uses. The
+          # OAuth blob already carries the refresh token, so the same file serves both;
+          # without this, fetch-missing crashed with FileNotFoundError on tk.json.
+          cp _sec/oauth.json _sec/tk.json
           {
             echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
             echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"

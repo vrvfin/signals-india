@@ -90,12 +90,32 @@ class Store:
         if key not in self._files:
             try:
                 fid = find_file(self.drive, self.folder(path), name)
-                self._files[key] = (pd.DataFrame() if not fid else
-                                    pd.read_parquet(io.BytesIO(
-                                        download_bytes(self.drive, fid))))
+                # A genuine absence (no fid) is a STABLE fact — cache the empty frame.
+                # A read EXCEPTION is TRANSIENT (Drive rate-limit after heavy I/O), so
+                # it must NOT be cached: caching it once poisoned every later resolve()
+                # in the same run, which is how a mid-run --fetch-missing turned a
+                # working TCS run into "could not resolve 'TCS'". Retry with a short
+                # backoff, and on total failure return empty WITHOUT caching so the
+                # next call can try again.
+                if not fid:
+                    self._files[key] = pd.DataFrame()
+                else:
+                    self._files[key] = pd.read_parquet(
+                        io.BytesIO(download_bytes(self.drive, fid)))
             except Exception as e:
-                log(f"  WARNING: {path}/{name} unreadable ({str(e)[:80]})")
-                self._files[key] = pd.DataFrame()
+                import time as _t
+                for attempt in range(2):
+                    _t.sleep(1.5 * (attempt + 1))
+                    try:
+                        fid = find_file(self.drive, self.folder(path), name)
+                        if fid:
+                            return pd.read_parquet(io.BytesIO(
+                                download_bytes(self.drive, fid)))
+                    except Exception:
+                        continue
+                log(f"  WARNING: {path}/{name} unreadable after retries "
+                    f"({str(e)[:70]}) — returning empty, NOT caching")
+                return pd.DataFrame()
         return self._files[key]
 
     def by_isin(self, name: str, isin: str, symbol: str = "") -> pd.DataFrame:

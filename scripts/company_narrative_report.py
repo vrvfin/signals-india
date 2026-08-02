@@ -155,7 +155,13 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                                    check=False, timeout=2400)
                 except Exception as e:
                     log(f"     {mod} failed ({str(e)[:110]})")
-            store._files.clear()          # drop cached parquets so the new rows are seen
+            # Invalidate ONLY the tables the extractors just rewrote — clearing the whole
+            # cache forced a re-read of company_facts too, and a transient failure of
+            # that read cached an empty frame and broke resolve() for the rest of the run.
+            for _p, _n in list(store._files.keys()):
+                if _n in ("company_structure.parquet", "mgmt_quotes.parquet",
+                          "processing_queue.parquet", "ratings.parquet"):
+                    store._files.pop((_p, _n), None)
             rep = PRE.run(store, token) or rep
             rc = rep["readiness_counts"]
             log(f"     after fetch: {rc['READY']} ready / {rc['FETCHABLE']} fetchable / "
