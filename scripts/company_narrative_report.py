@@ -419,18 +419,46 @@ def _save_nqueue(store: FP.Store, df: pd.DataFrame):
 
 
 def enqueue_narrative(store: FP.Store, tokens: list[str]) -> int:
-    """Add pending rows, skipping any token already pending or done. Returns count added."""
+    """Queue tokens for the next drain. Returns how many are now pending.
+
+    Only an ALREADY-PENDING token is skipped. A token whose last run is `done` or
+    `error` is RE-QUEUED (its row resets to pending), because asking for a company
+    again is a legitimate request — a report is a point-in-time artefact and the code,
+    the filings and the data all move. Treating `done` as permanent meant a second
+    `--add` reported "0 added (already pending/done)", the drain then found nothing,
+    and the dispatch went green having built nothing.
+    """
     df = _load_nqueue(store)
-    seen = (set(df[df["status"].astype(str).isin(["pending", "done"])]["token"].astype(str))
-            if not df.empty else set())
-    toks = [t.strip() for t in dict.fromkeys(tokens) if t.strip() and t.strip() not in seen]
+    toks = [t.strip() for t in dict.fromkeys(tokens) if t.strip()]
     if not toks:
         return 0
-    new = pd.DataFrame([{"token": t, "status": "pending",
-                         "added_at": datetime.now().isoformat(timespec="seconds")}
-                        for t in toks])
-    _save_nqueue(store, pd.concat([df, new], ignore_index=True))
-    return len(toks)
+    if df.empty:
+        df = pd.DataFrame(columns=NQUEUE_COLS)
+    status = df["status"].astype(str) if not df.empty else pd.Series(dtype=str)
+    already_pending = (set(df[status == "pending"]["token"].astype(str))
+                       if not df.empty else set())
+
+    now = datetime.now().isoformat(timespec="seconds")
+    requeued, added = [], []
+    for t in toks:
+        if t in already_pending:
+            continue
+        m = (df["token"].astype(str) == t) if not df.empty else None
+        if m is not None and m.any():
+            df.loc[m, ["status", "added_at", "done_at", "error"]] = \
+                ["pending", now, None, None]
+            requeued.append(t)
+        else:
+            added.append(t)
+    if added:
+        df = pd.concat([df, pd.DataFrame([{"token": t, "status": "pending",
+                                           "added_at": now} for t in added])],
+                       ignore_index=True)
+    if added or requeued:
+        _save_nqueue(store, df)
+    if requeued:
+        log(f"  re-queued (previous run finished): {', '.join(requeued)}")
+    return len(added) + len(requeued)
 
 
 def _mark_nqueue(store: FP.Store, token: str, status: str, error: str = ""):
