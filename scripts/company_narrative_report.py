@@ -122,6 +122,28 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     # just has too few), so close those before building rather than rendering
     # DATA_MISSING and telling the user to run a command themselves.
     if args.fetch_missing:
+        # FINANCIALS FIRST. statements/<SYM>.parquet backs sections 5/8/18/19/22 — the
+        # deterministic core. The nightly Screener sweep covers 5,381 companies, but a
+        # name outside it had NO on-demand path and simply rendered those sections
+        # empty. Pull it here so "any company" really means any company.
+        st_now = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
+        if st_now.empty:
+            log(f"[1a] no fundamentals/statements/{co['symbol']}.parquet — "
+                f"fetching financials from Screener")
+            try:
+                import subprocess
+                subprocess.run([sys.executable,
+                                str(Path(_HERE) / "ingest_fundamentals.py"),
+                                "--symbols", co["symbol"]], check=False, timeout=900)
+                store._files.pop((f"{FP.FUND}/statements",
+                                  f"{co['symbol']}.parquet"), None)
+                got = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
+                log(f"     statements now: {len(got)} row(s)"
+                    if not got.empty else
+                    "     still empty — Screener has no statements for this symbol")
+            except Exception as e:
+                log(f"     financials fetch failed ({str(e)[:110]})")
+
         fetchable = [r for r in rep["readiness"] if r["state"] == "FETCHABLE"]
         if not fetchable:
             log("[1b] auto-fetch: nothing fetchable — Drive already has what it can")

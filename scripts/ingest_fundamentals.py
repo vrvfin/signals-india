@@ -143,6 +143,13 @@ def main():
                              "_index/results.parquet within the last N days. "
                              "summary.parquet is upserted (not replaced). "
                              "~90 names/day in peak season, ~0 off-season.")
+    parser.add_argument("--symbols", default="",
+                        help="Comma-separated symbols to fetch INSTEAD of the whole "
+                             "universe. Used for on-demand single-company pulls (the "
+                             "narrative report calls this when a company has no "
+                             "fundamentals/statements/<SYM>.parquet yet). Purely "
+                             "additive — omitting it leaves the nightly/weekly sweep "
+                             "behaviour unchanged.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch + log only; no Drive write.")
     args = parser.parse_args()
@@ -174,6 +181,20 @@ def main():
         return str(row["symbol"])
 
     work = [(str(r["symbol"]), _token(r)) for _, r in universe.iterrows()]
+
+    # On-demand single-company pull. Matches on `symbol` OR the Screener token (BSE
+    # names resolve through yf_ticker), so a caller can pass whatever identifier it
+    # holds. Applied before the incremental filter so an explicit request is never
+    # narrowed away by results-season logic.
+    if args.symbols:
+        want = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        work = [(s, t) for (s, t) in work
+                if s.upper() in want or str(t).upper() in want]
+        log(f"--symbols: {len(work)} of {len(want)} requested symbol(s) matched "
+            f"the universe")
+        if not work:
+            log("None of the requested symbols are in master_list.csv — nothing to do.")
+            return
 
     # Results-season incremental mode: shrink work to companies whose results
     # just hit the scraped feed — so quarterly tables update the NEXT morning

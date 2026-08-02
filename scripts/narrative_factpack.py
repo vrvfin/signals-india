@@ -1140,6 +1140,115 @@ def sec14_15_research(pack: Pack, store: Store):
              _src_parquet(f"{IDX}/research_map.parquet"))
 
 
+def sec29_documents_read(pack: Pack, store: Store):
+    """Section 29 — the SOURCE MANIFEST: every actual document this report drew on,
+    named individually.
+
+    Citing "company_page.md" or "annual_report" is not provenance — it hides WHICH
+    years were read. If the company page holds FY24 and FY25 but the run also pulled
+    FY23, the report must say AR FY23, AR FY24, AR FY25. Same for every other type:
+    each concall by quarter/date, each rating action, each presentation.
+    """
+    rows = []
+
+    # 1. Filings in the global document queue (what was fetched AND processed).
+    q = store.by_isin("processing_queue.parquet", pack.isin, pack.symbol)
+    if not q.empty:
+        qq = q[q["status"].astype(str).isin(["done", "superseded"])].copy()
+        qq["_d"] = pd.to_datetime(qq["announcement_date"], errors="coerce")
+        for _, r in qq.sort_values("_d", ascending=False).iterrows():
+            d = r.get("_d")
+            period = str(r.get("period") or "").strip()
+            iso = d.strftime("%Y-%m-%d") if pd.notna(d) else ""
+            # Show the FY/quarter when the filing carries one (AR FY24 reads better
+            # than a filing date), but KEEP the ISO date for joining: extractor doc_ids
+            # are "<doc_type>_<YYYY-MM-DD>", so matching on the display label alone
+            # listed the same annual report twice — once per naming convention.
+            rows.append({
+                "doc_type": str(r.get("doc_type", "")),
+                "period_or_date": period or iso or "undated",
+                "_iso": iso,
+                "title": str(r.get("title") or "")[:110],
+                "status": str(r.get("status", "")),
+                "used_for": "",
+                "source": "processing_queue",
+            })
+
+    # 2. Which of those the EXTRACTORS actually consumed, and for which sections.
+    used: dict[str, set] = {}
+    struct = store.by_isin("company_structure.parquet", pack.isin, pack.symbol)
+    if not struct.empty and "source_doc_id" in struct.columns:
+        for did in struct["source_doc_id"].astype(str).unique():
+            used.setdefault(did, set()).add("s1/3/4/6/9/12/23")
+    quotes = store.by_isin("mgmt_quotes.parquet", pack.isin, pack.symbol)
+    if not quotes.empty and "source_doc_id" in quotes.columns:
+        for did in quotes["source_doc_id"].astype(str).unique():
+            used.setdefault(did, set()).add("s20")
+    # doc_id is "<doc_type>_<YYYY-MM-DD>" — join on (doc_type, ISO date), which is the
+    # only key both sides share.
+    matched: set[str] = set()
+    for did, secs in used.items():
+        parts = str(did).rsplit("_", 1)
+        if len(parts) != 2:
+            continue
+        dtype, ddate = parts
+        for r in rows:
+            if r["doc_type"] == dtype and (r.get("_iso") == ddate
+                                           or r["period_or_date"] == ddate):
+                r["used_for"] = ", ".join(sorted(secs))
+                matched.add(did)
+    # Anything an extractor used that is NOT in the queue (e.g. re-fetched directly)
+    # still deserves a row — but only if it genuinely did not match above.
+    for did, secs in used.items():
+        if did in matched:
+            continue
+        parts = str(did).rsplit("_", 1)
+        if len(parts) == 2:
+            rows.append({"doc_type": parts[0], "period_or_date": parts[1], "_iso": parts[1],
+                         "title": "(re-fetched for extraction)", "status": "used",
+                         "used_for": ", ".join(sorted(secs)), "source": "extractor"})
+
+    # 3. Broker research documents, named individually.
+    rm = store.parquet(IDX, "research_map.parquet")
+    if not rm.empty:
+        mine = rm[(rm["scope"] == "company") &
+                  (rm["isin"].astype(str) == str(pack.isin))]
+        for _, r in mine.sort_values("doc_date", ascending=False).head(20).iterrows():
+            rows.append({"doc_type": f"research/{r.get('doc_kind', '')}",
+                         "period_or_date": str(r.get("doc_date", ""))[:10],
+                         "title": f"{r.get('source', '')} — "
+                                  f"{str(r.get('file_name', ''))[:70]}",
+                         "status": "mapped", "used_for": "s14",
+                         "source": "research_map"})
+
+    if not rows:
+        pack.gap(29, "no source documents on record for this company")
+        return
+
+    order = {"annual_report": 0, "concall": 1, "results": 2, "presentation": 3,
+             "rating": 4}
+    rows.sort(key=lambda r: (order.get(r["doc_type"], 9), r["doc_type"],
+                             r["period_or_date"]), reverse=False)
+    for r in rows:                      # drop the join-only helper column
+        r.pop("_iso", None)
+    pack.table("tbl.documents_read", "Every source document this report drew on", 29,
+               ["doc_type", "period_or_date", "title", "status", "used_for", "source"],
+               rows, _src_parquet(f"{IDX}/processing_queue.parquet + "
+                                  f"company_structure + mgmt_quotes + research_map"),
+               note="Named individually and by period — an annual-report row per "
+                    "financial year, a concall row per call. `used_for` shows which "
+                    "sections consumed that document; blank means it is on record but "
+                    "no section drew on it in this run.")
+
+    by_type: dict[str, int] = {}
+    for r in rows:
+        by_type[r["doc_type"]] = by_type.get(r["doc_type"], 0) + 1
+    for dt, n in sorted(by_type.items()):
+        pack.add(f"docs.n_{dt.replace('/', '_')}", f"Documents on record: {dt}", n,
+                 "count", "extracted", 29,
+                 _src_parquet(f"{IDX}/processing_queue.parquet"))
+
+
 def sec7_ratings(pack: Pack, store: Store):
     """Credit-rating actions — the agencies' own view, which is independent of the
     company's framing."""
@@ -1194,6 +1303,7 @@ def build(store: Store, token: str, live: bool = True) -> Pack | None:
     sec23_structural_risks(pack, store)
     # live exchange feed
     sec27_exchange_filings(pack, store, live=live)
+    sec29_documents_read(pack, store)
     return pack
 
 
