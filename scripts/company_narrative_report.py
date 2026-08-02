@@ -456,6 +456,10 @@ def main():
                     help="ISIN / symbol / name fragment. Omit to drain the queue.")
     ap.add_argument("--add", nargs="+", default=None,
                     help="enqueue these tokens for the next scheduled run, then exit")
+    ap.add_argument("--allow-empty-queue", action="store_true",
+                    help="an empty queue exits 0 instead of failing. For the SCHEDULED "
+                         "run, where nothing queued is normal; a manual dispatch that "
+                         "builds nothing should fail loudly instead.")
     ap.add_argument("--outdir", default="./_narrative")
     ap.add_argument("--cache", default="")
     ap.add_argument("--sections", nargs="*", type=int, default=None)
@@ -516,9 +520,21 @@ def main():
         pending = (q[q["status"].astype(str) == "pending"]["token"].astype(str).tolist()
                    if not q.empty else [])
         if not pending:
-            log("narrative_queue is empty — nothing to do. Add companies with "
-                "`--add TOKEN` or pass --names for an ad-hoc run.")
-            return 0
+            # A MANUAL run that produces nothing must not report success: dispatching
+            # with a blank `names` field drains the queue, and an empty queue meant the
+            # job went green having done no work — indistinguishable from a finished
+            # report. A SCHEDULED run finding an empty queue is normal and stays green.
+            if a.allow_empty_queue:
+                log("narrative_queue is empty — nothing to do (scheduled run).")
+                return 0
+            log("ERROR: no company to build.")
+            log("  This run was told to drain the queue (blank `names`), but")
+            log("  narrative_queue.parquet has no pending companies.")
+            log("  Either:")
+            log("    - re-dispatch with names=<COMPANY>, or")
+            log("    - queue one first:  python scripts/company_narrative_report.py "
+                "--add \"<COMPANY>\"")
+            return 1
         log(f"draining narrative_queue: {len(pending)} pending "
             f"({', '.join(pending[:8])}{'...' if len(pending) > 8 else ''})")
         tokens = pending

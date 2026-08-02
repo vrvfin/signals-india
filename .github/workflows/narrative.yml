@@ -154,7 +154,10 @@ jobs:
           #  - `--names` (empty) -> the script drains narrative_queue.parquet
           #  - `!= 'false'` keeps mail + fetch ON for scheduled runs while still letting
           #    a manual dispatch turn them off (mail=false).
+          # A scheduled run with an empty queue is normal (exit 0). A MANUAL dispatch
+          # that builds nothing must fail, or it goes green having produced no report.
           python scripts/company_narrative_report.py \
+            ${{ github.event_name == 'schedule' && '--allow-empty-queue' || '' }} \
             ${{ inputs.names != '' && format('--names {0}', inputs.names) || '' }} \
             --outdir ./_narrative \
             --upload \
