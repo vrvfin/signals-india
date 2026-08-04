@@ -1053,6 +1053,70 @@ def _decision_chip(dec, nb, nv) -> str:
             f'{dec}{frac} strat</span>')
 
 
+def _select_ipos(drive, args, exch):
+    """Recent listings (IPO view): every name whose master_list listing_date is
+    within --ipo-days, ranked on PURE RETURNS (1m > 3m > 6m > 12m) — no strategy
+    count, because a stock listed months ago has too little history to accumulate
+    strategy hits and would be unfairly buried. Strategy count is still shown on
+    the card so a name that IS being flagged stands out.
+
+    NOTE: listing_date only exists for NSE rows; BSE-only names carry no date and
+    are therefore absent from this view."""
+    uni = _read_csv(drive, _folder(drive, "universe"), "master_list.csv")
+    if uni.empty or "listing_date" not in uni.columns:
+        log("  master_list has no listing_date — IPO view unavailable")
+        return pd.DataFrame()
+    ld = pd.to_datetime(uni["listing_date"], format="%d-%b-%Y", errors="coerce")
+    cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=args.ipo_days)
+    rec = uni.assign(_ld=ld)[ld >= cut].copy()
+    log(f"  {len(rec)} names listed in the last {args.ipo_days}d")
+    if rec.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({"symbol": rec["symbol"].astype(str),
+                        "_listed": rec["_ld"]})
+    # attach returns + liquidity from features; a listing with no features yet
+    # (too new to compute) is dropped rather than shown blank
+    feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+    if feats.empty or "symbol" not in feats.columns:
+        log("  features/latest.parquet missing — IPO view unavailable")
+        return pd.DataFrame()
+    fsym = feats["symbol"].astype(str)
+    for lb in _RANK_RETURNS:
+        col = f"return_{lb}_pct"
+        out[col] = out["symbol"].map(dict(zip(fsym, pd.to_numeric(
+            feats[col], errors="coerce")))) if col in feats.columns else float("nan")
+    tcol = ("avg_turnover_30d_cr" if "avg_turnover_30d_cr" in feats.columns
+            else "avg_turnover_20d_cr")
+    if tcol in feats.columns:
+        out["_turn"] = out["symbol"].map(dict(zip(fsym, pd.to_numeric(
+            feats[tcol], errors="coerce"))))
+        if args.turnover > 0:
+            before = len(out)
+            out = out[out["_turn"].fillna(-1.0) >= args.turnover]
+            log(f"  {len(out)}/{before} pass Rs{args.turnover:.0f}cr turnover floor")
+    out = out[out[[f"return_{lb}_pct" for lb in _RANK_RETURNS]].notna().any(axis=1)]
+
+    # strategy hits (shown, not used for ranking) + consensus decision
+    sig = _load_signals(drive)
+    if not sig.empty:
+        dec = _consensus_decision(sig)
+        ns = (sig.groupby("symbol")["strategy_group"].nunique()
+              .reset_index(name="n_strategies"))
+        out = out.merge(ns, on="symbol", how="left").merge(dec, on="symbol", how="left")
+    if "n_strategies" not in out.columns:
+        out["n_strategies"] = 0
+    out["n_strategies"] = out["n_strategies"].fillna(0).astype(int)
+
+    sort_cols = [f"return_{lb}_pct" for lb in _RANK_RETURNS
+                 if f"return_{lb}_pct" in out.columns]
+    out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols),
+                          na_position="last")
+    out["_exch"] = out["symbol"].map(exch).fillna("NSE")
+    log("  IPO view ranked by: " + " > ".join(sort_cols))
+    return out.reset_index(drop=True)
+
+
 def _select_signals(drive, args, exch):
     sig = _load_signals(drive)
     if sig.empty:
@@ -1208,10 +1272,15 @@ def main():
     ap.add_argument("--mode", choices=["signals", "pf", "guidance"], default="signals",
                     help="signals=ranked signal gallery; pf=portfolio holdings; "
                          "guidance=top companies by implied guidance CAGR.")
-    ap.add_argument("--view", choices=["full", "additions", "drops"], default="full",
+    ap.add_argument("--view", choices=["full", "additions", "drops", "ipo"],
+                    default="full",
                     help="signals mode: full=all ranked (existing limits); "
                          "additions=first seen last 14d (fresh/new/recent); "
-                         "drops=fell off the select list in last 7d.")
+                         "drops=fell off the select list in last 7d; "
+                         "ipo=names listed in the last --ipo-days, ranked on "
+                         "pure returns (no strategy-count gate).")
+    ap.add_argument("--ipo-days", type=int, default=365,
+                    help="IPO view: listing-date lookback window (default 365)")
     ap.add_argument("--min-strats", type=int, default=2)
     ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
     ap.add_argument("--timeframe-days", type=int, default=252)
@@ -1338,6 +1407,12 @@ def main():
             ranked["n_strategies"] = 0
             ranked["_exch"] = ranked["symbol"].map(exch).fillna("NSE")
             log(f"  {len(ranked)} names dropped from the select list in last 7d")
+        elif args.view == "ipo":
+            title = f"🚀 Recent listings ({args.ipo_days}d) — ranked by return"
+            out_default = "gallery_ipo.html"
+            ranked = _select_ipos(drive, args, exch)
+            if ranked.empty:
+                log("Nothing to render."); return
         else:
             ranked = _select_signals(drive, args, exch)
             if args.view == "additions":
