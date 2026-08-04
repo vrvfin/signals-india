@@ -724,6 +724,10 @@ def _highlight_numbers(text: str) -> str:
 # first-word hit (+1, e.g. "Rishab Pant...") or a bare fragment does not.
 _NEWS_DIRECT_MIN = 3
 
+# Card ranking tiebreak ladder, applied after n_strategies: shorter horizons
+# first, so recent momentum decides between names with equal strategy counts.
+_RANK_RETURNS = ("1m", "3m", "6m", "12m")
+
 _LISTICLE_PAT = re.compile(
     r"(\b\d+\s+(?:stocks?|shares?|picks?|multibagger|smallcap|midcap|largecap)"
     r"|\bstocks? to (?:buy|watch|sell)|\btop \d+|\bportfolio\b|\bbuy or sell\b"
@@ -1063,9 +1067,13 @@ def _select_signals(drive, args, exch):
     conv = conv.merge(best, on="symbol", how="left")
     conv = conv.merge(dec, on="symbol", how="left")
     log(f"  {len(conv)} names with >={args.min_strats} strategies")
-    if args.turnover > 0:
-        feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
-        if not feats.empty and "symbol" in feats.columns:
+
+    # Features carry both the liquidity floor AND the return ladder used for
+    # ranking, so load once regardless of whether the turnover floor is on.
+    feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+    if not feats.empty and "symbol" in feats.columns:
+        fsym = feats["symbol"].astype(str)
+        if args.turnover > 0:
             if "avg_turnover_30d_cr" in feats.columns:      # #24: 30-day floor
                 turn = pd.to_numeric(feats["avg_turnover_30d_cr"], errors="coerce")
             elif "avg_turnover_20d_cr" in feats.columns:     # fallback until recompute
@@ -1075,13 +1083,33 @@ def _select_signals(drive, args, exch):
                         * pd.to_numeric(feats["close"], errors="coerce")) / 1e7
             else:
                 turn = pd.Series(float("nan"), index=feats.index)
-            tmap = dict(zip(feats["symbol"].astype(str), turn))
+            tmap = dict(zip(fsym, turn))
             conv = conv[conv["symbol"].astype(str).map(tmap).fillna(-1.0) >= args.turnover]
             log(f"  {len(conv)} pass Rs{args.turnover:.0f}cr turnover floor")
+        # Return ladder for the sort (missing -> -inf so it ranks last, never first)
+        for _lb in _RANK_RETURNS:
+            col = f"return_{_lb}_pct"
+            if col in feats.columns:
+                rmap = dict(zip(fsym, pd.to_numeric(feats[col], errors="coerce")))
+                conv[col] = conv["symbol"].astype(str).map(rmap)
+            else:
+                conv[col] = float("nan")
+
+    # RANKING: most strategies first, then the return ladder 1m > 3m > 6m > 12m
+    # (each is a tiebreak for the one before it). best_score is deliberately NOT
+    # used — it is the max RAW score across strategies whose units differ
+    # (RS rank 0-100 vs streak DAYS vs raw 3m return %), so it silently favoured
+    # whichever strategy happened to emit big numbers.
+    sort_cols = ["n_strategies"] + [f"return_{lb}_pct" for lb in _RANK_RETURNS
+                                    if f"return_{lb}_pct" in conv.columns]
+    conv = conv.sort_values(sort_cols, ascending=[False] * len(sort_cols),
+                            na_position="last")
     conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
-    conv = conv.sort_values(["n_strategies", "best_score"], ascending=[False, False])
-    return pd.concat([conv[conv["_exch"] != "BSE"], conv[conv["_exch"] == "BSE"]],
-                     ignore_index=True)
+    if args.bse_last:      # opt-in: park thinner BSE-only names below NSE
+        conv = pd.concat([conv[conv["_exch"] != "BSE"], conv[conv["_exch"] == "BSE"]],
+                         ignore_index=True)
+    log("  ranked by: " + " > ".join(sort_cols))
+    return conv.reset_index(drop=True)
 
 
 _ADD_BADGE = {"fresh": ("🆕 FRESH", "#8e44ad"), "new": ("NEW", "#2980b9"),
@@ -1196,6 +1224,9 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--bse-last", action="store_true",
+                    help="park BSE-only names below NSE regardless of rank "
+                         "(off by default so the strategy/return sort is honoured)")
     ap.add_argument("--no-macro", action="store_true",
                     help="consumed by the .bat wrapper (skips the market_state "
                          "dashboard step); ignored here so pass-through never breaks")
