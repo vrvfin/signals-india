@@ -44,6 +44,7 @@ from screener_client import ScreenerClient, BASE_URL, CookieExpiredError
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, load_parquet, save_parquet,
                              acquire_lock, release_lock, log)
+from earnings_calendar import CAL_PARQUET, recent_reporter_symbols
 from run_backfill import build_company_order   # canonical priority order
 
 LOCK_NAME = "_fin3stmt.lock"   # mutual-exclusion: backfill vs daily incremental
@@ -240,36 +241,49 @@ def scrape_company(client: ScreenerClient, isin: str, symbol: str) -> list[dict]
     return rows
 
 
-def incremental_companies(drive, index_id, order, days: int) -> list[dict]:
-    """NEW reporters from results.parquet (written by scrape_results_table) —
-    ISINs whose results FIRST appeared on the feed within `days` (first_seen_at;
-    scraped_at fallback for parquets predating that column). Maps to
-    {symbol,isin,name}. An empty result is valid: nothing newly declared."""
-    fid = find_file(drive, index_id, "results.parquet")
+def _read_parquet(drive, folder_id, name):
+    """Drive parquet -> DataFrame, or None when absent/unreadable."""
+    fid = find_file(drive, folder_id, name)
     if not fid:
-        log("  --incremental: results.parquet not found — nothing to refresh.")
-        return []
+        return None
     try:
-        res = pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
+        return pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
     except Exception as e:
-        log(f"  --incremental: could not read results.parquet ({str(e)[:60]})")
+        log(f"  --incremental: could not read {name} ({str(e)[:60]})")
+        return None
+
+
+def incremental_companies(drive, root_id, index_id, order, days: int) -> list[dict]:
+    """NEW reporters within `days`, as {symbol,isin,name} entries from `order`.
+
+    Trigger = results.parquet (Screener's /results/latest/ feed) UNION
+    results_calendar.parquet (NSE+BSE board-meeting calendar), resolved by the
+    shared earnings_calendar.recent_reporter_symbols so this and
+    ingest_fundamentals cannot drift apart. The feed alone misses whatever
+    scrolled out of its fixed 25-item window between two scrapes.
+
+    An empty result is valid: nothing newly declared.
+    """
+    uni_id = get_or_create_subfolder(drive, root_id, "universe")
+    uni_fid = find_file(drive, uni_id, "master_list.csv")
+    if not uni_fid:
+        log("  --incremental: universe/master_list.csv not found — skipping.")
         return []
-    if res.empty or "isin" not in res.columns:
+    universe = pd.read_csv(io.BytesIO(download_bytes(drive, uni_fid)))
+    res = _read_parquet(drive, index_id, "results.parquet")
+    cal = _read_parquet(drive, index_id, CAL_PARQUET)
+    if res is None and cal is None:
+        log(f"  --incremental: no results.parquet and no {CAL_PARQUET} — "
+            "nothing to refresh.")
         return []
-    ts_col = "first_seen_at" if "first_seen_at" in res.columns else (
-        "scraped_at" if "scraped_at" in res.columns else None)
-    if ts_col is None:      # very old parquet, no timestamps: refresh everything
-        isins = res["isin"].astype(str).str.strip().unique().tolist()
-    else:
-        res = res.copy()
-        res["_d"] = pd.to_datetime(res[ts_col], errors="coerce")
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-        recent = res[res["_d"] >= cutoff]
-        isins = [i for i in recent["isin"].astype(str).str.strip().unique().tolist() if i]
-    by_isin = {c["isin"]: c for c in order if c.get("isin")}
-    out = [by_isin[i] for i in isins if i in by_isin]
-    log(f"  --incremental: {len(out)} reporter(s) to refresh "
-        f"({ts_col or 'no-timestamp'} within {days}d)")
+    want, stats = recent_reporter_symbols(universe, days,
+                                          results_df=res, calendar_df=cal)
+    by_sym = {str(c.get("symbol", "")).upper(): c for c in order}
+    out = [by_sym[s.upper()] for s in sorted(want) if s.upper() in by_sym]
+    log(f"  --incremental: {len(out)} reporter(s) to refresh within {days}d "
+        f"(feed {stats['feed_symbols']} of {stats['feed_tokens']}, "
+        f"calendar {stats['cal_symbols']} of {stats['cal_tokens']}, "
+        f"{stats['unresolved_n']} token(s) unresolved)")
     return out
 
 
@@ -330,7 +344,8 @@ def main() -> None:
     explicit = [s.strip() for s in args.symbols.split(",") if s.strip()]
     if args.incremental:
         order = build_company_order(drive, root_id)
-        companies = incremental_companies(drive, index_id, order, args.recent_days)
+        companies = incremental_companies(drive, root_id, index_id, order,
+                                          args.recent_days)
     elif explicit:
         order = build_company_order(drive, root_id)  # resolve ISIN via universe
         by_sym = {c["symbol"].upper(): c for c in order}

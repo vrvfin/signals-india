@@ -63,6 +63,14 @@ jobs:
             echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
           } > .env
 
+      # Board-meeting calendar -> results_calendar.parquet. The incremental step
+      # below reads it UNIONed with results.parquet, so it must run first.
+      # pead.yml persists the same file earlier in the evening; refreshing it
+      # here too means this job never depends on that one's ordering.
+      - name: Persist results calendar (NSE+BSE board meetings, next 14d)
+        run: python scripts/earnings_calendar.py --days-back 1 --days-ahead 14 --persist
+        continue-on-error: true
+
       # Full universe (NSE symbol + BSE bse_code). Writes summary + per_symbol +
       # statements. SCREENER_SESSION_COOKIE is read from .env by the script.
       # Which mode runs depends on which cron fired: the Monday 01:00 slot (and

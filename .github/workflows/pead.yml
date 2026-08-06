@@ -90,6 +90,18 @@ jobs:
           pip install requests beautifulsoup4 lxml pandas pyarrow \
             google-api-python-client google-auth google-auth-oauthlib python-dotenv
 
+      # Board-meeting calendar -> results_calendar.parquet. This is the TRIGGER
+      # the daily financial refresh reads (unioned with results.parquet below).
+      # It must run BEFORE the incremental steps that consume it. Screener's
+      # /results/latest feed is a fixed 25-item window that turns over inside an
+      # hour at peak season; the exchange calendar is complete by construction.
+      # --days-ahead 14: both APIs are forthcoming-only, so the backward window
+      # the refresh needs is ACCUMULATED by storing meetings before they happen.
+      # 14 days means a few missed runs still cannot lose a reporter.
+      - name: Persist results calendar (NSE+BSE board meetings, next 14d)
+        run: python scripts/earnings_calendar.py --days-back 1 --days-ahead 14 --persist
+        continue-on-error: true
+
       - name: Refresh today's results (Screener /results/latest)
         run: python scripts/scrape_results_table.py
         continue-on-error: true

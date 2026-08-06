@@ -34,6 +34,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
+from earnings_calendar import CAL_PARQUET, recent_reporter_symbols
 from screener_client import ScreenerClient, CookieExpiredError
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -130,6 +131,26 @@ def upload_parquet(drive, folder_id, filename, df, existing_id=None):
 
 # ---- Main ----
 
+def _write_summary(drive, fund_id, rows: list, partial: bool) -> int:
+    """Write fundamentals/summary.parquet, UPSERTING when the run is partial.
+
+    Any run that scrapes a SUBSET of the universe (--symbols, --limit, --resume,
+    --recent-results-days, or a mid-run checkpoint) must merge into the stored
+    frame. A plain write there replaces the whole full-universe summary with
+    that subset — `--symbols UNIPARTS` once cut 5,543 rows down to 1.
+    Only a completed full-universe pass may write the frame wholesale.
+    """
+    summary_df = pd.DataFrame(rows)
+    sum_fid = find_file(drive, fund_id, "summary.parquet")
+    if partial and sum_fid:
+        full = download_parquet(drive, sum_fid)
+        full = full[~full["symbol"].astype(str).isin(
+            summary_df["symbol"].astype(str))]
+        summary_df = pd.concat([full, summary_df], ignore_index=True)
+    upload_parquet(drive, fund_id, "summary.parquet", summary_df, sum_fid)
+    return len(summary_df)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
@@ -197,24 +218,33 @@ def main():
             return
 
     # Results-season incremental mode: shrink work to companies whose results
-    # just hit the scraped feed — so quarterly tables update the NEXT morning
-    # instead of waiting for the Monday full run.
+    # just landed — so quarterly tables update the NEXT morning instead of
+    # waiting for the Monday full run.
+    #
+    # Trigger = results.parquet (Screener's /results/latest/ feed) UNION
+    # results_calendar.parquet (NSE+BSE board-meeting calendar). The feed alone
+    # is not enough: it is a fixed 25-item window that fully turns over inside
+    # an hour at peak season, so most evening reporters scrolled past it and sat
+    # on stale quarters until the weekly sweep. See recent_reporter_symbols().
     if args.recent_results_days:
         repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
         idx_id = get_or_create_subfolder(drive, repo_id, "_index")
         res_fid = find_file(drive, idx_id, "results.parquet")
-        if not res_fid:
-            log("No results.parquet — nothing to refresh incrementally.")
+        cal_fid = find_file(drive, idx_id, CAL_PARQUET)
+        if not res_fid and not cal_fid:
+            log(f"Neither results.parquet nor {CAL_PARQUET} — "
+                "nothing to refresh incrementally.")
             return
-        res = download_parquet(drive, res_fid)
-        fs = pd.to_datetime(res.get("first_seen_at"), errors="coerce")
-        cutoff = datetime.now() - timedelta(days=args.recent_results_days)
-        recent_isins = set(res.loc[fs >= cutoff, "isin"].astype(str))
-        want = set(universe.loc[universe["isin"].astype(str).isin(recent_isins),
-                                "symbol"].astype(str))
+        res = download_parquet(drive, res_fid) if res_fid else None
+        cal = download_parquet(drive, cal_fid) if cal_fid else None
+        want, stats = recent_reporter_symbols(
+            universe, args.recent_results_days, results_df=res, calendar_df=cal)
         work = [(s, t) for (s, t) in work if s in want]
         log(f"Incremental mode: {len(work)} companies with results in the "
-            f"last {args.recent_results_days}d")
+            f"last {args.recent_results_days}d "
+            f"(feed {stats['feed_symbols']} of {stats['feed_tokens']}, "
+            f"calendar {stats['cal_symbols']} of {stats['cal_tokens']}, "
+            f"{stats['unresolved_n']} token(s) unresolved)")
         if not work:
             log("Nothing to refresh — done.")
             return
@@ -231,6 +261,12 @@ def main():
         work = [(s, t) for (s, t) in work if f"{s}.parquet" not in existing]
         log(f"Resume mode: {len(work)} symbols left after skipping {len(existing)} done.")
     log(f"Symbols to fetch: {len(work)} (full universe NSE+BSE)")
+
+    # A partial run scrapes a subset of the universe, so its summary rows must be
+    # merged into the stored frame rather than replacing it (see _write_summary).
+    # A full-universe run keeps the old wholesale-write behaviour unchanged.
+    partial = bool(args.symbols or args.recent_results_days or args.limit
+                   or args.resume)
 
     rows = []
     stmt_total = 0
@@ -282,22 +318,12 @@ def main():
         # expiry, runner hiccup, local restart) still persists partial progress
         # instead of losing everything — summary is otherwise only written at the end.
         if i % 500 == 0 and rows and not args.dry_run:
-            upload_parquet(drive, fund_id, "summary.parquet", pd.DataFrame(rows),
-                           find_file(drive, fund_id, "summary.parquet"))
-            log(f"  [checkpoint] summary.parquet flushed ({len(rows)} rows)")
+            n = _write_summary(drive, fund_id, rows, partial)
+            log(f"  [checkpoint] summary.parquet flushed ({n} rows)")
 
     if rows and not args.dry_run:
-        summary_df = pd.DataFrame(rows)
-        sum_fid = find_file(drive, fund_id, "summary.parquet")
-        if args.recent_results_days and sum_fid:
-            # Incremental: UPSERT into the full-universe summary (a plain write
-            # would shrink 5.5k rows down to today's delta).
-            full = download_parquet(drive, sum_fid)
-            full = full[~full["symbol"].astype(str).isin(
-                summary_df["symbol"].astype(str))]
-            summary_df = pd.concat([full, summary_df], ignore_index=True)
-        upload_parquet(drive, fund_id, "summary.parquet", summary_df, sum_fid)
-        log(f"Wrote fundamentals/summary.parquet ({len(summary_df)} rows)")
+        n = _write_summary(drive, fund_id, rows, partial)
+        log(f"Wrote fundamentals/summary.parquet ({n} rows)")
     elif rows:
         log(f"[dry-run] would write fundamentals/summary.parquet ({len(rows)} rows) "
             f"+ statements ({stmt_total} rows across statements/) — no write")
