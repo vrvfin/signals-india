@@ -185,6 +185,16 @@ jobs:
         run: python scripts/daily_ar_summary.py --email
         continue-on-error: true
 
+      # PF quarterly-results digest (user 2026-08-05): season-scoped, cumulative —
+      # every PF holding that has reported the CURRENT quarter, newest first, with
+      # the 6-quarter revenue/profit/EPS/margin table + YoY/QoQ. Never mixes two
+      # quarters. Self-gating: silent outside the results season and once every
+      # holding has reported. Runs after ingest_fundamentals refreshed statements.
+      - name: PF results digest mail (quarterly numbers per holding, season)
+        if: always()
+        run: python scripts/pf_results_digest.py
+        continue-on-error: true
+
       - name: PF daily digest mail (filings/research/flags/community per holding)
         if: always()
         run: python scripts/run_pf_digest.py
