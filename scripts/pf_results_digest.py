@@ -63,7 +63,6 @@ except Exception:                        # import chain pulls ingest_company_doc
 from build_gallery import _bulk_parquet, _folder
 from daily_brief import load_pf
 from mailer import send_email, load_mail_settings, esc
-from screener_scraper import current_season_key
 from seasons import is_peak_season
 import quarterly_table as QT
 
@@ -315,7 +314,7 @@ def main():
     repo_id = get_or_create_subfolder(drive, root_id, "company_repo")
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
 
-    season = current_season_key()
+    season = QT.season_quarter()
     today = datetime.now().strftime("%Y-%m-%d")
     in_window = is_peak_season(datetime.now())
     log(f"season quarter={season} · peak-season={in_window} · today={today}")

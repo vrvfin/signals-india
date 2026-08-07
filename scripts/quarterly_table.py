@@ -35,6 +35,7 @@ Public API:
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 import pandas as pd
 
@@ -78,6 +79,27 @@ def q_order(qs) -> int:
     if not m:
         return -1
     return (int(m.group(2)) % 100) * 100 + int(m.group(1))
+
+
+def season_quarter(when: datetime | None = None) -> str:
+    """Results-season quarter for a date, e.g. 'Q1FY27' in Jul-Sep 2026 — the quarter
+    whose results are being ANNOUNCED (the one that just ended).
+
+    Byte-identical output to `screener_scraper.current_season_key()` and to
+    `backfill_company_docs._fy_quarter_label()` for the same date. It is reimplemented
+    here rather than imported because `screener_scraper.py` is a LOCAL-only module that
+    was never committed — importing it works on the dev machine and dies in CI with
+    ModuleNotFoundError. Keep this in sync if the FY convention ever changes.
+    """
+    d = when or datetime.now()
+    m, y = d.month, d.year
+    if m in (4, 5, 6):
+        return f"Q4FY{y % 100:02d}"          # Jan-Mar quarter, FY ending this March
+    if m in (7, 8, 9):
+        return f"Q1FY{(y + 1) % 100:02d}"
+    if m in (10, 11, 12):
+        return f"Q2FY{(y + 1) % 100:02d}"
+    return f"Q3FY{y % 100:02d}"              # Jan-Mar -> Oct-Dec quarter
 
 
 def norm_q(qs) -> str:
