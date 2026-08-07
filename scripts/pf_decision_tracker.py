@@ -75,11 +75,13 @@ MOVER_COLS = ["symbol", "isin", "name", "weight_pct",
               "return_6m_pct", "return_12m_pct",
               "leader_windows", "laggard_windows", "tag"]
 
-HOLD_COLS  = ["symbol", "isin", "name", "weight_pct", "first_seen", "days_held",
-              "buy_date_known", "basis", "anchor_ret_pct", "ret_since_held_pct",
+HOLD_COLS  = ["rank", "symbol", "isin", "name", "weight_pct", "first_seen",
+              "anchor_date", "days_held", "full_window", "ret_since_pct",
+              "pace_wk_pct", "vs_median_pp", "vs_bench_pp", "contrib_pp",
+              "contrib_share_pct", "contrib_rank", "left_on_table_pp",
               "return_1m_pct", "return_2m_pct", "return_3m_pct", "return_6m_pct",
-              "return_12m_pct", "vs_median_pp", "flat_days", "neg_windows",
-              "below_med_windows", "stagnant", "rank"]
+              "return_12m_pct", "flat_5d", "flat_10d", "neg_windows",
+              "below_med_windows", "below_target", "flags"]
 
 # ADD/TRIM band: a weight change counts as a real trade only if it exceeds the
 # drift-implied weight by BOTH an absolute (pp) and a relative margin.
@@ -90,8 +92,27 @@ ADD_TRIM_REL     = 0.20
 # stock has actually been held (a 6M number is meaningless a week after you buy).
 WINDOW_DAYS = {1: 30, 2: 61, 3: 91, 6: 182, 12: 365}
 MIN_ANNUALISE_DAYS = 91          # don't annualise anything shorter than a quarter
-STAGNANT_BAND = 0.05             # ±5% band for the "days not moving" streak
-STAG_3M_PP, STAG_6M_PP = 10.0, 15.0   # stagnant = |3M| <= 10% AND |6M| <= 15%
+
+# Stagnancy is defined ONLY as "how many consecutive trading days has the close
+# stayed inside ±band of today's close" — two bands, no fuzzy composite rule.
+FLAT_BANDS = (0.05, 0.10)
+
+# Goal tracking: the annual return you're aiming for, expressed as the weekly pace
+# it demands. 50%/yr => (1.5)^(7/365)-1 = ~0.78%/week.
+TARGET_CAGR_PCT = 50.0
+
+# Benchmarks from data/indices/ (Phase-1 `ingest_indices_macro.py`). First is primary.
+BENCHMARKS = ["NIFTY_500", "NIFTY_SMALLCAP_100"]
+
+# Allocation review: a "winner" is top-quartile pace; "underweight" is below equal
+# weight. The pair flags positions whose sizing capped their impact.
+WINNER_Q = 0.75
+
+# Pace over a day or two is noise amplified by the ^(7/days) exponent — a name up
+# 1% on its first day annualises to ~7.5%/week. Positions younger than this are
+# shown with their numbers but never FLAGGED fast / underweight / below-target,
+# and are excluded from the quantile that defines "fast".
+MIN_PACE_DAYS = 5
 REVIEW_MIN_DAYS    = 10   # a decision must be this old before REVIEW-NOW judges it
 REVIEW_MIN_MOVE_PP = 3.0  # ...and have moved this much; kills ~0% quartile noise
 
@@ -244,6 +265,31 @@ def cagr_pct(total_ret_pct, days) -> float | None:
         return None
 
 
+def pace_wk_pct(total_ret_pct, days) -> float | None:
+    """Compounded % PER WEEK — the one yardstick that makes different holding
+    periods comparable:  pace = (1 + ret)^(7/days) - 1
+
+        +100% over 30d  -> ~17.6%/wk        +100% over 365d -> ~1.34%/wk
+        +50%  over 365d -> ~0.78%/wk  (the 50%-a-year goal, in weekly terms)
+
+    Unlike CAGR this stays legible on short windows (a 2%-in-2-days move reads as
+    ~7%/wk, not a 4-digit annualised number), so it is safe to rank on."""
+    if total_ret_pct is None or days is None or days < 1:
+        return None
+    try:
+        base = 1.0 + float(total_ret_pct) / 100.0
+        if base <= 0:
+            return None
+        return float((base ** (7.0 / float(days)) - 1.0) * 100.0)
+    except Exception:
+        return None
+
+
+def required_wk_pct(target_annual_pct: float = TARGET_CAGR_PCT) -> float:
+    """Weekly pace an annual return target demands. 50%/yr -> ~0.78%/wk."""
+    return float(((1.0 + target_annual_pct / 100.0) ** (7.0 / 365.0) - 1.0) * 100.0)
+
+
 def xirr_pct(flows) -> float | None:
     """Money-weighted annual rate: the r solving  Σ CFi / (1+r)^(daysi/365) = 0.
     No closed form — solved by bisection. flows = [(date, amount)], negatives are
@@ -274,7 +320,7 @@ def xirr_pct(flows) -> float | None:
     return float((lo + hi) / 2.0 * 100.0)
 
 
-def flat_days(ser: pd.Series | None, band: float = STAGNANT_BAND) -> int | None:
+def flat_days(ser: pd.Series | None, band: float = FLAT_BANDS[0]) -> int | None:
     """Consecutive trading days, counting back from the latest bar, that the close
     stayed inside ±band of today's close — i.e. 'how long has this gone nowhere'."""
     if ser is None or len(ser) < 2:
@@ -289,6 +335,22 @@ def flat_days(ser: pd.Series | None, band: float = STAGNANT_BAND) -> int | None:
         else:
             break
     return n
+
+
+def load_benchmark(drive, root_id, name: str) -> pd.Series | None:
+    """Close series for a Phase-1 index parquet (data/indices/<NAME>.parquet).
+    Same columns as OHLCV, so it reuses the identical reader."""
+    try:
+        idx_id = _folder(drive, root_id, "data", "indices")
+        df = _read_drive_parquet(drive, idx_id, f"{name}.parquet")
+        if df is None or df.empty or "close" not in df.columns:
+            return None
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").set_index("date")["close"].astype(float)
+    except Exception as e:
+        log(f"  benchmark {name}: unavailable ({str(e)[:60]})")
+        return None
 
 
 # ── Snapshot + decision ledgers ──────────────────────────────────────────────
@@ -403,12 +465,12 @@ def compute_index(snaps: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
         return pd.DataFrame(columns=IDX_COLS), []
 
     end = pd.Timestamp(asof)
-    # Trailing view: extend back up to 12M before the first snapshot using the
-    # earliest snapshot's weights (active_weights() falls back to it), so the index
-    # is useful from day 1 and becomes fully real as snapshots accrue.
-    # 13 months, not 12, so the trailing 12M window is fully covered (a 12M base
-    # that predates the series by even a day would blank the 12M column).
-    start = min(pd.Timestamp(snaps["snapshot_date"].min()), end - relativedelta(months=13))
+    # The index starts at the FIRST REAL SNAPSHOT and never before it. An earlier
+    # build back-projected today's weights over ~12M of price history; that number
+    # was a backtest of the current book, not this portfolio's record, so it is gone.
+    # Consequence by design: windows longer than the tracked history stay blank
+    # until enough real days accrue.
+    start = pd.Timestamp(snaps["snapshot_date"].min())
     close = pd.DataFrame(series).sort_index()
     close = close.loc[(close.index >= start) & (close.index <= end)]
     if len(close) < 2:
@@ -459,37 +521,64 @@ PERIOD_OFFSETS = {"1D": relativedelta(days=1), "1W": relativedelta(weeks=1),
                   "12M": relativedelta(months=12)}
 
 
-def index_period_returns(idx: pd.DataFrame) -> dict:
-    """Total return per horizon off the index level series, plus the annualised
-    (CAGR) view and since-inception XIRR. Returns {'ret':{}, 'cagr':{}, ...}."""
+def index_period_returns(idx: pd.DataFrame, benches: dict | None = None) -> dict:
+    """Total return per horizon off the index level series, plus weekly pace, the
+    annualised (CAGR) view, since-inception XIRR, and the same windows for each
+    benchmark with the PF-minus-benchmark alpha.
+
+    A window is reported ONLY if the tracked history actually covers it — with the
+    back-projection removed, anything older than the first snapshot is blank rather
+    than silently measured off a shorter span."""
     if idx.empty:
         return {}
     s = idx.set_index(pd.to_datetime(idx["date"]))["pf_index"].sort_index()
     last = float(s.iloc[-1]); end = s.index[-1]
     start_ts, start_lvl = s.index[0], float(s.iloc[0])
+    benches = benches or {}
 
-    ret, cagr, days = {}, {}, {}
+    def window_ret(ser, base_ts):
+        """% move of `ser` from base_ts -> end, or None if base_ts predates it."""
+        if ser is None or ser.empty or base_ts < ser.index[0]:
+            return None
+        p0, p1 = ser.asof(base_ts), ser.asof(end)
+        if pd.isna(p0) or pd.isna(p1) or not p0:
+            return None
+        return float((p1 / p0 - 1) * 100)
+
+    ret, cagr, pace, days = {}, {}, {}, {}
+    bret = {b: {} for b in benches}
+    alpha = {b: {} for b in benches}
     for lbl, off in PERIOD_OFFSETS.items():
         base_ts = end - off
-        base = s.asof(base_ts)
-        if pd.notna(base) and base:
-            ret[lbl] = float((last / base - 1) * 100)
-            days[lbl] = (end - max(base_ts, start_ts)).days
-            cagr[lbl] = cagr_pct(ret[lbl], days[lbl])
-        else:
-            ret[lbl] = cagr[lbl] = days[lbl] = None
+        r = window_ret(s, base_ts)
+        ret[lbl] = r
+        days[lbl] = (end - base_ts).days if r is not None else None
+        cagr[lbl] = cagr_pct(r, days[lbl])
+        pace[lbl] = pace_wk_pct(r, days[lbl])
+        for b, ser in benches.items():
+            br = window_ret(ser, base_ts) if r is not None else None
+            bret[b][lbl] = br
+            alpha[b][lbl] = (r - br) if (r is not None and br is not None) else None
 
     si_days = (end - start_ts).days
     ret["SI"] = float((last / start_lvl - 1) * 100) if start_lvl else None
     days["SI"] = si_days
     cagr["SI"] = cagr_pct(ret["SI"], si_days)
+    pace["SI"] = pace_wk_pct(ret["SI"], si_days)
+    for b, ser in benches.items():
+        br = window_ret(ser, start_ts)
+        bret[b]["SI"] = br
+        alpha[b]["SI"] = (ret["SI"] - br) if (ret["SI"] is not None and br is not None) else None
+
     return {
         "level": last, "start_level": start_lvl,
         "start_date": start_ts.strftime("%Y-%m-%d"), "end_date": end.strftime("%Y-%m-%d"),
-        "si_days": si_days, "ret": ret, "cagr": cagr, "days": days,
+        "si_days": si_days, "ret": ret, "cagr": cagr, "pace": pace, "days": days,
+        "bret": bret, "alpha": alpha, "bench_names": list(benches),
         # Only visible cashflows in a weightage-only book: money in at inception,
-        # value out today. (Equals SI CAGR until real dated contributions exist.)
-        "xirr": xirr_pct([(start_ts, -start_lvl), (end, last)]),
+        # value out today. Gated to >= a quarter — annualising a fortnight is noise.
+        "xirr": (xirr_pct([(start_ts, -start_lvl), (end, last)])
+                 if si_days >= MIN_ANNUALISE_DAYS else None),
     }
 
 
@@ -522,59 +611,70 @@ def compute_movers(drive, root_id, pf: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
-                          asof: date) -> pd.DataFrame:
-    """Per-holding comparison table, anchored on when you first held the stock.
+                          asof: date, bench_ser=None) -> pd.DataFrame:
+    """Per-holding table where EVERY number is measured from the day the position
+    actually entered the tracked book — never earlier, never from a common date the
+    stock wasn't held on.
 
-    first_seen = earliest snapshot the ISIN appears in. For holdings that were
-    already in the book when tracking began, that date is a LOWER BOUND, not a
-    purchase date — those are marked buy_date_known=False ('pre-tracking') and
-    judged on trailing windows, since their real cost date is unknowable here.
-    For anything bought after tracking began, windows LONGER than the holding
-    period are blanked — a 6M return means nothing a week after you buy."""
+        base_date   = first snapshot we hold (start of PF reporting)
+        first_seen  = first snapshot this ISIN appears in
+        anchor_date = max(base_date, first_seen)
+
+    So a name added on 6-Aug is measured from 6-Aug, not from the base date. Because
+    that leaves every stock on a different-length window, the cross-stock comparator
+    is `pace_wk_pct` (compounded %/week), which is window-neutral; the raw
+    `ret_since_pct` is the honest "what this position actually did for me".
+
+    Contribution answers the allocation question: `contrib_pp` is the points of PF
+    growth the position actually delivered (weight x return), so a big winner held
+    small shows a high return next to a small contribution."""
     if pf.empty:
         return pd.DataFrame(columns=HOLD_COLS)
     ret_cols = list(FEAT_RET_COLS.values())
     v = pf[["symbol", "isin", "name", "weight_pct"]].merge(
         movers[["isin"] + ret_cols], on="isin", how="left")
 
-    tracking_start = snaps["snapshot_date"].min() if not snaps.empty else str(asof)
+    base_date = snaps["snapshot_date"].min() if not snaps.empty else str(asof)
     first_map = (snaps.groupby("isin")["snapshot_date"].min().to_dict()
                  if not snaps.empty else {})
+    end_ts = pd.Timestamp(asof)
+    req_wk = required_wk_pct()
 
     rows = []
     for r in v.itertuples():
-        first_seen = first_map.get(r.isin, str(asof))
-        known = str(first_seen) > str(tracking_start)      # bought after tracking began
-        days_held = (pd.Timestamp(asof) - pd.Timestamp(first_seen)).days
+        first_seen = str(first_map.get(r.isin, str(asof)))
+        anchor = max(first_seen, str(base_date))       # never measure before we held it
+        anchor_ts = pd.Timestamp(anchor)
+        days_held = max((end_ts - anchor_ts).days, 0)
+
         ser = load_close_series(drive, ohlcv_id, r.symbol, price_cache)
-        since = fwd_return(ser, pd.Timestamp(first_seen), pd.Timestamp(asof))
+        since = fwd_return(ser, anchor_ts, end_ts)
+        pace = pace_wk_pct(since, days_held)
+        bench = fwd_return(bench_ser, anchor_ts, end_ts) if bench_ser is not None else None
 
-        wins = {}
-        for m_, col in FEAT_RET_COLS.items():
-            val = getattr(r, col, np.nan)
-            # Gate windows the stock hasn't actually been held through.
-            if known and days_held < WINDOW_DAYS[m_]:
-                val = np.nan
-            wins[col] = float(val) if pd.notna(val) else np.nan
+        wt = float(r.weight_pct) if pd.notna(r.weight_pct) else np.nan
+        contrib = (wt / 100.0 * since) if (pd.notna(wt) and since is not None) else np.nan
 
-        if known:
-            basis, anchor = f"since buy ({days_held}d)", since
-        else:
-            anchor = next((wins[FEAT_RET_COLS[m_]] for m_ in (12, 6, 3, 2, 1)
-                           if pd.notna(wins[FEAT_RET_COLS[m_]])), np.nan)
-            basis = "12M trailing (pre-tracking)"
+        # Trailing market windows are CONTEXT only — they pre-date the holding and
+        # are never used for the PF median or the ranking.
+        wins = {col: (float(getattr(r, col)) if pd.notna(getattr(r, col, np.nan)) else np.nan)
+                for col in ret_cols}
 
-        r3, r6 = wins["return_3m_pct"], wins["return_6m_pct"]
-        stagnant = bool(pd.notna(r3) and pd.notna(r6)
-                        and abs(r3) <= STAG_3M_PP and abs(r6) <= STAG_6M_PP)
         rows.append(dict(
-            symbol=r.symbol, isin=r.isin, name=r.name, weight_pct=r.weight_pct,
-            first_seen=str(first_seen), days_held=days_held, buy_date_known=known,
-            basis=basis, anchor_ret_pct=anchor, ret_since_held_pct=since,
-            flat_days=flat_days(ser), stagnant=stagnant, **wins))
+            symbol=r.symbol, isin=r.isin, name=r.name, weight_pct=wt,
+            first_seen=first_seen, anchor_date=anchor, days_held=days_held,
+            full_window=bool(anchor == str(base_date)),
+            ret_since_pct=since if since is not None else np.nan,
+            pace_wk_pct=pace if pace is not None else np.nan,
+            vs_bench_pp=(since - bench) if (since is not None and bench is not None) else np.nan,
+            contrib_pp=contrib,
+            flat_5d=flat_days(ser, FLAT_BANDS[0]), flat_10d=flat_days(ser, FLAT_BANDS[1]),
+            **wins))
 
     h = pd.DataFrame(rows)
-    # Count fails per stock against the BOOK MEDIAN of each window (own-book yardstick).
+
+    # Trailing-window fail counts: each window judged against ITS OWN median, so the
+    # comparison inside a column is always like-for-like.
     neg = pd.Series(0, index=h.index); below = pd.Series(0, index=h.index)
     for col in ret_cols:
         c = h[col]
@@ -583,9 +683,53 @@ def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
             below += (c < c.median()).fillna(False).astype(int)
     h["neg_windows"], h["below_med_windows"] = neg, below
 
-    med_anchor = h["anchor_ret_pct"].median()
-    h["vs_median_pp"] = h["anchor_ret_pct"] - med_anchor
-    h = h.sort_values("anchor_ret_pct", ascending=False, na_position="last").reset_index(drop=True)
+    # THE book median = median weekly PACE. Window-neutral, so a 2-day-old position
+    # and a since-base one sit on the same scale.
+    med_pace = h["pace_wk_pct"].median()
+    h["vs_median_pp"] = h["pace_wk_pct"] - med_pace
+
+    tot = h["contrib_pp"].sum(skipna=True)
+    h["contrib_share_pct"] = (h["contrib_pp"] / tot * 100.0) if tot else np.nan
+
+    # Allocation cost, measured against EQUAL weight (100/N), not the median weight.
+    # On a long-tailed book the median position is tiny (0.5% here), so a median
+    # counterfactual makes every gap look negligible; equal weight is the neutral
+    # "no view on sizing" baseline and gives an honest sense of scale.
+    # This is arithmetic, not advice.
+    eq_wt = 100.0 / len(h) if len(h) else np.nan
+    gap_wt = (eq_wt - h["weight_pct"]).clip(lower=0)
+    h["left_on_table_pp"] = np.where(h["ret_since_pct"] > 0,
+                                     gap_wt / 100.0 * h["ret_since_pct"], np.nan)
+
+    # Rank gap: performs like #3 but contributes like #40 => sizing is the reason.
+    h["contrib_rank"] = h["contrib_pp"].rank(ascending=False, method="min")
+
+    # Only positions old enough for pace to mean anything get rated (see MIN_PACE_DAYS).
+    ratable = h["days_held"] >= MIN_PACE_DAYS
+    h["below_target"] = ratable & h["pace_wk_pct"].notna() & (h["pace_wk_pct"] < req_wk)
+    rated_pace = h.loc[ratable, "pace_wk_pct"]
+    pace_q = rated_pace.quantile(WINNER_Q) if rated_pace.notna().any() else np.nan
+
+    def _flags(row):
+        f = []
+        young = row["days_held"] < MIN_PACE_DAYS
+        if young:
+            f.append(f"new({int(row['days_held'])}d)")
+        fast = (not young) and pd.notna(pace_q) and row["pace_wk_pct"] >= pace_q
+        if fast:
+            f.append("fast")
+        if fast and pd.notna(eq_wt) and row["weight_pct"] < eq_wt:
+            f.append("underweight-winner")
+        if row["below_target"]:
+            f.append("below-target")
+        if pd.notna(row["ret_since_pct"]) and row["ret_since_pct"] < 0:
+            f.append("negative")
+        if row["flat_10d"] and row["flat_10d"] >= 30:
+            f.append(f"flat{int(row['flat_10d'])}d")
+        return ",".join(f)
+
+    h["flags"] = h.apply(_flags, axis=1)
+    h = h.sort_values("pace_wk_pct", ascending=False, na_position="last").reset_index(drop=True)
     h["rank"] = np.arange(1, len(h) + 1)
     return h[HOLD_COLS]
 
@@ -728,130 +872,206 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                  "padding:10px 12px;margin:8px 0'><b>REVIEW NOW</b><ul style='margin:6px 0'>"
                  + "".join(f"<li>{w}</li>" for w in dict.fromkeys(warn)) + "</ul></div>")
 
-    # 1) PF index — level, horizon ladder, CAGR, XIRR
+    req_wk = required_wk_pct()
+
+    # 1) PF index — base date, horizon ladder, benchmark + alpha
     if periods:
-        ret, cg = periods["ret"], periods["cagr"]
+        ret, cg, pc = periods["ret"], periods["cagr"], periods.get("pace", {})
+        bret, alpha = periods.get("bret", {}), periods.get("alpha", {})
+        bnames = periods.get("bench_names", [])
         order = ["1D", "1W", "1M", "2M", "3M", "6M", "12M", "SI"]
+        dash = "<span style='color:#bbb'>—</span>"
+
+        def row(label, src, bold=False, grey=False):
+            style = "padding:3px 10px" + (";color:#555" if grey else "")
+            cells = "".join(
+                f"<td align='center' style='{style}'>"
+                f"{_pct(src.get(k)) if src.get(k) is not None else dash}</td>" for k in order)
+            lab = f"<b>{label}</b>" if bold else label
+            return f"<tr><td align='left' style='padding:3px 8px'>{lab}</td>{cells}</tr>"
+
         head = "".join(f"<th style='padding:3px 10px;text-align:center'>{k}</th>" for k in order)
-        rrow = "".join(f"<td align='center' style='padding:3px 10px'>{_pct(ret.get(k))}</td>"
-                       for k in order)
-        crow = "".join(f"<td align='center' style='padding:3px 10px;color:#555'>"
-                       f"{_pct(cg.get(k)) if cg.get(k) is not None else '<span style=color:#bbb>—</span>'}"
-                       f"</td>" for k in order)
+        body = [row("PF return", ret, bold=True),
+                row("PF pace (%/wk)", pc, grey=True),
+                row("CAGR (annualised)", cg, grey=True)]
+        for b in bnames:
+            body.append(row(b.replace("_", " "), bret.get(b, {}), grey=True))
+            body.append(row(f"Alpha vs {b.replace('_',' ')}", alpha.get(b, {})))
+
         H.append(
             f"<h3>1 · How the PF is doing</h3>"
-            f"<p style='margin:4px 0'>Started at <b>100.0</b> on <b>{periods['start_date']}</b> "
-            f"→ <b>{periods['level']:.1f}</b> today "
-            f"(<b>{_pct(ret.get('SI'))}</b> over {periods['si_days']} days)</p>"
+            f"<p style='margin:4px 0'>Index set to <b>100.0</b> on <b>{periods['start_date']}</b> "
+            f"— the first day portfolio reporting exists — and <b>{periods['level']:.1f}</b> today: "
+            f"<b>{_pct(ret.get('SI'))}</b> over <b>{periods['si_days']} tracked days</b>.</p>"
             f"<table style='border-collapse:collapse;font-size:13px'>"
             f"<tr><th align='left' style='padding:3px 8px'></th>{head}</tr>"
-            f"<tr><td align='left' style='padding:3px 8px'><b>Return</b></td>{rrow}</tr>"
-            f"<tr><td align='left' style='padding:3px 8px'>CAGR (annualised)</td>{crow}</tr>"
-            f"</table>"
-            f"<p style='margin:6px 0'><b>XIRR (since inception): {_pct(periods.get('xirr'))}</b></p>")
+            f"{''.join(body)}</table>")
+        if periods.get("xirr") is not None:
+            H.append(f"<p style='margin:6px 0'><b>XIRR: {_pct(periods['xirr'])}</b></p>")
         H.append(
-            "<div style='background:#f6f8fa;border-left:3px solid #ccc;padding:8px 12px;"
-            "margin:8px 0;font-size:12px;color:#555'>"
-            "<b>How these are calculated</b><br>"
-            "• <b>Return</b> — plain change in the weighted index over the window "
-            "(each stock moves the index in proportion to its <i>Portfolio Weight</i>).<br>"
-            "• <b>CAGR</b> = (End ÷ Start)<sup>365/days</sup> − 1 — the steady yearly rate that "
-            "produces the same result. Blank for windows under a quarter: annualising a few "
-            "weeks of noise produces silly numbers.<br>"
-            "• <b>XIRR</b> — the annual rate r solving Σ CF ÷ (1+r)<sup>days/365</sup> = 0 over "
-            "dated cashflows. Your export carries weights only (no rupee amounts), so the only "
-            "visible flows are 100 in at inception and today's value out — which makes XIRR "
-            "equal to since-inception CAGR until an export with actual amounts exists.</div>")
+            f"<div style='background:#f6f8fa;border-left:3px solid #ccc;padding:8px 12px;"
+            f"margin:8px 0;font-size:12px;color:#555'>"
+            f"<b>Base date {periods['start_date']} — nothing before it is shown.</b> "
+            f"Windows longer than {periods['si_days']} days are blank because that history "
+            f"isn't tracked yet; they fill in as days accrue.<br>"
+            f"• <b>Return</b> — change in the weighted index (each stock moves it in proportion "
+            f"to its <i>Portfolio Weight</i>).<br>"
+            f"• <b>Pace</b> = (1+return)<sup>7/days</sup> − 1 — the same return expressed as "
+            f"%/week, so windows of different lengths compare fairly. "
+            f"{TARGET_CAGR_PCT:.0f}%/yr needs <b>{req_wk:.2f}%/week</b>.<br>"
+            f"• <b>CAGR</b> = (End ÷ Start)<sup>365/days</sup> − 1. Blank under a quarter — "
+            f"annualising a fortnight produces silly numbers.<br>"
+            f"• <b>Alpha</b> — PF return minus the index over the identical window.</div>")
         if contrib:
             up = contrib[0]; dn = contrib[-1]
             H.append(f"<p style='color:#666'>Today's biggest lift: <b>{esc(up[0])}</b> "
                      f"({_pct(up[1])} of PF) · biggest drag: <b>{esc(dn[0])}</b> ({_pct(dn[1])})</p>")
-        H.append("<p style='color:#888;font-size:12px'>Weighted-return index. Before tracking "
-                 "began it assumes your current weights (a constant-weight trailing view); it "
-                 "becomes fully real as daily snapshots accrue.</p>")
 
-    # 2) Every holding, ranked — the compare-them-all table
+    # 2) Every holding, ranked — measured from the day it entered the book
     if hold is not None and not hold.empty:
+        base_d = periods.get("start_date", "base") if periods else "base"
+        n_full = int(hold["full_window"].sum())
         H.append("<h3>2 · Every holding, ranked</h3>")
-        n_known = int(hold["buy_date_known"].sum())
-        H.append(f"<p style='color:#888;font-size:12px'>Ranked by return on its "
-                 f"<b>basis</b> — since you bought it where that date is known "
-                 f"({n_known} of {len(hold)}), else 12M trailing for holdings that pre-date "
-                 f"tracking (their true buy date isn't in the data). "
-                 f"“Flat days” = trading days the price has stayed within ±5% of today's close. "
-                 f"Compare within the same basis.</p>")
+        H.append(f"<p style='color:#888;font-size:12px'>Every stock is measured "
+                 f"<b>from the day it entered the book</b> — {n_full} of {len(hold)} have been "
+                 f"held since the base date ({base_d}); the rest start from when they were added, "
+                 f"so a name bought last week shows last week's return, not the market's. "
+                 f"Ranked by <b>pace</b> (%/week) because that is the only fair way to compare "
+                 f"different holding lengths. <b>vs med</b> = pace minus your book's median pace. "
+                 f"<b>Contrib</b> = points of PF growth actually delivered (weight × return). "
+                 f"1M/3M/12M are market trailing windows, shown as context only.</p>")
         H.append("<table style='border-collapse:collapse;font-size:12px'>"
                  "<tr><th style='padding:2px 6px'>#</th><th align='left'>Symbol</th>"
-                 "<th style='padding:2px 6px'>Wt%</th><th style='padding:2px 6px'>Basis</th>"
-                 "<th style='padding:2px 6px'>Return</th><th style='padding:2px 6px'>vs median</th>"
+                 "<th style='padding:2px 6px'>Wt%</th><th style='padding:2px 6px'>From</th>"
+                 "<th style='padding:2px 6px'>Days</th><th style='padding:2px 6px'>Return</th>"
+                 "<th style='padding:2px 6px'>%/wk</th><th style='padding:2px 6px'>vs med</th>"
+                 "<th style='padding:2px 6px'>vs idx</th><th style='padding:2px 6px'>Contrib</th>"
                  "<th style='padding:2px 6px'>1M</th><th style='padding:2px 6px'>3M</th>"
-                 "<th style='padding:2px 6px'>12M</th><th style='padding:2px 6px'>Flat days</th>"
+                 "<th style='padding:2px 6px'>12M</th><th style='padding:2px 6px'>±5%</th>"
+                 "<th style='padding:2px 6px'>±10%</th>"
                  "<th align='left' style='padding:2px 6px'>Flags</th></tr>")
         for r in hold.itertuples():
-            flags = []
-            if r.stagnant:
-                flags.append("<span style='color:#a60'>stagnant</span>")
-            if r.neg_windows >= 5:
-                flags.append("<span style='color:#c0392b'>negative in ALL</span>")
-            elif r.neg_windows >= 3:
-                flags.append(f"<span style='color:#c0392b'>negative in {r.neg_windows}</span>")
-            if r.below_med_windows >= 5:
-                flags.append("below median in ALL")
-            fd = "—" if r.flat_days is None or pd.isna(r.flat_days) else f"{int(r.flat_days)}"
+            f5 = "—" if r.flat_5d is None or pd.isna(r.flat_5d) else f"{int(r.flat_5d)}"
+            f10 = "—" if r.flat_10d is None or pd.isna(r.flat_10d) else f"{int(r.flat_10d)}"
+            fl = str(r.flags or "").replace("underweight-winner",
+                                            "<span style='color:#1a7f37'>underweight-winner</span>")
+            fl = fl.replace("negative", "<span style='color:#c0392b'>negative</span>")
             H.append(
                 f"<tr><td align='center' style='padding:2px 6px'>{r.rank}</td>"
                 f"<td>{esc(r.symbol)}</td>"
                 f"<td align='right' style='padding:2px 6px'>"
                 f"{'' if pd.isna(r.weight_pct) else format(r.weight_pct, '.1f')}</td>"
-                f"<td style='padding:2px 6px;color:#777'>{esc(r.basis, 40)}</td>"
-                f"<td align='right' style='padding:2px 6px'><b>{_pct(r.anchor_ret_pct)}</b></td>"
+                f"<td align='center' style='padding:2px 6px;color:#777'>{esc(r.anchor_date, 10)}</td>"
+                f"<td align='right' style='padding:2px 6px;color:#777'>{r.days_held}</td>"
+                f"<td align='right' style='padding:2px 6px'><b>{_pct(r.ret_since_pct)}</b></td>"
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.pace_wk_pct)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.vs_median_pp)}</td>"
-                f"<td align='right' style='padding:2px 6px'>{_pct(r.return_1m_pct)}</td>"
-                f"<td align='right' style='padding:2px 6px'>{_pct(r.return_3m_pct)}</td>"
-                f"<td align='right' style='padding:2px 6px'>{_pct(r.return_12m_pct)}</td>"
-                f"<td align='right' style='padding:2px 6px'>{fd}</td>"
-                f"<td style='padding:2px 6px'>{' · '.join(flags)}</td></tr>")
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.vs_bench_pp)}</td>"
+                f"<td align='right' style='padding:2px 6px'>{_pct(r.contrib_pp)}</td>"
+                f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_1m_pct)}</td>"
+                f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_3m_pct)}</td>"
+                f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_12m_pct)}</td>"
+                f"<td align='right' style='padding:2px 6px'>{f5}</td>"
+                f"<td align='right' style='padding:2px 6px'>{f10}</td>"
+                f"<td style='padding:2px 6px;font-size:11px'>{fl}</td></tr>")
         H.append("</table>")
 
-    # 3) Problem stocks — compact matrix (fails in >=3 of 5 windows, or stagnant)
+    # 3) Allocation — did sizing match performance?
     if hold is not None and not hold.empty:
-        bad = hold[(hold["neg_windows"] >= 3) | (hold["below_med_windows"] >= 3)
-                   | (hold["stagnant"])].copy()
-        H.append("<h3>3 · Problem stocks</h3>")
-        if bad.empty:
-            H.append("<p style='color:#888'>Nothing failing in 3+ windows and nothing stagnant.</p>")
+        H.append("<h3>3 · Where the growth came from (allocation)</h3>")
+        eq_wt = 100.0 / len(hold)
+        uw = hold[hold["flags"].str.contains("underweight-winner", na=False)].copy()
+        uw = uw.sort_values("left_on_table_pp", ascending=False).head(12)
+        H.append(f"<p style='color:#888;font-size:12px'>Equal weight across "
+                 f"{len(hold)} holdings would be <b>{eq_wt:.2f}%</b>. These are top-quartile "
+                 f"performers held <b>below</b> that — they earned well but were too small to "
+                 f"move the PF. <b>Perf#/Con#</b> contrasts where the stock ranks on pace "
+                 f"versus where it ranks on actual contribution; a wide gap means sizing, not "
+                 f"the stock, is the limit. <b>Cost</b> = growth foregone had it merely been "
+                 f"equal-weighted. Arithmetic, not a recommendation.</p>"
+                 f"<p style='color:#aaa;font-size:11px'>Contributions use today's weights, so "
+                 f"they sum to slightly more than the index — the index also chains daily "
+                 f"compounding, weight changes and names you've since sold.</p>")
+        if uw.empty:
+            H.append("<p style='color:#888'>No underweight winners — sizing is tracking "
+                     "performance.</p>")
         else:
-            bad = bad.sort_values(["neg_windows", "below_med_windows"], ascending=False)
-            rc = list(FEAT_RET_COLS.values())
-            H.append(f"<p style='color:#888;font-size:12px'>{len(bad)} holding(s) that are "
-                     f"negative or below your book's median in at least 3 of the 5 windows, "
-                     f"or flat (|3M| ≤ {STAG_3M_PP:.0f}% and |6M| ≤ {STAG_6M_PP:.0f}%).</p>")
             H.append("<table style='border-collapse:collapse;font-size:12px'>"
-                     "<tr><th align='left'>Symbol</th>"
-                     + "".join(f"<th style='padding:2px 8px'>{c.replace('return_','').replace('_pct','').upper()}</th>"
-                               for c in rc)
-                     + "<th style='padding:2px 8px'>Neg</th><th style='padding:2px 8px'>&lt;Med</th>"
-                       "<th style='padding:2px 8px'>Flat days</th><th align='left'>Verdict</th></tr>")
-            for r in bad.itertuples():
-                tds = "".join(f"<td align='right' style='padding:2px 8px'>"
-                              f"{_pct(getattr(r, c))}</td>" for c in rc)
-                if r.neg_windows >= 5:
-                    verdict = "losing money in every window"
-                elif r.stagnant and r.neg_windows < 3:
-                    verdict = "dead money — going nowhere"
-                elif r.below_med_windows >= 5:
-                    verdict = "consistently behind your book"
-                else:
-                    verdict = "weak in most windows"
-                fd = "—" if r.flat_days is None or pd.isna(r.flat_days) else f"{int(r.flat_days)}"
-                H.append(f"<tr><td>{esc(r.symbol)}</td>{tds}"
-                         f"<td align='center' style='padding:2px 8px'>{r.neg_windows}/5</td>"
-                         f"<td align='center' style='padding:2px 8px'>{r.below_med_windows}/5</td>"
-                         f"<td align='center' style='padding:2px 8px'>{fd}</td>"
-                         f"<td style='padding:2px 8px;color:#a60'>{verdict}</td></tr>")
+                     "<tr><th align='left'>Symbol</th><th style='padding:2px 8px'>Wt%</th>"
+                     "<th style='padding:2px 8px'>Return</th><th style='padding:2px 8px'>%/wk</th>"
+                     "<th style='padding:2px 8px'>Perf#/Con#</th>"
+                     "<th style='padding:2px 8px'>Contrib</th>"
+                     "<th style='padding:2px 8px'>Cost of sizing</th></tr>")
+            for r in uw.itertuples():
+                cr = "—" if pd.isna(r.contrib_rank) else f"{int(r.contrib_rank)}"
+                H.append(f"<tr><td>{esc(r.symbol)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{r.weight_pct:.2f}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.ret_since_pct)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.pace_wk_pct)}</td>"
+                         f"<td align='center' style='padding:2px 8px;color:#777'>"
+                         f"{r.rank} → {cr}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.contrib_pp)}</td>"
+                         f"<td align='right' style='padding:2px 8px;color:#1a7f37'>"
+                         f"<b>{_pct(r.left_on_table_pp)}</b></td></tr>")
             H.append("</table>")
 
-    # 2) Movers
+        # The mirror image: big positions that aren't earning their weight.
+        ow = hold[(hold["weight_pct"] > eq_wt) & (hold["vs_median_pp"] < 0)].copy()
+        ow = ow.sort_values("contrib_pp").head(10)
+        if not ow.empty:
+            H.append(f"<p style='color:#888;font-size:12px;margin-top:10px'>"
+                     f"<b>Big but slow</b> — above-median weight, below-median pace. These "
+                     f"occupy the room the names above would need.</p>")
+            H.append("<table style='border-collapse:collapse;font-size:12px'>"
+                     "<tr><th align='left'>Symbol</th><th style='padding:2px 8px'>Wt%</th>"
+                     "<th style='padding:2px 8px'>Return</th><th style='padding:2px 8px'>%/wk</th>"
+                     "<th style='padding:2px 8px'>vs med</th>"
+                     "<th style='padding:2px 8px'>Contrib</th></tr>")
+            for r in ow.itertuples():
+                H.append(f"<tr><td>{esc(r.symbol)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{r.weight_pct:.1f}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.ret_since_pct)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.pace_wk_pct)}</td>"
+                         f"<td align='right' style='padding:2px 8px;color:#c0392b'>"
+                         f"{_pct(r.vs_median_pp)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.contrib_pp)}</td></tr>")
+            H.append("</table>")
+
+    # 4) Pace vs goal + stagnancy
+    if hold is not None and not hold.empty:
+        H.append(f"<h3>4 · Off the pace &amp; going nowhere</h3>")
+        slow = hold[hold["below_target"]].copy().sort_values("pace_wk_pct")
+        H.append(f"<p style='color:#888;font-size:12px'>A <b>{TARGET_CAGR_PCT:.0f}%/year</b> "
+                 f"target needs <b>{req_wk:.2f}%/week</b>. "
+                 f"{len(slow)} of {len(hold)} holdings are below that pace since they entered "
+                 f"the book. <b>±5% / ±10%</b> = consecutive trading days the close has stayed "
+                 f"inside that band of today's price — the cleanest read on dead money.</p>")
+        if not slow.empty:
+            H.append("<table style='border-collapse:collapse;font-size:12px'>"
+                     "<tr><th align='left'>Symbol</th><th style='padding:2px 8px'>Wt%</th>"
+                     "<th style='padding:2px 8px'>Return</th><th style='padding:2px 8px'>%/wk</th>"
+                     "<th style='padding:2px 8px'>Short by</th>"
+                     "<th style='padding:2px 8px'>±5% days</th>"
+                     "<th style='padding:2px 8px'>±10% days</th></tr>")
+            for r in slow.head(25).itertuples():
+                short = (req_wk - r.pace_wk_pct) if pd.notna(r.pace_wk_pct) else None
+                f5 = "—" if r.flat_5d is None or pd.isna(r.flat_5d) else f"{int(r.flat_5d)}"
+                f10 = "—" if r.flat_10d is None or pd.isna(r.flat_10d) else f"{int(r.flat_10d)}"
+                H.append(f"<tr><td>{esc(r.symbol)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>"
+                         f"{'' if pd.isna(r.weight_pct) else format(r.weight_pct, '.1f')}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.ret_since_pct)}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{_pct(r.pace_wk_pct)}</td>"
+                         f"<td align='right' style='padding:2px 8px;color:#c0392b'>"
+                         f"{'—' if short is None else format(short, '.2f')}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{f5}</td>"
+                         f"<td align='right' style='padding:2px 8px'>{f10}</td></tr>")
+            H.append("</table>")
+            if len(slow) > 25:
+                H.append(f"<p style='color:#888;font-size:12px'>…and {len(slow)-25} more "
+                         f"in the attached workbook.</p>")
+
+    # 5) Movers
     def mover_table(df, cols, title):
         h = [f"<h3>{title}</h3><table style='border-collapse:collapse;font-size:13px'>"
              "<tr><th align='left'>Symbol</th>"
@@ -871,13 +1091,13 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
         # feature row must not masquerade as the 'bottom' movers).
         ranked = movers.dropna(subset=["return_3m_pct"]).sort_values(
             "return_3m_pct", ascending=False)
-        H.append("<h3>4 · Movers (trailing, as of today)</h3>")
+        H.append("<h3>5 · Movers (trailing, as of today)</h3>")
         H.append(mover_table(ranked.head(5), rc, "Top 5 by 3M"))
         H.append(mover_table(ranked.tail(5).iloc[::-1], rc, "Bottom 5 by 3M"))
 
     # 3) Decision correctness (matured hit-rates)
     if not score.empty:
-        H.append("<h3>5 · Are my decisions correct? (vs own-book median)</h3>")
+        H.append("<h3>6 · Are my decisions correct? (vs own-book median)</h3>")
         body = []
         for act, label in [("BUY", "Buys correct"), ("SELL", "Sells correct"),
                            ("ADD", "Adds correct"), ("TRIM", "Trims correct")]:
@@ -905,7 +1125,7 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
 
     # 4) Sold-stock relook
     if not relook.empty:
-        H.append("<h3>6 · Relook: stocks you sold</h3>"
+        H.append("<h3>7 · Relook: stocks you sold</h3>"
                  "<table style='border-collapse:collapse;font-size:13px'>"
                  "<tr><th align='left'>Sold</th><th>On</th><th>Since sell</th>"
                  "<th>Latest YoY</th><th>Verdict</th></tr>")
@@ -926,11 +1146,19 @@ def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None) -> bytes:
     drill-down). One sheet per view; header frozen + light auto-width."""
     holdings = pf[["isin", "symbol", "name", "weight_pct"]].copy()
     hold = hold if hold is not None else pd.DataFrame(columns=HOLD_COLS)
-    problems = (hold[(hold["neg_windows"] >= 3) | (hold["below_med_windows"] >= 3)
-                     | (hold["stagnant"])] if not hold.empty else hold)
+    if not hold.empty:
+        problems = hold[(hold["neg_windows"] >= 3) | (hold["below_med_windows"] >= 3)
+                        | (hold["below_target"])]
+        slow = hold[hold["below_target"]].sort_values("pace_wk_pct")
+        underweight = hold[hold["flags"].str.contains("underweight-winner", na=False)] \
+            .sort_values("left_on_table_pp", ascending=False)
+    else:
+        problems = slow = underweight = hold
     sheets = {
         "Holdings Today":     holdings,
         "Ranked Holdings":    hold,
+        "Underweight Winners": underweight,
+        "Off The Pace":       slow,
         "Problem Stocks":     problems,
         "Movers":             movers,
         "Decision Scorecard": score,
@@ -1000,11 +1228,23 @@ def main() -> None:
     if not dry and len(decs) != decs_before:
         save_parquet(drive, out_id, "pf_decisions.parquet", decs)
 
-    # 4. Compute everything.
+    # 4. Compute everything. Benchmarks come from Phase-1 data/indices/.
+    benches = {}
+    for b in BENCHMARKS:
+        ser = load_benchmark(drive, root_id, b)
+        if ser is not None and not ser.empty:
+            benches[b] = ser
+    log(f"  Benchmarks: {', '.join(benches) if benches else 'none available'}")
+    primary = benches.get(BENCHMARKS[0])
+
     idx, contrib = compute_index(snaps, price_cache, drive, ohlcv_id, asof)
-    periods = index_period_returns(idx)
+    periods = index_period_returns(idx, benches)
+    if periods:
+        log(f"  Index base {periods['start_date']} = 100.0 -> {periods['level']:.1f} "
+            f"({periods['si_days']} tracked days)")
     movers = compute_movers(drive, root_id, pf)
-    hold = compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id, asof)
+    hold = compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id, asof,
+                                 bench_ser=primary)
     score = score_decisions(decs, snaps, price_cache, drive, ohlcv_id, asof)
     results = _read_drive_parquet(drive, index_id, "results.parquet")
     relook = sold_relook(decs, price_cache, drive, ohlcv_id, results, asof)
@@ -1023,7 +1263,7 @@ def main() -> None:
     si = (periods.get("ret") or {}).get("SI") if periods else None
     if periods and si is not None:
         subject = (f"PF Tracker — {asof} · index {periods['level']:.1f} "
-                   f"({si:+.1f}% since {periods['start_date']}) · {len(pf)} holdings")
+                   f"({si:+.1f}% since base {periods['start_date']}) · {len(pf)} holdings")
     else:
         subject = f"PF Tracker — {asof} ({len(pf)} holdings)"
     xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold)
