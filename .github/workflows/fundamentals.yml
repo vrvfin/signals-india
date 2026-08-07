@@ -76,11 +76,18 @@ jobs:
       # Which mode runs depends on which cron fired: the Monday 01:00 slot (and
       # manual dispatch) does the FULL universe; the daily 14:30 slot refreshes
       # only companies whose results appeared in the feed in the last 4 days.
-      - name: Fundamentals (full universe + statements)
+      # GAP-SCAN, not a blind sweep (changed 2026-08-07). Was: fetch all ~5,600
+      # companies every Monday, ~290 min. Now: scan coverage first and fetch only
+      # companies whose current-quarter numbers are due-or-overdue and not yet
+      # stored — measured 177 companies / ~4.5 min mid-season. Companies already
+      # current, and those whose board meeting is still ahead, are skipped.
+      # Falls back to the full sweep automatically if results_calendar.parquet is
+      # missing. Drop --gap-scan to force a true full sweep.
+      - name: Fundamentals (gap scan + statements)
         if: github.event.schedule != '30 14 * * *'
         env:
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
-        run: python scripts/ingest_fundamentals.py
+        run: python scripts/ingest_fundamentals.py --gap-scan
         continue-on-error: true
 
       - name: Fundamentals (incremental — recent result declarers)

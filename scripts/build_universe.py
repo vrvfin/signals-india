@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -151,6 +152,40 @@ def fetch_bse_only_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFr
     return out[cols].reset_index(drop=True)
 
 
+# Non-equity instruments that BSE's scrip list carries alongside companies.
+# They have no Screener company page (both URL variants 404), so every sweep
+# spent two requests each on them and logged them as failures — 63 of the 66
+# weekly "failures" were exactly this, which masked the 3 real ones. They also
+# cost OHLCV and feature work downstream, since master_list feeds those too.
+_NON_EQUITY_NAME = re.compile(
+    r"SEGREGATED\s+PORTFOLIO|MUTUAL\s+FUND|\bIDCW\b|"
+    r"(?:DIRECT|REGULAR)\s+PLAN|\bLONG[-\s]?SHORT\s+FUND\b|"
+    r"\bFUND\b.*\b(?:GROWTH|PAYOUT|REINVEST)", re.IGNORECASE)
+
+# ETFs are managed by a fund house, so their names trip the markers above — but
+# unlike the unlisted fund units they DO have Screener pages, price history, and
+# are tradable, so they stay in the universe that OHLCV/features/gallery read.
+# They have no quarterly results, which is a coverage concern, not a universe one.
+_ETF_NAME = re.compile(r"\bETF\b|\bBeES\b|\bINDEX\s+FUND\b", re.IGNORECASE)
+
+
+def filter_equity_only(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split master_list rows into (keep, drop).
+
+    Conservative by design: a row is dropped only when its NAME matches a fund
+    marker, or its SYMBOL ends in '-RE' (a rights entitlement — a temporary
+    tradable form, not the company; the underlying company keeps its own row).
+    Anything that looks like an ETF is exempted. Nothing is dropped on
+    series/exchange alone, so a genuine company with a sparse row is never lost.
+    """
+    name = df["name"].astype(str)
+    sym = df["symbol"].astype(str).str.upper()
+    is_fund = name.str.contains(_NON_EQUITY_NAME) & ~name.str.contains(_ETF_NAME)
+    is_rights = sym.str.endswith("-RE")
+    bad = is_fund | is_rights
+    return (df[~bad].reset_index(drop=True), df[bad].reset_index(drop=True))
+
+
 def fetch_nse_emerge_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFrame:
     """NSE Emerge (SME) rows from company_universe.csv — names that HAVE an NSE
     symbol but are NOT on the mainboard EQUITY_L (so their ISIN is not in
@@ -242,6 +277,14 @@ def main() -> None:
     if extra:
         df = pd.concat([df, *extra], ignore_index=True)
     df = df.drop_duplicates("symbol").reset_index(drop=True)
+    df, dropped = filter_equity_only(df)
+    if not dropped.empty:
+        log(f"Non-equity dropped: {len(dropped)} "
+            f"(mutual-fund units, segregated portfolios, rights entitlements)")
+        for r in dropped.head(8).itertuples():
+            log(f"    {r.symbol:12s} {str(r.name)[:56]}")
+        if len(dropped) > 8:
+            log(f"    ... and {len(dropped) - 8} more")
     log(f"Unified universe: {len(df)} "
         f"(NSE {int((df['exchange'] == 'NSE').sum())} "
         f"[incl. Emerge {len(emerge)}] + "

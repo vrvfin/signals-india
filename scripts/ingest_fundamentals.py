@@ -35,6 +35,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from earnings_calendar import CAL_PARQUET, recent_reporter_symbols
+from results_coverage import build_gap_list, log_stats
 from screener_client import ScreenerClient, CookieExpiredError
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -171,6 +172,13 @@ def main():
                              "fundamentals/statements/<SYM>.parquet yet). Purely "
                              "additive — omitting it leaves the nightly/weekly sweep "
                              "behaviour unchanged.")
+    parser.add_argument("--gap-scan", action="store_true",
+                        help="WEEKLY mode: scan coverage first, then fetch only "
+                             "companies whose current-quarter numbers are due (or "
+                             "overdue) and not yet stored. Skips those already "
+                             "current and those whose board meeting is still ahead. "
+                             "Falls back to the full sweep if the results calendar "
+                             "is missing.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch + log only; no Drive write.")
     args = parser.parse_args()
@@ -216,6 +224,33 @@ def main():
         if not work:
             log("None of the requested symbols are in master_list.csv — nothing to do.")
             return
+
+    # Weekly GAP-SCAN mode: scan first, then fetch only what is actually missing.
+    # The sweep used to visit all ~5,600 companies blindly for ~290 minutes; the
+    # overwhelming majority either already hold the current quarter or have not
+    # reported it yet. results_coverage decides which is which — see that module
+    # for the three skip rules.
+    if args.gap_scan:
+        repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
+        idx_id = get_or_create_subfolder(drive, repo_id, "_index")
+        fund_tmp = get_or_create_subfolder(drive, folder_id, "fundamentals")
+        s_fid = find_file(drive, fund_tmp, "summary.parquet")
+        c_fid = find_file(drive, idx_id, CAL_PARQUET)
+        if not c_fid:
+            log(f"  WARNING: {CAL_PARQUET} missing — cannot tell 'not yet due' "
+                f"from 'missing'. Falling back to the FULL sweep.")
+        else:
+            summary = download_parquet(drive, s_fid) if s_fid else None
+            calendar = download_parquet(drive, c_fid)
+            gap, stats = build_gap_list(universe, summary, calendar)
+            log("Gap scan:")
+            log_stats(stats, log)
+            want = set(gap)
+            work = [(s, t) for (s, t) in work if s in want]
+            if not work:
+                log("Nothing missing — every due company already has "
+                    f"{stats['expected']}. Done.")
+                return
 
     # Results-season incremental mode: shrink work to companies whose results
     # just landed — so quarterly tables update the NEXT morning instead of
@@ -266,7 +301,7 @@ def main():
     # merged into the stored frame rather than replacing it (see _write_summary).
     # A full-universe run keeps the old wholesale-write behaviour unchanged.
     partial = bool(args.symbols or args.recent_results_days or args.limit
-                   or args.resume)
+                   or args.resume or args.gap_scan)
 
     rows = []
     stmt_total = 0
