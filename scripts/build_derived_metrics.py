@@ -10,7 +10,8 @@ Derived (from income/balance/cashflow):
   rev_cagr_3y_pct, fcf(=CFO+CFI), fcf_sales_pct, cfo_pat_ratio,
   net_debt_ebitda(=Borrowings/Operating Profit; gross-debt proxy),
   interest_coverage(=Operating Profit/Interest), roe_pct(=Net Profit/Net Worth)
-Passed through from Screener "ratios": receivable_days, inventory_days, wc_days, roce_pct.
+Passed through from Screener "ratios": receivable_days, inventory_days, payable_days,
+wc_days, roce_pct. Derived from those three: ccc_days (= receivable + inventory - payable).
 
 Usage:
     python scripts/build_derived_metrics.py
@@ -46,7 +47,9 @@ OUT_NAME = "financials_derived.parquet"
 RATIO_PASSTHROUGH = {  # statement="ratios" line_item -> (metric, unit)
     "receivable_days": ("receivable_days", "days"),
     "inventory_days":  ("inventory_days", "days"),
+    "payable_days":    ("payable_days", "days"),
     "wc_days":         ("wc_days", "days"),
+    "ccc_days":        ("ccc_days", "days"),   # Screener publishes this directly
     "roce_pct":        ("roce_pct", "%"),
 }
 
@@ -145,6 +148,24 @@ def derive_company(df_c: pd.DataFrame, isin: str, symbol: str, now: str) -> list
     for li, (metric, unit) in RATIO_PASSTHROUGH.items():
         for p, v in _ordered(df_c, "ratios", li, "annual"):
             emit(metric, p, "annual", v, unit)
+
+    # ---------- Cash conversion cycle: fallback only ----------
+    # Screener publishes "Cash Conversion Cycle" itself, and the passthrough above
+    # already emitted it. Recomputing from the rounded components drifts by ~1 day
+    # (APLAPOLLO FY26: published -12, recomputed -11), so the published figure always
+    # wins. This fills in only periods Screener left blank, and only when all three
+    # components exist — a partial CCC is worse than none.
+    have_ccc = {p for p, _v in _ordered(df_c, "ratios", "ccc_days", "annual")}
+    rec_d = _dict(_ordered(df_c, "ratios", "receivable_days", "annual"))
+    inv_d = _dict(_ordered(df_c, "ratios", "inventory_days", "annual"))
+    pay_d = _dict(_ordered(df_c, "ratios", "payable_days", "annual"))
+    for p in rec_d:
+        if p in have_ccc:
+            continue
+        r, i, pay = rec_d.get(p), inv_d.get(p), pay_d.get(p)
+        if r is None or i is None or pay is None:
+            continue
+        emit("ccc_days", p, "annual", r + i - pay, "days")
 
     return out
 

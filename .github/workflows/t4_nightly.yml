@@ -195,6 +195,20 @@ jobs:
         run: python scripts/pf_results_digest.py
         continue-on-error: true
 
+      # Quarterly teardown (user 2026-08-09): the NUANCE layer beside the numbers
+      # digest above. For each PF holding that reported in the last 24h — clean PAT
+      # (profit stripped of the other-income swing and tax drift), the divergence
+      # engine against this repo's own forensic thresholds, the merged red-flag
+      # register (ar_red_flags + rating concerns/tripwires + gf4 + announcements),
+      # and the deck teardown where one exists.
+      # Self-gating: exits silently when nothing reported in the window, and a
+      # per-season ledger (quarter_teardown_mailed.parquet) means each holding is
+      # mailed once. Runs after ingest_fundamentals has refreshed statements.
+      - name: Quarterly teardown mail (clean PAT + early warnings, last 24h)
+        if: always()
+        run: python scripts/quarter_teardown.py --daily
+        continue-on-error: true
+
       - name: PF daily digest mail (filings/research/flags/community per holding)
         if: always()
         run: python scripts/run_pf_digest.py

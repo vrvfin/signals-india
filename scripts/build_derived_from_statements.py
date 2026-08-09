@@ -10,10 +10,15 @@ its metric logic, and UNIONS the result into financials_derived — so build_fra
 build_scorecard and fraud_tracker all inherit full coverage with no other change.
 
 Computable from statements/: cfo_pat_ratio, net_debt_ebitda (Borrowings/OP),
-interest_coverage, roe_pct, npm/opm, revenue & PAT growth, fcf. The Screener "ratios"
-section (receivable_days, roce_pct, wc_days) is NOT in statements/, so those passthrough
-metrics stay sourced from the 45-row financials_3stmt path (kept on union) until the
-statements capture is extended.
+interest_coverage, roe_pct, npm/opm, revenue & PAT growth, fcf.
+
+The Screener "ratios" section (receivable_days, inventory_days, payable_days, wc_days,
+roce_pct) IS now captured in statements/ — screener_client.STATEMENT_SECTIONS gained a
+"ratios" entry, so these reach the whole universe rather than only the ~45 companies in
+the financials_3stmt path. That is what lets build_fraud_risk's `receivables_rising` and
+`wc_blowup` rules fire at all: before this they had no input outside those 45 names.
+Companies whose Screener page has no #ratios section (some banks/NBFCs) simply yield no
+rows — parse_table_section returns empty and nothing is emitted.
 
 Usage:
   python scripts/build_derived_from_statements.py --dry-run        # compute + counts, no write
@@ -47,13 +52,24 @@ from build_derived_metrics import derive_company, DERIVED_COLS
 STMT_MAP = {"quarterly_pl": ("income", "quarterly"),
             "annual_pl": ("income", "annual"),
             "balance_sheet": ("balance", "annual"),
-            "cash_flow": ("cashflow", "annual")}
-# statements `line_item` (Screener label) -> derive_company line_item
+            "cash_flow": ("cashflow", "annual"),
+            "ratios": ("ratios", "annual")}
+# statements `line_item` (Screener label) -> derive_company line_item.
+# The five "… Days"/ROCE entries arrive under statement="ratios" once
+# screener_client.STATEMENT_SECTIONS captures the #ratios section; they are renamed to
+# the canonical metric names build_derived_metrics.RATIO_PASSTHROUGH keys off. None of
+# these labels occur in any other Screener section, so the flat map is unambiguous.
 LINE_MAP = {"Sales": "Sales", "Net Profit": "Net Profit",
             "Operating Profit": "Operating Profit", "OPM %": "OPM %",
             "Interest": "Interest", "Borrowings": "Borrowings",
             "Cash from Operating Activity": "CFO",
-            "Cash from Investing Activity": "CFI"}
+            "Cash from Investing Activity": "CFI",
+            "Debtor Days": "receivable_days",
+            "Inventory Days": "inventory_days",
+            "Days Payable": "payable_days",
+            "Working Capital Days": "wc_days",
+            "Cash Conversion Cycle": "ccc_days",
+            "ROCE %": "roce_pct"}
 
 _tl = threading.local()
 

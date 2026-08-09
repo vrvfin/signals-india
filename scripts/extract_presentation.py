@@ -42,6 +42,7 @@ from _extractor_base import (
     salvage_json_objects, clamp, sstr, fnum, upsert_structured,  # Stage 3 tabulation
     run_structured_over_doc,                                     # Stage 3b: from source
 )
+import deck_teardown as DT          # Stage 3c: --teardown only (PF/watchlist, opt-in)
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
 # company_page.md / parquets (Phase-2 live vs backfill can never write concurrently).
@@ -86,6 +87,29 @@ PPT_HIGHLIGHTS_COLS = [
 _PPT_GTYPES = {"growth", "margin", "capacity", "orderbook", "capex", "other"}
 _PPT_HCATS = {"demand", "capacity", "orderbook", "cost", "new_product",
               "margin", "expansion", "other"}
+
+
+def _teardown_scope(drive, folder_id, index_id) -> set:
+    """PF u watchlist ISINs — the only companies the teardown pass may run for.
+
+    Both halves are best-effort: watchlist.py is not committed, so in CI the import
+    fails and the scope degrades to PF alone rather than taking the whole universe.
+    """
+    isins: set[str] = set()
+    try:
+        isins |= {str(i).strip() for i in load_portfolio_isins(drive, folder_id) if i}
+    except Exception as e:
+        log(f"  Teardown scope: PF unavailable ({str(e)[:70]})")
+    try:
+        import watchlist as WL
+        wl = WL.build_watchlist(drive)
+        if wl is not None and not wl.empty and "isin" in wl.columns:
+            isins |= {str(i).strip() for i in wl["isin"] if str(i).strip()}
+    except ImportError:
+        log("  Teardown scope: watchlist.py not importable (not committed) — PF only")
+    except Exception as e:
+        log(f"  Teardown scope: watchlist failed ({str(e)[:70]}) — PF only")
+    return {i for i in isins if i}
 
 
 def parse_ppt_structured(text, row, quarter, now_str):
@@ -230,6 +254,14 @@ def main() -> None:
                         help="Wall-clock cap (min): exit cleanly after this so the "
                              "shared _extract.lock is released before the CI job "
                              "timeout (prevents a killed step leaving a stale lock).")
+    parser.add_argument("--teardown", action="store_true",
+                        help="ADDITIVE third pass: deck operating metrics, deck-vs-deck "
+                             "diff, framing flags -> deck_*.parquet. Runs ONLY for "
+                             "PF/watchlist ISINs. Off by default; with this flag absent "
+                             "every existing output is unchanged.")
+    parser.add_argument("--teardown-isin", action="append", default=None,
+                        help="Restrict the teardown pass to these ISINs (repeatable). "
+                             "Overrides the PF/watchlist set — for single-company tests.")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -256,6 +288,25 @@ def main() -> None:
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
     index_id  = get_or_create_subfolder(drive, repo_id,   "_index")
+
+    # ---- Teardown pass (ADDITIVE, default OFF). Scope is resolved once, here, so the
+    # per-document path is a cheap set lookup and cannot accidentally run universe-wide.
+    teardown_isins: set[str] = set()
+    teardown_prompt = ""
+    if args.teardown:
+        _td_path = Path(__file__).resolve().parent / DT.PROMPT_FILE
+        if not _td_path.exists():
+            print(f"ERROR: --teardown needs {DT.PROMPT_FILE}")
+            sys.exit(1)
+        teardown_prompt = _td_path.read_text(encoding="utf-8")
+        if args.teardown_isin:
+            teardown_isins = {s.strip() for s in args.teardown_isin if s.strip()}
+            log(f"Teardown: restricted to {len(teardown_isins)} ISIN(s) from --teardown-isin")
+        else:
+            teardown_isins = _teardown_scope(drive, folder_id, index_id)
+            log(f"Teardown: PF u watchlist = {len(teardown_isins)} ISINs")
+        if not teardown_isins:
+            log("Teardown: scope is EMPTY — the pass will not run for any document.")
 
     # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
     # On contention exit cleanly — the next run resumes (rows stay pending).
@@ -360,6 +411,36 @@ def main() -> None:
                 log("  Structured pass: keys exhausted — tabulation skipped.")
             except Exception as _e:
                 log(f"  WARNING: presentation tabulation failed ({str(_e)[:90]}).")
+
+            # Stage 3c teardown (ADDITIVE, opt-in, PF/watchlist only). Writes ONLY to
+            # deck_*.parquet — never to ppt_guidance/ppt_highlights/quarterly_facts — so
+            # without --teardown this block is skipped entirely and Phase 2 is unchanged.
+            # Must run here, at ingest: the source PDF is deleted 2 days after processing
+            # (retention rule 1), and the diff/flag work needs the actual slides.
+            _isin = str(row.get("isin") or "").strip()
+            if args.teardown and _isin and _isin in teardown_isins:
+                try:
+                    _prior_df = load_parquet(drive, index_id, "deck_metrics.parquet",
+                                             DT.DECK_METRICS_COLS)
+                    _blk, _pq = DT.prior_deck_context(_prior_df, _isin, facts["quarter"])
+                    _td = DT.run_teardown(
+                        gemini, teardown_prompt, pdf_bytes, row, facts["quarter"],
+                        datetime.now().isoformat(timespec="seconds"), _blk, _pq)
+                    for _name, _cols, _key in (
+                            ("deck_metrics.parquet", DT.DECK_METRICS_COLS, "metrics"),
+                            ("deck_diff.parquet", DT.DECK_DIFF_COLS, "diff"),
+                            ("deck_flags.parquet", DT.DECK_FLAGS_COLS, "flags"),
+                            ("deck_questions.parquet", DT.DECK_QUESTIONS_COLS, "questions")):
+                        upsert_structured(drive, index_id, _name, _cols, _td[_key])
+                    log(f"  Teardown: metrics={len(_td['metrics'])} "
+                        f"diff={len(_td['diff'])} flags={len(_td['flags'])} "
+                        f"questions={len(_td['questions'])}"
+                        + (f" | dropped {_td['dropped']}" if _td["dropped"] else "")
+                        + (f" | prior deck {_pq}" if _pq else " | no prior deck"))
+                except RateLimitExhausted:
+                    log("  Teardown: keys exhausted — skipped.")
+                except Exception as _e:
+                    log(f"  WARNING: teardown failed ({str(_e)[:90]}).")
 
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")
