@@ -260,17 +260,58 @@ def build_register(isin: str, symbol: str = "", *, ar_red_flags=None,
                 r.get("summary"), "high" if mat == "high" else "medium",
                 ADVERSE, r.get("ann_date"), "event")
 
-    # --- fraud tracker band (one row; link out rather than recompute)
+    # --- fraud tracker, SPLIT BY WHAT THE SIGNAL ACTUALLY IS
+    #
+    # build_fraud_tracker fuses two unlike things into one score:
+    #     fraud_score = max(investigative_grade/4*100, fraud_risk_score)
+    # investigative_grade is driven mostly by exchange SURVEILLANCE lists — ASM, GSM,
+    # ESM, T2T, BSE group. Those are price-and-volatility controls for illiquid or
+    # speculative counters. They are NOT findings of fraud, yet ESM alone grades 3,
+    # which becomes 75 points, which is the RED band. Reporting that as "fraud RED"
+    # is a category error, and company_deep_report.py already refuses to make it
+    # ("exchange surveillance (price/volatility control measures — NOT fraud per se)").
+    #
+    # So split it here rather than inherit the fusion:
+    #   forensic flags        -> real accounting evidence      -> ADVERSE
+    #   SEBI / NFRA / news    -> real integrity signals        -> ADVERSE
+    #   surveillance listing  -> liquidity & volatility only   -> NEUTRAL, labelled
     ft_rows = _rows_for(fraud_tracker, isin)
     if not ft_rows.empty:
         r = ft_rows.iloc[0]
         band = _clean(r.get("band"), 12).upper()
-        if band in ("RED", "ALERT", "WATCH"):
-            add("fraud_tracker", "fraud_band", f"Fraud tracker: {band}",
-                r.get("reason"),
-                {"RED": "high", "ALERT": "high", "WATCH": "medium"}[band],
-                ADVERSE, r.get("as_of"), "event",
-                f"score {_clean(r.get('fraud_score'), 8)}")
+        when = r.get("as_of")
+
+        def _n(col):
+            try:
+                return int(float(_clean(r.get(col), 12) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        n_forensic = _n("n_forensic_flags")
+        n_reg = _n("sebi_actions") + _n("nfra_actions")
+        n_news = _n("news_hits")
+
+        if n_forensic > 0:
+            add("fraud_tracker", "forensic_flags",
+                f"Accounting forensics: {n_forensic} flag(s)",
+                _clean(r.get("forensic_flags"), 300), "high", ADVERSE, when, "event",
+                f"forensic score {_clean(r.get('forensic_score'), 8)}")
+        if n_reg > 0:
+            add("fraud_tracker", "regulatory_action",
+                f"SEBI/NFRA action ({n_reg})", _clean(r.get("grade_reason"), 300),
+                "high", ADVERSE, when, "event")
+        if n_news > 0:
+            add("fraud_tracker", "adverse_news", f"Adverse news hits ({n_news})",
+                _clean(r.get("grade_reason"), 300), "medium", ADVERSE, when, "event")
+
+        # Surveillance with nothing behind it: report it, do not call it fraud.
+        if band in ("RED", "ALERT", "WATCH") and not (n_forensic or n_reg or n_news):
+            add("fraud_tracker", "exchange_surveillance",
+                "Exchange surveillance listing",
+                (_clean(r.get("grade_reason"), 260) or _clean(r.get("reason"), 260))
+                + " — price/volatility control, not a fraud finding",
+                "low", NEUTRAL, when, "event",
+                f"tracker band {band}")
 
     df = pd.DataFrame(out, columns=REGISTER_COLS)
     if df.empty:
@@ -423,6 +464,32 @@ def _self_test() -> int:
     cov = covered(I, ar_red_flags=ar, ratings=pd.DataFrame())
     check("coverage counts rows", cov["ar_red_flags"] == 2)
     check("coverage flags empty source", cov["ratings"] == 0)
+
+    # --- surveillance must never be reported as fraud
+    surv_only = pd.DataFrame([{
+        "isin": I, "band": "RED", "fraud_score": 75, "score_driver": "investigative",
+        "reason": "ESM stage 1", "grade_reason": "NSE ESM stage 1",
+        "investigative_grade": 3, "forensic_score": 0, "n_forensic_flags": 0,
+        "forensic_flags": "", "news_hits": 0, "sebi_actions": 0, "nfra_actions": 0,
+        "trend": "flat", "as_of": "2026-08-01"}])
+    s = build_register(I, "X", fraud_tracker=surv_only, today=date(2026, 8, 8))
+    kinds = set(s["kind"])
+    check("ESM-only is NOT called fraud", "fraud_band" not in kinds)
+    check("ESM-only surfaces as surveillance", "exchange_surveillance" in kinds)
+    check("ESM-only is not adverse",
+          s[s["kind"] == "exchange_surveillance"]["direction"].iloc[0] == NEUTRAL)
+    check("ESM-only excluded from headline risks", headline_risks(s).empty)
+
+    real = surv_only.copy()
+    real.loc[0, ["n_forensic_flags", "forensic_flags", "sebi_actions"]] = \
+        [2, "cfo_below_pat_2y;high_leverage", 1]
+    rr = build_register(I, "X", fraud_tracker=real, today=date(2026, 8, 8))
+    check("real forensics ARE adverse",
+          rr[rr["kind"] == "forensic_flags"]["direction"].iloc[0] == ADVERSE)
+    check("SEBI action IS adverse",
+          rr[rr["kind"] == "regulatory_action"]["direction"].iloc[0] == ADVERSE)
+    check("evidence-backed rows reach headline",
+          "forensic_flags" in set(headline_risks(rr)["kind"]))
 
     empty = build_register("INE_NOTHING", ar_red_flags=ar, today=date(2026, 8, 8))
     check("unknown isin -> empty", empty.empty)
