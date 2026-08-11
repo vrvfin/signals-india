@@ -915,9 +915,20 @@ def _queue_dates(queue: pd.DataFrame, season: str) -> dict[str, str]:
     if q.empty:
         return {}
 
+    # `period` is blank on results rows (the T12 column was never populated by results
+    # ingestion). How that blank materialises depends on the pandas/pyarrow dtype
+    # backend: older builds give None -> str() -> "None", newer ones give NaN ->
+    # str() -> "nan". A test for `!= "none"` therefore PASSES on "nan", returns
+    # norm_q("nan"), matches no season, and silently drops every filing-dated
+    # reporter. That is the whole reason CI logged filing=0 while local logged 42 on
+    # byte-identical Drive data. Treat every spelling of empty as empty.
+    _EMPTY = {"", "none", "nan", "nat", "<na>", "null"}
+
     def _per(row) -> str:
-        p = str(row.get("period") or "").strip()
-        if p and p.lower() != "none":
+        raw = row.get("period")
+        p = "" if raw is None or (isinstance(raw, float) and pd.isna(raw)) \
+            else str(raw).strip()
+        if p.lower() not in _EMPTY:
             return QT.norm_q(p)
         try:
             return QT.norm_q(QT.season_quarter(pd.to_datetime(row["_d"])))
