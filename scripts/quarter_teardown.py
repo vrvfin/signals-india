@@ -889,6 +889,47 @@ def compact_table(rows_html: str) -> str:
 # loading
 # --------------------------------------------------------------------------- #
 
+def _queue_dates(queue: pd.DataFrame, season: str) -> dict[str, str]:
+    """{isin: YYYY-MM-DD} from the global processing queue — results filings for this
+    season. Covers the reporters the 25-item Screener /results/latest window misses.
+
+    Deliberately does NOT reuse pf_results_digest._queue_dates. That function depends on
+    `backfill_company_docs._fy_quarter_label`, imported under a try/except that sets it
+    to None on failure. The import chain pulls ingest_company_docs and its PDF
+    dependencies, which are not in scripts/requirements.txt — so on a CI runner it is
+    ALWAYS None, `_per()` returns "", nothing matches, and the function silently yields
+    zero dates. Observed live: `report dates: screener=1213 filing=0` in CI against
+    filing=34 locally. The degradation is invisible unless you read that log line.
+
+    quarterly_table.season_quarter() is documented as byte-identical to
+    _fy_quarter_label() for the same date and has no imports beyond pandas, so the
+    mapping is done with that instead and cannot degrade.
+    """
+    if queue is None or queue.empty or "doc_type" not in queue.columns:
+        return {}
+    q = queue[queue["doc_type"].astype(str) == "results"].copy()
+    if q.empty or "announcement_date" not in q.columns:
+        return {}
+    q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)
+    q = q[q["_d"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
+    if q.empty:
+        return {}
+
+    def _per(row) -> str:
+        p = str(row.get("period") or "").strip()
+        if p and p.lower() != "none":
+            return QT.norm_q(p)
+        try:
+            return QT.norm_q(QT.season_quarter(pd.to_datetime(row["_d"])))
+        except Exception:
+            return ""
+
+    q = q[q.apply(_per, axis=1) == QT.norm_q(season)]
+    if q.empty:
+        return {}
+    return q.groupby(q["isin"].astype(str).str.strip())["_d"].min().to_dict()
+
+
 LEDGER_NAME = "quarter_teardown_mailed.parquet"
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on",
                "date_source", "mailed_at"]
@@ -917,8 +958,11 @@ def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tup
         queue = pd.DataFrame()
 
     screener_d = PRD._results_dates(results, season)
-    queue_d = PRD._queue_dates(queue, season)
+    queue_d = _queue_dates(queue, season)
     log(f"  report dates: screener={len(screener_d)} filing={len(queue_d)}")
+    if not queue_d and queue is not None and not queue.empty:
+        log("  WARNING: zero filing dates from a non-empty queue — check the "
+            "announcement_date column")
 
     # exact timestamps where the screener scrape has them
     exact: dict[str, str] = {}
