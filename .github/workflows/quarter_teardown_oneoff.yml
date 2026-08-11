@@ -59,12 +59,13 @@ jobs:
             echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
           } > .env
 
+      # Use the repo's own requirements file, exactly as t4_nightly does. A hand-listed
+      # subset missed google-genai, which _extractor_base imports at module scope, so
+      # the run died on import before touching Drive.
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas pyarrow requests beautifulsoup4 lxml python-dotenv \
-                      google-api-python-client google-auth google-auth-oauthlib \
-                      google-auth-httplib2 xlrd openpyxl
+          pip install -r scripts/requirements.txt
 
       - name: Self-tests (fail fast before touching mail)
         run: |

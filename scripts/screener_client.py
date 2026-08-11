@@ -235,11 +235,21 @@ class ScreenerClient:
         return out
 
     # statement section_id -> normalized statement name
+    #
+    # "ratios" carries Screener's efficiency days (Debtor / Inventory / Days Payable /
+    # Working Capital) plus ROCE %, annual. It is the ONLY source for receivables and
+    # inventory — Screener publishes no such balance-sheet line — so without it
+    # build_fraud_risk's `receivables_rising` and `wc_blowup` rules can never fire.
+    # These previously existed only for the ~45 companies covered by the slow
+    # backfill_results_3stmt scrape; capturing them here extends them to the universe.
+    # Labels are stored verbatim; build_derived_from_statements.LINE_MAP maps them to
+    # the canonical metric names build_derived_metrics.RATIO_PASSTHROUGH expects.
     STATEMENT_SECTIONS = {
         "quarters": "quarterly_pl",
         "profit-loss": "annual_pl",
         "balance-sheet": "balance_sheet",
         "cash-flow": "cash_flow",
+        "ratios": "ratios",
     }
 
     def extract_statements(self, symbol: str, soup: BeautifulSoup) -> list[dict]:

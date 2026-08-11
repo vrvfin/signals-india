@@ -48,6 +48,7 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "pf_docs_digest":  "PF new documents: AR/concall/presn/rating/announcement + summary",
     "pf_decision":     "PF decision scorecard: index + movers + buy/sell/hold verdicts + sold relook",
     "infra_health":    "Infra code-red: broken keys/cookies + fix steps (CRIT bypasses this)",
+    "quarter_teardown": "Quarterly teardown: clean PAT + divergence engine + red-flag register + deck",
 }
 
 
