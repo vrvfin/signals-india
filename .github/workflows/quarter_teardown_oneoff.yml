@@ -22,6 +22,10 @@ on:
       since_hours:
         description: "Optional window in hours instead of the whole season (blank = whole season)"
         default: ""
+      full_detail:
+        description: "Full per-company teardown instead of compact day-grouped rows"
+        type: boolean
+        default: false
 
 concurrency:
   group: quarter-teardown-oneoff
@@ -79,7 +83,13 @@ jobs:
         run: |
           ARGS="--season-all"
           if [ -n "${{ inputs.since_hours }}" ]; then
-            ARGS="--pf --mail --by-day --force --since-hours ${{ inputs.since_hours }}"
+            # --by-day gives one compact row per company; full_detail gives the whole
+            # teardown per company (bridge, ladder, divergence rails, register).
+            if [ "${{ inputs.full_detail }}" = "true" ]; then
+              ARGS="--pf --mail --force --since-hours ${{ inputs.since_hours }}"
+            else
+              ARGS="--pf --mail --by-day --force --since-hours ${{ inputs.since_hours }}"
+            fi
           fi
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"

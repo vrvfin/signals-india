@@ -1132,6 +1132,83 @@ def compact_table(rows_html: str) -> str:
 # loading
 # --------------------------------------------------------------------------- #
 
+def filed_awaiting_numbers(queue, pf, season: str, hours: float | None,
+                           rendered: set) -> list[dict]:
+    """PF holdings that HAVE FILED results but whose numbers are not on Screener yet.
+
+    The 'has reported' test is deliberately statements-based — rendering a teardown from
+    a quarter Screener has not published would mix quarters. But silently skipping those
+    companies makes a filed result invisible, which for a portfolio is the one thing that
+    must never happen: VMARCIND filed its Q1 FY27 board outcome AND an investor deck on
+    12 Aug, and appeared nowhere because Screener had not caught up.
+
+    So they are surfaced as their own section — named, dated, with the filing title —
+    instead of being dropped. The numbers follow in a later run.
+    """
+    if queue is None or getattr(queue, "empty", True):
+        return []
+    if "doc_type" not in queue.columns or "announcement_date" not in queue.columns:
+        return []
+    by_isin = {i: (s, n) for i, s, n in pf}
+    q = queue[queue["doc_type"].astype(str).isin(["results", "presentation"])].copy()
+    if q.empty:
+        return []
+    q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)
+    q = q[q["_d"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
+    if hours is not None:
+        floor = (datetime.now() - pd.Timedelta(hours=hours)).date().isoformat()
+        q = q[q["_d"] >= floor]
+    else:                                   # season catch-up: this season's filings only
+        try:
+            edge = RR.period_end(season)
+            q = q[q["_d"] >= (edge.isoformat() if edge else "1900-01-01")]
+        except Exception:
+            pass
+    q = q[q["isin"].astype(str).isin(by_isin)]
+    if q.empty:
+        return []
+
+    out = {}
+    for _, r in q.sort_values("_d").iterrows():
+        isin = str(r["isin"]).strip()
+        if isin in rendered:                # numbers already rendered — nothing pending
+            continue
+        sym, name = by_isin.get(isin, ("", ""))
+        e = out.setdefault(isin, {"isin": isin, "symbol": sym, "name": name,
+                                  "filed_on": r["_d"], "title": "", "deck": False})
+        e["filed_on"] = max(e["filed_on"], r["_d"])
+        if str(r["doc_type"]) == "presentation":
+            e["deck"] = True
+        elif not e["title"]:
+            e["title"] = str(r.get("title") or "")[:90]
+    return sorted(out.values(), key=lambda x: x["filed_on"], reverse=True)
+
+
+def render_awaiting(rows: list[dict]) -> str:
+    """The 'filed, numbers pending' section. Deliberately loud — a PF company that has
+    reported must be visible on the day it reports, even before the figures land."""
+    if not rows:
+        return ""
+    body = "".join(
+        "<tr>"
+        f"<td><b>{esc(r['symbol'] or r['isin'], 18)}</b></td>"
+        f"<td>{esc(r['name'], 44)}</td>"
+        f"<td>{esc(r['filed_on'], 12)}</td>"
+        f"<td>{'&#128202; deck too' if r['deck'] else ''}</td>"
+        f"<td>{esc(r['title'], 80)}</td></tr>" for r in rows)
+    return (
+        _h(f"&#9888; Filed &mdash; numbers not on Screener yet ({len(rows)})",
+           "These PF holdings have filed results with the exchange. Screener has not "
+           "published the figures, so a teardown would have to guess at the quarter and "
+           "is deliberately withheld — but the filing itself is not hidden.")
+        + f"<table border='1' cellpadding='6' cellspacing='0' "
+          f"style='border-collapse:collapse;margin:6px 0 14px;border-color:#ddd;"
+          f"font:13px Arial,Helvetica,sans-serif;color:#222'>"
+          f"<thead><tr style='background:#9c5c0d;color:#fff;text-align:left'>"
+          f"<th>Company</th><th>Name</th><th>Filed</th><th></th><th>Filing</th></tr>"
+          f"</thead><tbody>{body}</tbody></table>")
+
+
 LEDGER_NAME = "quarter_teardown_mailed.parquet"
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on",
                "date_source", "mailed_at"]
@@ -1572,14 +1649,33 @@ def main() -> None:
             log(f"     audit: {a['n_facts']} facts, {a['n_missing']} missing, "
                 f"origins={a['by_origin']}, join_violations={len(a['join_violations'])}")
 
-    if args.mail and pages:
-        qlabel = pages[0][1]["quarter"]
+    # PF holdings that filed but whose numbers have not landed. Computed even when
+    # `pages` is empty, so a night where every reporter is still awaiting Screener
+    # still produces a mail instead of silence.
+    awaiting = []
+    if windowed:
+        try:
+            from _extractor_base import load_queue as _lq
+            awaiting = filed_awaiting_numbers(
+                _lq(drive, idx), pf_all, season,
+                None if args.season_all else args.since_hours,
+                {d["isin"] for _s, d, _h in pages})
+            if awaiting:
+                log(f"  filed but numbers pending: "
+                    f"{', '.join(a['symbol'] or a['isin'] for a in awaiting)}")
+        except Exception as e:
+            log(f"  WARNING: could not compute pending filings ({str(e)[:70]})")
+
+    if args.mail and (pages or awaiting):
+        qlabel = pages[0][1]["quarter"] if pages else QT.qtr_label(season)
+        n_pend = f" · {len(awaiting)} awaiting numbers" if awaiting else ""
         subject = (f"📊 Quarterly teardown — {qlabel} · "
-                   f"{len(pages)} compan{'y' if len(pages) == 1 else 'ies'}")
+                   f"{len(pages)} compan{'y' if len(pages) == 1 else 'ies'}{n_pend}")
         if args.by_day:
             subject = (f"📊 {qlabel} teardown — {len(pages)} PF holdings reported "
-                       f"so far")
-            body = render_by_day(pages, reported, qlabel, len(pf_all))
+                       f"so far{n_pend}")
+            body = render_by_day(pages, reported, qlabel, len(pf_all)) \
+                + render_awaiting(awaiting)
             log(f"  day-grouped body: {len(body.encode()):,} B")
             _write_and_send(args, drive, idx, season, pages, reported, body, subject, log)
             return
@@ -1602,6 +1698,7 @@ def main() -> None:
                  + compact_table(rest)) if rest else "")
             log(f"  over budget — {n_full} full + {len(compact)} compact "
                 f"({len(body.encode()):,} B)")
+        body += render_awaiting(awaiting)
         prev = os.path.join(args.out_dir, "quarter_teardown_preview.html")
         with open(prev, "w", encoding="utf-8") as fh:
             fh.write(body)
