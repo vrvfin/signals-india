@@ -468,7 +468,7 @@ def _norm_period(s) -> str:
     return "".join(str(s or "").split()).upper()
 
 
-def verdict_chip(gva, period: str = "") -> str:
+def verdict_chip(gva, period: str = "", compact: bool = False) -> str:
     """Block A's chip, measured against the company's OWN prior guidance.
 
     Scoped to `period` when given — Block A is "the quarter in one line", so a chip
@@ -485,6 +485,11 @@ def verdict_chip(gva, period: str = "") -> str:
         v = v[gva["period"].map(_norm_period) == want]
     measured = v[v.isin(MEASURED_VERDICTS)] if not v.empty else v
     if measured.empty:
+        # In the by-day table most holdings made no measurable promise for the quarter,
+        # and 30-odd full chips cost ~4 KB against an 8 KB clip headroom. A dash says
+        # the same thing there; the spelled-out chip stays on the per-company page.
+        if compact:
+            return "&mdash;"
         return (f"<span style='background:#eef1f3;color:{MUTED};border-radius:3px;"
                 f"padding:2px 8px;font-size:12px;font-weight:600'>NO GUIDANCE</span>")
     counts = measured.value_counts()
@@ -497,28 +502,50 @@ def verdict_chip(gva, period: str = "") -> str:
             f"padding:2px 8px;font-size:12px;font-weight:600'>{label}</span>")
 
 
+def _cred_pattern(raw) -> str:
+    """Match a stored pattern to the fixed vocabulary. Gemini returns the label with
+    trailing punctuation and sometimes a parenthetical rationale ('Conservative Bias
+    (management consistently guided lower...)'), so match on the leading label rather
+    than demanding an exact string. Anything unrecognised is dropped, not guessed."""
+    s = str(raw or "").strip()
+    for p in CRED_PATTERNS:
+        if s.upper().startswith(p.upper()):
+            return p
+    return ""
+
+
 def _cred_line(gva) -> str:
-    """Credibility score + pattern from the newest gf_track row. Omitted entirely when
-    no gf_track row exists — a missing score is not a score of zero."""
+    """Credibility score + pattern from the newest SCORED gf_track row.
+
+    `cred_score` is an object column that holds the literal string 'NA' whenever the
+    extractor had nothing to score, so `notna()` is always true and tells you nothing —
+    coerce numerically instead. Omitted entirely when nothing scored: a missing score
+    is not a score of zero.
+    """
     if gva is None or gva.empty or "source" not in gva.columns:
         return ""
-    gf = gva[gva["source"].astype(str) == "gf_track"]
-    gf = gf[gf["cred_score"].notna()] if "cred_score" in gf.columns else gf.iloc[0:0]
+    if "cred_score" not in gva.columns:
+        return ""
+    gf = gva[gva["source"].astype(str) == "gf_track"].copy()
     if gf.empty:
         return ""
-    if "as_of" in gf.columns:
-        gf = gf.sort_values("as_of", ascending=False)
-    r = gf.iloc[0]
-    try:
-        score = f"{float(r['cred_score']):.1f}"
-    except (TypeError, ValueError):
+    gf["_score"] = pd.to_numeric(gf["cred_score"], errors="coerce")
+    scored_rows = gf[gf["_score"].notna()]
+    if scored_rows.empty:
         return ""
-    pattern = str(r.get("cred_pattern") or "").strip()
-    pat = (f" &middot; <b>{esc(pattern, 30)}</b>"
-           if pattern in CRED_PATTERNS else "")
+    if "as_of" in scored_rows.columns:
+        scored_rows = scored_rows.sort_values("as_of", ascending=False)
+    r = scored_rows.iloc[0]
+    pattern = _cred_pattern(r.get("cred_pattern"))
+    # A 0.0 beside 'Insufficient Data' is a NULL, not a zero: the prompt averages only
+    # scored verdicts (EXCEEDED=5..MISSED=1, TOO_EARLY/NA excluded), so an empty average
+    # surfaces as 0.0. Printing it would read as the worst possible management.
+    if r["_score"] == 0 and pattern in ("Insufficient Data", ""):
+        return ""
+    pat = f" &middot; <b>{esc(pattern, 30)}</b>" if pattern else ""
     scored = int((_verdicts(gf).isin(MEASURED_VERDICTS)).sum())
     return (f"<div style='margin:2px 0 10px;font-size:13px'>Management credibility "
-            f"<b>{score} / 5</b>{pat} <span style='color:{MUTED}'>&mdash; from "
+            f"<b>{r['_score']:.1f} / 5</b>{pat} <span style='color:{MUTED}'>&mdash; from "
             f"{scored} scored guidance line{'' if scored == 1 else 's'}.</span></div>")
 
 
@@ -984,7 +1011,7 @@ def render_compact(d: dict) -> str:
         fmt(A["pat"]["cur"], 0), f"<span style='color:{tone(A['pat']['yoy'])}'>"
                                  f"{signed(A['pat']['yoy'])}</span>",
         signed(B.get("clean_gap")) if B.get("clean_gap") else "&mdash;",
-        verdict_chip(d.get("gva"), d.get("quarter", "")),
+        verdict_chip(d.get("gva"), d.get("quarter", ""), compact=True),
         f"{cfo.num:.2f}x" if cfo is not None and cfo.present else "&mdash;",
         top or "&mdash;",
     ]
@@ -1223,9 +1250,38 @@ def _self_test() -> int:
           "NO GUIDANCE" in verdict_chip(scoped, "Q3 FY27"))
     check("chip: no period -> full history",
           "1 BEAT" in verdict_chip(scoped) and "1 DELIVERED" in verdict_chip(scoped))
+    check("chip: compact renders a dash, not a chip",
+          verdict_chip(scoped, "Q3 FY27", compact=True) == "&mdash;")
+    check("chip: compact still shows a real verdict",
+          ">DELIVERED<" in verdict_chip(scoped, "Q1 FY27", compact=True))
 
     # credibility must never be invented from pead rows — they carry no score
     check("no cred line from pead-only", _cred_line(_gva(pead)) == "")
+    # cred_score is an object column holding the literal string 'NA' — notna() is
+    # always true, so a numeric coercion is the only honest test.
+    na_score = {**gf, "cred_score": "NA", "cred_pattern": "NA"}
+    check("string 'NA' score is not rendered", _cred_line(_gva(na_score)) == "")
+    check("string 'NA' score does not raise", isinstance(block_d({"gva": _gva(na_score)}), str))
+    newest = {**gf, "cred_score": 4.2, "as_of": "2026-08-11T00:00:00"}
+    older = {**gf, "cred_score": 1.1, "as_of": "2025-01-01T00:00:00"}
+    check("newest scored row wins", "4.2 / 5" in _cred_line(_gva(older, newest)))
+    check("unscored rows do not mask a scored one",
+          "4.2 / 5" in _cred_line(_gva(na_score, newest)))
+    # pattern vocabulary arrives with trailing punctuation and parentheticals
+    check("pattern with trailing period matched",
+          _cred_pattern("Insufficient Data.") == "Insufficient Data")
+    check("pattern with parenthetical matched",
+          _cred_pattern("Conservative Bias (guided lower than actual)") == "Conservative Bias")
+    check("unknown pattern dropped, not guessed", _cred_pattern("Sandbagging") == "")
+    check("empty pattern dropped", _cred_pattern(None) == "")
+    # 0.0 + Insufficient Data is an empty average, not a damning score
+    zero_insuff = {**gf, "cred_score": 0.0, "cred_pattern": "Insufficient Data"}
+    check("0.0 with Insufficient Data suppressed", _cred_line(_gva(zero_insuff)) == "")
+    check("0.0 with no pattern suppressed",
+          _cred_line(_gva({**gf, "cred_score": 0.0, "cred_pattern": None})) == "")
+    check("0.0 with a real pattern still shown",
+          "0.0 / 5" in _cred_line(_gva({**gf, "cred_score": 0.0,
+                                        "cred_pattern": "Erratic"})))
 
     print(f"\nquarter_teardown self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
