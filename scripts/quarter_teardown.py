@@ -68,7 +68,10 @@ AMBER = "#b8860b"
 # every Gemini verdict for any company that also had one pead row.
 MEASURED_VERDICTS = {"BEAT", "INLINE", "MISS",
                      "DELIVERED", "EXCEEDED", "MISSED", "PARTIAL"}
-UNMEASURED_VERDICTS = {"TOO_EARLY", "NA", ""}
+# Points behind the credibility score, straight from concall_prompt.txt §Mgmt Credibility
+# Summary. Only the gf_track vocabulary has defined points — BEAT/INLINE/MISS carry none,
+# and inventing a mapping for them would put a number on the page that no rule produced.
+CRED_POINTS = {"EXCEEDED": 5, "DELIVERED": 4, "PARTIAL": 3, "MISSED": 1}
 VERDICT_TONE = {"BEAT": UP, "EXCEEDED": UP, "DELIVERED": UP,
                 "MISS": DOWN, "MISSED": DOWN,
                 "INLINE": MUTED, "PARTIAL": AMBER}
@@ -237,25 +240,57 @@ def build_facts(isin: str, symbol: str, name: str, stmts: pd.DataFrame,
         B[label] = F(item, cur)
         B[label + "_qoq"] = _pct_change(F(item, cur), F(item, qoq), label + "_qoq_pct")
 
-    # Clean PAT: strip the YoY swing in other income, then tax at the normal rate.
+    # ---- Adjusted PAT, built as an explicit bridge FROM reported PAT.
+    #
+    # Anchored on the reported figure rather than recomputed from PBT, so the
+    # adjustments tie out exactly and every line can be shown:
+    #
+    #   Reported PAT
+    #     less   the YoY INCREASE in other income, after tax at the actual rate
+    #     add    the amount over-taxed this quarter vs the prior-4Q average rate
+    #   = Adjusted PAT
+    #
+    # Recomputing as PBT x (1 - normal rate) instead leaves an unexplained residual,
+    # because Screener rounds PAT and PBT independently to whole crore.
     pat_c = F("Net Profit", cur)
-    if yoy and pbt_c.present and oi_c.present and tax_mean.present:
+    tax_c_f = B["tax_cur"]
+    if yoy and pat_c.present and pbt_c.present and oi_c.present \
+            and tax_mean.present and tax_c_f.present:
         oi_y = F("Other Income", yoy)
         if oi_y.present:
-            clean_pbt = pbt_c.num - (oi_c.num - oi_y.num)
-            clean = clean_pbt * (1 - tax_mean.num / 100.0)
-            B["clean_pat"] = Fact.derive(
-                round(clean, 1), "clean_pat", [pbt_c, oi_c, oi_y, tax_mean],
-                "PBT less the YoY change in other income, taxed at the prior-4Q mean rate",
+            t_cur, t_bar = tax_c_f.num, tax_mean.num
+            oi_excl = oi_c.num - oi_y.num
+            oi_effect = oi_excl * (1 - t_cur / 100.0)
+            tax_norm = (pbt_c.num - oi_excl) * (t_cur - t_bar) / 100.0
+            adjusted = pat_c.num - oi_effect + tax_norm
+
+            B["oi_excluded"] = Fact.derive(
+                round(oi_excl, 1), "other_income_excluded_pretax", [oi_c, oi_y],
+                f"other income {oi_c.num:,.0f} this quarter less {oi_y.num:,.0f} a year "
+                f"ago — only the INCREASE is excluded, not the whole line", "Cr")
+            B["oi_effect"] = Fact.derive(
+                round(oi_effect, 1), "other_income_effect_posttax",
+                [B["oi_excluded"], tax_c_f],
+                f"the excluded {oi_excl:,.0f} Cr after tax at the actual {t_cur:.1f}%",
                 "Cr")
-            B["clean_gap"] = Fact.derive(
-                round((clean / pat_c.num - 1) * 100, 1) if pat_c.num else None,
-                "clean_pat_gap_pct", [B["clean_pat"], pat_c],
-                "clean PAT vs reported PAT", "%")
+            B["tax_norm"] = Fact.derive(
+                round(tax_norm, 1), "tax_normalisation_effect",
+                [pbt_c, B["oi_excluded"], tax_c_f, tax_mean],
+                f"tax at {t_cur:.1f}% vs the prior-4Q average {t_bar:.2f}%, applied to "
+                f"{pbt_c.num - oi_excl:,.0f} Cr", "Cr")
+            B["adjusted_pat"] = Fact.derive(
+                round(adjusted, 1), "adjusted_pat",
+                [pat_c, B["oi_effect"], B["tax_norm"]],
+                "reported PAT, less the post-tax effect of the rise in other income, "
+                "plus the amount over- or under-taxed against the prior-4Q rate", "Cr")
+            B["adjusted_gap"] = Fact.derive(
+                round((adjusted / pat_c.num - 1) * 100, 1) if pat_c.num else None,
+                "adjusted_pat_gap_pct", [B["adjusted_pat"], pat_c],
+                "adjusted PAT vs reported PAT", "%")
         else:
-            B["clean_pat"] = MISSING("clean_pat", src, "no year-ago other income")
+            B["adjusted_pat"] = MISSING("adjusted_pat", src, "no year-ago other income")
     else:
-        B["clean_pat"] = MISSING("clean_pat", src, "insufficient history")
+        B["adjusted_pat"] = MISSING("adjusted_pat", src, "insufficient history")
     B["pat"] = pat_c
     # Screener publishes one combined Expenses line — gross margin is not separable.
     B["gross_vs_opex"] = MISSING(
@@ -514,39 +549,64 @@ def _cred_pattern(raw) -> str:
     return ""
 
 
-def _cred_line(gva) -> str:
-    """Credibility score + pattern from the newest SCORED gf_track row.
+def cred_score(gva) -> tuple[float | None, dict, str]:
+    """(score, verdict counts, pattern) computed from the rows this page actually shows.
 
-    `cred_score` is an object column that holds the literal string 'NA' whenever the
-    extractor had nothing to score, so `notna()` is always true and tells you nothing —
-    coerce numerically instead. Omitted entirely when nothing scored: a missing score
-    is not a score of zero.
+    The score is the average of the points each kept promise earns — EXCEEDED 5,
+    DELIVERED 4, PARTIAL 3, MISSED 1 — over the promises that have been measured.
+    TOO_EARLY and NA are excluded, because a promise whose deadline has not arrived is
+    not a broken one; including them would drag every score toward zero as a company
+    guided FURTHER ahead, which is backwards.
+
+    Computed here rather than read from the stored `cred_score` column on purpose. The
+    stored value is Gemini's own average over ONE concall's historical context, so it
+    cannot be checked against anything on the page. This one is the arithmetic of the
+    verdicts in the table above it, so the reader can count the rows and verify it.
     """
-    if gva is None or gva.empty or "source" not in gva.columns:
-        return ""
-    if "cred_score" not in gva.columns:
-        return ""
+    if gva is None or getattr(gva, "empty", True) or "source" not in gva.columns:
+        return None, {}, ""
     gf = gva[gva["source"].astype(str) == "gf_track"].copy()
     if gf.empty:
+        return None, {}, ""
+    v = _verdicts(gf)
+    scored = v[v.isin(CRED_POINTS)]
+    pattern = ""
+    if "cred_pattern" in gf.columns:
+        order = gf.sort_values("as_of", ascending=False) if "as_of" in gf.columns else gf
+        for raw in order["cred_pattern"]:
+            pattern = _cred_pattern(raw)
+            if pattern and pattern != "Insufficient Data":
+                break
+    if scored.empty:
+        return None, {}, pattern
+    counts = scored.value_counts().to_dict()
+    total = sum(CRED_POINTS[k] * n for k, n in counts.items())
+    return total / len(scored), counts, pattern
+
+
+def _cred_line(gva) -> str:
+    """Credibility score with its arithmetic shown, so the number can be checked.
+
+    Omitted entirely when nothing has been measured — a missing score is not a zero.
+    """
+    score, counts, pattern = cred_score(gva)
+    if score is None:
         return ""
-    gf["_score"] = pd.to_numeric(gf["cred_score"], errors="coerce")
-    scored_rows = gf[gf["_score"].notna()]
-    if scored_rows.empty:
-        return ""
-    if "as_of" in scored_rows.columns:
-        scored_rows = scored_rows.sort_values("as_of", ascending=False)
-    r = scored_rows.iloc[0]
-    pattern = _cred_pattern(r.get("cred_pattern"))
-    # A 0.0 beside 'Insufficient Data' is a NULL, not a zero: the prompt averages only
-    # scored verdicts (EXCEEDED=5..MISSED=1, TOO_EARLY/NA excluded), so an empty average
-    # surfaces as 0.0. Printing it would read as the worst possible management.
-    if r["_score"] == 0 and pattern in ("Insufficient Data", ""):
-        return ""
+    # e.g. "7 DELIVERED x4 + 2 EXCEEDED x5"
+    terms = " + ".join(f"{n} {k}&#215;{CRED_POINTS[k]}"
+                       for k, n in sorted(counts.items(),
+                                          key=lambda kv: -CRED_POINTS[kv[0]]))
+    n = sum(counts.values())
+    total = sum(CRED_POINTS[k] * c for k, c in counts.items())
     pat = f" &middot; <b>{esc(pattern, 30)}</b>" if pattern else ""
-    scored = int((_verdicts(gf).isin(MEASURED_VERDICTS)).sum())
     return (f"<div style='margin:2px 0 10px;font-size:13px'>Management credibility "
-            f"<b>{r['_score']:.1f} / 5</b>{pat} <span style='color:{MUTED}'>&mdash; from "
-            f"{scored} scored guidance line{'' if scored == 1 else 's'}.</span></div>")
+            f"<b>{score:.1f} / 5</b>{pat}"
+            f"<div style='color:{MUTED};font-size:11.5px;margin-top:2px'>"
+            f"{terms} = {total} &divide; {n} promise{'' if n == 1 else 's'} measured "
+            f"= <b>{score:.1f}</b>. Scale: EXCEEDED 5 &middot; DELIVERED 4 &middot; "
+            f"PARTIAL 3 &middot; MISSED 1. TOO_EARLY and NA are excluded &mdash; a "
+            f"promise whose deadline has not arrived is not a broken one."
+            f"</div></div>")
 
 
 def block_a(d: dict) -> str:
@@ -1212,7 +1272,7 @@ def _self_test() -> int:
     check("mixed: pead verdict rendered", "BEAT" in mixed)
     check("mixed: gf_track verdict rendered", "DELIVERED" in mixed)
     check("mixed: source column rendered", "gf track" in mixed)
-    check("mixed: credibility line rendered", "3.6 / 5" in mixed)
+    check("mixed: credibility line rendered", "4.0 / 5" in mixed)
     check("mixed: credibility pattern rendered", "Optimistic Bias" in mixed)
 
     gf_only = block_d({"gva": _gva(gf)})
@@ -1255,18 +1315,42 @@ def _self_test() -> int:
     check("chip: compact still shows a real verdict",
           ">DELIVERED<" in verdict_chip(scoped, "Q1 FY27", compact=True))
 
-    # credibility must never be invented from pead rows — they carry no score
+    # credibility must never be invented from pead rows — BEAT/INLINE/MISS have no
+    # defined points, so scoring them would put a number on the page no rule produced.
     check("no cred line from pead-only", _cred_line(_gva(pead)) == "")
-    # cred_score is an object column holding the literal string 'NA' — notna() is
-    # always true, so a numeric coercion is the only honest test.
-    na_score = {**gf, "cred_score": "NA", "cred_pattern": "NA"}
-    check("string 'NA' score is not rendered", _cred_line(_gva(na_score)) == "")
-    check("string 'NA' score does not raise", isinstance(block_d({"gva": _gva(na_score)}), str))
-    newest = {**gf, "cred_score": 4.2, "as_of": "2026-08-11T00:00:00"}
-    older = {**gf, "cred_score": 1.1, "as_of": "2025-01-01T00:00:00"}
-    check("newest scored row wins", "4.2 / 5" in _cred_line(_gva(older, newest)))
-    check("unscored rows do not mask a scored one",
-          "4.2 / 5" in _cred_line(_gva(na_score, newest)))
+    check("pead verdicts score nothing", cred_score(_gva(pead))[0] is None)
+
+    # THE ARITHMETIC: 7 DELIVERED x4 + 2 EXCEEDED x5 = 38 / 9 = 4.222
+    seven_d = [{**gf, "metric": f"m{i}"} for i in range(7)]
+    two_e = [{**gf, "metric": f"e{i}", "verdict": "EXCEEDED"} for i in range(2)]
+    s, counts, _p = cred_score(_gva(*seven_d, *two_e))
+    check("score is the weighted average", round(s, 3) == round(38 / 9, 3))
+    check("counts are the tally used", counts == {"DELIVERED": 7, "EXCEEDED": 2})
+    line = _cred_line(_gva(*seven_d, *two_e))
+    check("arithmetic is shown, not just the result", "= 38 &divide; 9" in line)
+    check("both terms shown", "7 DELIVERED" in line and "2 EXCEEDED" in line)
+    check("scale legend shown", "EXCEEDED 5" in line and "MISSED 1" in line)
+    check("rounded score matches the arithmetic", "4.2 / 5" in line)
+
+    # every point value, one promise each: (5+4+3+1)/4 = 3.25
+    one_each = [{**gf, "metric": k, "verdict": k} for k in CRED_POINTS]
+    check("all four verdict points score", cred_score(_gva(*one_each))[0] == 3.25)
+
+    # TOO_EARLY / NA never dilute — guiding further ahead must not lower the score
+    check("TOO_EARLY excluded from the average",
+          cred_score(_gva(*seven_d, *two_e, early, early))[0] == cred_score(
+              _gva(*seven_d, *two_e))[0])
+    na_score = {**gf, "verdict": "NA", "cred_score": "NA", "cred_pattern": "NA"}
+    check("NA excluded from the average",
+          cred_score(_gva(*seven_d, na_score))[0] == 4.0)
+    check("nothing measured -> no line at all", _cred_line(_gva(early, na_score)) == "")
+    check("nothing measured -> no raise",
+          isinstance(block_d({"gva": _gva(early, na_score)}), str))
+    # the stored cred_score column is no longer trusted — it is Gemini's own per-concall
+    # average and cannot be checked against the table, so a bogus one must not leak through
+    check("stored cred_score is ignored",
+          "9.9 / 5" not in _cred_line(_gva({**gf, "cred_score": 9.9})))
+
     # pattern vocabulary arrives with trailing punctuation and parentheticals
     check("pattern with trailing period matched",
           _cred_pattern("Insufficient Data.") == "Insufficient Data")
@@ -1274,14 +1358,11 @@ def _self_test() -> int:
           _cred_pattern("Conservative Bias (guided lower than actual)") == "Conservative Bias")
     check("unknown pattern dropped, not guessed", _cred_pattern("Sandbagging") == "")
     check("empty pattern dropped", _cred_pattern(None) == "")
-    # 0.0 + Insufficient Data is an empty average, not a damning score
-    zero_insuff = {**gf, "cred_score": 0.0, "cred_pattern": "Insufficient Data"}
-    check("0.0 with Insufficient Data suppressed", _cred_line(_gva(zero_insuff)) == "")
-    check("0.0 with no pattern suppressed",
-          _cred_line(_gva({**gf, "cred_score": 0.0, "cred_pattern": None})) == "")
-    check("0.0 with a real pattern still shown",
-          "0.0 / 5" in _cred_line(_gva({**gf, "cred_score": 0.0,
-                                        "cred_pattern": "Erratic"})))
+    check("a real pattern outranks 'Insufficient Data'",
+          cred_score(_gva({**gf, "cred_pattern": "Insufficient Data",
+                           "as_of": "2026-08-11"},
+                          {**gf, "cred_pattern": "Erratic",
+                           "as_of": "2025-01-01"}))[2] == "Erratic")
 
     print(f"\nquarter_teardown self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

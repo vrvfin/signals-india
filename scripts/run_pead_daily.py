@@ -42,7 +42,7 @@ from build_pead_flags import PEAD_COLS
 from earnings_calendar import get_results_calendar, _html_table
 from guidance_digest_email import (GUIDANCE_COLS, HORIZON_LABEL, METRIC_LABEL,
                                    _to_pct)
-from mailer import send_email, load_mail_settings
+from mailer import send_email, load_mail_settings, esc as _esc
 # season_quarter, NOT screener_scraper.current_season_key — that module is gitignored
 # and importing it dies in CI with ModuleNotFoundError (see commit 46f33b7).
 from quarterly_table import season_quarter
@@ -303,11 +303,6 @@ def _guidance_cell(rows: pd.DataFrame, hidden: int) -> str:
     tail = (f"<div style='color:#888;font-size:11.5px'>+{hidden} older line(s) not "
             f"shown.</div>" if hidden else "")
     return f"<ul style='margin:2px 0 0 16px;padding:0;font-size:13px'>{''.join(out)}</ul>{tail}"
-
-
-def _esc(s, n=200) -> str:
-    t = str(s or "")[:n]
-    return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _pf_preview_html(events: list[dict], pf_map: dict, g: pd.DataFrame) -> tuple[str, int]:
