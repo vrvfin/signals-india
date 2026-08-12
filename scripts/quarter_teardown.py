@@ -1110,15 +1110,22 @@ def render_compact(d: dict) -> str:
         f"{cfo.num:.2f}x" if cfo is not None and cfo.present else "&mdash;",
         top or "&mdash;",
     ]
-    return ("<tr>" + "".join(f"<td style='{_TD}'>{c}</td>" for c in cells) + "</tr>")
+    # Bare <td> — font, borders and padding live on the <table> in compact_table().
+    # Repeating the ~95-char inline style on 10 cells x N companies is what pushed the
+    # season mail from 64 KB to 87 KB against Gmail's ~102 KB clip. Same discipline
+    # quarterly_table.py documents (7 KB -> 1.5 KB per company).
+    return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
 
 
 def compact_table(rows_html: str) -> str:
     heads = ["Company", "Revenue", "YoY", "Reported PAT", "YoY", "Adjusted PAT",
              "vs reported", "Guidance", "CFO/PAT", "Top live flag"]
-    h = "".join(f"<th style='{_TH}'>{c}</th>" for c in heads)
-    return (f"<table style='border-collapse:collapse;margin:6px 0 14px'>"
-            f"<tr>{h}</tr>{rows_html}</table>")
+    h = "".join(f"<th>{c}</th>" for c in heads)
+    return (f"<table border='1' cellpadding='6' cellspacing='0' "
+            f"style='border-collapse:collapse;margin:6px 0 14px;border-color:#ddd;"
+            f"font:13px Arial,Helvetica,sans-serif;color:#222;text-align:right'>"
+            f"<thead><tr style='background:#34495e;color:#fff;text-align:left'>{h}</tr>"
+            f"</thead><tbody>{rows_html}</tbody></table>")
 
 
 # --------------------------------------------------------------------------- #
