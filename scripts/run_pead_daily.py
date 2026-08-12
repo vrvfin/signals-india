@@ -37,10 +37,15 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
-                             download_bytes, load_parquet, log)
+                             download_bytes, load_parquet, log, load_portfolio_isins)
 from build_pead_flags import PEAD_COLS
 from earnings_calendar import get_results_calendar, _html_table
+from guidance_digest_email import (GUIDANCE_COLS, HORIZON_LABEL, METRIC_LABEL,
+                                   _to_pct)
 from mailer import send_email, load_mail_settings
+# season_quarter, NOT screener_scraper.current_season_key — that module is gitignored
+# and importing it dies in CI with ModuleNotFoundError (see commit 46f33b7).
+from quarterly_table import season_quarter
 
 _VERDICT_COLOR = {"BEAT": "#27ae60", "MISS": "#e74c3c", "INLINE": "#777", "NA": "#aaa"}
 MAX_GUIDANCE_LINES = 4      # per company; the cell used to print ALL of them (max 34)
@@ -222,6 +227,118 @@ def _verdict_sentence(fr, v: str, color: str, doc_by: dict | None = None) -> str
     return (f"{what} → {act} → <b style='color:{color}'>{v}</b> {by}")
 
 
+def _pf_symbol_map(drive, root_id, index_id) -> dict:
+    """NSE symbol -> (isin, name) for PF holdings only. The calendar keys on symbol;
+    the portfolio keys on ISIN, so one of them has to be translated."""
+    isins = load_portfolio_isins(drive, root_id)
+    if not isins:
+        return {}
+    fid = find_file(drive, index_id, "company_universe.csv")
+    if not fid:
+        return {}
+    try:
+        uni = pd.read_csv(io.BytesIO(download_bytes(drive, fid))).fillna("")
+    except Exception:
+        return {}
+    out = {}
+    for _, r in uni.iterrows():
+        isin = str(r.get("isin", "")).strip()
+        if isin not in isins:
+            continue
+        sym = str(r.get("nse_symbol") or r.get("bse_symbol") or "").strip().upper()
+        if sym and sym.lower() != "nan":
+            out[sym] = (isin, str(r.get("name", "")).strip() or sym)
+    return out
+
+
+def _open_guidance(g: pd.DataFrame, isin: str, cur_fy: int | None
+                   ) -> tuple[pd.DataFrame, int]:
+    """A company's guidance that is still OPEN — the promises tomorrow's print can be
+    read against. Mirrors _relevant_guidance (the after-the-fact side): drop horizons
+    that have already passed, de-duplicate the 2-/4-digit FY spellings, rank by the most
+    recent concall, cap the list. Returns (rows_to_show, n_hidden)."""
+    if g is None or g.empty:
+        return pd.DataFrame(), 0
+    d = g[g["isin"].astype(str) == isin].copy()
+    if d.empty:
+        return d, 0
+    d["_fy"] = d["horizon_fy"].map(_norm_fy)
+    d["_said"] = d["quarter"].map(_guid_qkey)
+    if cur_fy is not None:
+        keep = d[d["_fy"].isna() | (d["_fy"] >= cur_fy)]
+        # A horizon that is purely qualitative ("NEAR_TERM") has no FY to compare, so it
+        # stays; one that names a year already past does not.
+        d = keep if not keep.empty else d
+    d = d.drop_duplicates(subset=["_fy", "metric", "value"])
+    d = d.sort_values(["_said", "_fy"], ascending=False)
+    return d.head(MAX_GUIDANCE_LINES), max(0, len(d) - MAX_GUIDANCE_LINES)
+
+
+def _guidance_cell(rows: pd.DataFrame, hidden: int) -> str:
+    """The promise lines for one company, most recently said first."""
+    if rows.empty:
+        return (f"<div style='color:#888;font-size:12.5px'>No guidance on record &mdash; "
+                f"nothing to hold the print against.</div>")
+    out = []
+    for _, r in rows.iterrows():
+        metric = str(r.get("metric") or "")
+        horizon = str(r.get("horizon_fy") or "")
+        pct = _to_pct(r.get("value"), r.get("cagr_pct"), metric, horizon)
+        # _to_pct is the plausibility-capped path: re-parsing `value` here is what once
+        # turned a capacity target of "178,000" into 178000%.
+        raw = str(r.get("value") or "").strip()
+        shown = f"<b>{pct:+.1f}%</b>" if pct is not None else f"<b>{_esc(raw, 60)}</b>"
+        unit = str(r.get("unit") or "").strip()
+        # The unit is often already spelled inside the value ('150,000 units/annum'
+        # + unit 'UNITS', '1.0%' + unit '%'), so append it only when it adds something.
+        if (pct is None and unit and unit.lower() != "nan"
+                and unit.lower().rstrip("s") not in raw.lower()):
+            shown += f" {_esc(unit, 12)}"
+        label = METRIC_LABEL.get(metric, metric.title() or "&mdash;")
+        hz = HORIZON_LABEL.get(horizon, horizon)
+        said = str(r.get("quarter") or "")
+        out.append(f"<li style='margin:2px 0'>{_esc(label, 22)} {shown}"
+                   f"<span style='color:#888'> &middot; {_esc(hz, 16)}"
+                   f"{f' &middot; said in {_esc(said, 12)}' if said else ''}</span></li>")
+    tail = (f"<div style='color:#888;font-size:11.5px'>+{hidden} older line(s) not "
+            f"shown.</div>" if hidden else "")
+    return f"<ul style='margin:2px 0 0 16px;padding:0;font-size:13px'>{''.join(out)}</ul>{tail}"
+
+
+def _esc(s, n=200) -> str:
+    t = str(s or "")[:n]
+    return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _pf_preview_html(events: list[dict], pf_map: dict, g: pd.DataFrame) -> tuple[str, int]:
+    """The PF block that leads the 'results tomorrow' mail: for each holding on the
+    calendar, what management has already promised. Returns (html, n_pf)."""
+    hits = [e for e in events if str(e.get("symbol", "")).strip().upper() in pf_map]
+    if not hits:
+        return "", 0
+    cur_fy = _norm_fy(season_quarter())
+    blocks = []
+    for e in sorted(hits, key=lambda x: (x.get("date", ""), x.get("symbol", ""))):
+        sym = str(e["symbol"]).strip().upper()
+        isin, name = pf_map[sym]
+        rows, hidden = _open_guidance(g, isin, cur_fy)
+        blocks.append(
+            f"<div style='border:1px solid #e0e6ea;border-radius:6px;padding:10px 13px;"
+            f"margin:0 0 9px;background:#fbfcfd'>"
+            f"<div style='font-size:14px'><b>{_esc(sym, 18)}</b> "
+            f"<span style='color:#666'>{_esc(name, 60)}</span></div>"
+            f"<div style='color:#888;font-size:11.5px;margin:1px 0 6px'>"
+            f"board meeting {_esc(e.get('date'), 12)} &middot; {_esc(e.get('source'), 8)}"
+            f"</div>{_guidance_cell(rows, hidden)}</div>")
+    return (f"<h3 style='margin:0 0 3px;font-size:15px'>&#128188; Your portfolio: "
+            f"{len(hits)} holding{'' if len(hits) == 1 else 's'} reporting</h3>"
+            f"<div style='color:#888;font-size:12px;margin:0 0 10px'>What management has "
+            f"already promised &mdash; the open guidance tomorrow's numbers can be read "
+            f"against. Guidance only; no forecast is implied.</div>"
+            f"{''.join(blocks)}"
+            f"<div style='border-top:1px solid #ddd;margin:14px 0 10px'></div>"), len(hits)
+
+
 def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
                   pead: pd.DataFrame, sym_map: dict,
                   doc_by: dict | None = None) -> str | None:
@@ -308,13 +425,27 @@ def main() -> None:
                       zip(q["doc_id"], q["announcement_date"])}
     html_b = _email_b_html(reporters, res, pead, sym_map, doc_by)
 
-    # ---- Email A: tomorrow's announcers ----
+    # ---- Email A: tomorrow's announcers, PF holdings first ----
     events = get_results_calendar(args.days_ahead)
-    html_a = _html_table(events) if events else None
+    # The PF block is the reason to open this mail, but it must never be the reason the
+    # mail fails to arrive — the universe-wide calendar below stands on its own.
+    pf_html, n_pf = "", 0
+    if events:
+        try:
+            pf_map = _pf_symbol_map(drive, root_id, index_id)
+            gtrack = load_parquet(drive, index_id, "guidance_tracker.parquet",
+                                  GUIDANCE_COLS)
+            pf_html, n_pf = _pf_preview_html(events, pf_map, gtrack)
+            log(f"  PF preview: {n_pf} of {len(pf_map)} holding(s) on the calendar")
+        except Exception as exc:                       # noqa: BLE001 — mail must still go
+            log(f"  PF preview FAILED ({type(exc).__name__}: {exc}) — "
+                f"sending the calendar without it")
+    html_a = (pf_html + _html_table(events)) if events else None
 
     if args.dry_run:
         print("=== EMAIL A (results tomorrow) ===")
-        print(f"{len(events)} events" if events else "(none)")
+        print(f"{len(events)} events; {n_pf} PF holding(s)" if events else "(none)")
+        print(pf_html or "(no PF holdings on the calendar)")
         print("\n=== EMAIL B (today's earnings vs guidance) ===")
         print(html_b or "(no reporters today)")
         return
@@ -328,12 +459,17 @@ def main() -> None:
             print("pead_guidance mail toggled OFF — skipped.")
     if html_a:
         if toggles.get("pead_tomorrow", True):
-            sent += send_email(f"📅 Results tomorrow ({len(events)} cos)", html_a)
+            # PF count leads the subject only when there is one — an unqualified
+            # "0 PF holdings" every off-season day is noise, not information.
+            subj = (f"📅 Results tomorrow — {n_pf} PF holding"
+                    f"{'' if n_pf == 1 else 's'} ({len(events)} cos)" if n_pf
+                    else f"📅 Results tomorrow ({len(events)} cos)")
+            sent += send_email(subj, html_a)
         else:
             print("pead_tomorrow mail toggled OFF — skipped.")
     print(f"run_pead_daily: {sent} email(s) sent "
           f"(reporters today={0 if reporters is None else len(reporters)}, "
-          f"calendar={len(events)}).")
+          f"calendar={len(events)}, pf={n_pf}).")
 
 
 if __name__ == "__main__":
