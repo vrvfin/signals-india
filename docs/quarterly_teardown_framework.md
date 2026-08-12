@@ -76,13 +76,32 @@ All from `quarterly_pl`. `q` = current quarter, `q-1` = QoQ, `q-4` = YoY.
 | **Tax rate** | `Tax %`, vs mean of prior 4 quarters | deviates > 5 pp |
 | **Interest step** | `Interest [q] / Interest [q-1] − 1` | > 25% jump |
 | **Depreciation step** | `Depreciation [q] / Depreciation [q-1] − 1` | > 25% jump |
-| **Clean PAT** | PBT less the YoY *change* in Other Income, taxed at the prior-4Q mean rate | show beside reported PAT |
+| **Adjusted PAT** | reported PAT − post-tax effect of the YoY *rise* in Other Income + amount over-taxed vs the prior-4Q rate | show beside reported PAT, with the bridge |
 | **Growth attribution** | revenue growth split into volume vs realisation | only when the deck gives volume |
 
 **Why these:** a jump in Interest or Depreciation usually means capitalisation ended — the
 capex story just landed in the P&L. A PAT beat carried by Other Income or a low tax rate is
-not an operating beat. **Clean PAT is the single most useful number on the page**: it is
-what the business earned before the two easiest levers were pulled.
+not an operating beat. **Adjusted PAT is the single most useful number on the page**: it
+is what the business earned before the two easiest levers were pulled.
+
+It is built as an explicit bridge FROM reported PAT, never recomputed from PBT, so every
+line can be shown and the total ties out exactly:
+
+```
+  Reported PAT                                          263.0
+  Less: rise in other income, post-tax                  −10.5   (₹14 Cr pre-tax @ 25.0%)
+  Add : over-taxed vs the prior-4Q average              + 8.4   (25.0% vs 22.50% on ₹338 Cr)
+  = Adjusted PAT                                        260.9   (−0.8% vs reported)
+```
+
+Two deliberate choices. Only the **increase** in other income is removed — a business is
+entitled to its usual treasury income, and stripping the whole line would understate every
+company that holds cash. And the tax line **adds back** what was over-taxed rather than
+silently re-taxing, because a quarter taxed above its own recent average was penalised,
+not flattered.
+
+Recomputing as `PBT × (1 − normal rate)` instead leaves an unexplained residual, since
+Screener rounds PAT and PBT independently to whole crore. Anchoring on reported avoids it.
 
 ---
 
@@ -267,6 +286,6 @@ revenue flattens · CWIP rising for three years without commissioning · a KPI s
 quarters silently dropped from the deck · a target quietly moved out · agency downgrade
 trigger language sharpening between reports.
 
-The single strongest pairing on this page: **Clean PAT (block B) beside CFO/PAT (H1) beside
+The single strongest pairing on this page: **Adjusted PAT (block B) beside CFO/PAT (H1) beside
 the deck diff (E).** Together they answer whether the profit is operating, whether it
 became cash, and whether management is still willing to be measured on it.

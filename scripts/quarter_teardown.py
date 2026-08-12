@@ -640,15 +640,40 @@ def block_b(d: dict) -> str:
               "swing in other income, and drift in the tax rate. Pure arithmetic off the "
               "quarterly P&amp;L; no model in this path.")]
 
-    if B["clean_pat"].present:
-        gap = B.get("clean_gap")
-        out.append(_tbl(["Reported PAT", "Clean PAT", "Gap"],
-                        [[f"<b>{fmt(B['pat'], 0, ' Cr')}</b>",
-                          f"<b>{fmt(B['clean_pat'], 0, ' Cr')}</b>",
-                          f"<span style='color:{tone(gap)}'>{signed(gap)}</span>"]]))
+    if B["adjusted_pat"].present:
+        gap = B.get("adjusted_gap")
+        oi_x, oi_e, tax_n = B["oi_excluded"], B["oi_effect"], B["tax_norm"]
+        adj = B["adjusted_pat"]
+        # The full bridge, line by line, so the number can be checked by hand.
+        bridge = [
+            ["Reported PAT", "", f"<b>{fmt(B['pat'], 1, '')}</b>",
+             "as filed"],
+            ["Less: rise in other income",
+             f"&minus;{fmt(oi_x, 1, '')} pre-tax",
+             f"<span style='color:{DOWN}'>&minus;{fmt(oi_e, 1, '')}</span>",
+             esc(oi_e.note, 130)],
+            ["Add: over/under-tax vs normal",
+             f"{signed(B['tax_cur'])} vs {fmt(B['tax_mean'], 2, '%')} avg",
+             (f"<span style='color:{UP}'>+{fmt(tax_n, 1, '')}</span>" if (tax_n.num or 0) >= 0
+              else f"<span style='color:{DOWN}'>{fmt(tax_n, 1, '')}</span>"),
+             esc(tax_n.note, 130)],
+            ["<b>Adjusted PAT</b>", "",
+             f"<b>{fmt(adj, 1, '')}</b>",
+             f"<b>{signed(gap)}</b> vs reported"],
+        ]
+        out.append(_tbl(["Bridge", "Basis", "&#8377; Cr", "How it was worked out"],
+                        bridge))
+        out.append(
+            f"<div style='color:{MUTED};font-size:11.5px;margin:-8px 0 14px'>"
+            f"Only the <i>increase</i> in other income is removed, not the whole line — "
+            f"a business is allowed its usual treasury income. The tax line adds back "
+            f"what was over-taxed this quarter relative to its own recent average "
+            f"(or subtracts what was under-taxed). Both adjustments are applied to "
+            f"reported PAT, so the bridge ties out exactly.</div>")
     else:
         out.append(f"<div style='color:{MUTED};font-size:12.5px;margin:6px 0 12px'>"
-                   f"Clean PAT not computable &mdash; {esc(B['clean_pat'].note, 90)}.</div>")
+                   f"Adjusted PAT not computable &mdash; "
+                   f"{esc(B['adjusted_pat'].note, 90)}.</div>")
 
     rows = []
     ois, oiy = B.get("oi_share"), B.get("oi_share_yoy")
@@ -970,7 +995,7 @@ def render_by_day(pages, reported: dict, quarter: str, pf_total: int) -> str:
 
     n_clean, n_dirty, flagged = 0, 0, 0
     for _sym, d, _html in pages:
-        g = d["B"].get("clean_gap")
+        g = d["B"].get("adjusted_gap")
         if g is not None and g.present and g.num is not None:
             if abs(g.num) <= 3:
                 n_clean += 1
@@ -989,7 +1014,7 @@ def render_by_day(pages, reported: dict, quarter: str, pf_total: int) -> str:
         f"<div style='background:#f6f8f9;border:1px solid #e0e6ea;border-radius:6px;"
         f"padding:11px 14px;margin:0 0 14px;font-size:13px'>"
         f"<b>{n_clean}</b> reported profit that is essentially all operating "
-        f"(clean-PAT gap within 3%) &middot; <b>{n_dirty}</b> where other income or the "
+        f"(adjusted PAT within 3% of reported) &middot; <b>{n_dirty}</b> where other income or the "
         f"tax rate moved the number materially &middot; <b>{flagged}</b> carry at least "
         f"one live adverse flag.</div>")
 
@@ -1011,10 +1036,13 @@ def render_by_day(pages, reported: dict, quarter: str, pf_total: int) -> str:
     out.append(
         f"<div style='margin-top:18px;padding-top:12px;border-top:1px solid #ddd;"
         f"font-size:11.5px;color:{MUTED};line-height:1.6'>"
-        f"<b>Clean gap</b> = clean PAT vs reported PAT. Clean PAT strips the year-on-year "
-        f"swing in other income and taxes the result at the prior-4-quarter average rate, "
-        f"so what is left is the operating outcome. A large gap is not itself bad &mdash; "
-        f"it means the headline was moved by something other than operations.<br>"
+        f"<b>Adjusted PAT</b> = reported PAT, <i>less</i> the post-tax effect of the "
+        f"year-on-year INCREASE in other income (the usual level is left alone), "
+        f"<i>plus</i> whatever was over-taxed this quarter against the prior-4-quarter "
+        f"average rate. Both adjustments are applied to the reported figure, so the "
+        f"bridge ties out exactly &mdash; the full line-by-line working is in block B of "
+        f"each company's page. A wide gap is not itself bad; it means the headline was "
+        f"moved by something other than operations.<br>"
         f"<b>CFO/PAT</b> is annual (latest FY), not quarterly &mdash; Screener publishes no "
         f"quarterly cash flow. Below 1.0 for two years running is the anchor forensic flag."
         f"<br>Signals only &mdash; human-in-the-loop. Not investment advice.</div>")
@@ -1050,9 +1078,14 @@ def _page_shell(title: str, inner: str) -> str:
 
 
 def render_compact(d: dict) -> str:
-    """One row per company: the verdict line, clean-PAT gap, the anchor divergence, and
-    the single most severe live flag. Roughly 1.5 KB — used when the mail would otherwise
-    be clipped, so no holding disappears from the digest."""
+    """One row per company: headline numbers, reported vs adjusted PAT, the anchor
+    divergence, and the single most severe live flag. Roughly 1.7 KB — used when the mail
+    would otherwise be clipped, so no holding disappears from the digest.
+
+    Shows adjusted PAT as a FIGURE beside reported, not just a percentage gap: a bare
+    "gap" column asks the reader to trust arithmetic they cannot see. The full bridge
+    (what was excluded, at what tax rate) is in block B of the per-company page.
+    """
     if not d.get("quarter"):
         return ""
     A, B, H1 = d["A"], d["B"], d["H1"]
@@ -1070,7 +1103,9 @@ def render_compact(d: dict) -> str:
                                      f"{signed(A['revenue']['yoy'])}</span>",
         fmt(A["pat"]["cur"], 0), f"<span style='color:{tone(A['pat']['yoy'])}'>"
                                  f"{signed(A['pat']['yoy'])}</span>",
-        signed(B.get("clean_gap")) if B.get("clean_gap") else "&mdash;",
+        fmt(B.get("adjusted_pat"), 0),
+        f"<span style='color:{tone(B.get('adjusted_gap'))}'>"
+        f"{signed(B.get('adjusted_gap'))}</span>",
         verdict_chip(d.get("gva"), d.get("quarter", ""), compact=True),
         f"{cfo.num:.2f}x" if cfo is not None and cfo.present else "&mdash;",
         top or "&mdash;",
@@ -1079,8 +1114,8 @@ def render_compact(d: dict) -> str:
 
 
 def compact_table(rows_html: str) -> str:
-    heads = ["Company", "Revenue", "YoY", "PAT", "YoY", "Clean gap", "Guidance",
-             "CFO/PAT", "Top live flag"]
+    heads = ["Company", "Revenue", "YoY", "Reported PAT", "YoY", "Adjusted PAT",
+             "vs reported", "Guidance", "CFO/PAT", "Top live flag"]
     h = "".join(f"<th style='{_TH}'>{c}</th>" for c in heads)
     return (f"<table style='border-collapse:collapse;margin:6px 0 14px'>"
             f"<tr>{h}</tr>{rows_html}</table>")
