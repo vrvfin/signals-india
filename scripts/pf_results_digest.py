@@ -56,10 +56,6 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, load_parquet,
                              save_parquet, log)
-try:                                     # the queue's own announcement_date ->
-    from backfill_company_docs import _fy_quarter_label   # quarter mapping; the
-except Exception:                        # import chain pulls ingest_company_docs,
-    _fy_quarter_label = None             # so degrade rather than kill the mail
 from build_gallery import _bulk_parquet, _folder
 from daily_brief import load_pf
 from mailer import send_email, load_mail_settings, esc
@@ -108,27 +104,17 @@ def _results_dates(results: pd.DataFrame, season: str) -> dict[str, str]:
 def _queue_dates(queue: pd.DataFrame, season: str) -> dict[str, str]:
     """{isin: YYYY-MM-DD} from the global processing queue — results filings for
     this period. Covers the ~150 reporters the 25-item Screener /results/latest/
-    window misses each season."""
-    if queue is None or queue.empty or "doc_type" not in queue.columns:
-        return {}
-    q = queue[queue["doc_type"].astype(str) == "results"].copy()
-    if q.empty:
-        return {}
-    q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)
-    # `period` is a T12 addition and is still blank on results rows — fall back to
-    # the same announcement-date -> quarter mapping the queue itself uses.
-    def _per(row):
-        p = str(row.get("period") or "").strip()
-        if p and p.lower() != "none":
-            return QT.norm_q(p)
-        return _fy_quarter_label(row["_d"]) if _fy_quarter_label else ""
-    q = q[q.apply(_per, axis=1) == QT.norm_q(season)]
-    if q.empty:
-        return {}
-    q = q[q["_d"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
-    if q.empty:
-        return {}
-    return q.groupby(q["isin"].astype(str).str.strip())["_d"].min().to_dict()
+    window misses each season.
+
+    Delegates to quarterly_table.queue_report_dates. The previous local copy mapped
+    announcement_date -> quarter via backfill_company_docs._fy_quarter_label, imported
+    under a try/except that leaves it None whenever that import chain fails — which it
+    always does on a CI runner, because the chain pulls ingest_company_docs and its PDF
+    dependencies and those are not in scripts/requirements.txt. The failure was silent:
+    no error, no warning, just every filing-dated reporter missing from the digest.
+    Measured against the live queue: 0 dates in CI vs 42 locally.
+    """
+    return QT.queue_report_dates(queue, season)
 
 
 def resolve_date(isin, screener_d, queue_d, prev_row, today):

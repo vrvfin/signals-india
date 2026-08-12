@@ -57,6 +57,24 @@ THRESHOLDS = {
     "interest_coverage": (1.5, "below", "coverage below 1.5x"),
 }
 UP, DOWN, MUTED = "#1a7a3a", "#c0392b", "#8a97a0"
+AMBER = "#b8860b"
+
+# guidance_vs_actual.parquet carries TWO verdict vocabularies in ONE table:
+#   source=pead_*   -> BEAT / INLINE / MISS / NA   (build_pead_flags._verdict, ±2 band)
+#   source=gf_track -> DELIVERED / EXCEEDED / MISSED / PARTIAL / TOO_EARLY / NA
+#                      (concall_prompt.txt §GF_TRACK, same ±2 band)
+# MEASURED = the guidance was joined back to a reported outcome, so the row answers
+# "was the promise kept?". Filtering on the pead spelling alone silently discarded
+# every Gemini verdict for any company that also had one pead row.
+MEASURED_VERDICTS = {"BEAT", "INLINE", "MISS",
+                     "DELIVERED", "EXCEEDED", "MISSED", "PARTIAL"}
+UNMEASURED_VERDICTS = {"TOO_EARLY", "NA", ""}
+VERDICT_TONE = {"BEAT": UP, "EXCEEDED": UP, "DELIVERED": UP,
+                "MISS": DOWN, "MISSED": DOWN,
+                "INLINE": MUTED, "PARTIAL": AMBER}
+# Credibility pattern vocabulary — concall_prompt.txt §Mgmt Credibility Summary.
+CRED_PATTERNS = {"Calibrated", "Optimistic Bias", "Conservative Bias",
+                 "Erratic", "Insufficient Data"}
 
 
 # --------------------------------------------------------------------------- #
@@ -438,6 +456,72 @@ def _h(title: str, sub: str = "") -> str:
             f"border-bottom:2px solid #34495e;padding-bottom:3px'>{title}</h3>{s}")
 
 
+def _verdicts(gva) -> pd.Series:
+    """Upper-cased verdict column, or an empty Series when there is nothing to read."""
+    if gva is None or getattr(gva, "empty", True) or "verdict" not in gva.columns:
+        return pd.Series(dtype=str)
+    return gva["verdict"].astype(str).str.strip().str.upper()
+
+
+def _norm_period(s) -> str:
+    """'Q1 FY27' / 'q1fy27' -> 'Q1FY27'. Periods arrive spelled both ways."""
+    return "".join(str(s or "").split()).upper()
+
+
+def verdict_chip(gva, period: str = "") -> str:
+    """Block A's chip, measured against the company's OWN prior guidance.
+
+    Scoped to `period` when given — Block A is "the quarter in one line", so a chip
+    summing every verdict on record would answer a different question than the block
+    it sits in. Block D keeps the full history.
+
+    Framework §Block A: never `INLINE` when there is simply no guidance, and never
+    collapse a mix of outcomes to a single word — a company that beat on revenue and
+    missed on margin has not "beaten". Both verdict vocabularies count.
+    """
+    v = _verdicts(gva)
+    if period and not v.empty and "period" in gva.columns:
+        want = _norm_period(period)
+        v = v[gva["period"].map(_norm_period) == want]
+    measured = v[v.isin(MEASURED_VERDICTS)] if not v.empty else v
+    if measured.empty:
+        return (f"<span style='background:#eef1f3;color:{MUTED};border-radius:3px;"
+                f"padding:2px 8px;font-size:12px;font-weight:600'>NO GUIDANCE</span>")
+    counts = measured.value_counts()
+    if len(counts) == 1:
+        label, colour = counts.index[0], VERDICT_TONE.get(counts.index[0], MUTED)
+    else:
+        label = " &middot; ".join(f"{n} {k}" for k, n in counts.items())
+        colour = "#34495e"
+    return (f"<span style='background:{colour};color:#fff;border-radius:3px;"
+            f"padding:2px 8px;font-size:12px;font-weight:600'>{label}</span>")
+
+
+def _cred_line(gva) -> str:
+    """Credibility score + pattern from the newest gf_track row. Omitted entirely when
+    no gf_track row exists — a missing score is not a score of zero."""
+    if gva is None or gva.empty or "source" not in gva.columns:
+        return ""
+    gf = gva[gva["source"].astype(str) == "gf_track"]
+    gf = gf[gf["cred_score"].notna()] if "cred_score" in gf.columns else gf.iloc[0:0]
+    if gf.empty:
+        return ""
+    if "as_of" in gf.columns:
+        gf = gf.sort_values("as_of", ascending=False)
+    r = gf.iloc[0]
+    try:
+        score = f"{float(r['cred_score']):.1f}"
+    except (TypeError, ValueError):
+        return ""
+    pattern = str(r.get("cred_pattern") or "").strip()
+    pat = (f" &middot; <b>{esc(pattern, 30)}</b>"
+           if pattern in CRED_PATTERNS else "")
+    scored = int((_verdicts(gf).isin(MEASURED_VERDICTS)).sum())
+    return (f"<div style='margin:2px 0 10px;font-size:13px'>Management credibility "
+            f"<b>{score} / 5</b>{pat} <span style='color:{MUTED}'>&mdash; from "
+            f"{scored} scored guidance line{'' if scored == 1 else 's'}.</span></div>")
+
+
 def block_a(d: dict) -> str:
     A = d["A"]
     rows = []
@@ -449,9 +533,16 @@ def block_a(d: dict) -> str:
             f"<b>{label}</b>", fmt(g["cur"], dp, suf),
             f"<span style='color:{tone(g['yoy'])}'>{signed(g['yoy'])}</span>",
             f"<span style='color:{tone(g['qoq'])}'>{signed(g['qoq'])}</span>"])
+    # The chip is measured against the company's OWN prior guidance — there is no
+    # consensus feed in this repo and implying one would be fiction.
+    chip = (f"<div style='margin:2px 0 8px'>"
+            f"{verdict_chip(d.get('gva'), d.get('quarter', ''))} "
+            f"<span style='color:{MUTED};font-size:11.5px'>vs what the company itself "
+            f"guided for {esc(d.get('quarter'), 12)} &mdash; not consensus.</span></div>")
     return (_h("A &middot; The quarter in one line",
                f"{d['quarter']} ({d['period']}) &middot; YoY vs {d['yoy_period'] or 'n/a'}"
                f" &middot; QoQ vs {d['qoq_period']}. Margins in percentage points.")
+            + chip
             + _tbl(["Metric", d["quarter"], "YoY", "QoQ"], rows))
 
 
@@ -708,17 +799,39 @@ def block_d(d: dict) -> str:
         return "".join(out) + (f"<div style='color:{MUTED};font-size:13px'>No guidance "
                                f"rows for this company.</div>")
     g = gva.copy()
-    measured = g[g["verdict"].astype(str).str.upper().isin(["BEAT", "INLINE", "MISS"])]
-    show = measured if not measured.empty else g
-    out.append(_tbl(["Period", "Metric", "Guided", "Actual", "Verdict"],
-                    [[esc(r.get("period"), 12), esc(r.get("metric"), 26),
-                      esc(r.get("guided"), 30), esc(r.get("actual"), 30) or "&mdash;",
-                      esc(r.get("verdict"), 12)] for _, r in show.head(10).iterrows()]))
-    if measured.empty:
+    g["_v"] = _verdicts(g)
+    g["_measured"] = g["_v"].isin(MEASURED_VERDICTS)
+    # Sort, never filter. Both verdict vocabularies live in this one table, so filtering
+    # on either spelling drops the other side's rows entirely; ordering shows the
+    # answered promises first and keeps the open ones visible underneath.
+    show = g.sort_values("_measured", ascending=False).head(10)
+    n_measured = int(g["_measured"].sum())
+
+    out.append(_cred_line(g))
+    rows = []
+    for _, r in show.iterrows():
+        v = r["_v"]
+        colour = VERDICT_TONE.get(v, MUTED)
+        src = str(r.get("source") or "").replace("pead_", "").replace("_", " ") or "&mdash;"
+        rows.append([
+            esc(r.get("period"), 12), esc(r.get("metric"), 26),
+            esc(r.get("guided"), 30), esc(r.get("actual"), 30) or "&mdash;",
+            f"<span style='color:{colour};font-weight:600'>{esc(v, 12)}</span>",
+            f"<span style='color:{MUTED};font-size:11.5px'>{esc(src, 20)}</span>"])
+    out.append(_tbl(["Period", "Metric", "Guided", "Actual", "Verdict", "Source"], rows))
+
+    n_open = len(g) - n_measured
+    if n_measured == 0:
         out.append(f"<div style='color:{MUTED};font-size:12px'>"
                    f"{len(g)} guidance rows exist and none has been joined back to a "
                    f"reported outcome &mdash; every one resolves to TOO_EARLY or NA. Shown "
                    f"as unmeasured rather than filled with a guess.</div>")
+    elif n_open:
+        out.append(f"<div style='color:{MUTED};font-size:12px'>"
+                   f"{n_measured} promise{'' if n_measured == 1 else 's'} measured against "
+                   f"a reported outcome; {n_open} still open (TOO_EARLY or NA). "
+                   f"<b>Source</b> is which document the promise came from &mdash; "
+                   f"gf_track rows are read from the concall transcript.</div>")
     return "".join(out)
 
 
@@ -871,6 +984,7 @@ def render_compact(d: dict) -> str:
         fmt(A["pat"]["cur"], 0), f"<span style='color:{tone(A['pat']['yoy'])}'>"
                                  f"{signed(A['pat']['yoy'])}</span>",
         signed(B.get("clean_gap")) if B.get("clean_gap") else "&mdash;",
+        verdict_chip(d.get("gva"), d.get("quarter", "")),
         f"{cfo.num:.2f}x" if cfo is not None and cfo.present else "&mdash;",
         top or "&mdash;",
     ]
@@ -878,8 +992,8 @@ def render_compact(d: dict) -> str:
 
 
 def compact_table(rows_html: str) -> str:
-    heads = ["Company", "Revenue", "YoY", "PAT", "YoY", "Clean gap", "CFO/PAT",
-             "Top live flag"]
+    heads = ["Company", "Revenue", "YoY", "PAT", "YoY", "Clean gap", "Guidance",
+             "CFO/PAT", "Top live flag"]
     h = "".join(f"<th style='{_TH}'>{c}</th>" for c in heads)
     return (f"<table style='border-collapse:collapse;margin:6px 0 14px'>"
             f"<tr>{h}</tr>{rows_html}</table>")
@@ -888,58 +1002,6 @@ def compact_table(rows_html: str) -> str:
 # --------------------------------------------------------------------------- #
 # loading
 # --------------------------------------------------------------------------- #
-
-def _queue_dates(queue: pd.DataFrame, season: str) -> dict[str, str]:
-    """{isin: YYYY-MM-DD} from the global processing queue — results filings for this
-    season. Covers the reporters the 25-item Screener /results/latest window misses.
-
-    Deliberately does NOT reuse pf_results_digest._queue_dates. That function depends on
-    `backfill_company_docs._fy_quarter_label`, imported under a try/except that sets it
-    to None on failure. The import chain pulls ingest_company_docs and its PDF
-    dependencies, which are not in scripts/requirements.txt — so on a CI runner it is
-    ALWAYS None, `_per()` returns "", nothing matches, and the function silently yields
-    zero dates. Observed live: `report dates: screener=1213 filing=0` in CI against
-    filing=34 locally. The degradation is invisible unless you read that log line.
-
-    quarterly_table.season_quarter() is documented as byte-identical to
-    _fy_quarter_label() for the same date and has no imports beyond pandas, so the
-    mapping is done with that instead and cannot degrade.
-    """
-    if queue is None or queue.empty or "doc_type" not in queue.columns:
-        return {}
-    q = queue[queue["doc_type"].astype(str) == "results"].copy()
-    if q.empty or "announcement_date" not in q.columns:
-        return {}
-    q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)
-    q = q[q["_d"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
-    if q.empty:
-        return {}
-
-    # `period` is blank on results rows (the T12 column was never populated by results
-    # ingestion). How that blank materialises depends on the pandas/pyarrow dtype
-    # backend: older builds give None -> str() -> "None", newer ones give NaN ->
-    # str() -> "nan". A test for `!= "none"` therefore PASSES on "nan", returns
-    # norm_q("nan"), matches no season, and silently drops every filing-dated
-    # reporter. That is the whole reason CI logged filing=0 while local logged 42 on
-    # byte-identical Drive data. Treat every spelling of empty as empty.
-    _EMPTY = {"", "none", "nan", "nat", "<na>", "null"}
-
-    def _per(row) -> str:
-        raw = row.get("period")
-        p = "" if raw is None or (isinstance(raw, float) and pd.isna(raw)) \
-            else str(raw).strip()
-        if p.lower() not in _EMPTY:
-            return QT.norm_q(p)
-        try:
-            return QT.norm_q(QT.season_quarter(pd.to_datetime(row["_d"])))
-        except Exception:
-            return ""
-
-    q = q[q.apply(_per, axis=1) == QT.norm_q(season)]
-    if q.empty:
-        return {}
-    return q.groupby(q["isin"].astype(str).str.strip())["_d"].min().to_dict()
-
 
 LEDGER_NAME = "quarter_teardown_mailed.parquet"
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on",
@@ -969,7 +1031,7 @@ def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tup
         queue = pd.DataFrame()
 
     screener_d = PRD._results_dates(results, season)
-    queue_d = _queue_dates(queue, season)
+    queue_d = QT.queue_report_dates(queue, season)
     log(f"  report dates: screener={len(screener_d)} filing={len(queue_d)}")
     if not queue_d and queue is not None and not queue.empty:
         log("  WARNING: zero filing dates from a non-empty queue — check the "
@@ -1087,6 +1149,88 @@ def load_company(drive, idx, stmt_fid, repo_id, isin, symbol, name, tables) -> t
     return stmts, register, arsc, gva, deck
 
 
+# --------------------------------------------------------------------------- #
+# self-test — no Drive, no Gemini
+# --------------------------------------------------------------------------- #
+
+def _gva(*rows) -> pd.DataFrame:
+    """Synthetic guidance_vs_actual frame. Columns mirror build_pead_flags.GVA_COLS."""
+    cols = ["isin", "symbol", "period", "metric", "guided", "actual", "delta",
+            "verdict", "source", "cred_score", "cred_pattern", "as_of"]
+    base = {c: None for c in cols}
+    return pd.DataFrame([{**base, **r} for r in rows], columns=cols)
+
+
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print(f"  FAIL {name}")
+
+    pead = {"period": "FY26", "metric": "revenue", "guided": "~15%", "actual": "+21%",
+            "verdict": "BEAT", "source": "pead_concall"}
+    gf = {"period": "Q1FY27", "metric": "ebitda margin", "guided": "18%",
+          "actual": "17.4%", "verdict": "DELIVERED", "source": "gf_track",
+          "cred_score": 3.6, "cred_pattern": "Optimistic Bias", "as_of": "2026-08-01"}
+    early = {"period": "FY28", "metric": "capacity", "guided": "150k units",
+             "verdict": "TOO_EARLY", "source": "gf_track"}
+
+    # THE REGRESSION: a gf_track verdict must survive alongside a pead row.
+    mixed = block_d({"gva": _gva(pead, gf)})
+    check("mixed: pead verdict rendered", "BEAT" in mixed)
+    check("mixed: gf_track verdict rendered", "DELIVERED" in mixed)
+    check("mixed: source column rendered", "gf track" in mixed)
+    check("mixed: credibility line rendered", "3.6 / 5" in mixed)
+    check("mixed: credibility pattern rendered", "Optimistic Bias" in mixed)
+
+    gf_only = block_d({"gva": _gva(gf)})
+    check("gf_track only: verdict rendered", "DELIVERED" in gf_only)
+
+    unmeasured = block_d({"gva": _gva(early)})
+    check("unmeasured: row still shown", "capacity" in unmeasured)
+    check("unmeasured: explained as open", "TOO_EARLY" in unmeasured)
+    check("unmeasured: no credibility score invented", "/ 5" not in unmeasured)
+
+    check("empty gva -> message, no raise",
+          "No guidance" in block_d({"gva": pd.DataFrame()}))
+    check("missing gva -> message, no raise", "No guidance" in block_d({}))
+
+    check("chip: unmeasured only -> NO GUIDANCE", "NO GUIDANCE" in verdict_chip(_gva(early)))
+    check("chip: empty frame -> NO GUIDANCE", "NO GUIDANCE" in verdict_chip(pd.DataFrame()))
+    check("chip: none -> NO GUIDANCE", "NO GUIDANCE" in verdict_chip(None))
+    check("chip: single verdict", ">BEAT<" in verdict_chip(_gva(pead)))
+    mix_chip = verdict_chip(_gva(pead, {**gf, "verdict": "MISSED"}))
+    check("chip: mixed shows counts, not one word",
+          "1 BEAT" in mix_chip and "1 MISSED" in mix_chip)
+    check("chip: unmeasured rows ignored in counts",
+          "TOO_EARLY" not in verdict_chip(_gva(pead, early)))
+
+    # Block A's chip is scoped to the quarter being reported — an all-history tally
+    # would answer a different question than the block it sits in.
+    scoped = _gva(pead, gf)                      # pead=FY26, gf=Q1FY27
+    check("chip: scoped to the reported quarter",
+          ">DELIVERED<" in verdict_chip(scoped, "Q1 FY27"))
+    check("chip: other periods excluded from scope",
+          "BEAT" not in verdict_chip(scoped, "Q1 FY27"))
+    check("chip: spacing in the period label ignored",
+          verdict_chip(scoped, "Q1FY27") == verdict_chip(scoped, "Q1 FY27"))
+    check("chip: quarter with no guidance -> NO GUIDANCE",
+          "NO GUIDANCE" in verdict_chip(scoped, "Q3 FY27"))
+    check("chip: no period -> full history",
+          "1 BEAT" in verdict_chip(scoped) and "1 DELIVERED" in verdict_chip(scoped))
+
+    # credibility must never be invented from pead rows — they carry no score
+    check("no cred line from pead-only", _cred_line(_gva(pead)) == "")
+
+    print(f"\nquarter_teardown self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1114,7 +1258,11 @@ def main() -> None:
                     help="Write the fact-provenance sidecar JSON beside the page.")
     ap.add_argument("--dry-run", action="store_true", help="Never send; write previews.")
     ap.add_argument("--out-dir", default=".")
+    ap.add_argument("--self-test", action="store_true",
+                    help="Offline render checks — no Drive, no Gemini, no mail.")
     args = ap.parse_args()
+    if args.self_test:
+        sys.exit(_self_test())
     if args.daily:
         args.pf = True
         args.mail = True

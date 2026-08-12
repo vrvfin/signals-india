@@ -108,6 +108,59 @@ def norm_q(qs) -> str:
     return f"Q{m.group(1)}FY{int(m.group(2)) % 100:02d}" if m else str(qs).strip()
 
 
+# Every spelling a blank `period` can take once it has been through a parquet round
+# trip. Which one you get depends on the pandas/pyarrow dtype backend: older builds
+# surface None (-> "None"), newer ones NaN (-> "nan"). Testing only for "none" is the
+# bug that made queue_report_dates return ZERO rows on CI while returning 42 locally
+# against byte-identical data.
+_BLANK_PERIOD = {"", "none", "nan", "nat", "<na>", "null"}
+
+
+def queue_report_dates(queue, season: str) -> dict:
+    """{isin: 'YYYY-MM-DD'} — results filings for `season` from the global queue.
+
+    This is the second of the two report-date sources (the first being
+    results.parquet.first_seen_at). It covers the ~150 reporters a season that the
+    25-item Screener /results/latest window never shows, so losing it silently loses
+    a quarter of the coverage.
+
+    Lives here, in the pure-pandas module, because BOTH pf_results_digest and
+    quarter_teardown need it and each previously had its own copy. The older copies
+    mapped announcement_date -> quarter via backfill_company_docs._fy_quarter_label,
+    imported under a try/except that leaves it None whenever the import chain (which
+    pulls ingest_company_docs and its PDF dependencies) fails — i.e. always, on a CI
+    runner, where those deps are not in scripts/requirements.txt. season_quarter()
+    below is documented as byte-identical for the same date and needs only pandas.
+    """
+    if queue is None or getattr(queue, "empty", True):
+        return {}
+    if "doc_type" not in queue.columns or "announcement_date" not in queue.columns:
+        return {}
+    q = queue[queue["doc_type"].astype(str) == "results"].copy()
+    if q.empty:
+        return {}
+    q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)
+    q = q[q["_d"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
+    if q.empty:
+        return {}
+
+    def _per(row) -> str:
+        raw = row.get("period")
+        p = "" if raw is None or (isinstance(raw, float) and pd.isna(raw)) \
+            else str(raw).strip()
+        if p.lower() not in _BLANK_PERIOD:
+            return norm_q(p)
+        try:
+            return norm_q(season_quarter(pd.to_datetime(row["_d"])))
+        except Exception:
+            return ""
+
+    q = q[q.apply(_per, axis=1) == norm_q(season)]
+    if q.empty:
+        return {}
+    return q.groupby(q["isin"].astype(str).str.strip())["_d"].min().to_dict()
+
+
 def _quarterly(stmts_df) -> pd.DataFrame:
     """The quarterly_pl slice, or an empty frame. Annual is NEVER substituted —
     mixing an annual column into a quarter's report is exactly what this digest
