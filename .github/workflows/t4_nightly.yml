@@ -53,7 +53,12 @@ jobs:
     needs: guard
     if: needs.guard.outputs.go == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 was not enough: the run of 2026-08-12 was CANCELLED at 94.6 min inside
+    # "Derive forensic metrics", skipping fraud rules, screener grades, the 8-factor
+    # scorecard, combined strength, the fraud tracker, the FACT table and catalyst
+    # notes. A timeout SIGKILL also cannot run atexit, which is how _extract.lock was
+    # found held by 'live' for 337 minutes.
+    timeout-minutes: 170
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -143,7 +148,7 @@ jobs:
       # Full-universe forensic metrics from fundamentals/statements/ -> lifts
       # financials_derived (and thus fraud_risk) from ~45 to the whole universe.
       - name: Derive forensic metrics (full universe from statements)
-        run: python scripts/build_derived_from_statements.py --workers 12
+        run: python scripts/build_derived_from_statements.py --workers 24
         continue-on-error: true
 
       - name: Financial fraud rules (T2 forensics)
