@@ -156,9 +156,15 @@ jobs:
         run: python scripts/extract_rating.py
         continue-on-error: true
 
-      - name: Extract investor presentations
+      # --teardown adds ONE extra structured pass per deck, for PF/watchlist ISINs only,
+      # writing solely to deck_*.parquet. It fills blocks C/E/F of the quarterly teardown
+      # (operating engine, deck-vs-deck diff, framing flags), which stay empty until it
+      # runs. It MUST run here at ingest: source PDFs are deleted 2 days after processing
+      # (retention rule 1), so a deck cannot be re-read afterwards. Every row it stores
+      # must quote the deck verbatim or it is dropped at parse time.
+      - name: Extract investor presentations (+ PF deck teardown)
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/extract_presentation.py
+        run: python scripts/extract_presentation.py --teardown
         continue-on-error: true
 
       - name: Extract annual reports

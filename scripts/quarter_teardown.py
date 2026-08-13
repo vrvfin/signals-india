@@ -1280,7 +1280,8 @@ def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tup
     return out
 
 
-def _write_and_send(args, drive, idx, season, pages, reported, body, subject, log) -> None:
+def _write_and_send(args, drive, idx, season, pages, reported, body, subject, log,
+                    attachments=None) -> None:
     """Write the preview, then send if this environment can. Shared by the day-grouped
     and per-company mail paths so the ledger/toggle/credential rules cannot diverge."""
     prev = os.path.join(args.out_dir, "quarter_teardown_preview.html")
@@ -1677,7 +1678,22 @@ def main() -> None:
             body = render_by_day(pages, reported, qlabel, len(pf_all)) \
                 + render_awaiting(awaiting)
             log(f"  day-grouped body: {len(body.encode()):,} B")
-            _write_and_send(args, drive, idx, season, pages, reported, body, subject, log)
+            # The body must stay under Gmail's ~102 KB clip, so the summary is compact.
+            # The FULL teardown for every company rides along as one attached HTML file
+            # — all companies AND all detail, without having to choose between them.
+            atts = None
+            if pages:
+                full = _page_shell(
+                    subject,
+                    f"<h2 style='margin:0 0 10px'>{esc(qlabel, 16)} &mdash; full teardown, "
+                    f"{len(pages)} companies</h2>"
+                    + "<hr>".join(h for _s, _d, h in pages))
+                fname = f"teardown_{qlabel.replace(' ', '')}_{len(pages)}co.html"
+                atts = [(fname, full.encode("utf-8"), "html")]
+                log(f"  attachment: {fname} ({len(full.encode()):,} B, "
+                    f"{len(pages)} full teardowns)")
+            _write_and_send(args, drive, idx, season, pages, reported, body, subject,
+                            log, attachments=atts)
             return
         body = "<hr>".join(h for _s, _d, h in pages)
         if len(body.encode()) > MAX_HTML_BYTES:
@@ -1715,7 +1731,7 @@ def main() -> None:
                     "are not set in this environment. The preview above is the exact "
                     "body that would go out. Add them to .env, or run this from CI.")
             else:
-                ok = send_email(subject, body)
+                ok = send_email(subject, body, attachments=attachments or None)
                 log(f"  mail sent={ok}  ({subject.encode('ascii', 'ignore').decode()})")
                 # Ledger is stamped ONLY after a confirmed send — a failed or toggled-off
                 # mail must not mark the work as delivered.
