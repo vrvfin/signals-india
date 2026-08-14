@@ -132,20 +132,33 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
         if not metric:
             continue
 
-        # Value from current-quarter column
-        if q_col is not None and q_col < len(cells):
+        low_label = cells[0].lower()
+
+        # A row labelled "PAT Margin %" identifies as `pat`, because METRIC_ALIASES is
+        # first-match-wins with ("pat","pat") ahead of ("margin","margin") — so its
+        # percentage was being written into pat_cr, clobbering the real PAT. Measured
+        # 2026-08-14: only 25 of 123 stored rows had a numeric pat_cr. Margin rows are
+        # captured by MARGIN_MAP below and must never write an absolute field.
+        # The same first-match rule corrupted ebitda_cr from "EBITDA Margin %".
+        is_margin_row = "margin" in low_label
+
+        # Value from current-quarter column. Anything that is not a plain number is
+        # dropped rather than stored: a repeated header row put the literal string
+        # 'Revenue (Cr)' into revenue_cr on 49 of 123 rows, and a '%' in an absolute
+        # field is always a mis-parse. Absent beats wrong.
+        if q_col is not None and q_col < len(cells) and not is_margin_row:
             raw = clean_val(cells[q_col])
-            if metric in ("revenue", "sales") and raw != "NA":
+            numeric = raw != "NA" and "%" not in raw and try_float(raw) is not None
+            if metric in ("revenue", "sales") and numeric:
                 facts["revenue_cr"] = raw
-            elif metric == "ebitda" and raw != "NA":
+            elif metric == "ebitda" and numeric:
                 facts["ebitda_cr"] = raw
-            elif metric == "pat" and raw != "NA":
+            elif metric == "pat" and numeric:
                 facts["pat_cr"] = raw
-            elif metric == "eps" and raw != "NA":
+            elif metric == "eps" and numeric:
                 facts["eps"] = raw
 
         # Margin rows (labelled like "EBITDA Margin %" or "PAT Margin %")
-        low_label = cells[0].lower()
         for pfx, col_name in MARGIN_MAP.items():
             if pfx in low_label and "margin" in low_label:
                 if q_col is not None and q_col < len(cells):

@@ -769,7 +769,10 @@ def set_phase2_beacon(drive, index_id: str) -> None:
     """Announce 'Phase 2 wants the lock'. Idempotent; refreshes the timestamp."""
     try:
         fid = find_file(drive, index_id, _PHASE2_BEACON)
-        payload = datetime.now().isoformat(timespec="seconds").encode("utf-8")
+        # UTC — see the note on acquire_lock. Writer and reader may sit in different
+        # timezones (CI is UTC, a dev box is IST), and a naive local stamp makes this
+        # beacon read 330 min old the moment a local process looks at it.
+        payload = datetime.utcnow().isoformat(timespec="seconds").encode("utf-8")
         upload_bytes(drive, index_id, _PHASE2_BEACON, payload, "text/plain",
                      existing_id=fid)
     except Exception as e:
@@ -796,7 +799,7 @@ def phase2_beacon_fresh(drive, index_id: str,
         ts = datetime.fromisoformat(ts_str) if ts_str else None
         if not ts:
             return False
-        return (datetime.now() - ts).total_seconds() / 60.0 < max_age_min
+        return (datetime.utcnow() - ts).total_seconds() / 60.0 < max_age_min
     except Exception:
         return False                                 # fail-open: don't block backfill
 
@@ -816,7 +819,22 @@ def acquire_lock(drive, index_id: str, lock_name: str, owner: str,
     A genuinely-held lock persists; a just-released one disappears once Drive's
     file-list index settles, so a fresh foreign lock is re-checked after a short nap
     before yielding (absorbs sequential hand-off lag). Uncontended acquires pay
-    nothing."""
+    nothing.
+
+    TIMESTAMPS ARE UTC ON BOTH SIDES — do not "simplify" this back to datetime.now().
+    The stamp is written by one process and aged by another, and those two need not
+    share a timezone: CI runners are UTC, a dev box here is IST (+5:30). With naive
+    local stamps, a local run reading a CI-written lock computes an age 330 minutes
+    too large. Observed 2026-08-14: a live Phase-2 lock 30 minutes old was reported as
+    360 minutes — exactly max_age_min — so the next local run of ANY lock-taking
+    script would have declared it stale and stolen it mid-extraction, putting two
+    writers on processing_queue.parquet and company_page.md. The beacon had the same
+    fault in the opposite direction: a CI beacon looked permanently stale to a local
+    reader, so backfill would never yield to Phase 2.
+
+    In CI nothing changes — utcnow() == now() on a UTC runner. A lock written by the
+    OLD code on a local box reads as negative age here, which errs toward never
+    stealing: the safe direction."""
     if defer_to_phase2 and phase2_beacon_fresh(drive, index_id):
         log(f"  Phase 2 active — '{owner}' yields {lock_name}, exiting cleanly.")
         return False
@@ -833,7 +851,7 @@ def acquire_lock(drive, index_id: str, lock_name: str, owner: str,
             content = download_bytes(drive, fid).decode("utf-8", errors="replace")
             ts_str = content.split("|", 2)[1] if "|" in content else ""
             ts = datetime.fromisoformat(ts_str) if ts_str else None
-            age_min = ((datetime.now() - ts).total_seconds() / 60.0) if ts else 1e9
+            age_min = ((datetime.utcnow() - ts).total_seconds() / 60.0) if ts else 1e9
         except Exception as e:
             log(f"  LOCK {lock_name} read failed ({str(e)[:60]}) — overwriting.")
             break
@@ -853,7 +871,7 @@ def acquire_lock(drive, index_id: str, lock_name: str, owner: str,
         log(f"  LOCK {lock_name} held by '{content.split('|')[0]}' "
             f"({age_min:.0f} min) — exiting cleanly.")
         return False
-    payload = f"{owner}|{datetime.now().isoformat(timespec='seconds')}".encode("utf-8")
+    payload = f"{owner}|{datetime.utcnow().isoformat(timespec='seconds')}".encode("utf-8")
     upload_bytes(drive, index_id, lock_name, payload, "text/plain", existing_id=fid)
     return True
 

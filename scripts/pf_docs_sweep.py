@@ -61,6 +61,106 @@ from _extractor_base import (get_drive, get_or_create_subfolder, load_queue, sav
 
 _LOCK_NAME = "_extract.lock"
 
+
+def hydrate(drive, idx, repo_id, args) -> None:
+    """Download the PDF for queued rows that never got one, and fill drive_file_id.
+
+    WHY THIS EXISTS. `--enqueue` writes rows with `drive_file_id=""` — it records the
+    document, it does not fetch it. But every extractor skips exactly that case:
+
+        extract_results.py:  drive_fid = str(row.get("drive_file_id") or "").strip()
+                             if not drive_fid: log("  SKIP: no drive_file_id"); continue
+
+    and `ingest_company_docs.py` only ever APPENDS newly-discovered feed rows — it never
+    revisits an existing pending row to fill the id in. So a swept row could never be
+    processed by anything, ever. Measured on Drive 2026-08-14: 30 rows stranded this way
+    (24 results, 5 rating, 1 presentation) going back to 31 Jul, including both of
+    OBSCP's Q1 FY27 filings — the very documents this sweep was written to rescue.
+
+    Downloading is delegated to `ingest_company_docs.download_pdf`, which carries the
+    BSE Akamai workaround (AnnPdfOpen.aspx serves an HTML block page for real PDFs;
+    the same attachment is un-blocked under AttachLive/AttachHis). Re-implementing that
+    here would mean re-learning it the hard way.
+    """
+    from _extractor_base import upload_bytes
+    # Imported lazily: this pulls the Screener/BSE fetch stack, which the report-only
+    # path has no need of.
+    from ingest_company_docs import download_pdf, screener_session
+
+    queue = load_queue(drive, idx)
+    if queue.empty:
+        log("Queue is empty — nothing to hydrate.")
+        return
+    pend = queue[(queue["status"].astype(str) == "pending")
+                 & (queue["pdf_url"].astype(str).str.strip() != "")
+                 & (queue["drive_file_id"].astype(str).str.strip() == "")]
+    if args.symbols:
+        want = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        pend = pend[pend["symbol"].astype(str).str.upper().isin(want)]
+    if pend.empty:
+        log("No queued rows are missing their PDF — nothing to hydrate.")
+        return
+
+    log(f"Stranded rows (pending, have a url, no Drive file): {len(pend)}")
+    for dt, n in pend["doc_type"].value_counts().items():
+        log(f"   {str(dt):<14} {n}")
+    idxs = list(pend.index)[: args.limit] if args.limit else list(pend.index)
+
+    if args.dry_run:
+        for i in idxs:
+            r = queue.loc[i]
+            log(f"   WOULD FETCH {str(r['announcement_date'])[:10]}  "
+                f"{str(r['symbol']):<12} {str(r['doc_type']):<13} "
+                + str(r["title"])[:52].encode("ascii", "ignore").decode())
+        log(f"\nDRY RUN — {len(idxs)} document(s) would be downloaded. No writes.")
+        return
+
+    if not acquire_lock(drive, idx, _LOCK_NAME, "pf_sweep", max_age_min=360, wait_min=10):
+        log("Could not take the extract lock — skipping the write this run.")
+        return
+    try:
+        queue = load_queue(drive, idx)          # re-read under the lock
+        session = screener_session()
+        done = failed = 0
+        for i in idxs:
+            if i not in queue.index:
+                continue
+            r = queue.loc[i]
+            if str(r.get("drive_file_id") or "").strip():
+                continue                        # another run got there first
+            sym = str(r["symbol"])
+            try:
+                pdf = download_pdf(session, str(r["pdf_url"]))
+                if not pdf:
+                    # Leave it pending: the url may work later, and marking it done
+                    # would bury the document permanently.
+                    log(f"  ! {sym:<12} download returned nothing — left pending")
+                    failed += 1
+                    continue
+                key = str(r.get("key") or r.get("isin") or sym)
+                comp_id = get_or_create_subfolder(drive, repo_id, key)
+                docs_id = get_or_create_subfolder(drive, comp_id, "documents")
+                fname = (f"{r['doc_type']}__{str(r['announcement_date'])[:10]}__"
+                         f"{r['doc_id']}.pdf")
+                fid = upload_bytes(drive, docs_id, fname, pdf, "application/pdf")
+                queue.loc[i, "drive_file_id"] = fid
+                done += 1
+                log(f"  + {sym:<12} {str(r['doc_type']):<13} {len(pdf):,} bytes")
+            except Exception as e:
+                log(f"  ! {sym:<12} {str(e)[:70]} — left pending")
+                failed += 1
+            time.sleep(args.sleep)
+            # Save as we go: a crash halfway must not throw away the uploads already
+            # made, or the next run re-downloads them.
+            if done and done % 5 == 0:
+                save_queue(drive, idx, queue)
+        if done:
+            save_queue(drive, idx, queue)
+        log(f"Hydrated {done} document(s); {failed} left pending. "
+            f"The doc-type extractors can now drain them.")
+    finally:
+        release_lock(drive, idx, _LOCK_NAME)
+
 # Link text -> doc_type. Order matters: first match wins.
 DOC_PATTERNS = [
     ("results", ("outcome of board meeting", "financial result", "press release",
@@ -177,13 +277,23 @@ def main() -> None:
                     help="Append missing docs to processing_queue as status=pending.")
     ap.add_argument("--dry-run", action="store_true", help="Report only; never write.")
     ap.add_argument("--sleep", type=float, default=1.2)
+    ap.add_argument("--hydrate", action="store_true",
+                    help="Download the PDF for already-queued rows that have a url but "
+                         "no Drive file, so the extractors can drain them. Does not "
+                         "sweep Screener.")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="With --hydrate: cap how many documents to fetch this run.")
     args = ap.parse_args()
 
     from screener_client import ScreenerClient
     drive = get_drive()
     root = os.environ["GDRIVE_FOLDER_ID"]
-    idx = get_or_create_subfolder(
-        drive, get_or_create_subfolder(drive, root, "company_repo"), "_index")
+    repo_id = get_or_create_subfolder(drive, root, "company_repo")
+    idx = get_or_create_subfolder(drive, repo_id, "_index")
+
+    if args.hydrate:
+        hydrate(drive, idx, repo_id, args)
+        return
 
     from daily_brief import load_pf
     pf = load_pf(drive, root, idx)
@@ -231,6 +341,7 @@ def main() -> None:
 
     if args.dry_run or not args.enqueue:
         log("\nReport only. Re-run with --enqueue to add these to processing_queue.")
+        log("Already-queued rows still needing their PDF: use --hydrate.")
         return
 
     if not acquire_lock(drive, idx, _LOCK_NAME, "pf_sweep", max_age_min=360, wait_min=10):

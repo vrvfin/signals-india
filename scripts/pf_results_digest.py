@@ -61,15 +61,24 @@ from daily_brief import load_pf
 from mailer import send_email, load_mail_settings, esc
 from seasons import is_peak_season
 import quarterly_table as QT
+import filing_results as FR
 
 LEDGER_NAME = "pf_results_digest.parquet"
+# `data_source` added 2026-08-14 (ADDITIVE — old rows read NaN and are treated as
+# "screener"): records whether a company was mailed off Screener's statements or off
+# its own filing, so the filing-sourced version can be re-mailed once the full table
+# lands. Adding a column is safe; readers get NaN for old rows.
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "name", "quarter_label",
-               "reported_on", "date_source", "first_covered_at", "last_mailed_at"]
+               "reported_on", "date_source", "data_source",
+               "first_covered_at", "last_mailed_at"]
 MAIL_KEY = "pf_results"
 
 # only the columns the date cascade needs (load_parquet slices to exactly these)
 RESULTS_COLS = ["isin", "latest_q", "first_seen_at", "scraped_at"]
-QUEUE_COLS = ["isin", "doc_type", "period", "announcement_date"]
+# doc_id / title / pdf_url are for the filing_results join: results_gemini carries no
+# filing date of its own, only the timestamp Gemini ran at.
+QUEUE_COLS = ["isin", "doc_type", "period", "announcement_date",
+              "doc_id", "title", "pdf_url"]
 
 # Gmail clips a message around 102 KB behind a "View entire message" link, which
 # would cut the mail off mid-table. Past this the already-covered tail collapses
@@ -130,9 +139,22 @@ def resolve_date(isin, screener_d, queue_d, prev_row, today):
 
 
 # ── coverage ─────────────────────────────────────────────────────────────────
-def build_coverage(pf, stmts_map, results, queue, ledger, season, today):
-    """(covered_rows, awaiting_rows). `covered` = the company's newest quarterly_pl
-    column IS the season quarter — the no-mixing guard."""
+def build_coverage(pf, stmts_map, results, queue, ledger, season, today, filings=None):
+    """(covered_rows, awaiting_rows). `covered` = this holding has reported the season
+    quarter, by EITHER of two routes, recorded per row as `data_source`:
+
+      screener  the newest quarterly_pl column IS the season quarter (the full table)
+      filing    Screener has not republished yet, but the company's own filing has
+                been extracted into results_gemini for this quarter (one quarter, no
+                history — rendered as its own card, never as a column in a Screener
+                table)
+
+    The no-mixing guard is unchanged: a holding whose statements still sit on an older
+    quarter never gets a 6-quarter table under this quarter's heading. The filing route
+    adds a company the mail would otherwise not mention at all — VMARCIND and OBSCP
+    filed on 12 Aug and were invisible in this mail for days because Screener lagged.
+    """
+    filings = filings or {}
     prev = {}
     if ledger is not None and not ledger.empty:
         for _, r in ledger[ledger["season_quarter"].astype(str)
@@ -141,13 +163,32 @@ def build_coverage(pf, stmts_map, results, queue, ledger, season, today):
 
     screener_d = _results_dates(results, season)
     queue_d = _queue_dates(queue, season)
-    log(f"report dates available: screener={len(screener_d)} queue={len(queue_d)}")
+    log(f"report dates available: screener={len(screener_d)} queue={len(queue_d)} "
+        f"filing={len(filings)}")
 
     covered, awaiting = [], []
     for isin, sym, name in pf:
         stmts = stmts_map.get(sym)
         lbl = QT.latest_quarter_label(stmts)
         if lbl is None or QT.norm_q(lbl) != QT.norm_q(season):
+            fil = filings.get(isin)
+            if fil is not None:
+                p = prev.get(isin)
+                covered.append({
+                    "season_quarter": season, "isin": isin, "symbol": sym, "name": name,
+                    "quarter_label": fil["quarter"],
+                    "reported_on": fil.get("filed_on") or queue_d.get(isin) or today,
+                    "date_source": "filing", "data_source": "filing",
+                    "first_covered_at": (str(p["first_covered_at"])[:10]
+                                         if p is not None
+                                         and str(p.get("first_covered_at") or "").strip()
+                                         else today),
+                    "last_mailed_at": (str(p.get("last_mailed_at") or "")
+                                       if p is not None else ""),
+                    "upgraded": False,
+                    "stmts": None, "filing": fil,
+                })
+                continue
             awaiting.append({"isin": isin, "symbol": sym, "name": name,
                              "quarter_label": lbl or "",
                              "reason": "no quarterly data" if lbl is None else f"still {lbl}"})
@@ -158,14 +199,22 @@ def build_coverage(pf, stmts_map, results, queue, ledger, season, today):
         if p is not None and str(p.get("date_source") or "") in SRC_RANK:
             if SRC_RANK[src] > SRC_RANK[str(p["date_source"])]:
                 rep, src = str(p["reported_on"])[:10], str(p["date_source"])
+        # A holding mailed earlier off its own filing now has the full Screener table.
+        # Treat that as new for exactly one mail so the 6-quarter history actually
+        # reaches the reader instead of being suppressed by the already-mailed ledger.
+        was_filing = (p is not None
+                      and str(p.get("data_source") or "screener").strip() == "filing")
         covered.append({
             "season_quarter": season, "isin": isin, "symbol": sym, "name": name,
             "quarter_label": lbl, "reported_on": rep, "date_source": src,
-            "first_covered_at": (str(p["first_covered_at"])[:10]
-                                 if p is not None and str(p.get("first_covered_at") or "").strip()
-                                 else today),
+            "data_source": "screener", "upgraded": was_filing,
+            "first_covered_at": (today if was_filing else
+                                 (str(p["first_covered_at"])[:10]
+                                  if p is not None
+                                  and str(p.get("first_covered_at") or "").strip()
+                                  else today)),
             "last_mailed_at": (str(p.get("last_mailed_at") or "") if p is not None else ""),
-            "stmts": stmts,
+            "stmts": stmts, "filing": None,
         })
     covered.sort(key=lambda r: (r["reported_on"], r["symbol"]), reverse=True)
     awaiting.sort(key=lambda r: r["symbol"])
@@ -183,7 +232,69 @@ def _fmt_day(d: str) -> str:
         return str(d)[:10]
 
 
+def _filing_block(row) -> str:
+    """One quarter, straight from the exchange filing, for a holding Screener has not
+    republished yet.
+
+    Deliberately NOT a 6-quarter table with the filing pasted into the last column.
+    The filing may be consolidated where Screener is standalone, and its "Revenue"
+    need not tie to Screener's "Sales" — putting the two bases in one row would hide
+    that. One quarter, labelled, on its own.
+    """
+    f = row.get("filing") or {}
+    sym, name = esc(row["symbol"], 24), esc(row["name"], 70)
+    when = _fmt_day(row["reported_on"])
+
+    def _line(label, val, dp, suffix, extra=""):
+        if val is None:
+            return ""
+        return (f"<tr><td>{label}</td>"
+                f"<td style='text-align:right;font-weight:700'>"
+                f"{format(val, f',.{dp}f')}{suffix}</td>"
+                f"<td style='color:#666'>{extra}</td></tr>")
+
+    def _yoy(v):
+        if v is None:
+            return ""
+        col = QT.UP if v >= 0 else QT.DOWN
+        return f"<span style='color:{col};font-weight:700'>{v:+.1f}% YoY</span>"
+
+    rows = (
+        _line("Revenue", f.get("revenue_cr"), 2, " Cr", _yoy(f.get("revenue_yoy_pct")))
+        + _line("EBITDA", f.get("ebitda_cr"), 2, " Cr",
+                "" if f.get("ebitda_margin_pct") is None
+                else f"{f['ebitda_margin_pct']:.2f}% margin")
+        + _line("PAT", f.get("pat_cr"), 2, " Cr", _yoy(f.get("pat_yoy_pct")))
+        + _line("EPS", f.get("eps"), 2, "", "")
+    )
+    # Margins survive even when the absolute line did not parse, so show them rather
+    # than leaving the company with a single revenue figure.
+    if f.get("pat_cr") is None and f.get("pat_margin_pct") is not None:
+        rows += ("<tr><td>PAT margin</td>"
+                 f"<td style='text-align:right;font-weight:700'>"
+                 f"{f['pat_margin_pct']:.2f}%</td>"
+                 "<td style='color:#666'>absolute PAT not readable in the filing</td></tr>")
+    if not rows:
+        return ""
+
+    title = esc(str(f.get("title") or "")[:70], 70)
+    return (
+        "<div style='margin:0 0 14px 0;border-left:3px solid #b8860b;padding-left:9px'>"
+        f"<div style='font-size:14px;font-weight:700;color:#111'>{name} "
+        f"<span style='color:#888;font-weight:400'>· {sym}</span></div>"
+        f"<div style='color:#b8860b;font-size:11px;margin:0 0 3px'>"
+        f"{esc(row['quarter_label'], 12)} · from the exchange filing, {esc(when, 12)}"
+        + (f" · {title}" if title else "") + "</div>"
+        f"<table cellpadding='4' cellspacing='0' style='{QT._TBL}'>{rows}</table>"
+        "<div style='color:#999;font-size:10.5px;margin-top:2px'>"
+        "Screener has not republished this company yet, so there is no quarter history "
+        "to compare against. The full table follows once it does.</div></div>"
+    )
+
+
 def _company_block(row) -> str:
+    if row.get("data_source") == "filing":
+        return _filing_block(row)
     table = QT.quarterly_table_html(row["stmts"])
     if not table:
         return ""
@@ -210,6 +321,24 @@ def _compact_rows(rows) -> str:
             + "</tr>")
     body = ""
     for r in rows:
+        if r.get("data_source") == "filing":
+            # No statements to headline off — take the filing's own figures, and mark
+            # the row so a filing number is never read as a Screener one.
+            f = r.get("filing") or {}
+            def _fv(v, dp=0):
+                return "—" if v is None else format(v, f",.{dp}f")
+            def _fg(v):
+                if v is None:
+                    return "<td style='color:#bbb'>—</td>"
+                col = QT.UP if v >= 0 else QT.DOWN
+                return f"<td style='font-weight:700;color:{col}'>{v:+.0f}%</td>"
+            body += (f"<tr><td style='text-align:left'><b>{esc(r['symbol'], 24)}</b>"
+                     f"<span style='color:#b8860b'> (filing)</span></td>"
+                     f"<td>{_fmt_day(r['reported_on'])}</td>"
+                     f"<td>{_fv(f.get('revenue_cr'))}</td>{_fg(f.get('revenue_yoy_pct'))}"
+                     f"<td>{_fv(f.get('pat_cr'))}</td>{_fg(f.get('pat_yoy_pct'))}"
+                     f"<td>{_fv(f.get('pat_margin_pct'), 1)}</td></tr>")
+            continue
         h = QT.headline(r["stmts"])
         if not h:
             continue
@@ -239,9 +368,11 @@ def build_html(covered, awaiting, season, today, pf_n, in_window,
     season_lbl = esc(f"{season[:2]} {season[2:]}", 12)   # Q1FY27 -> "Q1 FY27"
     done = len(covered) >= pf_n and pf_n > 0
 
+    n_filing = sum(1 for r in covered if r.get("data_source") == "filing")
     head = (f"<h2 style='margin:0 0 2px'>📊 PF results — {season_lbl}</h2>"
             f"<div style='color:#888;font-size:12px;margin:0 0 8px'>"
             f"{len(covered)} of {pf_n} holdings reported · as of {today}"
+            + (f" · {n_filing} from the filing, awaiting Screener" if n_filing else "")
             + ("" if in_window else " · season window closed") + "</div>")
     if done:
         head += ("<div style='background:#e8f5e9;border-left:3px solid #1a7a3a;"
@@ -282,7 +413,11 @@ def build_html(covered, awaiting, season, today, pf_n, in_window,
              "Revenue / Net Profit in ₹ Cr, EPS in ₹, margins in %. "
              "YoY = same quarter last year; QoQ = previous quarter; "
              "margin deltas in percentage points. Source: Screener quarterly P&amp;L."
-             "</div>")
+             + (" Blocks marked <b>from the exchange filing</b> were read from the "
+                "company's own results filing because Screener has not republished it "
+                "yet — one quarter, no history, and not comparable line-for-line with "
+                "the Screener tables above." if n_filing else "")
+             + "</div>")
     return f"<div style='{_WRAP}'>{head}{body}{foot}</div>"
 
 
@@ -324,11 +459,22 @@ def main():
     queue = load_parquet(drive, index_id, "processing_queue.parquet", QUEUE_COLS)
     ledger = load_parquet(drive, index_id, LEDGER_NAME, LEDGER_COLS)
 
-    covered, awaiting = build_coverage(pf, stmts_map, results, queue, ledger, season, today)
+    # The filing fallback: companies whose own results filing has been extracted but
+    # whose Screener statements still sit on the previous quarter.
+    filings = FR.load_filing_results(drive, index_id, season, queue=queue, log=log)
+
+    covered, awaiting = build_coverage(pf, stmts_map, results, queue, ledger, season,
+                                       today, filings=filings)
     new_today = [r for r in covered if str(r["first_covered_at"])[:10] == today]
     never_mailed = [r for r in covered if not str(r["last_mailed_at"] or "").strip()]
-    log(f"covered={len(covered)} awaiting={len(awaiting)} "
-        f"new_today={len(new_today)} never_mailed={len(never_mailed)}")
+    upgraded = [r for r in covered if r.get("upgraded")]
+    n_filing = sum(1 for r in covered if r.get("data_source") == "filing")
+    log(f"covered={len(covered)} (filing-sourced={n_filing}) awaiting={len(awaiting)} "
+        f"new_today={len(new_today)} never_mailed={len(never_mailed)} "
+        f"upgraded={len(upgraded)}")
+    if upgraded:
+        log("  Screener caught up for: "
+            + ", ".join(r["symbol"] for r in upgraded))
 
     if not covered:
         log(f"no PF holding has reported {season} yet — no mail.")
@@ -345,7 +491,7 @@ def main():
     if args.dry_run:
         show = pd.DataFrame([{k: r[k] for k in
                               ("symbol", "quarter_label", "reported_on", "date_source",
-                               "first_covered_at")} for r in covered])
+                               "data_source", "first_covered_at")} for r in covered])
         print(show.to_string(index=False))
         if awaiting:
             print("\nAWAITING:")
@@ -357,9 +503,11 @@ def main():
               f"({len(html.encode('utf-8')) / 1024:.0f} KB); no Drive write, no mail.")
         return
 
-    # stop rule: mail daily while incomplete; one final mail when coverage completes
+    # stop rule: mail daily while incomplete; one final mail when coverage completes.
+    # An upgrade (filing -> Screener) re-opens the mail even when everything is
+    # complete and already mailed, or the fuller table would never be delivered.
     complete = len(covered) >= len(pf)
-    if complete and not never_mailed and not args.force:
+    if complete and not never_mailed and not upgraded and not args.force:
         log("season complete and already mailed — no mail. (--force to override)")
         return
 
@@ -370,6 +518,7 @@ def main():
     season_lbl = f"{season[:2]} {season[2:]}"
     subject = (f"📊 PF results {season_lbl} — {len(covered)}/{len(pf)} reported"
                + (f" · {len(new_today)} new" if new_today else "")
+               + (f" · {n_filing} from filings" if n_filing else "")
                + (" · complete" if complete else ""))
     sent = send_email(subject, html)
     # ascii-only in log lines — local console is cp1252, emoji crash print()

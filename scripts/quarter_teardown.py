@@ -44,6 +44,8 @@ import quarterly_table as QT
 import redflag_register as RR
 import ar_scorecard as ARS
 import deck_teardown as DT
+import filing_results as FR
+import season_summary as SS
 from provenance import (Fact, MISSING, SCREENER, ANNUAL, QUARTERLY, write_audit, audit)
 
 MAIL_KEY = "quarter_teardown"
@@ -304,7 +306,10 @@ def build_facts(isin: str, symbol: str, name: str, stmts: pd.DataFrame,
                          ("interest_coverage", "x"), ("roce_pct", "%"),
                          ("roe_pct", "%"), ("rev_cagr_3y_pct", "%"),
                          ("receivable_days", "days"), ("inventory_days", "days"),
-                         ("wc_days", "days"), ("ccc_days", "days")):
+                         ("wc_days", "days"), ("ccc_days", "days"),
+                         # build_derived_metrics has always emitted these two; H1 simply
+                         # never read them. The cash-flow panel needs them.
+                         ("fcf", "Cr"), ("fcf_sales_pct", "%")):
         m = _derived_map(derived, isin, metric)
         ser = _ordered_annual(m)
         if not ser:
@@ -633,12 +638,233 @@ def block_a(d: dict) -> str:
             + _tbl(["Metric", d["quarter"], "YoY", "QoQ"], rows))
 
 
+# ---- Block B card ---------------------------------------------------------------
+# Three panels, side by side, meant to answer "are these earnings real?" in about ten
+# seconds: is the profit operating, is the balance sheet paying for it, did it become
+# cash. Panel 1 is QUARTERLY; panels 2 and 3 are ANNUAL and carry an FY stamp, because
+# Screener publishes balance sheet and cash flow once a year. They are never combined
+# into one derived number — provenance.Fact.derive refuses mixed grains by design, and
+# an unlabelled annual ratio beside a quarterly one is the error this file exists to
+# prevent.
+#
+# Style discipline (see render_compact): font/colour live on the container, cells stay
+# bare. This card renders once per company, so a repeated ~95-char inline style per
+# cell is what pushes the mail past Gmail's clip threshold.
+_CARD = ("border-collapse:collapse;width:100%;font:12px Arial,Helvetica,sans-serif;"
+         "color:#222;margin:4px 0 14px")
+_PANEL = "vertical-align:top;padding:0 6px 0 0"
+_INNER = ("border-collapse:collapse;width:100%;font:11.5px Arial,Helvetica,sans-serif;"
+          "color:#222")
+
+
+def _chip(label: str, colour: str) -> str:
+    return (f"<span style='background:{colour};color:#fff;border-radius:3px;"
+            f"padding:1px 6px;font-size:10.5px;font-weight:700'>{label}</span>")
+
+
+def _trend(series, dp=2) -> str:
+    """'0.82 &rarr; 1.10 &rarr; 0.94' — the last few annual readings, oldest first."""
+    if not series:
+        return ""
+    vals = [v for _p, v in series[-4:] if v is not None]
+    if len(vals) < 2:
+        return ""
+    return " &rarr; ".join(f"{v:,.{dp}f}" for v in vals)
+
+
+def _panel(title: str, stamp: str, chip: str, colour: str, rows: list) -> str:
+    """One panel. `rows` = [(label, value_html, note)]."""
+    body = "".join(
+        f"<tr><td>{lab}</td>"
+        f"<td style='text-align:right;font-weight:700'>{val}</td></tr>"
+        + (f"<tr><td colspan='2' style='color:{MUTED};font-size:10.5px;"
+           f"padding-bottom:3px'>{note}</td></tr>" if note else "")
+        for lab, val, note in rows)
+    if not body:
+        body = (f"<tr><td colspan='2' style='color:{MUTED}'>not computed</td></tr>")
+    return (
+        f"<td style='{_PANEL}'>"
+        f"<div style='border:1px solid #e0e6ea;border-left:3px solid {colour};"
+        f"background:#f6f8f9;padding:7px 9px'>"
+        f"<div style='font-size:11px;font-weight:700;color:#34495e;text-transform:uppercase;"
+        f"letter-spacing:.3px'>{title} {chip}</div>"
+        + (f"<div style='color:{MUTED};font-size:10.5px;margin:0 0 4px'>{stamp}</div>"
+           if stamp else "<div style='height:3px'></div>")
+        + f"<table cellpadding='2' cellspacing='0' style='{_INNER}'>{body}</table>"
+        f"</div></td>")
+
+
+def _panel_bridge(B: dict) -> str:
+    """Panel 1 — the adjusted-PAT bridge, every line shown so it ties out by hand."""
+    rows, chip, colour = [], "", "#34495e"
+    if B["adjusted_pat"].present:
+        gap = B.get("adjusted_gap")
+        oi_e, tax_n, adj = B["oi_effect"], B["tax_norm"], B["adjusted_pat"]
+        g = gap.num if gap and gap.present else None
+        # A quarter whose adjusted profit is materially below reported was carried by
+        # other income or a soft tax rate — that is the whole point of the bridge.
+        if g is None:
+            chip, colour = "", "#34495e"
+        elif g <= -5:
+            chip, colour = _chip("FLATTERED", DOWN), DOWN
+        elif g >= 5:
+            chip, colour = _chip("UNDERSTATED", UP), UP
+        else:
+            chip, colour = _chip("CLEAN", UP), UP
+        # The bridge subtracts oi_effect. When other income FELL year on year the
+        # effect is negative, so the line is an ADD-back — printing a hardcoded minus
+        # in front of it produced "−-0.7".
+        oi_line = -(oi_e.num or 0.0)
+        rows = [
+            ("Reported PAT", fmt(B["pat"], 1, ""), ""),
+            ("Less: rise in other income",
+             f"<span style='color:{DOWN if oi_line < 0 else UP}'>"
+             f"{oi_line:+,.1f}</span>",
+             esc(oi_e.note, 90)),
+            ("Add: over/under-tax vs normal",
+             (f"<span style='color:{UP}'>+{fmt(tax_n, 1, '')}</span>"
+              if (tax_n.num or 0) >= 0
+              else f"<span style='color:{DOWN}'>{fmt(tax_n, 1, '')}</span>"),
+             esc(tax_n.note, 90)),
+            ("<b>Adjusted PAT</b>", f"<b>{fmt(adj, 1, '')}</b>",
+             f"<b>{signed(gap)}</b> vs reported"),
+        ]
+    else:
+        rows = [("Adjusted PAT", "&mdash;",
+                 esc(B["adjusted_pat"].note, 90))]
+    return _panel("Adjusted PAT", "&#8377; Cr &middot; this quarter", chip, colour, rows)
+
+
+def _panel_balance(H1: dict) -> str:
+    """Panel 2 — what the balance sheet did while the profit was earned. ANNUAL."""
+    fy = esc(str(H1.get("_fy") or ""), 12)
+    rows, adverse = [], 0
+
+    def _last_move(key):
+        ser = H1.get(key + "_series") or []
+        if len(ser) < 2 or ser[-2][1] in (None, 0):
+            return None
+        return (ser[-1][1] / ser[-2][1] - 1) * 100
+
+    borr, cwip, fa = H1.get("Borrowings"), H1.get("CWIP"), H1.get("Fixed Assets")
+    if borr is not None and borr.present:
+        mv = _last_move("Borrowings")
+        note = "" if mv is None else f"{mv:+.0f}% YoY"
+        if mv is not None and mv > 15:
+            adverse += 1
+            note = f"<span style='color:{DOWN}'>{note}</span>"
+        rows.append(("Borrowings", fmt(borr, 0, " Cr"), note))
+
+    if cwip is not None and cwip.present:
+        cw_mv, fa_mv = _last_move("CWIP"), _last_move("Fixed Assets")
+        # CWIP falling while fixed assets rise = a project commissioned. CWIP rising
+        # while fixed assets sit still is the classic capex-that-never-lands pattern.
+        if cw_mv is not None and fa_mv is not None:
+            if cw_mv < 0 and fa_mv > 0:
+                note = f"<span style='color:{UP}'>converting into fixed assets</span>"
+            elif cw_mv > 10 and fa_mv < 2:
+                note = f"<span style='color:{DOWN}'>rising, fixed assets flat</span>"
+                adverse += 1
+            else:
+                note = f"CWIP {cw_mv:+.0f}% &middot; fixed assets {fa_mv:+.0f}%"
+        else:
+            note = ""
+        rows.append(("CWIP", fmt(cwip, 0, " Cr"), note))
+    if fa is not None and fa.present:
+        rows.append(("Fixed assets", fmt(fa, 0, " Cr"), ""))
+
+    wc = H1.get("wc_days")
+    if wc is not None and wc.present:
+        ser = H1.get("wc_days_series") or []
+        prior = [v for _p, v in ser[:-1][-3:] if v is not None]
+        note = ""
+        if prior:
+            mean = sum(prior) / len(prior)
+            if mean and wc.num > 1.5 * mean:
+                note = (f"<span style='color:{DOWN}'>vs {mean:,.0f} avg of prior "
+                        f"{len(prior)}</span>")
+                adverse += 1
+            elif mean:
+                note = f"vs {mean:,.0f} avg of prior {len(prior)}"
+        rows.append(("Working capital", fmt(wc, 0, " days"), note))
+
+    chip = (_chip("STRETCHED", DOWN) if adverse >= 2 else
+            _chip("WATCH", AMBER) if adverse == 1 else
+            _chip("STEADY", UP) if rows else "")
+    colour = DOWN if adverse >= 2 else AMBER if adverse == 1 else UP if rows else MUTED
+    return _panel("Balance sheet", f"annual{' &middot; ' + fy if fy else ''}",
+                  chip, colour, rows)
+
+
+def _panel_cash(H1: dict) -> str:
+    """Panel 3 — did the profit become cash. ANNUAL. CFO/PAT is the anchor."""
+    fy = esc(str(H1.get("_fy") or ""), 12)
+    rows, adverse = [], 0
+
+    cfo = H1.get("cfo_pat_ratio")
+    ser = H1.get("cfo_pat_ratio_series") or []
+    if cfo is not None and cfo.present:
+        below = [v for _p, v in ser[-2:] if v is not None and v < 1]
+        note = ""
+        if cfo.num < 1:
+            adverse += 1
+            note = (f"<span style='color:{DOWN}'>below 1"
+                    + (" two years running" if len(below) >= 2 else "") + "</span>")
+        else:
+            note = f"<span style='color:{UP}'>profit is converting to cash</span>"
+        rows.append(("CFO / PAT", fmt(cfo, 2, "x"), note))
+        t = _trend(ser)
+        if t:
+            rows.append(("Trend", f"<span style='font-weight:400'>{t}</span>", ""))
+    else:
+        rows.append(("CFO / PAT", "&mdash;",
+                     esc(cfo.note, 80) if cfo is not None else "not computed"))
+
+    fcf = H1.get("fcf")
+    if fcf is not None and fcf.present:
+        note = ""
+        if fcf.num < 0:
+            adverse += 1
+            note = f"<span style='color:{DOWN}'>free cash flow negative</span>"
+        pct = H1.get("fcf_sales_pct")
+        if not note and pct is not None and pct.present:
+            note = f"{pct.num:,.1f}% of sales"
+        rows.append(("Free cash flow", fmt(fcf, 0, " Cr"), note))
+
+    chip = (_chip("POOR", DOWN) if adverse >= 2 else
+            _chip("WATCH", AMBER) if adverse == 1 else
+            _chip("GOOD", UP) if (cfo is not None and cfo.present) else "")
+    colour = (DOWN if adverse >= 2 else AMBER if adverse == 1 else
+              UP if (cfo is not None and cfo.present) else MUTED)
+    return _panel("Cash quality", f"annual{' &middot; ' + fy if fy else ''}",
+                  chip, colour, rows)
+
+
+def block_b_card(d: dict) -> str:
+    """The three-panel quality-of-earnings card, inline in the mail body.
+
+    This used to live only inside the season attachment — which, until the send call
+    was fixed, was never actually attached to anything. It is the single most useful
+    view on the page, so it belongs in the body.
+    """
+    return (f"<table cellpadding='0' cellspacing='0' style='{_CARD}'><tr>"
+            + _panel_bridge(d["B"]) + _panel_balance(d["H1"]) + _panel_cash(d["H1"])
+            + "</tr></table>")
+
+
 def block_b(d: dict) -> str:
     B = d["B"]
     out = [_h("B &middot; Is this profit real?",
-              "Reported profit stripped of the two easiest levers &mdash; the year-on-year "
-              "swing in other income, and drift in the tax rate. Pure arithmetic off the "
-              "quarterly P&amp;L; no model in this path.")]
+              "The three panels answer it in one look: whether the profit is operating, "
+              "what the balance sheet did to earn it, and whether it became cash. "
+              "Balance-sheet and cash panels are ANNUAL and stamped with their FY — "
+              "they are never mixed into the quarterly arithmetic."),
+           block_b_card(d)]
+    out.append(_h(
+        "The bridge in full",
+        "Reported profit stripped of the two easiest levers &mdash; the year-on-year "
+        "swing in other income, and drift in the tax rate. Pure arithmetic off the "
+        "quarterly P&amp;L; no model in this path."))
 
     if B["adjusted_pat"].present:
         gap = B.get("adjusted_gap")
@@ -648,9 +874,12 @@ def block_b(d: dict) -> str:
         bridge = [
             ["Reported PAT", "", f"<b>{fmt(B['pat'], 1, '')}</b>",
              "as filed"],
+            # Signed, not a hardcoded minus: a FALL in other income makes this an
+            # add-back, and "&minus;-0.7" is not a number anyone should have to read.
             ["Less: rise in other income",
-             f"&minus;{fmt(oi_x, 1, '')} pre-tax",
-             f"<span style='color:{DOWN}'>&minus;{fmt(oi_e, 1, '')}</span>",
+             f"{-(oi_x.num or 0.0):+,.1f} pre-tax",
+             f"<span style='color:{DOWN if -(oi_e.num or 0.0) < 0 else UP}'>"
+             f"{-(oi_e.num or 0.0):+,.1f}</span>",
              esc(oi_e.note, 130)],
             ["Add: over/under-tax vs normal",
              f"{signed(B['tax_cur'])} vs {fmt(B['tax_mean'], 2, '%')} avg",
@@ -954,6 +1183,25 @@ def block_d(d: dict) -> str:
 _WRAP = "font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222"
 
 
+def block_season(d: dict) -> str:
+    """Everything the company itself published about this quarter, in one block.
+
+    The blocks above are this repo's reading of the quarter. This one is the company's
+    own account of it — the results release, the deck, the concall and every other
+    filing — so the two can be held side by side.
+    """
+    s = d.get("season_summary")
+    if not s:
+        return ""
+    inner = SS.render_summary(s)
+    if not inner:
+        return ""
+    return _h("The quarter as the company told it",
+              "Results release, investor presentation, concall and other filings for "
+              "this quarter, as published by the company. Scoped to the season quarter "
+              "— nothing from another period appears here.") + inner
+
+
 def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
     if not d.get("quarter"):
         return ""
@@ -965,7 +1213,7 @@ def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
             f"{esc(d['isin'], 16)} &middot; generated "
             f"{datetime.now().strftime('%d %b %Y')}</div>")
     body = (block_a(d) + block_b(d) + block_ladder(d, stmts) + block_h1(d, rich)
-            + block_h2(d) + block_deck(d) + block_d(d))
+            + block_h2(d) + block_deck(d) + block_d(d) + block_season(d))
     foot = (
         f"<div style='margin-top:22px;padding-top:12px;border-top:1px solid #ddd;"
         f"font-size:11.5px;color:{MUTED};line-height:1.6'>"
@@ -1209,9 +1457,66 @@ def render_awaiting(rows: list[dict]) -> str:
           f"</thead><tbody>{body}</tbody></table>")
 
 
+def render_filing(d: dict) -> str:
+    """A holding that has FILED the season quarter, rendered from the filing itself.
+
+    Blocks B / H1 and the six-quarter ladder are deliberately absent: every one of them
+    needs the quarterly P&L ladder, which Screener has not published yet. Showing an
+    adjusted-PAT bridge here would mean bridging from a number with no prior quarter to
+    compare against — the framework's whole point is not to do that.
+
+    What IS shown is the filing's own headline, labelled as such, so a holding that
+    reported is never silently missing from the mail for the days Screener lags.
+    """
+    f = d["filing"]
+    rows = []
+    for label, key, dp, suffix in (("Revenue", "revenue_cr", 2, " Cr"),
+                                   ("EBITDA", "ebitda_cr", 2, " Cr"),
+                                   ("PAT", "pat_cr", 2, " Cr"),
+                                   ("EPS", "eps", 2, "")):
+        v = f.get(key)
+        if v is None:
+            continue
+        yoy = f.get({"revenue_cr": "revenue_yoy_pct",
+                     "pat_cr": "pat_yoy_pct"}.get(key, ""), None)
+        mv = ""
+        if yoy is not None:
+            mv = (f"<span style='color:{UP if yoy >= 0 else DOWN};font-weight:700'>"
+                  f"{yoy:+.1f}%</span>")
+        rows.append([label, f"{v:,.{dp}f}{suffix}", mv])
+    for label, key in (("EBITDA margin", "ebitda_margin_pct"),
+                       ("PAT margin", "pat_margin_pct")):
+        v = f.get(key)
+        if v is not None:
+            rows.append([label, f"{v:.2f}%", ""])
+    if not rows:
+        return ""
+
+    title = esc(str(f.get("title") or "")[:80], 80)
+    filed = esc(str(f.get("filed_on") or ""), 12)
+    return (
+        f"<h2 style='margin:0 0 2px;font-size:16px'>{esc(d['name'], 60)} "
+        f"<span style='color:#888;font-weight:400;font-size:13px'>&middot; "
+        f"{esc(d['symbol'], 18)}</span></h2>"
+        + _h(f"{esc(d['quarter'], 12)} &middot; from the exchange filing",
+             "Screener has not republished this company's statements yet, so the "
+             "quarterly ladder does not exist and the quality-of-earnings blocks are "
+             "withheld rather than guessed. These are the filing's own figures"
+             + (f", filed {filed}" if filed else "") + ".")
+        + _tbl(["Line", "&#8377; Cr / %", "YoY"], rows)
+        + (f"<div style='color:{MUTED};font-size:11.5px;margin:-8px 0 14px'>"
+           f"Source: {title}. The full teardown &mdash; adjusted PAT, the divergence "
+           f"engine and the red-flag register &mdash; follows once the statements land."
+           f"</div>" if title else ""))
+
+
 LEDGER_NAME = "quarter_teardown_mailed.parquet"
+# `data_source` added 2026-08-14 (ADDITIVE — old rows read NaN, treated as "screener"):
+# distinguishes a holding mailed off its own filing from one mailed off the full
+# Screener ladder, so the filing-sourced version can be superseded by the real
+# teardown once the statements land instead of being suppressed as already-mailed.
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on",
-               "date_source", "mailed_at"]
+               "date_source", "data_source", "mailed_at"]
 
 
 def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tuple]:
@@ -1303,8 +1608,10 @@ def _write_and_send(args, drive, idx, season, pages, reported, body, subject, lo
             "set in this environment. The preview above is the exact body that would "
             "go out. Add them to .env, or run this from CI.")
         return
-    ok = send_email(subject, body)
+    ok = send_email(subject, body, attachments=attachments or None)
     log(f"  mail sent={ok}  ({subject.encode('ascii', 'ignore').decode()})")
+    # Ledger is stamped ONLY after a confirmed send — a failed or toggled-off mail
+    # must not mark the work as delivered.
     if ok and reported:
         _stamp_ledger(drive, idx, season, pages, reported, log)
 
@@ -1318,7 +1625,9 @@ def _stamp_ledger(drive, idx, season, pages, reported, log) -> None:
         when, src = reported.get(d["isin"], ("", ""))
         rows.append({"season_quarter": season, "isin": d["isin"], "symbol": d["symbol"],
                      "quarter_label": d["quarter"], "reported_on": when,
-                     "date_source": src, "mailed_at": now})
+                     "date_source": src,
+                     "data_source": d.get("data_source", "screener"),
+                     "mailed_at": now})
     if not rows:
         return
     led = load_parquet(drive, idx, LEDGER_NAME, LEDGER_COLS)
@@ -1484,6 +1793,144 @@ def _self_test() -> int:
                           {**gf, "cred_pattern": "Erratic",
                            "as_of": "2025-01-01"}))[2] == "Erratic")
 
+    # ---- Block B: the adjusted-PAT bridge and the three-panel card ----------------
+    # Built off a synthetic quarterly P&L so the arithmetic can be checked by hand.
+    # Nothing here touches Drive.
+    def _stmts(rows):
+        return pd.DataFrame([{"statement": "quarterly_pl", "line_item": li,
+                              "period": p, "value": v}
+                             for li, p, v in rows])
+
+    periods = ["Jun 2025", "Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026"]
+    rows = []
+    for i, p in enumerate(periods):
+        rows += [("Sales", p, 1000.0 + i), ("Net Profit", p, 100.0),
+                 ("Profit before tax", p, 133.0), ("Tax %", p, 25.0),
+                 ("Other Income", p, 10.0), ("Interest", p, 5.0),
+                 ("Depreciation", p, 8.0), ("EPS in Rs", p, 10.0),
+                 ("OPM %", p, 15.0)]
+    # Current quarter: other income jumps 10 -> 30, tax stays at the prior-4Q rate.
+    rows = [r for r in rows if not (r[1] == "Jun 2026" and r[0] == "Other Income")]
+    rows.append(("Other Income", "Jun 2026", 30.0))
+    d = build_facts("INE_T", "TEST", "Test Ltd", _stmts(rows),
+                    pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {})
+
+    B = d["B"]
+    check("bridge: adjusted PAT computed", B["adjusted_pat"].present)
+    # 20 Cr of extra other income, taxed at 25% -> 15 Cr post-tax removed. Tax is at
+    # the prior-4Q average, so the tax leg is zero and adjusted = 100 - 15 = 85.
+    check("bridge: only the RISE in other income is stripped",
+          abs(B["oi_excluded"].num - 20.0) < 0.01)
+    check("bridge: post-tax effect uses the actual rate",
+          abs(B["oi_effect"].num - 15.0) < 0.01)
+    check("bridge: no tax adjustment when the rate matches the prior-4Q mean",
+          abs(B["tax_norm"].num) < 0.01)
+    check("bridge: adjusted = reported - oi_effect + tax_norm",
+          abs(B["adjusted_pat"].num - 85.0) < 0.01)
+    # THE ARITHMETIC MUST TIE OUT: the printed lines have to reconstruct the total, or
+    # the bridge is decoration rather than a check.
+    check("bridge ties out from the shown lines",
+          abs((B["pat"].num - B["oi_effect"].num + B["tax_norm"].num)
+              - B["adjusted_pat"].num) < 0.01)
+
+    card = block_b_card(d)
+    check("card: three panels rendered", card.count("<td style='vertical-align:top") == 3)
+    check("card: adjusted PAT on the card", "Adjusted PAT" in card)
+    check("card: flattered quarter is called out", "FLATTERED" in card)
+    check("card: annual panels carry the grain", card.count("annual") == 2)
+    # MISSING ≠ clean. With no financials_derived rows at all, the annual panels must
+    # say so rather than render an implied pass.
+    check("card: empty balance sheet says not computed", "not computed" in card)
+    check("card: no CFO does not fake a verdict", "GOOD" not in card)
+
+    # THE REGRESSION: when other income FALLS, the bridge line is an add-back. A
+    # hardcoded minus in front of a negative rendered "&minus;-0.7" in the live mail.
+    rows_dn = [r for r in rows if not (r[1] == "Jun 2026" and r[0] == "Other Income")]
+    rows_dn.append(("Other Income", "Jun 2026", 2.0))
+    d_dn = build_facts("INE_D", "DOWN", "Down Ltd", _stmts(rows_dn),
+                       pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+                       pd.DataFrame(), {})
+    card_dn = block_b_card(d_dn)
+    check("falling other income is an add-back, signed once",
+          "&minus;-" not in card_dn and "--" not in card_dn)
+    check("falling other income shows a positive bridge line", "+6.0" in card_dn)
+    full_dn = block_b(d_dn)
+    check("full bridge table signs it once too",
+          "&minus;-" not in full_dn and "--" not in full_dn)
+
+    # A fully-missing H1 must not raise — this is the shape every company has before
+    # build_derived_from_statements has ever run for it.
+    empty_h1 = {k: MISSING(k, "financials_derived.parquet", "none", grain=ANNUAL)
+                for k in ("cfo_pat_ratio", "fcf", "fcf_sales_pct", "wc_days",
+                          "Borrowings", "CWIP", "Fixed Assets")}
+    empty_h1["_fy"] = ""
+    try:
+        c2 = block_b_card({"B": B, "H1": empty_h1})
+        check("card survives a completely empty H1", "not computed" in c2)
+    except Exception as exc:                                   # pragma: no cover
+        check(f"card survives a completely empty H1 ({exc})", False)
+
+    # Size: the card renders once per company against a 90 KB body budget.
+    check("card stays small enough to repeat per company", len(card.encode()) < 4500)
+
+    # ---- the filing fallback renders without a quarterly ladder -------------------
+    fil = {"quarter": "Q1 FY27", "revenue_cr": 555.51, "pat_cr": None, "eps": None,
+           "ebitda_cr": None, "pat_margin_pct": 5.13, "revenue_yoy_pct": 18.4,
+           "filed_on": "2026-08-13", "title": "Outcome of Board Meeting"}
+    fh = render_filing({"isin": "INE_F", "symbol": "VMARCIND", "name": "V Marc",
+                        "quarter": "Q1 FY27", "filing": fil, "data_source": "filing"})
+    check("filing card renders", "VMARCIND" in fh)
+    check("filing card shows the revenue", "555.51" in fh)
+    check("filing card labels its source", "exchange filing" in fh)
+    check("filing card shows the margin when PAT is unreadable", "5.13%" in fh)
+    # It must NOT imply a teardown was done.
+    check("filing card withholds the bridge", "Adjusted PAT" not in fh)
+
+    # ---- the send path itself ----------------------------------------------------
+    # THE REGRESSION THAT SHIPPED: the per-company branch called
+    #     send_email(subject, body, attachments=attachments or None)
+    # where `attachments` was never bound in that scope — a NameError that fired only
+    # where credentials exist (CI), behind continue-on-error, so every --daily mail
+    # died silently. --dry-run returns BEFORE the send call, so no dry run could ever
+    # catch it. The only honest test is to drive the send helper directly.
+    import types as _types
+    import mailer as _mailer
+    _sent = {}
+
+    def _fake_send(subject, html_body, plain_body="", to=None, attachments=None):
+        _sent["subject"] = subject
+        _sent["body"] = html_body
+        _sent["attachments"] = attachments
+        return True
+
+    _real_send, _real_settings = _mailer.send_email, _mailer.load_mail_settings
+    _real_env = {k: os.environ.get(k) for k in
+                 ("GMAIL_USER", "GMAIL_APP_PASSWORD", "NOTIFY_EMAIL")}
+    try:
+        _mailer.send_email = _fake_send
+        _mailer.load_mail_settings = lambda *a, **k: {MAIL_KEY: True}
+        for k in _real_env:
+            os.environ[k] = "self-test"
+        import tempfile
+        _args = _types.SimpleNamespace(dry_run=False, out_dir=tempfile.mkdtemp())
+        _att = [("teardown.html", b"<html></html>", "html")]
+        # `reported` empty => _stamp_ledger is skipped, so this touches no Drive state.
+        _write_and_send(_args, None, None, "Q1FY27", [], {}, "<p>body</p>",
+                        "subject", lambda *a: None, attachments=_att)
+        check("send path reached with no NameError", _sent.get("subject") == "subject")
+        check("attachments actually reach send_email", _sent.get("attachments") == _att)
+        _sent.clear()
+        _write_and_send(_args, None, None, "Q1FY27", [], {}, "<p>b</p>", "s",
+                        lambda *a: None)
+        check("no attachment sends None, not a crash", _sent.get("attachments") is None)
+    finally:
+        _mailer.send_email, _mailer.load_mail_settings = _real_send, _real_settings
+        for k, v in _real_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     print(f"\nquarter_teardown self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 
@@ -1578,8 +2025,14 @@ def main() -> None:
             led = load_parquet(drive, idx, LEDGER_NAME, LEDGER_COLS)
             done = set()
             if led is not None and not led.empty:
-                done = {str(r["isin"]).strip() for _, r in
-                        led[led["season_quarter"].astype(str) == season].iterrows()}
+                seen = led[led["season_quarter"].astype(str) == season]
+                for _, r in seen.iterrows():
+                    # A holding mailed only as a filing card is NOT done: the real
+                    # teardown (bridge, divergence rails, register) still owes it a
+                    # mail once Screener publishes the ladder.
+                    if str(r.get("data_source") or "screener").strip() == "filing":
+                        continue
+                    done.add(str(r["isin"]).strip())
             before = len(targets)
             targets = [t for t in targets if t[0] not in done]
             if before != len(targets):
@@ -1594,6 +2047,9 @@ def main() -> None:
         return
 
     log(f"Loading shared tables for {len(targets)} company(ies)...")
+    # Read once, used by both the red-flag register and the season summary — it is one
+    # of the larger tables on Drive and downloading it twice is pure waste.
+    tables_ann = _read(drive, idx, "announcement_ledger.parquet")
     tables = {
         "register": dict(
             ar_red_flags=_read(drive, idx, "ar_red_flags.parquet"),
@@ -1601,7 +2057,7 @@ def main() -> None:
             rating_sensitivity=_read(drive, idx, "rating_sensitivity.parquet"),
             ratings=_read(drive, idx, "ratings.parquet"),
             gf4=_read(drive, idx, "gf4_quality_flags.parquet"),
-            announcements=_read(drive, idx, "announcement_ledger.parquet"),
+            announcements=tables_ann,
             fraud_tracker=_read(drive, idx, "fraud_tracker.parquet")),
         "derived": _read(drive, idx, "financials_derived.parquet"),
         "gva": _read(drive, idx, "guidance_vs_actual.parquet"),
@@ -1609,15 +2065,55 @@ def main() -> None:
                  "diff": _read(drive, idx, "deck_diff.parquet"),
                  "flags": _read(drive, idx, "deck_flags.parquet"),
                  "questions": _read(drive, idx, "deck_questions.parquet")},
+        # What the company itself published this quarter (season_summary).
+        "season": {"ppt_highlights": _read(drive, idx, "ppt_highlights.parquet"),
+                   "ppt_guidance": _read(drive, idx, "ppt_guidance.parquet"),
+                   "gf1": _read(drive, idx, "gf1_guidance_statements.parquet"),
+                   "gf4": _read(drive, idx, "gf4_quality_flags.parquet"),
+                   "announcements": tables_ann},
     }
 
+    # The filing fallback. Screener is a lagging mirror of the exchange filing, and a
+    # holding that filed is not "not reported" — it is reported and unpublished.
+    try:
+        from _extractor_base import load_queue as _lq0
+        _queue_all = _lq0(drive, idx)
+    except Exception:
+        _queue_all = pd.DataFrame()
+    try:
+        filings = FR.load_filing_results(drive, idx, season, queue=_queue_all, log=log)
+    except Exception as e:
+        filings = {}
+        log(f"  WARNING: filing fallback unavailable ({str(e)[:70]})")
+
     os.makedirs(args.out_dir, exist_ok=True)
-    pages = []
+    pages, filing_pages = [], []
+    def _try_filing(isin, symbol, name, why) -> bool:
+        """Render the filing card when the statements cannot carry a teardown."""
+        fil = filings.get(isin)
+        if not fil:
+            return False
+        d = {"isin": isin, "symbol": symbol, "name": name,
+             "quarter": fil["quarter"], "filing": fil, "data_source": "filing"}
+        # A holding Screener has not caught up with still published a deck, a concall
+        # and its other filings — that is exactly what the season summary carries, and
+        # it needs no quarterly ladder.
+        d["season_summary"] = SS.build_summary(
+            isin, season, filing=fil, deck=tables["deck"], **tables["season"])
+        html = render_filing(d) + block_season(d)
+        if not html:
+            return False
+        filing_pages.append((symbol, d, html))
+        log(f"  {symbol}: {why} — rendered from the filing "
+            f"({fil['quarter']}, filed {fil.get('filed_on') or '?'})")
+        return True
+
     for isin, symbol, name in targets:
         stmts, register, arsc, gva, deck = load_company(
             drive, idx, stmt_fid, repo_id, isin, symbol, name, tables)
         if stmts is None or stmts.empty:
-            log(f"  {symbol}: no statements parquet — skipped")
+            if not _try_filing(isin, symbol, name, "no statements parquet"):
+                log(f"  {symbol}: no statements parquet — skipped")
             continue
         # NO QUARTER MIXING. A filing can be dated before the numbers land, so the
         # statements are the authority on whether this company has actually reported
@@ -1626,14 +2122,23 @@ def main() -> None:
         if windowed:
             lbl = QT.latest_quarter_label(stmts)
             if lbl is None or QT.norm_q(lbl) != QT.norm_q(season):
-                log(f"  {symbol}: filing dated {season} but statements still at "
-                    f"{lbl or 'n/a'} — skipped until the numbers land")
+                # The statements stay the authority for a TEARDOWN — the bridge and the
+                # rails are never built on a quarter Screener has not published. But the
+                # company still reported, so fall back to the filing's own numbers
+                # rather than dropping it out of the mail entirely.
+                if not _try_filing(isin, symbol, name,
+                                   f"statements still at {lbl or 'n/a'}"):
+                    log(f"  {symbol}: filing dated {season} but statements still at "
+                        f"{lbl or 'n/a'} — skipped until the numbers land")
                 continue
         d = build_facts(isin, symbol, name, stmts, tables["derived"], gva, register,
                         arsc, deck)
         if not d.get("quarter"):
             log(f"  {symbol}: fewer than two quarters of P&L — skipped")
             continue
+        d["season_summary"] = SS.build_summary(
+            isin, season, filing=filings.get(isin), deck=tables["deck"],
+            **tables["season"])
         html = render(d, stmts, rich=args.html)
         pages.append((symbol, d, html))
         log(f"  {symbol}: {d['quarter']} · {len(d['facts'])} facts · "
@@ -1660,23 +2165,44 @@ def main() -> None:
             awaiting = filed_awaiting_numbers(
                 _lq(drive, idx), pf_all, season,
                 None if args.season_all else args.since_hours,
-                {d["isin"] for _s, d, _h in pages})
+                # A holding rendered from its filing has been SHOWN, with numbers — it
+                # must not also appear under "filed, numbers pending".
+                {d["isin"] for _s, d, _h in pages}
+                | {d["isin"] for _s, d, _h in filing_pages})
             if awaiting:
                 log(f"  filed but numbers pending: "
                     f"{', '.join(a['symbol'] or a['isin'] for a in awaiting)}")
         except Exception as e:
             log(f"  WARNING: could not compute pending filings ({str(e)[:70]})")
 
-    if args.mail and (pages or awaiting):
-        qlabel = pages[0][1]["quarter"] if pages else QT.qtr_label(season)
+    if args.mail and (pages or filing_pages or awaiting):
+        qlabel = (pages[0][1]["quarter"] if pages else
+                  filing_pages[0][1]["quarter"] if filing_pages else
+                  QT.qtr_label(season))
         n_pend = f" · {len(awaiting)} awaiting numbers" if awaiting else ""
+        n_fil = f" · {len(filing_pages)} from filings" if filing_pages else ""
+        # Companies shown from their own filing go in their own section, ahead of the
+        # awaiting table and after the full teardowns, so the reader can always tell
+        # which numbers came off the ladder and which off the filing.
+        filing_section = ""
+        if filing_pages:
+            filing_section = (
+                _h(f"&#128196; Reported &mdash; from the filing, Screener still behind "
+                   f"({len(filing_pages)})",
+                   "These holdings have filed the season quarter and their figures were "
+                   "read from the filing itself. The quality-of-earnings blocks need the "
+                   "quarterly ladder Screener has not published yet, so they are withheld "
+                   "rather than estimated.")
+                + "<hr>".join(h for _s, _d, h in filing_pages))
+        ledger_pages = pages + filing_pages
         subject = (f"📊 Quarterly teardown — {qlabel} · "
-                   f"{len(pages)} compan{'y' if len(pages) == 1 else 'ies'}{n_pend}")
+                   f"{len(pages)} compan{'y' if len(pages) == 1 else 'ies'}"
+                   f"{n_fil}{n_pend}")
         if args.by_day:
             subject = (f"📊 {qlabel} teardown — {len(pages)} PF holdings reported "
-                       f"so far{n_pend}")
+                       f"so far{n_fil}{n_pend}")
             body = render_by_day(pages, reported, qlabel, len(pf_all)) \
-                + render_awaiting(awaiting)
+                + filing_section + render_awaiting(awaiting)
             log(f"  day-grouped body: {len(body.encode()):,} B")
             # The body must stay under Gmail's ~102 KB clip, so the summary is compact.
             # The FULL teardown for every company rides along as one attached HTML file
@@ -1692,8 +2218,8 @@ def main() -> None:
                 atts = [(fname, full.encode("utf-8"), "html")]
                 log(f"  attachment: {fname} ({len(full.encode()):,} B, "
                     f"{len(pages)} full teardowns)")
-            _write_and_send(args, drive, idx, season, pages, reported, body, subject,
-                            log, attachments=atts)
+            _write_and_send(args, drive, idx, season, ledger_pages, reported, body,
+                            subject, log, attachments=atts)
             return
         body = "<hr>".join(h for _s, _d, h in pages)
         if len(body.encode()) > MAX_HTML_BYTES:
@@ -1707,36 +2233,41 @@ def main() -> None:
                     break
             compact = pages[n_full:]
             rest = "".join(render_compact(d) for _s, d, _h in compact)
+            # The three-panel card is the whole point of the mail, so a holding whose
+            # full teardown does not fit still gets one — ~2 KB each against the ~45 KB
+            # a full teardown costs. Dropping to a single summary line for most of the
+            # night's reporters is what made Block B invisible in the first place.
+            # Cards are added while the budget allows. On a heavy results night the
+            # cards alone could push the mail past the clip threshold, so anything that
+            # does not fit still appears in the one-line table below — visible, never
+            # dropped.
+            cards, used, n_cards = [], len(rest.encode()) + size, 0
+            for _s, dd, _hh in compact:
+                blk = (f"<div style='font-size:13px;font-weight:700;color:#111;"
+                       f"margin:12px 0 0'>{esc(dd['name'], 60)}"
+                       f"<span style='color:#888;font-weight:400'> &middot; "
+                       f"{esc(dd['symbol'], 18)} &middot; {esc(dd['quarter'], 12)}"
+                       f"</span></div>" + block_b_card(dd))
+                if used + len(blk.encode()) > MAX_HTML_BYTES * 0.92:
+                    break
+                cards.append(blk)
+                used += len(blk.encode())
+                n_cards += 1
             body = "<hr>".join(full) + (
-                ("<hr>" + _h("Remaining holdings &mdash; compact",
+                ("<hr>" + _h("Remaining holdings &mdash; quality of earnings",
+                             "The same three-panel read that heads each full teardown. "
                              "Full teardowns for these are in the local HTML files; the "
                              "mail is capped so Gmail does not clip it.")
-                 + compact_table(rest)) if rest else "")
-            log(f"  over budget — {n_full} full + {len(compact)} compact "
-                f"({len(body.encode()):,} B)")
-        body += render_awaiting(awaiting)
-        prev = os.path.join(args.out_dir, "quarter_teardown_preview.html")
-        with open(prev, "w", encoding="utf-8") as fh:
-            fh.write(body)
-        log(f"  preview: {prev} ({len(body.encode()):,} bytes)")
-        if args.dry_run:
-            log("  --dry-run: not sending")
-        else:
-            from mailer import send_email, load_mail_settings
-            if not load_mail_settings(drive, idx).get(MAIL_KEY, True):
-                log(f"  mail toggle '{MAIL_KEY}' is OFF — not sending")
-            elif not (os.getenv("GMAIL_USER") and os.getenv("GMAIL_APP_PASSWORD")
-                      and os.getenv("NOTIFY_EMAIL")):
-                log("  mail NOT sent — GMAIL_USER / GMAIL_APP_PASSWORD / NOTIFY_EMAIL "
-                    "are not set in this environment. The preview above is the exact "
-                    "body that would go out. Add them to .env, or run this from CI.")
-            else:
-                ok = send_email(subject, body, attachments=attachments or None)
-                log(f"  mail sent={ok}  ({subject.encode('ascii', 'ignore').decode()})")
-                # Ledger is stamped ONLY after a confirmed send — a failed or toggled-off
-                # mail must not mark the work as delivered.
-                if ok and reported:
-                    _stamp_ledger(drive, idx, season, pages, reported, log)
+                 + "".join(cards) + compact_table(rest)) if rest else "")
+            log(f"  over budget — {n_full} full + {n_cards} card + "
+                f"{len(compact) - n_cards} line-only ({len(body.encode()):,} B)")
+        body += filing_section + render_awaiting(awaiting)
+        # Same helper as the day-grouped path above. This branch used to inline its own
+        # copy of the toggle/creds/ledger gates, and referenced an `attachments` name that
+        # was never bound in this scope — a NameError that only fired where credentials
+        # actually exist (CI), behind continue-on-error.
+        _write_and_send(args, drive, idx, season, ledger_pages, reported, body, subject,
+                        log)
 
 
 if __name__ == "__main__":

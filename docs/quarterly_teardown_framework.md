@@ -62,9 +62,52 @@ eps, opm, npm each as `{value, yoy, qoq}`.
 
 ---
 
+## Source of truth, part 2 — when Screener has not caught up
+
+Screener is a **lagging mirror** of the exchange filing. On 2026-08-12 VMARCIND and
+OBSCP filed Q1 FY27; two days later both still showed `Q4 FY26` as their newest
+`quarterly_pl` column, so both mails — which define "reported" as that column matching
+the season — could not see them at all.
+
+`results_gemini.parquet` already holds revenue / EBITDA / PAT / EPS / margins read from
+the filing PDF itself. `scripts/filing_results.py` is the validated read side of it, used
+by `pf_results_digest.py` and `quarter_teardown.py` alike.
+
+A filing-sourced company is rendered as **its own single-quarter card**, never as a column
+inside a Screener table: the filing may be consolidated where Screener is standalone, and
+its "Revenue" need not tie to Screener's "Sales". Blocks B and H1 and the six-quarter
+ladder are **withheld** for such a company — every one of them needs the quarterly ladder
+that does not exist yet. Withheld, not estimated.
+
+The stored table is dirtier than its schema suggests, so every field is validated on read
+(measured 2026-08-14, 123 rows):
+
+| Symptom | Cause | Handling |
+|---|---|---|
+| `pat_cr` numeric in only 25/123 | `METRIC_ALIASES` is first-match-wins with `("pat","pat")` ahead of `("margin","margin")`, so `PAT Margin %` identified as `pat` and wrote `"5.13%"` into `pat_cr`. `ebitda_cr` corrupted identically. | writer fixed in `extract_results.py`; a `%` in an absolute field is rejected on read |
+| `revenue_cr` numeric in 74/123 | a repeated header row parsed as data → the literal `'Revenue (Cr)'` | non-numeric drops the row |
+| 23 rows with a blank `quarter` | Gemini's table header carried no `Q# FY##` | dropped — unassignable to a quarter |
+
+Note `_extractor_base.try_float` **strips** `%`, so `try_float("5.13%")` returns `5.13`.
+A percent must be rejected *before* coercion or the mis-parse passes as a crore figure.
+
+Rows already stored are not rewritten — re-extraction is the honest repair.
+
+---
+
 ## Block B — Quality of the number  *(arithmetic, no LLM)*
 
 **Answers:** is this profit real, or engineered?
+
+Rendered as a **three-panel card inline in the mail body** — adjusted-PAT bridge ·
+balance-sheet movement · cash-flow quality — so the question is answerable in about ten
+seconds without opening an attachment. Panel 1 is quarterly; panels 2 and 3 are annual and
+carry an FY stamp. They are never combined into one derived number: `Fact.derive` refuses
+mixed grains by design.
+
+Every holding gets the card, including those whose full teardown does not fit the mail's
+size budget. Reducing most of the night's reporters to a single summary line is what made
+this block invisible in the first place.
 
 All from `quarterly_pl`. `q` = current quarter, `q-1` = QoQ, `q-4` = YoY.
 
@@ -248,6 +291,32 @@ Promoter 20% · Regulatory & Auditor Transparency 10% — with a
 `Clean (0–2) / Monitor (3–5) / Elevated (6–7) / Avoid (8–10)` label. It is written into
 `company_page.md` as prose and **never parsed**. Tabulating it is the cheapest high-value
 addition in this framework.
+
+---
+
+## Block S — The quarter as the company told it  *(rendering only)*
+
+**Answers:** what did the company itself publish about this quarter?
+
+Blocks A–H are this repo's reading of the quarter. Block S is the company's own account,
+assembled by `scripts/season_summary.py` from tables that already exist and had never
+been read together:
+
+| Section | Source | PF coverage for Q1 FY27 (2026-08-14) |
+|---|---|---|
+| Results release | `results_gemini` via `filing_results` | 25 companies |
+| Investor presentation | `ppt_highlights`, `ppt_guidance` | 23 / 12 companies |
+| Concall | `gf1_guidance_statements`, `gf4_quality_flags` | 28 companies |
+| Other filings | `announcement_ledger` (`summary`, `event_type`, `materiality`, `direction`) | 43 companies |
+| Deck teardown | `deck_metrics/diff/flags` | **0 — the files do not exist** |
+
+Announcements are dated rather than quarter-tagged, so they are windowed from the quarter
+end to at most 110 days after it. Everything else is matched on `quarter`.
+
+`--teardown` was enabled in `phase2.yml` on 13 Aug 2026 and has not yet written a row.
+`deck_diff` additionally needs **two consecutive quarters** of deck coverage before it can
+ever be non-empty, because `deck_teardown.parse_teardown` drops `diff_without_prior_deck`.
+Until rows land, the section says the pass has not run — it never renders as an all-clear.
 
 ---
 
