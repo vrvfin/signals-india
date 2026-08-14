@@ -77,6 +77,8 @@ jobs:
           python scripts/redflag_register.py --self-test
           python scripts/ar_scorecard.py --self-test
           python scripts/deck_teardown.py --self-test
+          python scripts/filing_results.py --self-test
+          python scripts/season_summary.py --self-test
           python scripts/quarter_teardown.py --self-test
 
       - name: Quarterly teardown — season catch-up
