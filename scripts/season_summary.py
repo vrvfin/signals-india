@@ -62,7 +62,49 @@ UP, DOWN, MUTED, AMBER = "#1a7a3a", "#c0392b", "#8a97a0", "#b8860b"
 
 _DIR_COLOUR = {"bull": UP, "bullish": UP, "positive": UP,
                "bear": DOWN, "bearish": DOWN, "negative": DOWN}
-_MAT_COLOUR = {"high": DOWN, "medium": AMBER, "low": MUTED}
+_MAT_COLOUR = {"high": DOWN, "med": AMBER, "medium": AMBER, "low": MUTED}
+
+# ---- Relevance filter for "other filings" -------------------------------------------
+# Measured over 2,924 PF announcements since 1 Jul 2026: 1,225 are `results`, 898 are
+# low materiality, 461 are AGM/EGM, 368 are generic `other`. Listing all of that is not
+# a summary, it is a firehose — and the results ones duplicate the teardown the reader
+# already has. This section exists for what MOVES A VIEW: an order win, a capex plan,
+# a fundraise, a downgrade, litigation.
+
+# Event types that carry an investment signal. `results` is deliberately absent — it has
+# its own mail and its own section above; repeating it here is duplication, not summary.
+_RELEVANT_EVENTS = {"order_win", "expansion", "capex", "mna", "fundraise", "debt",
+                    "litigation", "rating", "buyback", "dividend", "management_change",
+                    "regulatory"}
+
+# Routine filings that are legally required and analytically empty.
+_ROUTINE_CATEGORIES = {"agm/egm", "insider trading / sast", "corp. action", "corp action"}
+_ROUTINE_PATTERNS = ("newspaper publication", "trading window", "duplicate share",
+                     "share certificate", "investor meet - intimation",
+                     "board meeting intimation", "intimation of board meeting",
+                     "loss of share", "transfer of shares", "postal ballot",
+                     "scrutinizer", "voting results", "compliance certificate",
+                     "reg. 74(5)", "regulation 74", "certificate under regulation")
+
+
+def _is_relevant(a: dict) -> bool:
+    """Does this filing plausibly change how the company is viewed?"""
+    ev = str(a.get("event_type") or "").strip().lower()
+    mat = str(a.get("materiality") or "").strip().lower()
+    cat = str(a.get("category") or "").strip().lower()
+    head = f"{a.get('headline','')} {a.get('summary','')}".lower()
+
+    if any(p in head for p in _ROUTINE_PATTERNS):
+        return False
+    if cat in _ROUTINE_CATEGORIES and mat != "high":
+        return False
+    if ev == "results":                 # covered by the results teardown itself
+        return False
+    if ev in _RELEVANT_EVENTS:
+        return mat in ("high", "med", "medium") or ev in ("rating", "litigation")
+    # Anything else (incl. the generic 'other' bucket) only earns a place when the
+    # extractor judged it materially important.
+    return mat == "high"
 
 
 def quarter_end(season: str) -> date | None:
@@ -172,15 +214,20 @@ def build_summary(isin: str, season: str, *, ppt_highlights=None, ppt_guidance=N
             a["_r"] = a.get("materiality", pd.Series(dtype=str)).astype(str).str.lower(
             ).map(rank).fillna(3)
             a = a.sort_values(["_r", "_d"], ascending=[True, False])
-            for _, r in a.head(MAX_FILINGS).iterrows():
-                ann.append({
-                    "date": str(r["_d"]),
-                    "headline": str(r.get("headline") or ""),
-                    "summary": str(r.get("summary") or ""),
-                    "event_type": str(r.get("event_type") or ""),
-                    "materiality": str(r.get("materiality") or "").lower(),
-                    "direction": str(r.get("direction") or "").lower()})
-            out["n_filings"] = len(a)
+            cand = [{"date": str(r["_d"]),
+                     "headline": str(r.get("headline") or ""),
+                     "summary": str(r.get("summary") or ""),
+                     "event_type": str(r.get("event_type") or ""),
+                     "category": str(r.get("category") or ""),
+                     "materiality": str(r.get("materiality") or "").lower(),
+                     "direction": str(r.get("direction") or "").lower()}
+                    for _, r in a.iterrows()]
+            # Relevance, not volume. See _is_relevant: routine compliance filings and
+            # anything already covered by the results teardown are dropped.
+            keep = [x for x in cand if _is_relevant(x)]
+            ann = keep[:MAX_FILINGS]
+            out["n_filings"] = len(keep)
+            out["n_filings_seen"] = len(cand)
     out["filings"] = ann
     out.setdefault("n_filings", 0)
     out["window"] = (start, end)
@@ -291,9 +338,11 @@ def render_summary(s: dict) -> str:
             rows += (f"<tr><td style='color:{MUTED};white-space:nowrap'>{_esc(a['date'], 10)}</td>"
                      f"<td style='color:{col};white-space:nowrap'>{tag}</td>"
                      f"<td>{_esc(text, 200)}</td></tr>")
-        more = (f"{s['n_filings']} filings in the window"
-                if s["n_filings"] > len(s["filings"]) else "")
-        parts.append(_sub("Other filings this quarter", more)
+        seen = s.get("n_filings_seen", 0)
+        more = (f"{s['n_filings']} material of {seen} filed" if seen
+                else (f"{s['n_filings']} in the window"
+                      if s["n_filings"] > len(s["filings"]) else ""))
+        parts.append(_sub("What else moved this quarter", more)
                      + f"<table cellpadding='2' cellspacing='0' style='{_TBL}'>{rows}</table>")
 
     if s["deck_built"] and any(s["deck"].values()):
@@ -385,6 +434,51 @@ def _self_test() -> int:
     check("in-window filing kept", len(s["filings"]) == 1)
     check("pre-quarter filing excluded",
           all("BEFORE" not in a["headline"] for a in s["filings"]))
+
+    # ---- RELEVANCE, not volume. 1,225 of 2,924 live announcements are `results`,
+    # 898 are low materiality and 461 are AGM/EGM — a summary that lists them all is
+    # a firehose, and the results ones duplicate the teardown.
+    def _a(**kw):
+        base = {"headline": "", "summary": "", "event_type": "other",
+                "category": "Company Update", "materiality": "med", "direction": ""}
+        base.update(kw)
+        return base
+    check("order win is kept", _is_relevant(_a(event_type="order_win")))
+    check("capex is kept", _is_relevant(_a(event_type="capex")))
+    check("a downgrade is kept even at low materiality",
+          _is_relevant(_a(event_type="rating", materiality="low")))
+    check("litigation is kept even at low materiality",
+          _is_relevant(_a(event_type="litigation", materiality="low")))
+    check("results are NOT repeated here (the teardown covers them)",
+          not _is_relevant(_a(event_type="results", materiality="high")))
+    check("low-materiality generic filing dropped",
+          not _is_relevant(_a(event_type="other", materiality="low")))
+    check("high-materiality generic filing kept",
+          _is_relevant(_a(event_type="other", materiality="high")))
+    check("AGM/EGM dropped", not _is_relevant(_a(category="AGM/EGM")))
+    check("a HIGH-materiality AGM item still gets through",
+          _is_relevant(_a(category="AGM/EGM", materiality="high",
+                          event_type="mna")))
+    for junk in ("Copy of Newspaper Publication", "Trading Window closure",
+                 "Intimation of Board Meeting", "Duplicate share certificate",
+                 "Compliance Certificate under Regulation 74(5)"):
+        check(f"routine filing dropped: {junk[:28]}",
+              not _is_relevant(_a(headline=junk, materiality="high",
+                                  event_type="regulatory")))
+
+    ann2 = _df([{"isin": "INE1", "ann_date": "2026-07-20", "headline": "Order win",
+                 "summary": "300 Cr order", "event_type": "order_win",
+                 "materiality": "high", "direction": "bull"},
+                {"isin": "INE1", "ann_date": "2026-07-21",
+                 "headline": "Copy of Newspaper Publication", "summary": "",
+                 "event_type": "regulatory", "materiality": "med", "direction": ""},
+                {"isin": "INE1", "ann_date": "2026-07-22", "headline": "Q1 results",
+                 "summary": "", "event_type": "results", "materiality": "high",
+                 "direction": ""}], ANN + ["category"])
+    s3 = build_summary("INE1", "Q1FY27", announcements=ann2, today=date(2026, 8, 14))
+    check("only the material filing survives", len(s3["filings"]) == 1)
+    check("the survivor is the order win", s3["filings"][0]["event_type"] == "order_win")
+    check("the count reports material-of-total", s3.get("n_filings_seen") == 3)
 
     html = render_summary(s)
     check("renders the highlight", "Order book at a record" in html)

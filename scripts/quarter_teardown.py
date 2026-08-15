@@ -1951,6 +1951,10 @@ def main() -> None:
                     help="ONE-OFF catch-up: every PF holding that has reported this "
                          "season so far, in one mail grouped by reporting day. Implies "
                          "--pf --mail --by-day --force.")
+    ap.add_argument("--per-company", action="store_true",
+                    help="Send ONE MAIL PER COMPANY instead of one combined body. "
+                         "Fixes the Gmail clip on a large season catch-up (42 companies "
+                         "measured at 90,957 B) and gives each holding its own mail.")
     ap.add_argument("--by-day", action="store_true",
                     help="Group the mail by reporting date, newest day first, with a "
                          "compact row per company.")
@@ -1978,6 +1982,13 @@ def main() -> None:
         args.by_day = True
         args.force = True
         args.since_hours = None
+    if args.per_company:
+        # Mutually exclusive by construction: --by-day builds ONE compact day-grouped
+        # body, the opposite of a mail per company. Asking for both (e.g. --season-all
+        # --per-company) resolves to per-company, the more specific request.
+        args.by_day = False
+        args.pf = True
+        args.mail = True
     if not (args.html or args.mail):
         args.html = True
 
@@ -2261,6 +2272,34 @@ def main() -> None:
                  + "".join(cards) + compact_table(rest)) if rest else "")
             log(f"  over budget — {n_full} full + {n_cards} card + "
                 f"{len(compact) - n_cards} line-only ({len(body.encode()):,} B)")
+        # ONE MAIL PER COMPANY (user, 2026-08-15). The combined body reached 90,957 B on
+        # a 42-company season catch-up — past Gmail's ~90 KB guard, so the tail was at
+        # risk of being clipped away. Splitting fixes the size problem and the shape
+        # problem at once: each company's teardown arrives on its own, with room for the
+        # full detail instead of competing for one budget.
+        #
+        # Opt-in. Without --per-company the combined body is unchanged, so t4_nightly's
+        # --daily step behaves exactly as before.
+        if args.per_company:
+            n_sent = 0
+            for _s, d1, h1 in (pages + filing_pages):
+                one_sub = (f"📊 {d1['symbol']} — {d1.get('quarter') or qlabel} teardown"
+                           + (" (from the filing)"
+                              if d1.get("data_source") == "filing" else ""))
+                _write_and_send(args, drive, idx, season, [(_s, d1, h1)], reported,
+                                h1, one_sub, log)
+                n_sent += 1
+            # Companies that filed with no numbers anywhere still deserve to be named,
+            # but they have no page of their own — one short mail covers them.
+            if awaiting:
+                _write_and_send(args, drive, idx, season, [], reported,
+                                render_awaiting(awaiting),
+                                f"📊 {qlabel} — {len(awaiting)} filed, numbers pending",
+                                log)
+            log(f"  per-company: {n_sent} teardown mail(s)"
+                + (f" + 1 awaiting-summary mail" if awaiting else ""))
+            return
+
         body += filing_section + render_awaiting(awaiting)
         # Same helper as the day-grouped path above. This branch used to inline its own
         # copy of the toggle/creds/ledger gates, and referenced an `attachments` name that

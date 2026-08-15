@@ -95,9 +95,12 @@ jobs:
       # The results teardown keeps its own renderer — one mail per reporting company,
       # covering the last 26 hours so a late-evening filing is never straddled by the
       # 24-hour boundary.
-      - name: Results teardown mails (last 26h)
+      # --per-company: one mail per reporting company, matching the presentation and
+      # rating mails above. The combined body hit 90,957 B on a 42-company catch-up,
+      # past Gmail's clip threshold; splitting removes the size ceiling entirely.
+      - name: Results teardown mails (per company, last 26h)
         run: >
-          python scripts/quarter_teardown.py --pf --mail --since-hours 26
+          python scripts/quarter_teardown.py --per-company --since-hours 26
           ${{ inputs.dry_run == true && '--dry-run' || '' }}
         continue-on-error: true
 
