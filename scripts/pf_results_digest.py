@@ -461,7 +461,18 @@ def main():
 
     # The filing fallback: companies whose own results filing has been extracted but
     # whose Screener statements still sit on the previous quarter.
-    filings = FR.load_filing_results(drive, index_id, season, queue=queue, log=log)
+    # Reference revenue per holding = its most recent Screener quarter, used to catch
+    # filings stated in lakh rather than crore (PRECWIRE filed 177,048 against a prior
+    # quarter of 1,763 Cr — a unit mismatch, not a hundredfold jump).
+    refs = {}
+    for _isin, _sym, _n in pf:
+        _st = stmts_map.get(_sym)
+        if _st is not None and not _st.empty:
+            _r = FR.reference_revenue(_st)
+            if _r:
+                refs[str(_isin).strip()] = _r
+    filings = FR.load_filing_results(drive, index_id, season, queue=queue, log=log,
+                                     refs=refs)
 
     covered, awaiting = build_coverage(pf, stmts_map, results, queue, ledger, season,
                                        today, filings=filings)

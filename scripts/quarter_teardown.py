@@ -2118,11 +2118,17 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     pages, filing_pages = [], []
-    def _try_filing(isin, symbol, name, why) -> bool:
+    def _try_filing(isin, symbol, name, why, stmts=None) -> bool:
         """Render the filing card when the statements cannot carry a teardown."""
         fil = filings.get(isin)
         if not fil:
             return False
+        # Unit check against this company's own last Screener quarter, where we have it:
+        # a filing stated in lakh would otherwise print a hundredfold-wrong revenue.
+        if stmts is not None and not getattr(stmts, "empty", True):
+            ref = FR.reference_revenue(stmts)
+            if ref:
+                FR.apply_unit_check({isin: fil}, {isin: ref}, log)
         d = {"isin": isin, "symbol": symbol, "name": name,
              "quarter": fil["quarter"], "filing": fil, "data_source": "filing"}
         # A holding Screener has not caught up with still published a deck, a concall
@@ -2157,7 +2163,7 @@ def main() -> None:
                 # company still reported, so fall back to the filing's own numbers
                 # rather than dropping it out of the mail entirely.
                 if not _try_filing(isin, symbol, name,
-                                   f"statements still at {lbl or 'n/a'}"):
+                                   f"statements still at {lbl or 'n/a'}", stmts=stmts):
                     log(f"  {symbol}: filing dated {season} but statements still at "
                         f"{lbl or 'n/a'} — skipped until the numbers land")
                 continue

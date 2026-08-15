@@ -325,6 +325,71 @@ def _identity(d: dict) -> tuple:
             d.get("doc_type", ""), str(d.get("announcement_date", ""))[:10], t)
 
 
+def quarter_of(date_str: str) -> str:
+    """ISO date -> canonical season quarter ('2026-05-14' -> 'Q1FY27')."""
+    import quarterly_table as _QT
+    try:
+        return _QT.norm_q(_QT.season_quarter(pd.to_datetime(str(date_str)[:10])))
+    except Exception:
+        return ""
+
+
+def select_one_per_quarter(docs: list[dict], prefer_source: str = "screener") -> list[dict]:
+    """Keep ONE document per (doc_type, quarter). Screener wins; NSE fills gaps.
+
+    WHY THIS REPLACES CROSS-SOURCE TITLE MATCHING. Measured across 8 holdings: Screener
+    offered 134 documents and NSE 124, with **zero** identity matches between them —
+    the same filing is titled 'PPT — May 2026 Transcript AI Summary PPT REC' on Screener
+    and 'Investor Presentation' on NSE, and dated 2026-05-01 (month precision, from the
+    concall table) versus 2026-05-14 (the exact filing day). No title-and-date key can
+    reconcile those, so merging both sources enqueued — and Gemini-extracted — every
+    document twice.
+
+    Quarter is the unit that both sources DO agree on, and it is what the mail actually
+    needs: one deck per quarter to compare against the previous quarter. Screener's
+    concall table is already one row per quarter, which is why it is the primary.
+
+    A quarter with no Screener document falls through to whatever NSE has for it.
+    """
+    best: dict[tuple, dict] = {}
+    for d in docs:
+        q = quarter_of(d.get("announcement_date", ""))
+        if not q:
+            continue
+        key = (d.get("doc_type", ""), q)
+        cur = best.get(key)
+        if cur is None:
+            best[key] = {**d, "_quarter": q}
+            continue
+        # Screener beats NSE; within a source, the longer title carries more context
+        # (Screener's "PPT — May 2026 …" over a bare "PPT").
+        cur_pref = str(cur.get("source", prefer_source)) == prefer_source
+        new_pref = str(d.get("source", prefer_source)) == prefer_source
+        if (new_pref and not cur_pref) or (
+                new_pref == cur_pref and len(str(d.get("title", ""))) >
+                len(str(cur.get("title", "")))):
+            best[key] = {**d, "_quarter": q}
+    return list(best.values())
+
+
+def missing_quarters(docs: list[dict], doc_types, quarters: list[str]) -> set:
+    """(doc_type, quarter) pairs with no document — what NSE is asked to fill."""
+    have = {(d.get("doc_type"), quarter_of(d.get("announcement_date", ""))) for d in docs}
+    return {(t, q) for t in doc_types for q in quarters if (t, q) not in have}
+
+
+def recent_quarters(n: int = 6) -> list[str]:
+    """The last n season quarters, newest first."""
+    import quarterly_table as _QT
+    from datetime import datetime as _dt
+    out, d = [], _dt.now()
+    for _ in range(n):
+        out.append(_QT.norm_q(_QT.season_quarter(d)))
+        d = d - timedelta(days=92)
+    seen = set()
+    return [q for q in out if not (q in seen or seen.add(q))]
+
+
 def dedupe_across_sources(docs: list[dict]) -> list[dict]:
     """Collapse the same filing seen from more than one source. First seen wins —
     callers add Screener first, which the user set as the primary/cleanest view."""
@@ -506,6 +571,11 @@ def main() -> None:
     ap.add_argument("--types", default="",
                     help="Comma-separated doc_types to sweep (e.g. "
                          "presentation,rating,results). Blank = all types.")
+    ap.add_argument("--one-per-quarter", action="store_true",
+                    help="Keep ONE document per (doc_type, quarter). Screener wins; "
+                         "NSE only fills quarters Screener has nothing for.")
+    ap.add_argument("--quarters", type=int, default=6,
+                    help="How many recent quarters --one-per-quarter/--nse consider.")
     ap.add_argument("--nse", action="store_true",
                     help="Also query NSE's per-symbol announcements as a SECOND source "
                          "(index=sme for NSE Emerge names, equities otherwise). The only "
@@ -546,21 +616,40 @@ def main() -> None:
         docs = []
         try:
             docs = scrape_company_docs(client, sym)          # PRIMARY: cleanest view
+            for _d in docs:
+                _d["source"] = "screener"
         except Exception as e:
             log(f"  ! {sym:<14} screener fetch failed ({str(e)[:60]})")
+
         if args.nse:
-            # SECOND SOURCE. A document is only missing if BOTH miss it. This is what
-            # covers the SME holdings, which have no bse_code and which the shared
-            # Screener feed is most likely to lose.
-            try:
-                docs += nse_company_docs(nse, sym, boards.get(isin, ""))
-            except Exception as e:
-                log(f"  ! {sym:<14} nse fetch failed ({str(e)[:60]})")
+            # NSE FILLS GAPS ONLY (user, 2026-08-16). Screener is the primary and is
+            # already one row per quarter; NSE is consulted only for the quarters
+            # Screener has nothing for. Merging both wholesale enqueued every filing
+            # twice — the two sources share no title or exact date, so nothing matched.
+            types = want_types or {"presentation", "rating", "results"}
+            gaps = missing_quarters(docs, types, recent_quarters(args.quarters))
+            if gaps:
+                try:
+                    ndocs = nse_company_docs(nse, sym, boards.get(isin, ""))
+                    for _d in ndocs:
+                        _d["source"] = "nse"
+                    fill = [d for d in ndocs
+                            if (d.get("doc_type"),
+                                quarter_of(d.get("announcement_date", ""))) in gaps]
+                    if fill:
+                        log(f"    {sym}: NSE fills {len(fill)} gap(s) "
+                            f"{sorted({q for _t, q in gaps})[:4]}")
+                    docs += fill
+                except Exception as e:
+                    log(f"  ! {sym:<14} nse fetch failed ({str(e)[:60]})")
+
         if not docs:
             continue
         for _d in docs:
             _d.setdefault("isin", isin)      # identity keys on ISIN, not symbol
         docs = dedupe_across_sources(docs)
+        if args.one_per_quarter:
+            docs = select_one_per_quarter(docs)
         miss = missing_vs_queue(docs, queue, isin, since)
         if want_types:
             miss = [d for d in miss if d["doc_type"] in want_types]
