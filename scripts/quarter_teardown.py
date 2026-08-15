@@ -1516,7 +1516,14 @@ LEDGER_NAME = "quarter_teardown_mailed.parquet"
 # Screener ladder, so the filing-sourced version can be superseded by the real
 # teardown once the statements land instead of being suppressed as already-mailed.
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on",
-               "date_source", "data_source", "mailed_at"]
+               "date_source", "data_source", "mailed_at",
+               # `mail_mode` added 2026-08-15 (ADDITIVE — old rows read None, treated as
+               # "combined"). Two paths now send teardowns: t4_nightly's --daily combined
+               # body, and --per-company. They shared one ledger, so whichever ran first
+               # stamped the company and the other found nothing to send — in practice
+               # the evening combined run silenced the morning per-company run entirely.
+               # Tracking the mode separately lets both run as intended.
+               "mail_mode"]
 
 
 def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tuple]:
@@ -1613,11 +1620,14 @@ def _write_and_send(args, drive, idx, season, pages, reported, body, subject, lo
     # Ledger is stamped ONLY after a confirmed send — a failed or toggled-off mail
     # must not mark the work as delivered.
     if ok and reported:
-        _stamp_ledger(drive, idx, season, pages, reported, log)
+        _stamp_ledger(drive, idx, season, pages, reported, log,
+                      mode="per_company" if getattr(args, "per_company", False)
+                      else "combined")
 
 
-def _stamp_ledger(drive, idx, season, pages, reported, log) -> None:
-    """Record what was mailed, AFTER a confirmed send."""
+def _stamp_ledger(drive, idx, season, pages, reported, log, mode="combined") -> None:
+    """Record what was mailed, AFTER a confirmed send. `mode` keeps the combined and
+    per-company paths from suppressing each other — see LEDGER_COLS."""
     from _extractor_base import load_parquet, save_parquet
     now = datetime.now().isoformat(timespec="seconds")
     rows = []
@@ -1627,13 +1637,13 @@ def _stamp_ledger(drive, idx, season, pages, reported, log) -> None:
                      "quarter_label": d["quarter"], "reported_on": when,
                      "date_source": src,
                      "data_source": d.get("data_source", "screener"),
-                     "mailed_at": now})
+                     "mailed_at": now, "mail_mode": mode})
     if not rows:
         return
     led = load_parquet(drive, idx, LEDGER_NAME, LEDGER_COLS)
     new = pd.DataFrame(rows, columns=LEDGER_COLS)
     out = pd.concat([led, new], ignore_index=True) if led is not None and not led.empty else new
-    out = out.drop_duplicates(subset=["season_quarter", "isin"], keep="last")
+    out = out.drop_duplicates(subset=["season_quarter", "isin", "mail_mode"], keep="last")
     save_parquet(drive, idx, LEDGER_NAME, out)
     log(f"  ledger: +{len(rows)} row(s) -> _index/{LEDGER_NAME} ({len(out)} total)")
 
@@ -2037,6 +2047,15 @@ def main() -> None:
             done = set()
             if led is not None and not led.empty:
                 seen = led[led["season_quarter"].astype(str) == season]
+                # Only this mode's own sends suppress it. Old rows have no mail_mode and
+                # count as "combined", so the existing --daily path is unaffected.
+                _mode = "per_company" if args.per_company else "combined"
+                if "mail_mode" in seen.columns:
+                    seen = seen[seen["mail_mode"].astype(str)
+                                .replace({"None": "combined", "nan": "combined",
+                                          "": "combined"}) == _mode]
+                elif _mode == "per_company":
+                    seen = seen.iloc[0:0]        # no mode column yet -> nothing per-company
                 for _, r in seen.iterrows():
                     # A holding mailed only as a filing card is NOT done: the real
                     # teardown (bridge, divergence rails, register) still owes it a
