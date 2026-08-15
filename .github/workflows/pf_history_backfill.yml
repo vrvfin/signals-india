@@ -136,6 +136,18 @@ jobs:
           --limit "${{ inputs.limit }}" --deadline-min "${{ inputs.deadline_min }}"
         continue-on-error: true
 
+      # Results complete the set. This one has no --key-prefix flag, so it uses the
+      # Phase-2 GEMINI_API_KEY pool — acceptable here because the volume is small (tens,
+      # not hundreds) and the shared lock serialises it against any live run anyway.
+      - name: Stage 3c — extract results
+        if: inputs.stage == 'extract' || inputs.stage == 'all'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          echo "GEMINI_API_KEY=$GEMINI_API_KEY" >> .env
+          python scripts/extract_results.py --limit "${{ inputs.limit }}"
+        continue-on-error: true
+
       - name: Coverage after this run
         if: always()
         run: >
