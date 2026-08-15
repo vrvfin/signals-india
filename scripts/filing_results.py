@@ -113,6 +113,58 @@ def _row_to_facts(row) -> dict:
     return out
 
 
+# Indian filings quote figures in crore, lakh or (rarely) millions, and results_gemini
+# has NO units column — the prompt never asks Gemini to normalise. PRECWIRE's Q1 FY27
+# row reads revenue 177,048.48 where the prior quarter was 1,762.85 Cr: 177,048 LAKH is
+# 1,770 Cr, which lines up almost exactly. Printed as-is it claims a hundredfold jump.
+_SCALES = ((100.0, "lakh"), (10.0, "million"))   # divisor -> what the filing was in
+_TOL = 0.35        # a rescaled figure must land within +/-35% of the reference quarter
+
+
+def rescale_to_crore(value, reference):
+    """(value, note) — correct an obvious unit mismatch, or refuse to print the number.
+
+    `reference` is the company's own most recent quarterly revenue from Screener, in
+    crore. Only a scale that brings the figure back in line with it is applied, so this
+    can never invent a rescale for a company that genuinely grew.
+
+    Refusing beats guessing: when nothing fits, the value is dropped rather than shown,
+    because a hundredfold-wrong revenue in a mail is worse than a blank.
+    """
+    if value is None or not reference or reference <= 0:
+        return value, ""
+    ratio = value / reference
+    if 0.2 <= ratio <= 5.0:                 # already plausible in crore
+        return value, ""
+    for div, name in _SCALES:
+        cand = value / div
+        if abs(cand / reference - 1.0) <= _TOL:
+            return cand, f"converted from {name} (filing stated {value:,.0f})"
+    return None, (f"implausible vs the last quarter's {reference:,.0f} Cr "
+                  f"({ratio:,.2f}x) — suppressed rather than shown")
+
+
+def reference_revenue(stmts_df) -> float | None:
+    """The company's most recent quarterly revenue from Screener, in crore.
+
+    This is the yardstick for the unit check: the filing covers the quarter Screener has
+    NOT published yet, so the newest column available is the immediately prior quarter —
+    exactly the right thing to sanity-check a fresh figure against.
+    """
+    try:
+        periods, rows = QT.quarterly_rows(stmts_df, quarters=2)
+        if not periods:
+            return None
+        series = rows.get("Revenue") or {}
+        for p in reversed(periods):
+            v = series.get(p)
+            if v is not None and float(v) > 0:
+                return float(v)
+    except Exception:
+        return None
+    return None
+
+
 def usable(facts: dict) -> bool:
     """A row is usable only if it names a quarter and carries a real revenue.
 
@@ -174,13 +226,41 @@ def attach_filing_dates(found: dict[str, dict], queue: pd.DataFrame | None) -> d
     return found
 
 
+def apply_unit_check(found: dict[str, dict], refs: dict[str, float], log=None) -> dict:
+    """Sanity-check filing revenue against each company's own last Screener quarter."""
+    for isin, f in found.items():
+        ref = refs.get(str(isin).strip())
+        if not ref:
+            continue
+        for key in ("revenue_cr", "ebitda_cr", "pat_cr"):
+            v = f.get(key)
+            if v is None:
+                continue
+            # Only revenue is scale-checked against revenue; PAT/EBITDA follow whatever
+            # correction revenue needed, since a filing states all of them in one unit.
+            newv, note = rescale_to_crore(v, ref) if key == "revenue_cr" else (v, "")
+            if key == "revenue_cr" and note:
+                f["units_note"] = note
+                if log:
+                    log(f"  units: {f.get('symbol')} {note}")
+                factor = (newv / v) if (newv and v) else None
+                if factor:
+                    for k2 in ("ebitda_cr", "pat_cr"):
+                        if f.get(k2) is not None:
+                            f[k2] = f[k2] * factor
+                f[key] = newv
+    return found
+
+
 def load_filing_results(drive, idx, season: str, queue: pd.DataFrame | None = None,
-                        log=None) -> dict[str, dict]:
+                        log=None, refs: dict | None = None) -> dict[str, dict]:
     """{isin: validated facts} for the season, straight from the filings."""
     from _extractor_base import load_parquet
     df = load_parquet(drive, idx, FILING_NAME, FILING_COLS)
     found = select_season(df, season)
     found = attach_filing_dates(found, queue)
+    if refs:
+        found = apply_unit_check(found, refs, log)
     if log:
         log(f"filing results: {len(df)} rows in {FILING_NAME} -> "
             f"{len(found)} usable for {season}")
@@ -278,6 +358,33 @@ def _self_test() -> int:
     check("filing date joined", out["INE030"]["filed_on"] == "2026-08-12")
     check("title joined", out["INE030"]["title"].startswith("Outcome"))
     check("no queue is not a crash", attach_filing_dates({"A": {}}, None)["A"]["filed_on"] == "")
+
+    # ---- units: THE PRECWIRE CASE. Q1 FY27 filed 177,048.48 against a prior quarter of
+    # 1,762.85 Cr. 177,048 LAKH = 1,770 Cr, which matches — so it is a unit mismatch,
+    # not a hundredfold jump.
+    v, note = rescale_to_crore(177048.48, 1762.85)
+    check("lakh figure rescaled to crore", v is not None and abs(v - 1770.48) < 0.1)
+    check("the rescale is explained, not silent", "lakh" in note)
+    check("a plausible crore figure is left alone",
+          rescale_to_crore(1800.0, 1762.85) == (1800.0, ""))
+    check("genuine growth is not 'corrected'",
+          rescale_to_crore(2600.0, 1762.85)[0] == 2600.0)
+    check("a genuine halving is not 'corrected'",
+          rescale_to_crore(900.0, 1762.85)[0] == 900.0)
+    # Nothing fits -> refuse rather than guess.
+    v2, note2 = rescale_to_crore(9_999_999.0, 1762.85)
+    check("an unexplainable figure is suppressed, not printed", v2 is None)
+    check("suppression says why", "implausible" in note2)
+    check("no reference means no change", rescale_to_crore(177048.48, None)[0] == 177048.48)
+
+    # PAT/EBITDA follow revenue's correction — a filing states them all in one unit.
+    found = {"INE9": {"symbol": "P", "revenue_cr": 177048.48, "pat_cr": 262.0,
+                      "ebitda_cr": None}}
+    out = apply_unit_check(found, {"INE9": 1762.85})
+    check("revenue corrected", abs(out["INE9"]["revenue_cr"] - 1770.48) < 0.1)
+    check("pat scaled by the same factor", abs(out["INE9"]["pat_cr"] - 2.62) < 0.01)
+    check("a missing ebitda stays missing", out["INE9"]["ebitda_cr"] is None)
+    check("the note is carried for the render", "lakh" in out["INE9"]["units_note"])
 
     print(f"\nfiling_results self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
