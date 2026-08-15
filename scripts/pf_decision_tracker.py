@@ -30,6 +30,7 @@ Usage:
     python scripts/pf_decision_tracker.py                    # live: write + email
     python scripts/pf_decision_tracker.py --dry-run          # read-only, no write/mail, writes an HTML preview locally
     python scripts/pf_decision_tracker.py --no-mail          # compute + write parquets, skip email
+    python scripts/pf_decision_tracker.py --no-write         # send a PREVIEW email, write nothing
     python scripts/pf_decision_tracker.py --asof 2026-07-20  # recompute as of a past date (testing)
 """
 from __future__ import annotations
@@ -1494,13 +1495,20 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="Read-only: no Drive writes, no email; writes an HTML preview locally.")
     ap.add_argument("--no-mail", action="store_true", help="Compute + write, but skip email.")
+    ap.add_argument("--no-write", action="store_true",
+                    help="Send the email but persist NOTHING to Drive — a real preview "
+                         "mail that leaves the ledgers untouched (the mirror of --no-mail).")
     ap.add_argument("--asof", default=None, help="Recompute as of YYYY-MM-DD (default: today).")
     args = ap.parse_args()
 
     asof = (datetime.strptime(args.asof, "%Y-%m-%d").date() if args.asof else date.today())
     dry = args.dry_run
+    # --no-write still emails, but nothing reaches Drive: the ledgers, the snapshot
+    # and every derived table are left exactly as they were.
+    persist = not (dry or args.no_write)
+    mode = "  [DRY-RUN]" if dry else ("  [PREVIEW — no Drive writes]" if args.no_write else "")
     log("=" * 64)
-    log(f"PF Decision Tracker — asof {asof}{'  [DRY-RUN]' if dry else ''}")
+    log(f"PF Decision Tracker — asof {asof}{mode}")
     log("=" * 64)
 
     drive = get_drive()
@@ -1528,10 +1536,11 @@ def main() -> None:
     price_cache: dict = {}
 
     # 3. Snapshot capture (change-gated) + decision diff.
-    snaps, changed = append_snapshot(drive, out_id, snaps, pf, asof, target["name"], dry)
+    snaps, changed = append_snapshot(drive, out_id, snaps, pf, asof, target["name"],
+                                     not persist)
     decs_before = len(decs)
     decs = derive_decisions(snaps, decs, asof, price_cache, drive, ohlcv_id)
-    if not dry and len(decs) != decs_before:
+    if persist and len(decs) != decs_before:
         save_parquet(drive, out_id, "pf_decisions.parquet", decs)
 
     # 4. Compute everything. Benchmarks come from Phase-1 data/indices/.
@@ -1583,7 +1592,9 @@ def main() -> None:
             f"{net:+.2f} pp vs holding on.")
 
     # 5. Persist derived tables (overwrite; idempotent).
-    if not dry:
+    if not persist:
+        log("  Drive writes suppressed — ledgers and derived tables left untouched.")
+    if persist:
         save_parquet(drive, out_id, "pf_index.parquet", idx)
         save_parquet(drive, out_id, "pf_decision_scorecard.parquet", score)
         save_parquet(drive, out_id, "pf_movers.parquet", movers)
@@ -1606,6 +1617,8 @@ def main() -> None:
                    f"({si:+.1f}% since base {periods['start_date']}) · {len(pf)} holdings")
     else:
         subject = f"PF Tracker — {asof} ({len(pf)} holdings)"
+    if args.no_write:
+        subject = "[PREVIEW] " + subject
     xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold, spells)
     xlsx_name = f"pf_tracker_{asof}.xlsx"
     XLSX_MIME = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
