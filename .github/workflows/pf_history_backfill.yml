@@ -99,7 +99,7 @@ jobs:
       - name: Stage 1 — discover and enqueue
         if: inputs.stage == 'discover' || inputs.stage == 'all'
         run: >
-          python scripts/pf_docs_sweep.py --enqueue
+          python scripts/pf_docs_sweep.py --enqueue --nse
           --days "${{ inputs.days }}" --types presentation,rating,results
           ${{ inputs.symbols != '' && format('--symbols {0}', inputs.symbols) || '' }}
 

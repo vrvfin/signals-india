@@ -132,15 +132,30 @@ def hydrate(drive, idx, repo_id, args) -> None:
             try:
                 pdf = download_pdf(session, str(r["pdf_url"]))
                 if not pdf:
-                    # Stays PENDING — the url may work later, and marking it done would
-                    # bury the document permanently. But record WHY, so a repeatedly
-                    # unfetchable document is visible instead of looking untried.
-                    # (The commonest cause here is a rating rationale served as HTML.)
-                    mark_queue_error(queue, i, "download returned no PDF bytes",
-                                     status="pending")
-                    log(f"  ! {sym:<12} download returned nothing — left pending")
-                    failed += 1
-                    continue
+                    # NOT A PDF — but that does not make it useless. The extractors call
+                    # _extractor_base.call_over_doc, which already auto-detects: bytes
+                    # starting with %PDF go to call_pdf, anything else is decoded and
+                    # sent to call_text. Rating agencies serve their rationales as HTML
+                    # (measured: 22 stuck PF ratings — 17 Fitch, 3 CRISIL, 1 Brickwork,
+                    # 1 ICRA), and discarding those bytes here is what stranded them:
+                    # no drive_file_id, so every extractor skipped them forever.
+                    #
+                    # So fetch the raw document and store it as-is. Only genuinely empty
+                    # or binary-junk responses are refused.
+                    raw = _fetch_raw(session, str(r["pdf_url"]))
+                    if raw:
+                        pdf = raw
+                        log(f"    not a PDF — stored {len(raw):,} bytes as text/HTML "
+                            f"(call_over_doc handles it)")
+                    else:
+                        # Stays PENDING — the url may work later, and marking it done
+                        # would bury the document permanently. Record WHY so a
+                        # repeatedly unfetchable document is visible, not just untried.
+                        mark_queue_error(queue, i, "no bytes returned (PDF or text)",
+                                         status="pending")
+                        log(f"  ! {sym:<12} download returned nothing — left pending")
+                        failed += 1
+                        continue
                 key = str(r.get("key") or r.get("isin") or sym)
                 comp_id = get_or_create_subfolder(drive, repo_id, key)
                 docs_id = get_or_create_subfolder(drive, comp_id, "documents")
@@ -376,6 +391,34 @@ def nse_company_docs(session, symbol: str, board: str = "",
         out.append({"doc_type": doc_type, "title": (desc or url)[:200],
                     "pdf_url": url, "announcement_date": when})
     return out
+
+
+def _fetch_raw(session, url: str) -> bytes | None:
+    """Fetch a document that is NOT a PDF (an HTML rating rationale, typically).
+
+    download_pdf() deliberately returns None for anything without a %PDF header, which
+    is right for its own purpose but strands every agency that publishes HTML. The
+    extractors are already equipped for this — call_over_doc decodes non-PDF bytes and
+    uses the text path — so the bytes just have to reach Drive.
+
+    Refuses empties and obvious binary junk; an HTML error page is still stored, because
+    the extractor recording "this said 404" beats a row that looks untried forever.
+    """
+    try:
+        r = session.get(url, timeout=45)
+        if r.status_code != 200 or not r.content:
+            return None
+        body = r.content
+        if len(body.strip()) < 200:          # too small to hold a rationale
+            return None
+        # Reject binary that is neither PDF nor decodable text (images, zips).
+        try:
+            body[:2048].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return body
+    except Exception:
+        return None
 
 
 def _board_map(drive, index_id) -> dict:
