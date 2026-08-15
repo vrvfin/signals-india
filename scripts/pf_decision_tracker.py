@@ -6,7 +6,10 @@ Answers, in PLAIN, COUNTABLE, non-black-box terms, every daily run:
   2. Movers most/least              -> rank holdings over 1/2/3/6/12-month windows.
   3. Are my BUY/SELL/HOLD calls right? -> forward return of each decision vs the
      MEDIAN & QUARTILES of my OWN BOOK over the same window (no composite score).
-  4. Relook sold stocks             -> forward return since exit + latest results YoY.
+  4. Relook sold stocks             -> "what if I hadn't sold?": return since exit vs
+     what my OWN PF earned over the identical days, priced in portfolio points.
+  5. Like-for-like vs the index     -> every stock, held or sold, measured from the day
+     it entered the book, with NIFTY 500 / SMALLCAP 100 over the SAME days beside it.
   Plus a REVIEW-NOW block: recent buys sinking to the bottom quartile and recent
   sells that ran up — so wrong calls surface within weeks, not quarters.
 
@@ -77,11 +80,26 @@ MOVER_COLS = ["symbol", "isin", "name", "weight_pct",
 
 HOLD_COLS  = ["rank", "symbol", "isin", "name", "weight_pct", "first_seen",
               "anchor_date", "days_held", "full_window", "ret_since_pct",
-              "pace_wk_pct", "vs_median_pp", "vs_bench_pp", "contrib_pp",
+              "pace_wk_pct", "vs_median_pp", "vs_bench_pp",
+              "n500_ret_pct", "vs_n500_pp", "sc100_ret_pct", "vs_sc100_pp",
+              "contrib_pp",
               "contrib_share_pct", "contrib_rank", "left_on_table_pp",
               "return_1m_pct", "return_2m_pct", "return_3m_pct", "return_6m_pct",
               "return_12m_pct", "flat_5d", "flat_10d", "neg_windows",
               "below_med_windows", "below_target", "flags"]
+
+# Closed positions. Every window is measured from dates this book actually records:
+# spell_start (the day it entered) and sell_date (the day it left).
+EXIT_COLS  = ["symbol", "isin", "name", "first_seen", "sell_date",
+              "days_held", "days_since_sell", "weight_at_sell",
+              "realised_pct", "since_sell_pct", "full_hold_pct",
+              "pf_since_sell_pct", "opportunity_pp",
+              "n500_since_sell_pct", "vs_n500_pp",
+              "sc100_since_sell_pct", "vs_sc100_pp",
+              "latest_yoy_pct", "verdict"]
+
+SPELL_COLS = ["isin", "symbol", "name", "spell_start", "spell_end", "status",
+              "weight_at_entry", "weight_at_exit"]
 
 # ADD/TRIM band: a weight change counts as a real trade only if it exceeds the
 # drift-implied weight by BOTH an absolute (pp) and a relative margin.
@@ -103,6 +121,10 @@ TARGET_CAGR_PCT = 50.0
 
 # Benchmarks from data/indices/ (Phase-1 `ingest_indices_macro.py`). First is primary.
 BENCHMARKS = ["NIFTY_500", "NIFTY_SMALLCAP_100"]
+# Short column prefixes for the per-stock index columns, so a widened table stays
+# readable: NIFTY_500 -> n500_ret_pct / vs_n500_pp.
+BENCH_KEY = {"NIFTY_500": "n500", "NIFTY_SMALLCAP_100": "sc100"}
+PRIMARY_KEY = BENCH_KEY[BENCHMARKS[0]]
 
 # Allocation review: a "winner" is top-quartile pace; "underweight" is below equal
 # weight. The pair flags positions whose sizing capped their impact.
@@ -449,6 +471,57 @@ def derive_decisions(snaps: pd.DataFrame, decs: pd.DataFrame, asof: date,
     return decs
 
 
+# ── Holding spells (contiguous ownership runs) ───────────────────────────────
+
+def build_spells(snaps: pd.DataFrame, decs: pd.DataFrame) -> pd.DataFrame:
+    """Split the snapshot ledger into CONTIGUOUS ownership runs, one row per
+    (isin, spell): spell_start .. spell_end.
+
+    A position can be sold and bought back. Anchoring "since first seen" on the
+    EARLIEST-ever snapshot would then measure across the months it wasn't owned —
+    so every per-stock window in this report anchors on the CURRENT spell instead.
+    A spell breaks the moment the ISIN is missing from a snapshot date, which is the
+    same observation `derive_decisions` turns into a SELL event; `weight_at_exit`
+    is read off that SELL row, falling back to the last weight actually observed.
+
+    status = HELD (spell_end None, still in the latest snapshot) or SOLD."""
+    if snaps.empty:
+        return pd.DataFrame(columns=SPELL_COLS)
+
+    all_dates = sorted(snaps["snapshot_date"].unique())
+    exit_w = {}
+    if decs is not None and not decs.empty:
+        for r in decs[decs["action"] == "SELL"].itertuples():
+            exit_w[(r.isin, r.event_date)] = r.weight_before
+
+    rows = []
+    for isin, g in snaps.groupby("isin"):
+        seen = dict(zip(g["snapshot_date"], g["weight_pct"]))
+        sym = str(g["symbol"].iloc[-1])
+        nm = str(g["name"].iloc[-1])
+
+        def _close(start, end_date, status):
+            last_w = seen.get(max(d for d in seen if d < end_date)) \
+                if (end_date and any(d < end_date for d in seen)) else seen.get(start)
+            rows.append(dict(
+                isin=isin, symbol=sym, name=nm, spell_start=start, spell_end=end_date,
+                status=status, weight_at_entry=seen.get(start),
+                weight_at_exit=(np.nan if status == "HELD"
+                                else exit_w.get((isin, end_date), last_w))))
+
+        start = None
+        for d in all_dates:
+            if d in seen and start is None:
+                start = d
+            elif d not in seen and start is not None:
+                _close(start, d, "SOLD")       # `d` = the snapshot it vanished on
+                start = None
+        if start is not None:
+            _close(start, None, "HELD")
+
+    return pd.DataFrame(rows, columns=SPELL_COLS)
+
+
 # ── PF index (fixed-weight, daily-rebalanced weighted-return) ────────────────
 
 def compute_index(snaps: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
@@ -611,14 +684,21 @@ def compute_movers(drive, root_id, pf: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
-                          asof: date, bench_ser=None) -> pd.DataFrame:
+                          asof: date, bench_map=None, spells=None) -> pd.DataFrame:
     """Per-holding table where EVERY number is measured from the day the position
     actually entered the tracked book — never earlier, never from a common date the
     stock wasn't held on.
 
         base_date   = first snapshot we hold (start of PF reporting)
-        first_seen  = first snapshot this ISIN appears in
+        first_seen  = start of the CURRENT holding spell for this ISIN (see
+                      build_spells) — for a name sold and bought back this is the
+                      re-entry, not the original purchase, so the window never spans
+                      months the position wasn't owned
         anchor_date = max(base_date, first_seen)
+
+    Each benchmark in `bench_map` is measured over that SAME anchor→asof window, so
+    `<key>_ret_pct` answers "what the index did over exactly the days I held this"
+    and `vs_<key>_pp` is the like-for-like gap.
 
     So a name added on 6-Aug is measured from 6-Aug, not from the base date. Because
     that leaves every stock on a different-length window, the cross-stock comparator
@@ -635,8 +715,14 @@ def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
         movers[["isin"] + ret_cols], on="isin", how="left")
 
     base_date = snaps["snapshot_date"].min() if not snaps.empty else str(asof)
-    first_map = (snaps.groupby("isin")["snapshot_date"].min().to_dict()
-                 if not snaps.empty else {})
+    # Current spell only — never the earliest-ever appearance (see build_spells).
+    if spells is not None and not spells.empty:
+        first_map = {r.isin: r.spell_start
+                     for r in spells[spells["status"] == "HELD"].itertuples()}
+    else:
+        first_map = (snaps.groupby("isin")["snapshot_date"].min().to_dict()
+                     if not snaps.empty else {})
+    bench_map = bench_map or {}
     end_ts = pd.Timestamp(asof)
     req_wk = required_wk_pct()
 
@@ -650,7 +736,15 @@ def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
         ser = load_close_series(drive, ohlcv_id, r.symbol, price_cache)
         since = fwd_return(ser, anchor_ts, end_ts)
         pace = pace_wk_pct(since, days_held)
-        bench = fwd_return(bench_ser, anchor_ts, end_ts) if bench_ser is not None else None
+
+        # Each index measured over THIS stock's own holding window — like for like.
+        bcols = {}
+        for bname, bser in bench_map.items():
+            k = BENCH_KEY.get(bname, bname.lower())
+            b = fwd_return(bser, anchor_ts, end_ts)
+            bcols[f"{k}_ret_pct"] = b if b is not None else np.nan
+            bcols[f"vs_{k}_pp"] = ((since - b) if (since is not None and b is not None)
+                                   else np.nan)
 
         wt = float(r.weight_pct) if pd.notna(r.weight_pct) else np.nan
         contrib = (wt / 100.0 * since) if (pd.notna(wt) and since is not None) else np.nan
@@ -666,12 +760,18 @@ def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
             full_window=bool(anchor == str(base_date)),
             ret_since_pct=since if since is not None else np.nan,
             pace_wk_pct=pace if pace is not None else np.nan,
-            vs_bench_pp=(since - bench) if (since is not None and bench is not None) else np.nan,
+            # Kept as the primary-benchmark alias so existing readers don't shift.
+            vs_bench_pp=bcols.get(f"vs_{PRIMARY_KEY}_pp", np.nan),
             contrib_pp=contrib,
             flat_5d=flat_days(ser, FLAT_BANDS[0]), flat_10d=flat_days(ser, FLAT_BANDS[1]),
-            **wins))
+            **bcols, **wins))
 
     h = pd.DataFrame(rows)
+    # A benchmark parquet can be missing on Drive — keep the schema stable regardless.
+    for k in BENCH_KEY.values():
+        for c in (f"{k}_ret_pct", f"vs_{k}_pp"):
+            if c not in h.columns:
+                h[c] = np.nan
 
     # Trailing-window fail counts: each window judged against ITS OWN median, so the
     # comparison inside a column is always like-for-like.
@@ -734,6 +834,38 @@ def compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id,
     return h[HOLD_COLS]
 
 
+def matched_bench_returns(hold: pd.DataFrame) -> dict:
+    """Weight-average each holding's own-window return against the index's return over
+    THE SAME days:
+
+        matched_pf    = Σ wᵢ·rᵢ / Σ wᵢ     (rᵢ over stock i's anchor→asof)
+        matched_bench = Σ wᵢ·bᵢ / Σ wᵢ     (bᵢ over the identical window)
+
+    READ THIS CAREFULLY before using the number: at whole-portfolio level a
+    fully-invested book's "index adjusted for holding days" collapses to the plain
+    index over the tracked span, because the weights renormalise to 1 every day. This
+    weighted version differs from the plain index ONLY because it re-weights the
+    index's sub-periods by WHEN each name was entered. So it isolates entry timing —
+    it is not a second source of alpha, and the plain-index alpha in section 1
+    remains the headline. Positions are dropped from a benchmark's average when
+    either leg is missing, so both legs always cover the same names."""
+    out = {}
+    if hold is None or hold.empty:
+        return out
+    for bname, k in BENCH_KEY.items():
+        bcol = f"{k}_ret_pct"
+        if bcol not in hold.columns:
+            continue
+        d = hold[["weight_pct", "ret_since_pct", bcol]].dropna()
+        w = d["weight_pct"].sum()
+        if d.empty or w <= 0:
+            continue
+        pf_r = float((d["weight_pct"] * d["ret_since_pct"]).sum() / w)
+        bn_r = float((d["weight_pct"] * d[bcol]).sum() / w)
+        out[bname] = {"pf": pf_r, "bench": bn_r, "alpha": pf_r - bn_r, "n": int(len(d))}
+    return out
+
+
 # ── Decision scorecard (vs own-book median/quartiles) ────────────────────────
 
 def _peer_isins_at(snaps: pd.DataFrame, event_date: str) -> pd.DataFrame:
@@ -793,14 +925,41 @@ def score_decisions(decs: pd.DataFrame, snaps: pd.DataFrame, price_cache: dict,
 
 # ── Sold-stock relook ────────────────────────────────────────────────────────
 
-def sold_relook(decs: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
-                results: pd.DataFrame, asof: date, lookback_m: int = 12) -> pd.DataFrame:
-    sells = decs[decs["action"] == "SELL"].copy()
-    if sells.empty:
-        return pd.DataFrame(columns=["event_date", "symbol", "isin", "name",
-                                     "ret_since_sell_pct", "latest_yoy_pct", "verdict"])
+def compute_exits_view(spells: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
+                       idx: pd.DataFrame, results: pd.DataFrame, asof: date,
+                       bench_map=None, lookback_m: int = 12) -> pd.DataFrame:
+    """Closed positions, answering "what would I have if I hadn't sold?" in the only
+    honest baseline a weightage-only book has: your OWN portfolio.
+
+    Selling didn't put the money under a mattress — it went back into the book. So the
+    counterfactual for a sold name is the PF index over the identical days, not zero:
+
+        opportunity_pp = weight_at_sell/100 × (since_sell_pct − pf_since_sell_pct)
+
+    Positive = points of PF growth given up by selling; negative = points dodged.
+    Three windows are reported per exit, all off dates the ledger actually records:
+    `realised_pct` (entry→sell, what the position made), `since_sell_pct`
+    (sell→today, what it did once you were out) and `full_hold_pct` (entry→today,
+    where you'd be had you never sold). Each benchmark is measured over the same
+    sell→today window, so the index comparison is like for like."""
+    cols = EXIT_COLS
+    if spells is None or spells.empty:
+        return pd.DataFrame(columns=cols)
+    sold = spells[(spells["status"] == "SOLD") & spells["spell_end"].notna()].copy()
+    if sold.empty:
+        return pd.DataFrame(columns=cols)
     cutoff = pd.Timestamp(asof) - relativedelta(months=lookback_m)
-    sells = sells[pd.to_datetime(sells["event_date"]) >= cutoff]
+    sold = sold[pd.to_datetime(sold["spell_end"]) >= cutoff]
+    if sold.empty:
+        return pd.DataFrame(columns=cols)
+
+    bench_map = bench_map or {}
+    end_ts = pd.Timestamp(asof)
+    pf_ser = None
+    if idx is not None and not idx.empty and "pf_index" in idx.columns:
+        pf_ser = (idx.assign(_d=pd.to_datetime(idx["date"]))
+                     .set_index("_d")["pf_index"].astype(float).sort_index())
+
     yoy_map = {}
     if not results.empty and {"symbol", "yoy_pct"} <= set(results.columns):
         pcol = "period" if "period" in results.columns else None
@@ -810,21 +969,61 @@ def sold_relook(decs: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
             yoy_map[sym] = pd.to_numeric(g["yoy_pct"], errors="coerce").dropna().iloc[-1] \
                 if g["yoy_pct"].notna().any() else None
     rows = []
-    for ev in sells.itertuples():
-        r = fwd_return(load_close_series(drive, ohlcv_id, ev.symbol, price_cache),
-                       pd.Timestamp(ev.event_date), pd.Timestamp(asof))
+    for ev in sold.itertuples():
+        ser = load_close_series(drive, ohlcv_id, ev.symbol, price_cache)
+        start_ts, sell_ts = pd.Timestamp(ev.spell_start), pd.Timestamp(ev.spell_end)
+
+        realised = fwd_return(ser, start_ts, sell_ts)
+        since = fwd_return(ser, sell_ts, end_ts)
+        full = fwd_return(ser, start_ts, end_ts)
+        pf_since = fwd_return(pf_ser, sell_ts, end_ts) if pf_ser is not None else None
+
+        wt = float(ev.weight_at_exit) if pd.notna(ev.weight_at_exit) else np.nan
+        opp = (wt / 100.0 * (since - pf_since)) \
+            if (pd.notna(wt) and since is not None and pf_since is not None) else np.nan
+
+        bcols = {}
+        for bname, bser in bench_map.items():
+            k = BENCH_KEY.get(bname, bname.lower())
+            b = fwd_return(bser, sell_ts, end_ts)
+            bcols[f"{k}_since_sell_pct"] = b if b is not None else np.nan
+            bcols[f"vs_{k}_pp"] = ((since - b) if (since is not None and b is not None)
+                                   else np.nan)
+
+        # Verdict is judged against the book the money moved INTO, not against zero —
+        # a name up 8% while the PF did 20% was still the right thing to sell.
         yoy = yoy_map.get(ev.symbol)
-        if r is None:
+        gap = (since - pf_since) if (since is not None and pf_since is not None) else None
+        if since is None:
             v = "n/a"
-        elif r <= 0 or (yoy is not None and yoy < 0):
-            v = "validated exit"           # fell since sell and/or poor results
-        elif r >= 15:
+        elif gap is None:
+            v = "validated exit" if since <= 0 else ("regret — ran up" if since >= 15
+                                                     else "neutral")
+        elif gap <= -5 or (gap <= 0 and yoy is not None and yoy < 0):
+            v = "validated exit"          # lagged the book you moved into
+        elif gap >= 10:
             v = "regret — ran up"
         else:
             v = "neutral"
-        rows.append(dict(event_date=ev.event_date, symbol=ev.symbol, isin=ev.isin,
-                         name=ev.name, ret_since_sell_pct=r, latest_yoy_pct=yoy, verdict=v))
-    return pd.DataFrame(rows).sort_values("ret_since_sell_pct", na_position="last")
+
+        rows.append(dict(
+            symbol=ev.symbol, isin=ev.isin, name=ev.name,
+            first_seen=ev.spell_start, sell_date=ev.spell_end,
+            days_held=max((sell_ts - start_ts).days, 0),
+            days_since_sell=max((end_ts - sell_ts).days, 0),
+            weight_at_sell=wt,
+            realised_pct=realised if realised is not None else np.nan,
+            since_sell_pct=since if since is not None else np.nan,
+            full_hold_pct=full if full is not None else np.nan,
+            pf_since_sell_pct=pf_since if pf_since is not None else np.nan,
+            opportunity_pp=opp, latest_yoy_pct=yoy, verdict=v, **bcols))
+
+    out = pd.DataFrame(rows)
+    for c in cols:
+        if c not in out.columns:
+            out[c] = np.nan
+    # Biggest regret first — the exits that cost the most PF growth.
+    return out[cols].sort_values("opportunity_pp", ascending=False, na_position="last")
 
 
 # ── HTML digest ──────────────────────────────────────────────────────────────
@@ -836,8 +1035,48 @@ def _pct(v, signed=True):
     return f"<span style='color:{col}'>{v:+.1f}%</span>" if signed else f"{v:.1f}%"
 
 
+# The tables repeat the same dozen inline styles ~2,000 times; that alone is ~60 KB
+# and pushes the body past Gmail's ~102 KB clip, which silently truncates the mail.
+# Swapping the exact literals for classes in one pass keeps every table identical to
+# the byte but roughly halves the body. Longest first so no literal eats a prefix of
+# another. If a client strips <style>, the tables still render — just unpadded.
+_CSS_CLASSES = [
+    ("align='right' style='padding:2px 6px;color:#888'",  "class='r g'"),
+    ("align='right' style='padding:2px 8px;color:#888'",  "class='r8 g'"),
+    ("align='right' style='padding:2px 6px;color:#777'",  "class='r g2'"),
+    ("align='center' style='padding:2px 6px;color:#777'", "class='c g2'"),
+    ("align='center' style='padding:3px 10px;color:#555'", "class='c10 g3'"),
+    ("align='right' style='padding:2px 6px'",   "class='r'"),
+    ("align='right' style='padding:2px 8px'",   "class='r8'"),
+    ("align='center' style='padding:2px 6px'",  "class='c'"),
+    ("align='center' style='padding:3px 10px'", "class='c10'"),
+    ("style='padding:2px 6px;font-size:11px'",  "class='sm'"),
+    ("style='padding:2px 8px'",                 "class='p8'"),
+    ("style='color:#1a7a3c'",                   "class='up'"),
+    ("style='color:#c0392b'",                   "class='dn'"),
+    ("style='color:#bbb'",                      "class='g4'"),
+]
+_CSS_BLOCK = ("<style>"
+              ".r{padding:2px 6px;text-align:right}"
+              ".r8{padding:2px 8px;text-align:right}"
+              ".c{padding:2px 6px;text-align:center}"
+              ".c10{padding:3px 10px;text-align:center}"
+              ".p8{padding:2px 8px}"
+              ".sm{padding:2px 6px;font-size:11px}"
+              ".g{color:#888}.g2{color:#777}.g3{color:#555}.g4{color:#bbb}"
+              ".up{color:#1a7a3c}.dn{color:#c0392b}"
+              "</style>")
+
+
+def shrink_html(html: str) -> str:
+    """Fold the repeated inline styles into classes. Size only — no visual change."""
+    for literal, cls in sorted(_CSS_CLASSES, key=lambda x: -len(x[0])):
+        html = html.replace(literal, cls)
+    return _CSS_BLOCK + html
+
+
 def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,
-               hold=None):
+               hold=None, matched=None):
     H = []
     H.append(f"<h2 style='margin:0'>PF Decision Tracker — {asof}</h2>")
     H.append(f"<p style='color:#666;margin:2px 0 14px'>{len(pf)} holdings · "
@@ -922,6 +1161,27 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
             f"• <b>CAGR</b> = (End ÷ Start)<sup>365/days</sup> − 1. Blank under a quarter — "
             f"annualising a fortnight produces silly numbers.<br>"
             f"• <b>Alpha</b> — PF return minus the index over the identical window.</div>")
+
+        # Holding-window-matched view: each stock's own entry date, weight-averaged.
+        if matched:
+            lines = []
+            for b, m in matched.items():
+                lines.append(
+                    f"<li>{esc(b.replace('_', ' '))}: your book <b>{_pct(m['pf'])}</b> vs index "
+                    f"<b>{_pct(m['bench'])}</b> over the same days → "
+                    f"<b>{_pct(m['alpha'])}</b> ({m['n']} holdings)</li>")
+            H.append(
+                "<p style='margin:10px 0 2px'><b>Index-adjusted for the days you actually "
+                "held each name</b></p>"
+                "<ul style='margin:2px 0;font-size:13px'>" + "".join(lines) + "</ul>"
+                "<div style='background:#f6f8fa;border-left:3px solid #ccc;padding:8px 12px;"
+                "margin:4px 0 8px;font-size:12px;color:#555'>Every holding's return is paired "
+                "with the index over <i>its own</i> entry date → today, then both are averaged "
+                "by weight — so a name bought last week is compared against last week's index, "
+                "not the year's. Because the book is always fully invested, this differs from "
+                "the plain Alpha row above only through <b>entry timing</b>; it is not extra "
+                "alpha, and the row above stays the headline number.</div>")
+
         if contrib:
             up = contrib[0]; dn = contrib[-1]
             H.append(f"<p style='color:#666'>Today's biggest lift: <b>{esc(up[0])}</b> "
@@ -938,6 +1198,9 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                  f"so a name bought last week shows last week's return, not the market's. "
                  f"Ranked by <b>pace</b> (%/week) because that is the only fair way to compare "
                  f"different holding lengths. <b>vs med</b> = pace minus your book's median pace. "
+                 f"<b>Idx</b> = what NIFTY 500 did over that stock's <i>own</i> holding window, so "
+                 f"<b>vs idx</b> is a like-for-like gap over identical days (smallcap column is in "
+                 f"the workbook). "
                  f"<b>Contrib</b> = points of PF growth actually delivered (weight × return). "
                  f"1M/3M/12M are market trailing windows, shown as context only.</p>")
         H.append("<table style='border-collapse:collapse;font-size:12px'>"
@@ -945,7 +1208,8 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                  "<th style='padding:2px 6px'>Wt%</th><th style='padding:2px 6px'>From</th>"
                  "<th style='padding:2px 6px'>Days</th><th style='padding:2px 6px'>Return</th>"
                  "<th style='padding:2px 6px'>%/wk</th><th style='padding:2px 6px'>vs med</th>"
-                 "<th style='padding:2px 6px'>vs idx</th><th style='padding:2px 6px'>Contrib</th>"
+                 "<th style='padding:2px 6px'>Idx</th><th style='padding:2px 6px'>vs idx</th>"
+                 "<th style='padding:2px 6px'>Contrib</th>"
                  "<th style='padding:2px 6px'>1M</th><th style='padding:2px 6px'>3M</th>"
                  "<th style='padding:2px 6px'>12M</th><th style='padding:2px 6px'>±5%</th>"
                  "<th style='padding:2px 6px'>±10%</th>"
@@ -966,6 +1230,8 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                 f"<td align='right' style='padding:2px 6px'><b>{_pct(r.ret_since_pct)}</b></td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.pace_wk_pct)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.vs_median_pp)}</td>"
+                f"<td align='right' style='padding:2px 6px;color:#888'>"
+                f"{_pct(r.n500_ret_pct)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.vs_bench_pp)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.contrib_pp)}</td>"
                 f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_1m_pct)}</td>"
@@ -1123,25 +1389,63 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                      "in as you trade and each window (1/2/3/6/12M) elapses. Your existing book is "
                      "covered by the movers above.</p>")
 
-    # 4) Sold-stock relook
+    # 4) Sold-stock relook — what selling actually cost, vs your own book
     if not relook.empty:
-        H.append("<h3>7 · Relook: stocks you sold</h3>"
-                 "<table style='border-collapse:collapse;font-size:13px'>"
-                 "<tr><th align='left'>Sold</th><th>On</th><th>Since sell</th>"
-                 "<th>Latest YoY</th><th>Verdict</th></tr>")
+        cost = relook["opportunity_pp"].dropna()
+        net = float(cost.sum()) if len(cost) else None
+        H.append("<h3>7 · Relook: stocks you sold — what if you hadn't?</h3>")
+        H.append(
+            "<p style='color:#888;font-size:12px'>Selling didn't park the money — it went "
+            "back into this book. So each exit is judged against <b>your own PF</b> over the "
+            "identical days, not against zero. <b>Made</b> = the return while you held it. "
+            "<b>Since sell</b> = what it did once you were out. <b>Your PF</b> = what the book "
+            "returned over those same days. <b>Cost</b> = weight at sale × (since sell − your "
+            "PF): positive means selling gave up that many points of PF growth, negative means "
+            "it dodged them. <b>Held on</b> = where the position would stand today had you "
+            "never sold.</p>")
+        if net is not None:
+            verb = "cost" if net > 0 else "saved"
+            col = "#c0392b" if net > 0 else "#1a7a3c"
+            H.append(f"<p style='margin:4px 0'>Net across {len(cost)} exits: selling "
+                     f"<b style='color:{col}'>{verb} {abs(net):.2f} pp</b> of portfolio "
+                     f"growth versus holding on.</p>")
+        H.append("<table style='border-collapse:collapse;font-size:12px'>"
+                 "<tr><th align='left'>Sold</th><th style='padding:2px 8px'>On</th>"
+                 "<th style='padding:2px 8px'>Wt%</th><th style='padding:2px 8px'>Days out</th>"
+                 "<th style='padding:2px 8px'>Made</th><th style='padding:2px 8px'>Since sell</th>"
+                 "<th style='padding:2px 8px'>Your PF</th><th style='padding:2px 8px'>Idx</th>"
+                 "<th style='padding:2px 8px'>Cost</th><th style='padding:2px 8px'>Held on</th>"
+                 "<th style='padding:2px 8px'>YoY</th><th align='left'>Verdict</th></tr>")
         for r in relook.itertuples():
-            H.append(f"<tr><td>{esc(r.symbol)}</td><td style='padding:2px 8px'>{esc(r.event_date)}</td>"
-                     f"<td align='right'>{_pct(r.ret_since_sell_pct)}</td>"
-                     f"<td align='right'>{_pct(r.latest_yoy_pct)}</td>"
-                     f"<td style='padding:2px 8px'>{esc(r.verdict)}</td></tr>")
+            cc = "#c0392b" if (pd.notna(r.opportunity_pp) and r.opportunity_pp > 0) else "#1a7a3c"
+            H.append(
+                f"<tr><td>{esc(r.symbol)}</td>"
+                f"<td style='padding:2px 8px;color:#777'>{esc(str(r.sell_date), 10)}</td>"
+                f"<td align='right' style='padding:2px 8px'>"
+                f"{'—' if pd.isna(r.weight_at_sell) else format(r.weight_at_sell, '.1f')}</td>"
+                f"<td align='right' style='padding:2px 8px;color:#777'>{r.days_since_sell}</td>"
+                f"<td align='right' style='padding:2px 8px'>{_pct(r.realised_pct)}</td>"
+                f"<td align='right' style='padding:2px 8px'><b>{_pct(r.since_sell_pct)}</b></td>"
+                f"<td align='right' style='padding:2px 8px;color:#888'>"
+                f"{_pct(r.pf_since_sell_pct)}</td>"
+                f"<td align='right' style='padding:2px 8px;color:#888'>"
+                f"{_pct(r.n500_since_sell_pct)}</td>"
+                f"<td align='right' style='padding:2px 8px;color:{cc}'>"
+                f"<b>{'—' if pd.isna(r.opportunity_pp) else format(r.opportunity_pp, '+.2f')}"
+                f"</b></td>"
+                f"<td align='right' style='padding:2px 8px'>{_pct(r.full_hold_pct)}</td>"
+                f"<td align='right' style='padding:2px 8px;color:#888'>"
+                f"{_pct(r.latest_yoy_pct)}</td>"
+                f"<td style='padding:2px 8px'>{esc(r.verdict)}</td></tr>")
         H.append("</table>")
 
     H.append("<p style='color:#aaa;font-size:11px;margin-top:16px'>Signals only — human-in-the-loop. "
              "Decision dates are snapshot-observation dates. Weightage-only: no rupee P&L.</p>")
-    return "".join(H)
+    return shrink_html("".join(H))
 
 
-def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None) -> bytes:
+def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None,
+                      spells=None) -> bytes:
     """Detailed tables as a multi-sheet .xlsx (the email is the summary; this is the
     drill-down). One sheet per view; header frozen + light auto-width."""
     holdings = pf[["isin", "symbol", "name", "weight_pct"]].copy()
@@ -1162,7 +1466,9 @@ def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None) -> bytes:
         "Problem Stocks":     problems,
         "Movers":             movers,
         "Decision Scorecard": score,
-        "Sold Relook":        relook,
+        "Exits":              relook,
+        "Holding Spells":     (spells if spells is not None
+                               else pd.DataFrame(columns=SPELL_COLS)),
         "Decisions Log":      decs,
         "PF Index":           idx,
     }
@@ -1235,7 +1541,25 @@ def main() -> None:
         if ser is not None and not ser.empty:
             benches[b] = ser
     log(f"  Benchmarks: {', '.join(benches) if benches else 'none available'}")
-    primary = benches.get(BENCHMARKS[0])
+
+    # Ownership runs — every per-stock window anchors on the CURRENT spell, so a
+    # re-bought name is never measured across the months it wasn't owned.
+    spells = build_spells(snaps, decs)
+    if not spells.empty:
+        multi = spells.groupby("isin").size()
+        multi = multi[multi > 1]
+        if len(multi):
+            old_first = snaps.groupby("isin")["snapshot_date"].min().to_dict()
+            cur = {r.isin: r.spell_start
+                   for r in spells[spells["status"] == "HELD"].itertuples()}
+            moved = [(i, old_first[i], cur[i]) for i in multi.index
+                     if i in cur and cur[i] != old_first.get(i)]
+            log(f"  {len(multi)} ISIN(s) with >1 holding spell; "
+                f"{len(moved)} held name(s) re-anchored:")
+            for i, o, n in moved[:10]:
+                log(f"    {i}: anchor {o} -> {n}")
+        else:
+            log("  No re-bought names — anchors identical to the earliest-snapshot rule.")
 
     idx, contrib = compute_index(snaps, price_cache, drive, ohlcv_id, asof)
     periods = index_period_returns(idx, benches)
@@ -1244,10 +1568,19 @@ def main() -> None:
             f"({periods['si_days']} tracked days)")
     movers = compute_movers(drive, root_id, pf)
     hold = compute_holdings_view(pf, snaps, movers, price_cache, drive, ohlcv_id, asof,
-                                 bench_ser=primary)
+                                 bench_map=benches, spells=spells)
+    matched = matched_bench_returns(hold)
+    for b, m in matched.items():
+        log(f"  Holding-window matched vs {b}: PF {m['pf']:+.2f}% vs {m['bench']:+.2f}% "
+            f"-> {m['alpha']:+.2f} pp ({m['n']} holdings)")
     score = score_decisions(decs, snaps, price_cache, drive, ohlcv_id, asof)
     results = _read_drive_parquet(drive, index_id, "results.parquet")
-    relook = sold_relook(decs, price_cache, drive, ohlcv_id, results, asof)
+    relook = compute_exits_view(spells, price_cache, drive, ohlcv_id, idx, results,
+                                asof, bench_map=benches)
+    if not relook.empty:
+        net = relook["opportunity_pp"].dropna().sum()
+        log(f"  {len(relook)} exit(s) in the last 12M; net cost of selling "
+            f"{net:+.2f} pp vs holding on.")
 
     # 5. Persist derived tables (overwrite; idempotent).
     if not dry:
@@ -1255,18 +1588,25 @@ def main() -> None:
         save_parquet(drive, out_id, "pf_decision_scorecard.parquet", score)
         save_parquet(drive, out_id, "pf_movers.parquet", movers)
         save_parquet(drive, out_id, "pf_holdings_view.parquet", hold)
-        log("  Wrote pf_index / pf_decision_scorecard / pf_movers / pf_holdings_view.")
+        save_parquet(drive, out_id, "pf_exits.parquet", relook)
+        save_parquet(drive, out_id, "pf_spells.parquet", spells)
+        log("  Wrote pf_index / pf_decision_scorecard / pf_movers / pf_holdings_view "
+            "/ pf_exits / pf_spells.")
 
     # 6. Digest (HTML findings) + Excel workbook (detailed tables).
     html = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook,
-                      decs, hold)
+                      decs, hold, matched)
+    # Gmail clips a message body past ~102 KB — surface the size instead of finding
+    # out from a truncated mail.
+    kb = len(html.encode("utf-8")) / 1024.0
+    log(f"  HTML body {kb:.1f} KB{'  ** near Gmail 102 KB clip **' if kb > 92 else ''}")
     si = (periods.get("ret") or {}).get("SI") if periods else None
     if periods and si is not None:
         subject = (f"PF Tracker — {asof} · index {periods['level']:.1f} "
                    f"({si:+.1f}% since base {periods['start_date']}) · {len(pf)} holdings")
     else:
         subject = f"PF Tracker — {asof} ({len(pf)} holdings)"
-    xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold)
+    xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold, spells)
     xlsx_name = f"pf_tracker_{asof}.xlsx"
     XLSX_MIME = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
