@@ -57,7 +57,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, load_queue, save_queue,
-                             acquire_lock, release_lock, log)
+                             acquire_lock, release_lock, log, mark_queue_error)
 
 _LOCK_NAME = "_extract.lock"
 
@@ -132,8 +132,12 @@ def hydrate(drive, idx, repo_id, args) -> None:
             try:
                 pdf = download_pdf(session, str(r["pdf_url"]))
                 if not pdf:
-                    # Leave it pending: the url may work later, and marking it done
-                    # would bury the document permanently.
+                    # Stays PENDING — the url may work later, and marking it done would
+                    # bury the document permanently. But record WHY, so a repeatedly
+                    # unfetchable document is visible instead of looking untried.
+                    # (The commonest cause here is a rating rationale served as HTML.)
+                    mark_queue_error(queue, i, "download returned no PDF bytes",
+                                     status="pending")
                     log(f"  ! {sym:<12} download returned nothing — left pending")
                     failed += 1
                     continue
@@ -147,6 +151,7 @@ def hydrate(drive, idx, repo_id, args) -> None:
                 done += 1
                 log(f"  + {sym:<12} {str(r['doc_type']):<13} {len(pdf):,} bytes")
             except Exception as e:
+                mark_queue_error(queue, i, str(e), status="pending")
                 log(f"  ! {sym:<12} {str(e)[:70]} — left pending")
                 failed += 1
             time.sleep(args.sleep)
@@ -281,6 +286,123 @@ def scrape_company_docs(client, symbol: str, today: datetime | None = None) -> l
     return out
 
 
+_PUNCT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _identity(d: dict) -> tuple:
+    """Source-independent identity of a filing: (doc_type, date, normalised title).
+
+    The SAME filing arrives from Screener and from NSE with DIFFERENT urls and different
+    ids, so url identity — which is all the queue had — does not collapse them. Measured
+    on VMARCIND: 'Outcome of Board Meeting' on 2026-05-11 and 2026-03-23 each appeared
+    twice, once per source. Enqueuing both means downloading and Gemini-extracting the
+    same document twice, at double the quota, and then rendering it twice in a mail.
+
+    Title is normalised hard (case, punctuation, whitespace) because the two sources
+    label the same filing slightly differently.
+    """
+    t = _PUNCT_RE.sub(" ", str(d.get("title", "")).lower()).strip()
+    return (d.get("doc_type", ""), str(d.get("announcement_date", ""))[:10], t)
+
+
+def dedupe_across_sources(docs: list[dict]) -> list[dict]:
+    """Collapse the same filing seen from more than one source. First seen wins —
+    callers add Screener first, which the user set as the primary/cleanest view."""
+    out, seen = [], set()
+    for d in docs:
+        k = _identity(d)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(d)
+    return out
+
+
+_NSE_ANN = "https://www.nseindia.com/api/corporate-announcements"
+
+
+def nse_company_docs(session, symbol: str, board: str = "",
+                     today: datetime | None = None) -> list[dict]:
+    """That company's filings from NSE's per-symbol corporate-announcements API.
+
+    THE INDEX MATTERS. NSE serves SME names from a different index than the mainboard,
+    and querying the wrong one returns an empty list rather than an error:
+        index=equities  mainboard
+        index=sme       NSE Emerge
+    Measured 2026-08-15 for OBSCP (NSE Emerge): equities -> 0 rows, sme -> 134 rows.
+
+    WHY NSE AND NOT BSE FOR THESE. All four SME holdings in the portfolio — ANONDITA,
+    OBSCP, VMARCIND, AIMTRON — have NO bse_code, so no BSE endpoint can reach them. They
+    are also precisely the names the shared Screener feed loses. NSE is the only second
+    source that covers them.
+
+    Returns the same dict shape as scrape_company_docs, so both feed one dedupe path.
+    """
+    if not symbol:
+        return []
+    idx = "sme" if "sme" in str(board).lower() or "emerge" in str(board).lower() \
+        else "equities"
+    try:
+        r = session.get(f"{_NSE_ANN}?index={idx}&symbol={symbol}", timeout=25)
+        rows = r.json()
+        if isinstance(rows, dict):
+            rows = rows.get("data", [])
+    except Exception as e:
+        log(f"    NSE fetch failed for {symbol} ({str(e)[:50]})")
+        return []
+
+    out = []
+    for x in rows or []:
+        url = str(x.get("attchmntFile") or "").strip()
+        desc = str(x.get("desc") or "").strip()
+        if not url.startswith("http"):
+            continue
+        doc_type = classify(desc)
+        if not doc_type:
+            continue
+        # 'an_dt' is "14-Aug-2026 13:50:24" — a real timestamp, unlike Screener's
+        # year-less labels, so no inference is needed here.
+        raw = str(x.get("an_dt") or "")[:11].strip()
+        when = ""
+        try:
+            when = datetime.strptime(raw, "%d-%b-%Y").date().isoformat()
+        except ValueError:
+            when = parse_date(raw, today)
+        out.append({"doc_type": doc_type, "title": (desc or url)[:200],
+                    "pdf_url": url, "announcement_date": when})
+    return out
+
+
+def _board_map(drive, index_id) -> dict:
+    """{isin: board} from company_universe.csv — decides the NSE index to query."""
+    import io
+    from _extractor_base import find_file, download_bytes
+    try:
+        fid = find_file(drive, index_id, "company_universe.csv")
+        if not fid:
+            return {}
+        u = pd.read_csv(io.BytesIO(download_bytes(drive, fid))).fillna("")
+        return {str(r["isin"]).strip(): str(r.get("board", ""))
+                for _, r in u.iterrows() if str(r.get("isin", "")).strip()}
+    except Exception as e:
+        log(f"  board map unavailable ({str(e)[:60]}) — NSE defaults to equities")
+        return {}
+
+
+def nse_session():
+    """NSE rejects cold requests; hit the homepage first to pick up cookies.
+    Same bootstrap earnings_calendar.nse_results_calendar already relies on."""
+    import requests
+    from earnings_calendar import UA
+    s = requests.Session()
+    s.headers.update(UA)
+    try:
+        s.get("https://www.nseindia.com", timeout=15)
+    except Exception:
+        pass
+    return s
+
+
 def missing_vs_queue(docs: list[dict], queue: pd.DataFrame, isin: str,
                      since: str) -> list[dict]:
     """Docs this company has filed that the ONE global queue does not know about.
@@ -336,6 +458,10 @@ def main() -> None:
     ap.add_argument("--types", default="",
                     help="Comma-separated doc_types to sweep (e.g. "
                          "presentation,rating,results). Blank = all types.")
+    ap.add_argument("--nse", action="store_true",
+                    help="Also query NSE's per-symbol announcements as a SECOND source "
+                         "(index=sme for NSE Emerge names, equities otherwise). The only "
+                         "source that reaches the SME holdings, which have no bse_code.")
     args = ap.parse_args()
 
     from screener_client import ScreenerClient
@@ -365,13 +491,26 @@ def main() -> None:
 
     queue = load_queue(drive, idx)
     client = ScreenerClient()
+    boards = _board_map(drive, idx) if args.nse else {}
+    nse = nse_session() if args.nse else None
     found, per_company = [], {}
     for n, (isin, sym, name) in enumerate(pf, 1):
+        docs = []
         try:
-            docs = scrape_company_docs(client, sym)
+            docs = scrape_company_docs(client, sym)          # PRIMARY: cleanest view
         except Exception as e:
-            log(f"  ! {sym:<14} fetch failed ({str(e)[:60]})")
+            log(f"  ! {sym:<14} screener fetch failed ({str(e)[:60]})")
+        if args.nse:
+            # SECOND SOURCE. A document is only missing if BOTH miss it. This is what
+            # covers the SME holdings, which have no bse_code and which the shared
+            # Screener feed is most likely to lose.
+            try:
+                docs += nse_company_docs(nse, sym, boards.get(isin, ""))
+            except Exception as e:
+                log(f"  ! {sym:<14} nse fetch failed ({str(e)[:60]})")
+        if not docs:
             continue
+        docs = dedupe_across_sources(docs)
         miss = missing_vs_queue(docs, queue, isin, since)
         if want_types:
             miss = [d for d in miss if d["doc_type"] in want_types]
@@ -495,6 +634,27 @@ def _self_test() -> int:
     check("bare label gets a readable title",
           all("—" in d["title"] for d in ppts))
     check("no deck left undated", all(d["announcement_date"] for d in ppts))
+
+    # ---- cross-source dedupe: the same filing from Screener and from NSE
+    same = [
+        {"doc_type": "results", "title": "Outcome of Board Meeting",
+         "announcement_date": "2026-05-11", "pdf_url": "https://screener/x.pdf"},
+        {"doc_type": "results", "title": "Outcome of  Board   Meeting!",
+         "announcement_date": "2026-05-11", "pdf_url": "https://nsearchives/y.pdf"},
+        {"doc_type": "results", "title": "Outcome of Board Meeting",
+         "announcement_date": "2026-03-23", "pdf_url": "https://screener/z.pdf"},
+    ]
+    dd = dedupe_across_sources(same)
+    check("same filing from two sources collapses to one", len(dd) == 2)
+    check("the PRIMARY (first, Screener) url is the one kept",
+          dd[0]["pdf_url"].startswith("https://screener/"))
+    check("a genuinely different date survives",
+          {d["announcement_date"] for d in dd} == {"2026-05-11", "2026-03-23"})
+    check("a different doc_type on the same date is not collapsed",
+          len(dedupe_across_sources([
+              {"doc_type": "results", "title": "T", "announcement_date": "2026-05-11"},
+              {"doc_type": "presentation", "title": "T", "announcement_date": "2026-05-11"},
+          ])) == 2)
 
     print(f"\npf_docs_sweep self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

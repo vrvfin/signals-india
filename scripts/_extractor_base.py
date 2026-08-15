@@ -131,7 +131,35 @@ def upload_bytes(drive, folder_id: str, filename: str, data: bytes,
 
 QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "title", "description", "announcement_date", "pdf_url",
-              "drive_file_id", "status", "discovered_at", "processed_at"]
+              "drive_file_id", "status", "discovered_at", "processed_at",
+              # Failure diagnostics (added 2026-08-15, ADDITIVE — old rows read None).
+              # The queue recorded status='error' and nothing else, so 2,326 failures
+              # carried no reason at all and their causes had to be reverse-engineered
+              # from filing titles and date histograms. Any writer that sets an error
+              # status should also record WHY, via mark_queue_error() below.
+              # Safe to add: load_queue back-fills missing columns and never slices,
+              # and save_queue writes the frame as-is, so extra columns survive every
+              # load/save cycle in every pipeline (this is how backfill_process_date
+              # and source already work).
+              "attempts", "last_error", "last_attempt_at"]
+
+
+def mark_queue_error(queue, idx, reason: str, status: str = "error") -> None:
+    """Record a failure ON the queue row: status, reason, attempt count, timestamp.
+
+    In-place on the caller's frame; the caller still owns save_queue and the lock.
+    Truncates the reason — the point is triage ("HTML not PDF", "no drive_file_id"),
+    not a stack trace.
+    """
+    try:
+        prev = queue.loc[idx, "attempts"]
+        n = int(prev) if str(prev).strip() not in ("", "None", "nan", "<NA>") else 0
+    except Exception:
+        n = 0
+    queue.loc[idx, "status"] = status
+    queue.loc[idx, "attempts"] = n + 1
+    queue.loc[idx, "last_error"] = str(reason)[:300]
+    queue.loc[idx, "last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
 
 
 def load_queue(drive, index_id: str) -> pd.DataFrame:
