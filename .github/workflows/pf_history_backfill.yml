@@ -103,10 +103,18 @@ jobs:
           --days "${{ inputs.days }}" --types presentation,rating,results
           ${{ inputs.symbols != '' && format('--symbols {0}', inputs.symbols) || '' }}
 
+      # BOUNDED BY THE SAME --limit AS EXTRACT, DELIBERATELY.
+      # cleanup_company_docs.py deletes every PDF older than 2 days "REGARDLESS of queue
+      # status" and marks still-pending rows status='expired'. It runs in BOTH phase2.yml
+      # and backfill_nightly.yml, so it fires nightly or more often. Hydrating all 201
+      # documents and then extracting 40 a day would mean ~120 PDFs deleted, and their
+      # rows expired, before anything read them — the download work thrown away and the
+      # rows no longer pending. Hydrate only what this run can also extract.
       - name: Stage 2 — download the PDFs (no Gemini)
         if: inputs.stage == 'hydrate' || inputs.stage == 'all'
         run: >
           python scripts/pf_docs_sweep.py --hydrate
+          --limit "${{ inputs.limit }}"
           ${{ inputs.symbols != '' && format('--symbols {0}', inputs.symbols) || '' }}
 
       # FREE_POOL, not GEMINI_API_KEY — the live concall path keeps its own quota.
