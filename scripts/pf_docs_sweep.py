@@ -302,7 +302,12 @@ def _identity(d: dict) -> tuple:
     label the same filing slightly differently.
     """
     t = _PUNCT_RE.sub(" ", str(d.get("title", "")).lower()).strip()
-    return (d.get("doc_type", ""), str(d.get("announcement_date", ""))[:10], t)
+    # ISIN leads the key (user, 2026-08-15). Symbols differ between sources — Screener,
+    # NSE and BSE spell the same company differently, and SME names carry no bse_code at
+    # all — but the ISIN is the one identifier every source agrees on. Keying on it makes
+    # the identity safe to use globally, not just within one company's own document list.
+    return (str(d.get("isin", "")).strip(),
+            d.get("doc_type", ""), str(d.get("announcement_date", ""))[:10], t)
 
 
 def dedupe_across_sources(docs: list[dict]) -> list[dict]:
@@ -510,6 +515,8 @@ def main() -> None:
                 log(f"  ! {sym:<14} nse fetch failed ({str(e)[:60]})")
         if not docs:
             continue
+        for _d in docs:
+            _d.setdefault("isin", isin)      # identity keys on ISIN, not symbol
         docs = dedupe_across_sources(docs)
         miss = missing_vs_queue(docs, queue, isin, since)
         if want_types:
