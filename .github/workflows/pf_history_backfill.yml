@@ -1,0 +1,136 @@
+name: pf_history_backfill
+
+# ONE-TIME (dispatch-only) history backfill for PF holdings: investor presentations and
+# credit ratings, ~6 quarters back. Feeds the deck-vs-deck diff and the rating trajectory,
+# neither of which can say anything without history.
+#
+# WHY THIS EXISTS AS ITS OWN WORKFLOW
+#   Screener's per-company #documents section lists a company's whole filing history, but
+#   two bugs meant the sweep discarded almost all of it:
+#     * the concall table dates the ROW ("Aug 2026  Transcript  PPT  REC"), not the link,
+#       so every historical deck parsed as undated and was dropped;
+#     * an explicit 4-digit year was ignored, so anything older than ~12 months was filed
+#       into the last 12 under the wrong quarter.
+#   With both fixed, APLAPOLLO surfaces 35 dated decks where the queue held 1.
+#
+# PHASE 2 IS NEVER DEMOTED. This runs on FREE_POOL, a different Gemini quota pool from the
+# live concall path (GEMINI_API_KEY), so extraction here cannot starve concall. The queue
+# write holds _extract.lock only for seconds; the extractors keep their existing priority
+# semantics (live waits 15 min, backfill yields).
+#
+# Run it in stages, checking the summary between each:
+#   1. discover  — sweep + enqueue, no downloads, no Gemini
+#   2. hydrate   — download the PDFs, still no Gemini
+#   3. extract   — Gemini, bounded by --limit and --deadline-min
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Which stage to run"
+        type: choice
+        options: [discover, hydrate, extract, all]
+        default: discover
+      days:
+        description: "How far back to discover, in days (550 ~= 6 quarters)"
+        default: "550"
+      symbols:
+        description: "Comma-separated symbols; blank = all PF holdings"
+        default: ""
+      limit:
+        description: "Max documents to EXTRACT this run (quota guard)"
+        default: "40"
+      deadline_min:
+        description: "Wall-clock cap per extract step, minutes"
+        default: "60"
+
+concurrency:
+  group: pf-history-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          FREE_POOL:               ${{ secrets.FREE_POOL }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+            # multi-line secrets (KEY_N=value per line) flatten to one comma-joined line
+            echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      # Fail fast: the date parsing is the whole basis of this backfill. If it regresses,
+      # documents get filed under the wrong quarter and the diff is built on sand.
+      - name: Self-tests (fail fast)
+        run: python scripts/pf_docs_sweep.py --self-test
+
+      # --types is a hard scope guard: concall is P0 and this backfill must not add rows
+      # to its queue, and Screener's bare "REC" link is an AUDIO recording that classify()
+      # maps to concall — queueing it would feed audio to a PDF extractor.
+      - name: Stage 1 — discover and enqueue
+        if: inputs.stage == 'discover' || inputs.stage == 'all'
+        run: >
+          python scripts/pf_docs_sweep.py --enqueue
+          --days "${{ inputs.days }}" --types presentation,rating,results
+          ${{ inputs.symbols != '' && format('--symbols {0}', inputs.symbols) || '' }}
+
+      - name: Stage 2 — download the PDFs (no Gemini)
+        if: inputs.stage == 'hydrate' || inputs.stage == 'all'
+        run: >
+          python scripts/pf_docs_sweep.py --hydrate
+          ${{ inputs.symbols != '' && format('--symbols {0}', inputs.symbols) || '' }}
+
+      # FREE_POOL, not GEMINI_API_KEY — the live concall path keeps its own quota.
+      # --teardown fills deck_metrics / deck_diff / deck_flags, which is the entire point
+      # of pulling history: the diff needs a prior deck to compare against.
+      - name: Stage 3a — extract presentations (FREE_POOL)
+        if: inputs.stage == 'extract' || inputs.stage == 'all'
+        run: >
+          python scripts/extract_presentation.py --teardown
+          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY
+          --limit "${{ inputs.limit }}" --deadline-min "${{ inputs.deadline_min }}"
+        continue-on-error: true
+
+      - name: Stage 3b — extract ratings (FREE_POOL)
+        if: inputs.stage == 'extract' || inputs.stage == 'all'
+        run: >
+          python scripts/extract_rating.py
+          --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY
+          --limit "${{ inputs.limit }}" --deadline-min "${{ inputs.deadline_min }}"
+        continue-on-error: true
+
+      - name: Coverage after this run
+        if: always()
+        run: >
+          python scripts/pf_docs_sweep.py --dry-run
+          --days "${{ inputs.days }}" --types presentation,rating,results
+        continue-on-error: true

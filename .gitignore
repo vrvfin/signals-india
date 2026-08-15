@@ -72,3 +72,7 @@ signals_gallery_*.html
 
 # provider eval harness raw outputs (eval_providers.py) — local only
 scripts/_eval_out/
+
+# generated teardown previews (local only, never committed)
+teardown_preview/
+quarter_teardown_*.html

@@ -262,6 +262,12 @@ def main() -> None:
     parser.add_argument("--teardown-isin", action="append", default=None,
                         help="Restrict the teardown pass to these ISINs (repeatable). "
                              "Overrides the PF/watchlist set — for single-company tests.")
+    # Same flag, same semantics as extract_rating / extract_annual_report already carry.
+    # Default None keeps Phase 2 on GEMINI_API_KEY exactly as before; the deck backfill
+    # passes FREE_POOL so its quota cannot compete with the live concall path.
+    parser.add_argument("--key-prefix", type=str, default=None,
+                        help="Load keys from this env prefix / comma list (e.g. "
+                             "FREE_POOL,BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
     args = parser.parse_args()
 
     print(f"Phase 2 / Stage D — {DOC_TYPE_LABEL} extraction via Gemini")
@@ -269,11 +275,19 @@ def main() -> None:
 
     drive = get_drive()
 
-    api_keys = load_api_keys()
-    if not api_keys:
-        print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
-        sys.exit(1)
-    log(f"Loaded {len(api_keys)} Gemini API key(s)")
+    if args.key_prefix:
+        from gemini_pool import load_keys_multi
+        api_keys = load_keys_multi(os.environ, args.key_prefix)   # comma list ok
+        if not api_keys:
+            print(f"ERROR: no {args.key_prefix}* keys found in env")
+            sys.exit(1)
+    else:
+        api_keys = load_api_keys()
+        if not api_keys:
+            print("ERROR: no GEMINI_API_KEY or GEMINI_API_KEY_* found in .env")
+            sys.exit(1)
+    log(f"Loaded {len(api_keys)} Gemini API key(s)"
+        + (f" [{args.key_prefix}]" if args.key_prefix else ""))
 
     gemini = GeminiKeyPool(api_keys, GEMINI_MODEL)
 

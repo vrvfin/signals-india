@@ -180,7 +180,10 @@ IGNORE = ("newspaper publication", "shareholders meeting", "egm", "agm notice",
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
-_DATE_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3})\b")
+_DATE_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?(?:\s+(\d{4}))?\b")
+# Screener's concall table dates a whole ROW ("Aug 2026  Transcript  PPT  REC") rather
+# than each link, so month-year with no day has to parse too.
+_MONYEAR_RE = re.compile(r"\b([A-Za-z]{3})[a-z]*\.?\s+(\d{4})\b")
 
 
 def classify(text: str) -> str:
@@ -198,23 +201,46 @@ def classify(text: str) -> str:
 
 
 def parse_date(text: str, today: datetime | None = None) -> str:
-    """'Outcome of Board Meeting 12 Aug - ...' -> '2026-08-12'.
+    """Screener document label -> ISO date. Three shapes, in priority order:
 
-    Screener omits the year on recent items. A month ahead of the current one belongs
-    to last year, so a January run does not date a December filing into the future.
+        'Outcome of Board Meeting 12 Aug - ...'   -> 2026-08-12   (year inferred)
+        'Rating update 7 Nov 2024 from icra'      -> 2024-11-07   (year EXPLICIT)
+        'Aug 2026  Transcript  PPT  REC'          -> 2026-08-01   (concall row, no day)
+
+    THE EXPLICIT YEAR MUST WIN. The old regex stopped at '7 Nov' and inferred the year
+    from today, so every document older than ~12 months was dated into the last 12:
+    '7 Nov 2024' became 2025-11-07 and '4 Sep 2024' became 2025-09-04. That is harmless
+    for a 10-day sweep and fatal for a 6-quarter backfill, which would file historic
+    decks under the wrong quarter and poison every deck-vs-deck comparison built on them.
+
+    Only when no year is given is it inferred, and then a month ahead of the current one
+    belongs to last year, so a January run does not date a December filing into the future.
     """
     today = today or datetime.now()
     m = _DATE_RE.search(text or "")
-    if not m:
-        return ""
-    day, mon = int(m.group(1)), _MONTHS.get(m.group(2)[:3].lower())
-    if not mon or not (1 <= day <= 31):
-        return ""
-    year = today.year if mon <= today.month else today.year - 1
-    try:
-        return datetime(year, mon, day).date().isoformat()
-    except ValueError:
-        return ""
+    if m:
+        day, mon = int(m.group(1)), _MONTHS.get(m.group(2)[:3].lower())
+        if mon and 1 <= day <= 31:
+            if m.group(3):
+                year = int(m.group(3))
+            else:
+                year = today.year if mon <= today.month else today.year - 1
+            try:
+                return datetime(year, mon, day).date().isoformat()
+            except ValueError:
+                return ""
+    # Month-year only (the concall table's row label). Day is unknown; the 1st is used,
+    # which is precise enough — every consumer maps this to a quarter, and no calendar
+    # month straddles a quarter boundary.
+    m = _MONYEAR_RE.search(text or "")
+    if m:
+        mon, year = _MONTHS.get(m.group(1)[:3].lower()), int(m.group(2))
+        if mon:
+            try:
+                return datetime(year, mon, 1).date().isoformat()
+            except ValueError:
+                return ""
+    return ""
 
 
 def scrape_company_docs(client, symbol: str, today: datetime | None = None) -> list[dict]:
@@ -233,8 +259,25 @@ def scrape_company_docs(client, symbol: str, today: datetime | None = None) -> l
         if not doc_type:
             continue
         seen.add(url)
-        out.append({"doc_type": doc_type, "title": text[:200], "pdf_url": url,
-                    "announcement_date": parse_date(text, today)})
+        when = parse_date(text, today)
+        row_label = ""
+        if not when:
+            # Screener's concall table dates the ROW, not the link: the cell reads
+            # "Aug 2026" and the links inside it are bare "Transcript" / "PPT" / "REC".
+            # parse_date("PPT") is empty, and missing_vs_queue drops anything undated —
+            # so EVERY historical investor deck in that table was being discarded
+            # silently. That is the single largest reason presentation coverage sat at
+            # 37% of holdings while APLAPOLLO showed 1 deck against 78 documents.
+            parent = a.find_parent(["li", "tr", "div"])
+            if parent is not None:
+                row_label = parent.get_text(" ", strip=True)[:120]
+                when = parse_date(row_label, today)
+        title = text[:200]
+        if row_label and len(text) < 20:
+            # "PPT" alone is not a title anyone can read in a mail or a queue listing.
+            title = f"{text} — {row_label}"[:200]
+        out.append({"doc_type": doc_type, "title": title, "pdf_url": url,
+                    "announcement_date": when})
     return out
 
 
@@ -283,6 +326,16 @@ def main() -> None:
                          "sweep Screener.")
     ap.add_argument("--limit", type=int, default=0,
                     help="With --hydrate: cap how many documents to fetch this run.")
+    # Scope guard. Two reasons this matters, both learned the hard way:
+    #  1. Phase-2 concall is P0 — a history backfill has no business adding rows to its
+    #     queue as a side effect.
+    #  2. Screener's bare "REC" link is an AUDIO RECORDING, and classify() maps it to
+    #     concall. Queueing it sends an audio URL to a PDF extractor, which is exactly
+    #     the "document queued as a type it can never satisfy" failure that accounts for
+    #     the largest share of existing extraction errors.
+    ap.add_argument("--types", default="",
+                    help="Comma-separated doc_types to sweep (e.g. "
+                         "presentation,rating,results). Blank = all types.")
     args = ap.parse_args()
 
     from screener_client import ScreenerClient
@@ -305,8 +358,10 @@ def main() -> None:
         log("No PF companies to sweep.")
         return
 
+    want_types = {t.strip() for t in args.types.split(",") if t.strip()}
     since = (datetime.now() - timedelta(days=args.days)).date().isoformat()
-    log(f"PF docs sweep — {len(pf)} holdings, filings since {since}")
+    log(f"PF docs sweep — {len(pf)} holdings, filings since {since}"
+        + (f", types={sorted(want_types)}" if want_types else ""))
 
     queue = load_queue(drive, idx)
     client = ScreenerClient()
@@ -318,6 +373,8 @@ def main() -> None:
             log(f"  ! {sym:<14} fetch failed ({str(e)[:60]})")
             continue
         miss = missing_vs_queue(docs, queue, isin, since)
+        if want_types:
+            miss = [d for d in miss if d["doc_type"] in want_types]
         if miss:
             per_company[sym] = miss
             for d in miss:
@@ -373,5 +430,77 @@ def main() -> None:
         release_lock(drive, idx, _LOCK_NAME)
 
 
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print(f"  FAIL {name}")
+
+    T = datetime(2026, 8, 15)
+
+    # ---- the shape that always worked: day + month, year inferred
+    check("day-month infers the current year",
+          parse_date("Outcome of Board Meeting 12 Aug - x", T) == "2026-08-12")
+    check("a month ahead of today belongs to last year",
+          parse_date("Press Release 20 Dec - x", T) == "2025-12-20")
+
+    # ---- THE REGRESSION: an explicit year must win over inference.
+    # '7 Nov 2024' was becoming 2025-11-07, filing an 18-month-old document into the
+    # last 12 and assigning it the wrong quarter.
+    check("explicit year wins (Nov 2024)",
+          parse_date("Rating update 7 Nov 2024 from icra", T) == "2024-11-07")
+    check("explicit year wins (Sep 2024)",
+          parse_date("Rating update 4 Sep 2024 from icra", T) == "2024-09-04")
+    check("explicit year still right when it equals the inferred one",
+          parse_date("Rating update 30 Sep 2025 from crisil", T) == "2025-09-30")
+    check("no year given still infers",
+          parse_date("Rating update 26 Feb from icra", T) == "2026-02-26")
+
+    # ---- THE OTHER REGRESSION: the concall table dates the row, not the link.
+    check("month-year row label parses", parse_date("Aug 2026 Transcript PPT REC", T)
+          == "2026-08-01")
+    check("older row label parses", parse_date("Jan 2026 Transcript PPT REC", T)
+          == "2026-01-01")
+    check("a bare link is still undated on its own", parse_date("PPT", T) == "")
+    check("'Financial Year 2025 from bse' has no month, so no date",
+          parse_date("Financial Year 2025 from bse", T) == "")
+
+    # ---- classification of the bare labels the concall table uses
+    check("bare PPT is a presentation", classify("PPT") == "presentation")
+    check("bare Transcript is a concall", classify("Transcript") == "concall")
+
+    # ---- the parent-row fallback, against real Screener markup
+    from bs4 import BeautifulSoup
+    html = """<div id='documents'><ul>
+      <li>Aug 2026 <a href='http://x/t.pdf'>Transcript</a>
+                   <a href='http://x/p.pdf'>PPT</a></li>
+      <li>Jan 2026 <a href='http://x/p2.pdf'>PPT</a></li>
+    </ul></div>"""
+    sec = BeautifulSoup(html, "html.parser")
+
+    class _C:
+        def fetch_company(self, sym):
+            return sec
+    docs = scrape_company_docs(_C(), "TEST", today=T)
+    ppts = [d for d in docs if d["doc_type"] == "presentation"]
+    check("both historical decks recovered", len(ppts) == 2)
+    check("deck dated from its row", any(d["announcement_date"] == "2026-08-01" for d in ppts))
+    check("older deck dated from its row",
+          any(d["announcement_date"] == "2026-01-01" for d in ppts))
+    check("bare label gets a readable title",
+          all("—" in d["title"] for d in ppts))
+    check("no deck left undated", all(d["announcement_date"] for d in ppts))
+
+    print(f"\npf_docs_sweep self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
     main()
