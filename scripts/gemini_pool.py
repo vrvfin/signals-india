@@ -164,9 +164,8 @@ class BucketPool:
         inter_call_s: float = 6.0,    # min gap between successful calls (RPM hygiene)
         overload_backoff_s: float = 8.0,
         call_timeout_s: float = 180.0,  # hard per-call HTTP timeout (no infinite hangs)
-        model_overload_keys: int | None = None,  # 503 on this many DISTINCT keys ->
-                                        # drop the model for the run. None = scale with
-                                        # pool size; see the note in __init__.
+        model_overload_keys: int = 3,   # 503 on this many DISTINCT keys -> drop the
+                                        # whole model for the run (circuit breaker)
         model_fail_drop: int = 10,      # >=N fails of ANY type with 0 ok -> the model is
                                         # dead for the workload; drop it for the run
         key_fail_drop: int = 10,        # >=N fails of ANY type with 0 ok -> the key is
@@ -186,22 +185,7 @@ class BucketPool:
         self.overload_budget = overload_budget
         self.inter_call_s = inter_call_s
         self.overload_backoff_s = overload_backoff_s
-        # SCALE THE CIRCUIT BREAKER WITH THE POOL (2026-08-15).
-        # A fixed 3 was written for a small pool. With 28 keys it condemns a model after
-        # 503s on keys 1-3 and the run then has no live bucket left — so keys 4..28 are
-        # never tried at all. Measured on the deck backfill: 28 keys loaded, only
-        # key_idx 1/2/3 ever appear in gemini_usage, 120 successful calls, then
-        # "All Gemini keys rate-limited" with ~140 documents still pending. That message
-        # is misleading: nothing was rate-limited, two models had been circuit-broken on
-        # three transient 503s each.
-        #
-        # A 503 is a SERVER-side "high demand" signal, not a property of the key, so
-        # sampling more keys before condemning a model is the correct read.
-        #
-        # Small pools are unchanged: max(3, n // 3) is 3 for anything up to 11 keys, so
-        # the Phase-2 concall path keeps exactly today's behaviour.
-        self.model_overload_keys = (model_overload_keys if model_overload_keys is not None
-                                    else max(3, len(api_keys) // 3))
+        self.model_overload_keys = model_overload_keys
         self.model_fail_drop = model_fail_drop
         self.key_fail_drop = key_fail_drop
         # Distinct key indices that have hit 503 per model (circuit-breaker signal).
