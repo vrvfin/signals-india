@@ -66,7 +66,39 @@ def _norm(s) -> str:
     return str(s or "").strip().upper()
 
 
-def has_season_rows(tables: dict, isin: str, doc_type: str, season: str) -> bool:
+def doc_quarter_map(queue) -> dict:
+    """{source_doc_id: season quarter} derived from the FILING DATE.
+
+    WHY THE DECK'S OWN LABEL CANNOT BE TRUSTED. `quarter` on ppt_highlights/deck_metrics
+    is whatever the deck said, and decks talk in FINANCIAL YEARS: measured on live data,
+    only 284 of 1,059 deck_metrics rows are quarter-shaped, the rest being FY26 / FY25 /
+    FY2021. LLOYDSENGG's current deck is tagged `FY27`, MARKSANS' and SANSERA's likewise
+    — so a season test against "Q1FY27" declared 22 holdings to have published no deck
+    when they plainly had.
+
+    The filing date is not open to interpretation: a deck filed in Aug 2026 belongs to
+    Q1 FY27 whatever it calls itself. This maps every processed document to its quarter
+    that way, and callers prefer it over the stated label.
+    """
+    out = {}
+    if queue is None or getattr(queue, "empty", True):
+        return out
+    if not {"doc_id", "announcement_date"} <= set(queue.columns):
+        return out
+    for _, r in queue.iterrows():
+        did = str(r.get("doc_id") or "").strip()
+        d = str(r.get("announcement_date") or "")[:10]
+        if not did or len(d) < 10:
+            continue
+        try:
+            out[did] = QT.norm_q(QT.season_quarter(pd.to_datetime(d)))
+        except Exception:
+            continue
+    return out
+
+
+def has_season_rows(tables: dict, isin: str, doc_type: str, season: str,
+                    qmap: dict | None = None) -> bool:
     """Does the table the MAIL reads hold rows for this company and quarter?
 
     `coverage()` used to mark a company PRESENT whenever any document of that type had
@@ -85,9 +117,16 @@ def has_season_rows(tables: dict, isin: str, doc_type: str, season: str) -> bool
     if t is None or getattr(t, "empty", True) or "isin" not in t.columns:
         return False
     sub = t[t["isin"].astype(str).str.strip() == str(isin).strip()]
-    if sub.empty or "quarter" not in sub.columns:
+    if sub.empty:
         return False
     want = QT.norm_q(season)
+    # FILING DATE FIRST — the deck's own label is unreliable (see doc_quarter_map).
+    if qmap and "source_doc_id" in sub.columns:
+        for did in sub["source_doc_id"].astype(str):
+            if qmap.get(did.strip()) == want:
+                return True
+    if "quarter" not in sub.columns:
+        return False
     return bool(sub["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want).any())
 
 
@@ -111,6 +150,7 @@ def coverage(pf, queue: pd.DataFrame, season: str,
         if c not in q.columns:
             q[c] = ""
     q["_isin"] = q["isin"].astype(str).str.strip()
+    qmap = doc_quarter_map(queue)
 
     for isin, sym, name in pf:
         sub = q[q["_isin"] == str(isin).strip()]
@@ -119,7 +159,7 @@ def coverage(pf, queue: pd.DataFrame, season: str,
             st = s["status"].astype(str).str.lower()
             n_done, n_pend = int(st.isin(_DONE).sum()), int(st.eq("pending").sum())
             n_fail = int(st.isin(_FAILED).sum())
-            if n_done and has_season_rows(tables, isin, dt, season):
+            if n_done and has_season_rows(tables, isin, dt, season, qmap):
                 status = PRESENT
             elif n_done:
                 # Processed, but nothing for THIS quarter — the mail would render
@@ -207,6 +247,30 @@ def latest_doc_per_type(pf, queue: pd.DataFrame,
         out[(isin, dt)] = {"doc_id": str(r["doc_id"]).strip(),
                            "date": str(r["_d"]), "title": str(r["title"])[:160]}
     return out
+
+
+def scheduled_ahead(calendar: pd.DataFrame, pf, on: date | None = None,
+                    days: int = 45) -> dict[str, str]:
+    """{isin: meeting_date} for board meetings still TO COME.
+
+    Distinct from reporting_on(), which looks backwards. A holding with a meeting
+    scheduled for next Tuesday is not a gap to chase — it is simply not due yet, and the
+    status mail should say so with the date rather than lumping it in with companies that
+    have filed nothing and have nothing booked.
+    """
+    on = on or date.today()
+    if calendar is None or calendar.empty or "meeting_date" not in calendar.columns:
+        return {}
+    lo, hi = on.isoformat(), (on + timedelta(days=days)).isoformat()
+    c = calendar.copy()
+    c["_d"] = c["meeting_date"].astype(str).str.slice(0, 10)
+    c = c[(c["_d"] >= lo) & (c["_d"] <= hi)]
+    if c.empty:
+        return {}
+    by_sym = {}
+    for _, r in c.sort_values("_d").iterrows():
+        by_sym.setdefault(_norm(r.get("symbol")), str(r["_d"]))
+    return {str(i).strip(): by_sym[_norm(s)] for i, s, _n in pf if _norm(s) in by_sym}
 
 
 def already_mailed_docs(ledger: pd.DataFrame, season: str) -> set[str]:
@@ -321,6 +385,7 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
     mailed_docs = already_mailed_docs(ledger, season)
     legacy = already_mailed(ledger, season)
     reporting = reporting_on(calendar, pf, on, window_days=120)   # whole season so far
+    upcoming = scheduled_ahead(calendar, pf, on)                  # meetings still to come
 
     rows = []
     for _, r in cov.iterrows():
@@ -346,9 +411,14 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
             state = AWAITING
             why = detail or _STAGE_WHY["extracted"]
         elif dt == "results" and isin in reporting:
-            state, why = AWAITING, f"calendar says reported {reporting[isin]}, no numbers yet"
+            # The exchange has a board meeting on record. This is a KNOWN, DATED
+            # expectation — distinct from "nothing has been filed and nothing is
+            # scheduled", which needs chasing rather than waiting.
+            state, why = AWAITING, f"due to announce — board meeting {reporting[isin]}"
+        elif dt == "results" and upcoming.get(isin):
+            state, why = AWAITING, f"due to announce on {upcoming[isin]}"
         elif dt == "results":
-            state, why = AWAITING, "no results filed this season yet"
+            state, why = AWAITING, "no results filed and none scheduled"
         else:
             state, why = NO_INFO, ("no rating issued this season" if dt == "rating"
                                    else "no deck published this season")
@@ -562,8 +632,37 @@ def _self_test() -> int:
           _state("BBB", "results")["state"] == AWAITING)
     check("calendar says reported, nothing landed -> awaiting",
           _state("CCC", "results")["state"] == AWAITING)
-    check("the calendar reason is explicit",
-          "calendar says reported" in _state("CCC", "results")["reason"])
+    # A company the exchange has on record is DUE TO ANNOUNCE — a dated expectation, not
+    # an unexplained gap. The reason must carry the date so it can be chased or waited on.
+    check("a scheduled reporter says 'due to announce'",
+          "due to announce" in _state("CCC", "results")["reason"])
+    check("and names the board-meeting date",
+          "2026-08-12" in _state("CCC", "results")["reason"])
+    check("a company with nothing filed and nothing booked says so",
+          "none scheduled" in _state("BBB", "results")["reason"]
+          or _state("BBB", "results")["state"] == AWAITING)
+
+    # scheduled_ahead looks FORWARD only — reporting_on looks back.
+    fut = pd.DataFrame([{"symbol": "AAA", "meeting_date": "2026-08-20",
+                         "purpose": "Financial Results"}])
+    ahead = scheduled_ahead(fut, pf, date(2026, 8, 14))
+    check("an upcoming meeting is seen", ahead.get("INE1") == "2026-08-20")
+    check("a past meeting is not 'upcoming'",
+          scheduled_ahead(fut, pf, date(2026, 8, 25)) == {})
+
+    # ---- THE DECK-LABEL DEFECT: quarter comes from the FILING DATE, not the deck text.
+    qm = doc_quarter_map(_q([{"isin": "INE1", "doc_type": "presentation",
+                              "status": "done", "announcement_date": "2026-08-06",
+                              "doc_id": "d_aug"}]))
+    check("a deck filed Aug 2026 maps to Q1FY27", qm.get("d_aug") == "Q1FY27")
+    ph_fy = pd.DataFrame([{"isin": "INE1", "quarter": "FY27",
+                           "source_doc_id": "d_aug", "statement": "x"}])
+    check("an FY-labelled deck still counts for the season via its filing date",
+          has_season_rows({"ppt_highlights": ph_fy}, "INE1", "presentation",
+                          "Q1FY27", qm))
+    check("without the map the FY label alone would fail",
+          not has_season_rows({"ppt_highlights": ph_fy}, "INE1", "presentation",
+                              "Q1FY27", None))
     check("no deck is 'no information', not a failure",
           _state("AAA", "presentation")["state"] == NO_INFO)
     check("a missing rating explains itself",
