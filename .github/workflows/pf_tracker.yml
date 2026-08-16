@@ -13,6 +13,11 @@ on:
     workflows: ["Daily Pipeline Execution"]   # daily.yml (16:00 IST, data ready ~17:00)
     types: [completed]
   workflow_dispatch:                          # manual trigger from the GitHub UI
+    inputs:
+      no_write:
+        description: "Preview run — send the mail but write NOTHING to Drive"
+        type: boolean
+        default: false
 
 concurrency:
   group: pf_tracker
@@ -64,5 +69,10 @@ jobs:
           pip install -r scripts/requirements.txt
           pip install openpyxl xlrd            # .xlsx / legacy .xls holdings parse
 
+      # A preview dispatch adds --no-write: the mail goes out, but the snapshot,
+      # the decision ledger and every derived table are left untouched. The
+      # scheduled workflow_run path never sets it, so nightly behaviour is unchanged.
       - name: Run PF decision tracker
-        run: python scripts/pf_decision_tracker.py
+        run: |
+          python scripts/pf_decision_tracker.py \
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.no_write) && '--no-write' || '' }}
