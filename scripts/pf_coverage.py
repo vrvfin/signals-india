@@ -147,6 +147,47 @@ def reporting_on(calendar: pd.DataFrame, pf, on: date | None = None,
     return out
 
 
+def latest_doc_per_type(pf, queue: pd.DataFrame,
+                        doc_types=("results", "presentation", "rating")) -> dict:
+    """{(isin, doc_type): {doc_id, date, title}} — the NEWEST processed document.
+
+    This is what makes "a new document arrives" a mailable event. Keying the mail ledger
+    on (isin, doc_type, season) alone means the FIRST deck or rating of a quarter is
+    mailed and everything after it is silently suppressed — so a rating DOWNGRADE landing
+    a week after a routine reaffirmation would never reach the reader. Identity has to be
+    the document, not the slot it occupies.
+    """
+    out = {}
+    if queue is None or queue.empty:
+        return out
+    q = queue.copy()
+    for c in ("isin", "doc_type", "status", "announcement_date", "doc_id", "title"):
+        if c not in q.columns:
+            q[c] = ""
+    q = q[q["status"].astype(str).str.lower().isin(_DONE)]
+    q["_isin"] = q["isin"].astype(str).str.strip()
+    q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)
+    pf_isins = {str(i).strip() for i, _s, _n in pf}
+    q = q[q["_isin"].isin(pf_isins)]
+    for (isin, dt), grp in q.groupby(["_isin", "doc_type"]):
+        if dt not in doc_types:
+            continue
+        g = grp.sort_values("_d")
+        r = g.iloc[-1]
+        out[(isin, dt)] = {"doc_id": str(r["doc_id"]).strip(),
+                           "date": str(r["_d"]), "title": str(r["title"])[:160]}
+    return out
+
+
+def already_mailed_docs(ledger: pd.DataFrame, season: str) -> set[str]:
+    """Set of doc_ids already mailed this season."""
+    if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
+        return set()
+    l = ledger[ledger["season"].astype(str) == str(season)]
+    return {str(x).strip() for x in l["doc_id"] if str(x).strip()
+            and str(x).strip().lower() not in ("none", "nan")}
+
+
 def already_mailed(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     """{(isin, doc_type)} already delivered for this season."""
     if ledger is None or ledger.empty:
@@ -158,6 +199,71 @@ def already_mailed(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     l = l[l["season"].astype(str) == str(season)]
     return {(str(r["isin"]).strip(), str(r["doc_type"]))
             for _, r in l.iterrows()}
+
+
+#  Season status — the deterministic "where are we, out of 51" picture.
+DELIVERED, DUE, AWAITING, NO_INFO = "delivered", "due", "awaiting", "no information"
+
+
+def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
+                  doc_types=("results", "presentation", "rating")) -> list[dict]:
+    """Per holding x doc_type: delivered / due / awaiting / no information, WITH a reason.
+
+    The four states are deliberately distinct, because they need different actions:
+      delivered      a mail went out for the newest document
+      due            the document is processed and the mail has not gone yet
+      awaiting       the exchange calendar says this company reports, nothing has landed
+      no information nothing filed and nothing scheduled — for ratings and decks this is
+                     normal (not every company issues either), so it is NOT a failure
+    """
+    on = on or date.today()
+    cov = coverage(pf, queue, season, doc_types=doc_types)
+    latest = latest_doc_per_type(pf, queue, doc_types)
+    mailed_docs = already_mailed_docs(ledger, season)
+    legacy = already_mailed(ledger, season)
+    reporting = reporting_on(calendar, pf, on, window_days=120)   # whole season so far
+
+    rows = []
+    for _, r in cov.iterrows():
+        isin, dt = str(r["isin"]).strip(), r["doc_type"]
+        doc = latest.get((isin, dt)) or {}
+        doc_id = doc.get("doc_id", "")
+        sent = bool(doc_id and doc_id in mailed_docs) or \
+            (not mailed_docs and (isin, dt) in legacy) or \
+            (not doc_id and (isin, dt) in legacy)
+        if r["status"] == PRESENT and sent:
+            state, why = DELIVERED, f"mailed · {doc.get('date','')}"
+        elif r["status"] == PRESENT:
+            state, why = DUE, "processed, mail not sent yet"
+        elif r["status"] == PENDING:
+            state, why = AWAITING, "document fetched, extraction pending"
+        elif r["status"] == FAILED:
+            state, why = AWAITING, "extraction failed — will retry"
+        elif dt == "results" and isin in reporting:
+            state, why = AWAITING, f"calendar says reported {reporting[isin]}, no numbers yet"
+        elif dt == "results":
+            state, why = AWAITING, "no results filed this season yet"
+        else:
+            state, why = NO_INFO, ("no rating issued this season" if dt == "rating"
+                                   else "no deck published this season")
+        rows.append({"isin": isin, "symbol": r["symbol"], "name": r["name"],
+                     "doc_type": dt, "state": state, "reason": why,
+                     "doc_date": doc.get("date", "")})
+    return rows
+
+
+def season_rollup(rows: list[dict]) -> dict:
+    """Counts per state, and how many holdings are fully covered on results."""
+    out = {}
+    for dt in ("results", "presentation", "rating"):
+        sub = [r for r in rows if r["doc_type"] == dt]
+        out[dt] = {s: sum(1 for r in sub if r["state"] == s)
+                   for s in (DELIVERED, DUE, AWAITING, NO_INFO)}
+    res = [r for r in rows if r["doc_type"] == "results"]
+    out["_companies"] = len({r["isin"] for r in rows})
+    out["_results_done"] = sum(1 for r in res if r["state"] == DELIVERED)
+    out["_results_total"] = len(res)
+    return out
 
 
 def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFrame,
@@ -173,22 +279,35 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
     """
     on = on or date.today()
     cov = coverage(pf, queue, season, doc_types=doc_types)
-    done = already_mailed(ledger, season)
+    latest = latest_doc_per_type(pf, queue, doc_types)
+    mailed_docs = already_mailed_docs(ledger, season)
+    legacy = already_mailed(ledger, season)          # rows written before doc_id existed
     reporting = reporting_on(calendar, pf, on, window_days)
 
     out = []
     for _, r in cov.iterrows():
         if r["status"] != PRESENT:
             continue
-        key = (str(r["isin"]).strip(), r["doc_type"])
-        if key in done:
+        isin = str(r["isin"]).strip()
+        doc = latest.get((isin, r["doc_type"])) or {}
+        doc_id = doc.get("doc_id", "")
+        # A document is due when THIS document has not been mailed. Falling back to the
+        # old (isin, doc_type) key only for ledger rows written before doc_id existed
+        # stops a one-off flood of re-sends on the first run under the new scheme.
+        if doc_id and doc_id in mailed_docs:
             continue
+        if not doc_id and (isin, r["doc_type"]) in legacy:
+            continue
+        if doc_id and not mailed_docs and (isin, r["doc_type"]) in legacy:
+            continue                                  # legacy-only ledger: treat as sent
         if require_calendar and r["doc_type"] == "results":
-            if str(r["isin"]).strip() not in reporting:
+            if isin not in reporting:
                 continue
         out.append({"isin": r["isin"], "symbol": r["symbol"], "name": r["name"],
                     "doc_type": r["doc_type"], "season": season,
-                    "reported_on": reporting.get(str(r["isin"]).strip(), "")})
+                    "doc_id": doc_id, "doc_date": doc.get("date", ""),
+                    "doc_title": doc.get("title", ""),
+                    "reported_on": reporting.get(isin, "")})
     out.sort(key=lambda d: (d["doc_type"], d["symbol"]))
     return out
 
@@ -209,7 +328,7 @@ def _self_test() -> int:
             print(f"  FAIL {name}")
 
     pf = [("INE1", "AAA", "A Ltd"), ("INE2", "BBB", "B Ltd"), ("INE3", "CCC", "C Ltd")]
-    Q = ["isin", "doc_type", "status", "announcement_date"]
+    Q = ["isin", "doc_type", "status", "announcement_date", "doc_id", "title"]
 
     def _q(rows):
         return pd.DataFrame([{c: r.get(c) for c in Q} for r in rows])
@@ -285,6 +404,67 @@ def _self_test() -> int:
                     on=date(2026, 8, 14), require_calendar=False)
     check("without the gate it is due", ("INE2", "results")
           in {(d["isin"], d["doc_type"]) for d in due4})
+
+    # ---- THE DOWNGRADE CASE: a SECOND document of the same type in one season must
+    # still mail. Keying on (isin, doc_type) alone suppressed it, so a rating downgrade
+    # arriving after a routine reaffirmation would never have reached the reader.
+    q_two = _q([
+        {"isin": "INE1", "doc_type": "rating", "status": "done",
+         "announcement_date": "2026-07-01", "doc_id": "old_reaffirm"},
+        {"isin": "INE1", "doc_type": "rating", "status": "done",
+         "announcement_date": "2026-08-10", "doc_id": "new_downgrade"},
+    ])
+    lat = latest_doc_per_type([pf[0]], q_two)
+    check("latest document wins", lat[("INE1", "rating")]["doc_id"] == "new_downgrade")
+    led_old = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                             "doc_id": "old_reaffirm"}])
+    due_new = mail_due([pf[0]], q_two, pd.DataFrame(), led_old, "Q1FY27",
+                       on=date(2026, 8, 14))
+    check("a NEW rating after one was mailed is still due",
+          any(d["doc_type"] == "rating" for d in due_new))
+    check("the due item is the new document",
+          due_new[0]["doc_id"] == "new_downgrade")
+    led_new = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                             "doc_id": "new_downgrade"}])
+    check("once the new document is mailed it stops being due",
+          not mail_due([pf[0]], q_two, pd.DataFrame(), led_new, "Q1FY27",
+                       on=date(2026, 8, 14)))
+    # Legacy rows (written before doc_id existed) must not cause a mass re-send.
+    led_legacy = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1",
+                                "doc_type": "rating"}])
+    check("legacy ledger rows still suppress, no re-send flood",
+          not mail_due([pf[0]], q_two, pd.DataFrame(), led_legacy, "Q1FY27",
+                       on=date(2026, 8, 14)))
+
+    # ---- season status: four distinct states, each with a reason
+    q_st = _q([
+        {"isin": "INE1", "doc_type": "results", "status": "done",
+         "announcement_date": "2026-08-01", "doc_id": "r1"},
+        {"isin": "INE2", "doc_type": "results", "status": "pending"},
+    ])
+    cal_st = pd.DataFrame([{"symbol": "CCC", "meeting_date": "2026-08-12",
+                            "purpose": "Financial Results"}])
+    led_st = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1",
+                            "doc_type": "results", "doc_id": "r1"}])
+    st = season_status(pf, q_st, cal_st, led_st, "Q1FY27", on=date(2026, 8, 14))
+    def _state(sym, dt):
+        return [r for r in st if r["symbol"] == sym and r["doc_type"] == dt][0]
+    check("mailed document -> delivered", _state("AAA", "results")["state"] == DELIVERED)
+    check("fetched but unprocessed -> awaiting",
+          _state("BBB", "results")["state"] == AWAITING)
+    check("calendar says reported, nothing landed -> awaiting",
+          _state("CCC", "results")["state"] == AWAITING)
+    check("the calendar reason is explicit",
+          "calendar says reported" in _state("CCC", "results")["reason"])
+    check("no deck is 'no information', not a failure",
+          _state("AAA", "presentation")["state"] == NO_INFO)
+    check("a missing rating explains itself",
+          "no rating issued" in _state("AAA", "rating")["reason"])
+    roll = season_rollup(st)
+    check("rollup counts companies", roll["_companies"] == 3)
+    check("rollup counts delivered results", roll["_results_done"] == 1)
+    check("rollup covers every state key",
+          set(roll["results"]) == {DELIVERED, DUE, AWAITING, NO_INFO})
 
     # ---- empties must never raise
     check("no queue is all-missing",

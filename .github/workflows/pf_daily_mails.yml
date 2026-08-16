@@ -82,6 +82,7 @@ jobs:
         run: |
           python scripts/pf_coverage.py --self-test
           python scripts/pf_company_mails.py --self-test
+          python scripts/pf_season_status.py --self-test
 
       # Per-company presentation and rating mails.
       - name: Per-company mails (presentation, rating)
@@ -101,6 +102,15 @@ jobs:
       - name: Results teardown mails (per company, last 26h)
         run: >
           python scripts/quarter_teardown.py --per-company --since-hours 26
+          ${{ inputs.dry_run == true && '--dry-run' || '' }}
+        continue-on-error: true
+
+      # The completeness signal. Individual company mails say what arrived; only this
+      # one can say what did NOT - every holding, every document type, with a reason.
+      - name: Season status (delivered / due / awaiting / no information)
+        if: always()
+        run: >
+          python scripts/pf_season_status.py
           ${{ inputs.dry_run == true && '--dry-run' || '' }}
         continue-on-error: true
 

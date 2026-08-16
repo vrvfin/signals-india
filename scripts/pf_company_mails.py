@@ -57,7 +57,13 @@ import quarterly_table as QT
 import pf_coverage as COV
 
 LEDGER_NAME = "pf_company_mails.parquet"
-LEDGER_COLS = ["season", "isin", "symbol", "doc_type", "period", "mailed_at", "subject"]
+# `doc_id` added 2026-08-16 (ADDITIVE — legacy rows read blank and still suppress, so
+# adding it cannot cause a re-send flood). Identity is the DOCUMENT, not the slot: keying
+# on (isin, doc_type, season) alone meant the first deck or rating of a quarter mailed and
+# every later one was silently swallowed — a rating DOWNGRADE arriving after a routine
+# reaffirmation would never have reached the reader.
+LEDGER_COLS = ["season", "isin", "symbol", "doc_type", "period", "doc_id",
+               "mailed_at", "subject"]
 MAIL_KEY = "pf_company_mails"
 MAX_HTML_BYTES = 90_000
 
@@ -413,6 +419,7 @@ def main() -> None:
         if ok:
             sent_rows.append({"season": season, "isin": isin, "symbol": sym,
                               "doc_type": dt, "period": season,
+                              "doc_id": d.get("doc_id", ""),
                               "mailed_at": datetime.now().isoformat(timespec="seconds"),
                               "subject": subject[:200]})
 
@@ -421,7 +428,10 @@ def main() -> None:
         out = pd.concat([ledger, pd.DataFrame(sent_rows, columns=LEDGER_COLS)],
                         ignore_index=True) if ledger is not None and not ledger.empty \
             else pd.DataFrame(sent_rows, columns=LEDGER_COLS)
-        out = out.drop_duplicates(subset=["season", "isin", "doc_type"], keep="last")
+        # Keyed on the DOCUMENT: a second deck or a rating downgrade in the same quarter
+        # is a separate row, so it neither overwrites the earlier send nor gets suppressed.
+        out = out.drop_duplicates(subset=["season", "isin", "doc_type", "doc_id"],
+                                  keep="last")
         save_parquet(drive, idx, LEDGER_NAME, out)
         log(f"ledger: +{len(sent_rows)} -> _index/{LEDGER_NAME} ({len(out)} rows)")
 
