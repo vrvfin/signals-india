@@ -43,6 +43,7 @@ from _extractor_base import (
     run_structured_over_doc,                                     # Stage 3b: from source
 )
 import deck_teardown as DT          # Stage 3c: --teardown only (PF/watchlist, opt-in)
+import deck_summary as DS           # Stage 3d: --deck-summary only (PF/watchlist, opt-in)
 
 # T12: SAME lock the concall extractor uses → one global mutex on the shared queue /
 # company_page.md / parquets (Phase-2 live vs backfill can never write concurrently).
@@ -262,6 +263,12 @@ def main() -> None:
     parser.add_argument("--teardown-isin", action="append", default=None,
                         help="Restrict the teardown pass to these ISINs (repeatable). "
                              "Overrides the PF/watchlist set — for single-company tests.")
+    parser.add_argument("--deck-summary", action="store_true",
+                        help="ADDITIVE fourth pass: the deck read as a STANDALONE company "
+                             "summary across 18 sections -> deck_summary.parquet. Built for "
+                             "companies that hold no concall, where the deck is the only "
+                             "narrative management publishes. Same PF/watchlist scope as "
+                             "--teardown; independent of it, so either may run alone.")
     # Same flag, same semantics as extract_rating / extract_annual_report already carry.
     # Default None keeps Phase 2 on GEMINI_API_KEY exactly as before; the deck backfill
     # passes FREE_POOL so its quota cannot compete with the live concall path.
@@ -321,6 +328,27 @@ def main() -> None:
             log(f"Teardown: PF u watchlist = {len(teardown_isins)} ISINs")
         if not teardown_isins:
             log("Teardown: scope is EMPTY — the pass will not run for any document.")
+
+    # ---- Standalone deck summary (ADDITIVE, default OFF). Scope is resolved the same way
+    # and shares --teardown-isin, but the two flags are independent: the summary is a
+    # description of the deck and the teardown is a forensic diff of it, and a run may
+    # legitimately want one without the other.
+    summary_isins: set[str] = set()
+    summary_prompt = ""
+    if args.deck_summary:
+        _ds_path = Path(__file__).resolve().parent / DS.PROMPT_FILE
+        if not _ds_path.exists():
+            print(f"ERROR: --deck-summary needs {DS.PROMPT_FILE}")
+            sys.exit(1)
+        summary_prompt = _ds_path.read_text(encoding="utf-8")
+        if args.teardown_isin:
+            summary_isins = {s.strip() for s in args.teardown_isin if s.strip()}
+            log(f"Deck summary: restricted to {len(summary_isins)} ISIN(s) from --teardown-isin")
+        else:
+            summary_isins = teardown_isins or _teardown_scope(drive, folder_id, index_id)
+            log(f"Deck summary: PF u watchlist = {len(summary_isins)} ISINs")
+        if not summary_isins:
+            log("Deck summary: scope is EMPTY — the pass will not run for any document.")
 
     # T12 Phase-2 safety: serialize shared-file writes via the global _extract.lock.
     # On contention exit cleanly — the next run resumes (rows stay pending).
@@ -455,6 +483,26 @@ def main() -> None:
                     log("  Teardown: keys exhausted — skipped.")
                 except Exception as _e:
                     log(f"  WARNING: teardown failed ({str(_e)[:90]}).")
+
+            # Stage 3d standalone summary (ADDITIVE, opt-in). Writes ONLY to
+            # deck_summary.parquet. Must run here for the same reason as the teardown:
+            # the source PDF is deleted 2 days after processing (retention rule 1), so
+            # there is no later opportunity to read the slides without re-downloading.
+            if args.deck_summary and _isin and _isin in summary_isins:
+                try:
+                    _ds = DS.run_summary(
+                        gemini, summary_prompt, pdf_bytes, row, facts["quarter"],
+                        datetime.now().isoformat(timespec="seconds"))
+                    upsert_structured(drive, index_id, "deck_summary.parquet",
+                                      DS.DECK_SUMMARY_COLS, _ds["rows"])
+                    _have, _all = DS.coverage(_ds["rows"])
+                    log(f"  Deck summary: {len(_ds['rows'])} rows, {_have}/{_all} sections"
+                        + (f" | {DS.section_counts(_ds['rows'])}" if _ds["rows"] else "")
+                        + (f" | dropped {_ds['dropped']}" if _ds["dropped"] else ""))
+                except RateLimitExhausted:
+                    log("  Deck summary: keys exhausted — skipped.")
+                except Exception as _e:
+                    log(f"  WARNING: deck summary failed ({str(_e)[:90]}).")
 
             queue.loc[queue_idx, "status"] = "done"
             queue.loc[queue_idx, "processed_at"] = datetime.now().isoformat(timespec="seconds")

@@ -82,6 +82,7 @@ jobs:
       # a regression there is silent by nature — you get no mail, and no error either.
       - name: Self-tests (fail fast)
         run: |
+          python scripts/deck_summary.py --self-test
           python scripts/pf_coverage.py --self-test
           python scripts/pf_company_mails.py --self-test
           python scripts/pf_season_status.py --self-test
@@ -118,7 +119,11 @@ jobs:
             echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
             echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
           } >> .env
-          python scripts/extract_presentation.py --teardown \
+          # --deck-summary is the standalone read of the deck (18 sections). It runs HERE,
+          # at ingest, because retention rule 1 deletes the PDF two days later — measured
+          # today: of the 25 most recent decks on Drive, 24 already 404 and only the one
+          # filed this morning still downloads. There is no later chance to read the slides.
+          python scripts/extract_presentation.py --teardown --deck-summary \
             --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 25 --deadline-min 20 || true
           python scripts/extract_rating.py \
             --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 25 --deadline-min 20 || true

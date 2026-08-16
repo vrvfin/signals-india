@@ -55,6 +55,7 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 import quarterly_table as QT
 import pf_coverage as COV
+import deck_summary as DS
 
 LEDGER_NAME = "pf_company_mails.parquet"
 # `doc_id` added 2026-08-16 (ADDITIVE — legacy rows read blank and still suppress, so
@@ -68,6 +69,9 @@ MAIL_KEY = "pf_company_mails"
 MAX_HTML_BYTES = 90_000
 
 UP, DOWN, MUTED, AMBER = "#1a7a3a", "#c0392b", "#8a97a0", "#b8860b"
+# Theme colours, defined here with the rest of the palette because both the deck
+# summary sections and the theme chips need them.
+BLUE, PURPLE = "#1f4d6b", "#6b4d8f"
 _WRAP = "font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222"
 _TBL = ("border-collapse:collapse;width:100%;font:12px Arial,Helvetica,sans-serif;"
         "color:#222;margin:4px 0 12px")
@@ -161,6 +165,91 @@ def _slice(df, isin, cols=None):
 #  Presentation: current deck + what changed                          #
 # ------------------------------------------------------------------ #
 
+# The eighteen deck_summary sections, with the heading a reader sees and the colour that
+# lets them scan for it. Risk is red and guidance purple for the same reason as the theme
+# chips: those are the two a reader hunts for. The rest carry the neutral band so the
+# colour still means something when it appears.
+_SUMMARY_SECTIONS = (
+    ("business_overview",     "What the company does",            BLUE),
+    ("financials",            "Financials, as the deck states them", BLUE),
+    ("balance_sheet",         "Balance sheet",                    BLUE),
+    ("segment_performance",   "Segment performance",              BLUE),
+    ("geography",             "Geography",                        BLUE),
+    ("capacity_expansion",    "Capacity and expansion",           BLUE),
+    ("capex",                 "Capex",                            BLUE),
+    ("orderbook_pipeline",    "Order book and pipeline",          BLUE),
+    ("customers",             "Customers",                        BLUE),
+    ("products_rd",           "Products and R&amp;D",             BLUE),
+    ("industry_market",       "Industry and market",              BLUE),
+    ("strategy",              "Strategy",                         PURPLE),
+    ("guidance_outlook",      "Guidance and outlook",             PURPLE),
+    ("risks",                 "Risks the deck admits",            DOWN),
+    ("management_commentary", "Management commentary",            "#34495e"),
+    ("capital_allocation",    "Capital allocation",               BLUE),
+    ("subsidiary_ma",         "Subsidiaries and M&amp;A",         BLUE),
+    ("esg",                   "ESG",                              MUTED),
+)
+
+
+def standalone_summary(isin, season, tables) -> str:
+    """The deck read as a company note in its own right.
+
+    This is the section that matters for a company that never holds a concall: eighteen
+    sections spanning what the business does, how it performed, what it is building, what
+    it promises and what it admits — every line quoted from the deck at extraction.
+
+    The coverage count is printed deliberately. "7 of 18 sections" tells a reader the deck
+    was thin, which is itself information about the company; without it, an absent
+    balance sheet reads as a pipeline failure rather than as a 15-page deck.
+    """
+    ds = _slice(tables.get("deck_summary"), isin)
+    if ds.empty:
+        return ""
+    if "quarter" in ds.columns:
+        want = QT.norm_q(season)
+        ds = ds[ds["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+    if ds.empty:
+        return ""
+
+    present = {str(s).strip() for s in ds["section"]}
+    n_have = sum(1 for s, _, _ in _SUMMARY_SECTIONS if s in present)
+
+    out = [_h("The deck on its own terms",
+              f"Everything this presentation discloses, quoted from it. "
+              f"<b>{n_have} of 18</b> sections are covered by this deck.")]
+
+    body = []
+    for sec, title, colour in _SUMMARY_SECTIONS:
+        part = ds[ds["section"].astype(str).str.strip() == sec]
+        if part.empty:
+            continue
+        body.append(f"<tr><td colspan='3' style='padding-top:9px;color:{colour};"
+                    f"font-weight:700;border-bottom:1px solid {colour}'>{title}</td></tr>")
+        for _, r in part.iterrows():
+            val = r.get("value")
+            num = ""
+            if val is not None and str(val).strip() not in ("", "nan", "None"):
+                unit = _esc(DS.display_unit(r.get("unit")), 12)
+                # A percentage is directional and gets the up/down colour; an absolute
+                # level is not — a bigger number is not automatically better news.
+                txt = f"{float(val):g}"
+                num = (colour_num(f"{txt}{unit}") if unit == "%"
+                       else f"<b>{_esc(txt, 18)}{(' ' + unit) if unit else ''}</b>")
+            per = _esc(r.get("period"), 16)
+            det = _esc(r.get("detail"), 210)
+            body.append(
+                f"<tr><td style='width:31%'>{_esc(r.get('label'), 70)}"
+                + (f" <span style='color:{MUTED};font-size:11px'>{per}</span>" if per else "")
+                + f"</td><td style='width:17%;text-align:right'>{num}</td>"
+                  f"<td style='color:#444'>{det}</td></tr>")
+
+    if not body:
+        return ""
+    out.append(f"<table cellpadding='4' cellspacing='0' style='{_TBL}'>"
+               + "".join(body) + "</table>")
+    return "".join(out)
+
+
 def presentation_body(isin, symbol, name, season, tables) -> str:
     """This quarter's deck, then how it differs from the previous one."""
     hi = _slice(tables.get("ppt_highlights"), isin)
@@ -173,7 +262,11 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
         return df[df["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
 
     cur_hi, cur_gu = _q(hi), _q(gu)
-    if cur_hi.empty and cur_gu.empty:
+    # The standalone summary is computed BEFORE the gate: a company that holds no concall
+    # may have a full deck_summary and no ppt_highlights at all, and gating on the old
+    # two tables would suppress exactly the mail this section was built for.
+    standalone = standalone_summary(isin, season, tables)
+    if cur_hi.empty and cur_gu.empty and not standalone:
         return ""
 
     out = [f"<div style='{_WRAP}'>",
@@ -188,6 +281,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
         return f"<b>{v}{u}</b>" if v else ""
 
     out.append(_key_callouts(cur_hi))
+    out.append(standalone)
 
     hi_rows = [[_esc(r.get("category"), 24), _esc(r.get("statement"), 220), _val(r)]
                for _, r in cur_hi.iterrows()
@@ -285,7 +379,6 @@ _BUSINESS_VIEWS = (
 )
 
 
-BLUE, PURPLE = "#1f4d6b", "#6b4d8f"
 
 # Themes an operating line can belong to, each with the colour it is emphasised in.
 # Order matters: the first match wins, so the more specific themes are listed first.
@@ -856,7 +949,7 @@ def main() -> None:
         return
 
     tables = {n: _read(drive, idx, f"{n}.parquet") for n in
-              ("ppt_highlights", "ppt_guidance", "deck_metrics", "deck_diff",
+              ("ppt_highlights", "ppt_guidance", "deck_summary", "deck_metrics", "deck_diff",
                "ratings", "rating_concerns", "rating_sensitivity",
                # positives + promise-tracking: all already computed, never surfaced
                "rating_drivers", "guidance_vs_actual", "mgmt_credibility",
@@ -1110,6 +1203,48 @@ def _self_test() -> int:
     check("commentary flag surfaced", "Promotional Commentary" in rc)
     check("management change surfaced", "CFO" in rc)
     check("their sources are named, not implied to be the deck", "Not from the deck" in rc)
+
+    # ---- standalone deck summary: the section that carries a no-concall company
+    _ds = pd.DataFrame([
+        {"isin": "INE1", "quarter": "Q1FY27", "section": "financials",
+         "label": "Consolidated PAT", "value": 194.0, "unit": "Rs. Mn",
+         "period": "Q1FY27", "detail": "", "evidence": "194"},
+        {"isin": "INE1", "quarter": "Q1FY27", "section": "financials",
+         "label": "EBITDA growth", "value": 17.3, "unit": "%", "period": "Q1FY27",
+         "detail": "", "evidence": "17.3%"},
+        {"isin": "INE1", "quarter": "Q1FY27", "section": "segment_performance",
+         "label": "HPDC revenue", "value": -41.2, "unit": "%", "period": "Q1FY27",
+         "detail": "", "evidence": "-41.2%"},
+        {"isin": "INE1", "quarter": "Q1FY27", "section": "risks", "label": "Concentration",
+         "value": None, "unit": "", "period": "", "detail": "Top-5 customers are 46%",
+         "evidence": "top 5 are 46% of revenue"},
+        {"isin": "INE1", "quarter": "Q4FY26", "section": "capex", "label": "Old capex",
+         "value": 500.0, "unit": "cr", "period": "FY26", "detail": "",
+         "evidence": "500 cr"}])
+    T_ds = dict(T, deck_summary=_ds)
+    ss = standalone_summary("INE1", "Q1FY27", T_ds)
+    check("standalone summary renders", "The deck on its own terms" in ss)
+    check("coverage stated honestly", "3 of 18" in ss)
+    check("section heading shown", "Financials, as the deck states them" in ss)
+    check("unit normalised for display", "Rs mn" in ss and "Rs. Mn" not in ss)
+    check("percent gets direction colour", UP in ss and DOWN in ss)
+    check("absolute level is not colour-graded", f">194</b>" in ss or "194 Rs mn" in ss)
+    check("risk section carries the red band", "Risks the deck admits" in ss)
+    check("narrative detail shown", "Top-5 customers are 46%" in ss)
+    check("other quarters excluded", "Old capex" not in ss and "Capex" not in ss)
+    check("no deck_summary renders nothing", standalone_summary("INE1", "Q1FY27", T) == "")
+    check("other company renders nothing", standalone_summary("INE9", "Q1FY27", T_ds) == "")
+    check("summary reaches the mail body",
+          "The deck on its own terms" in presentation_body("INE1", "AAA", "A", "Q1FY27", T_ds))
+    check("18 sections mapped, matching the extractor",
+          {s for s, _, _ in _SUMMARY_SECTIONS} == set(DS.SECTIONS))
+
+    # A company with NO concall and NO ppt_highlights is the whole point: the old gate
+    # returned "" for it and the mail this section exists for would never have gone out.
+    only_ds = {k: pd.DataFrame() for k in T}
+    only_ds["deck_summary"] = _ds
+    check("deck-only company still gets a mail",
+          "The deck on its own terms" in presentation_body("INE1", "AAA", "A", "Q1FY27", only_ds))
 
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")
