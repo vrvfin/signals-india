@@ -364,9 +364,13 @@ def main() -> None:
     ledger = load_parquet(drive, idx, LEDGER_NAME, LEDGER_COLS)
     want = {t.strip() for t in args.types.split(",") if t.strip()}
 
+    # The same tables the renderers read, so "due" means "will actually send" —
+    # coverage tested only that an extractor had run, which reported 16 presentations
+    # as due and then skipped every one as "nothing renderable".
+    _pre = {n: _read(drive, idx, f"{n}.parquet") for n in ("ppt_highlights", "ratings")}
     due = COV.mail_due(pf, queue, calendar, ledger, season, on=today,
                        window_days=args.window_days, doc_types=tuple(want),
-                       require_calendar=args.require_calendar)
+                       require_calendar=args.require_calendar, tables=_pre)
     log(f"season={season} pf={len(pf)} due={len(due)} "
         f"({', '.join(sorted({d['doc_type'] for d in due})) or 'nothing'})")
     if not due:

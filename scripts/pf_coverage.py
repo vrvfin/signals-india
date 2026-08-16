@@ -66,8 +66,34 @@ def _norm(s) -> str:
     return str(s or "").strip().upper()
 
 
+def has_season_rows(tables: dict, isin: str, doc_type: str, season: str) -> bool:
+    """Does the table the MAIL reads hold rows for this company and quarter?
+
+    `coverage()` used to mark a company PRESENT whenever any document of that type had
+    reached `done`. But the presentation mail only renders SEASON-quarter rows, so 16
+    holdings whose newest processed deck belonged to an earlier quarter were reported as
+    "due" and then silently skipped as "nothing renderable" — the status mail promising
+    mails that could never arrive. Coverage has to test the same condition the renderer
+    tests, or it is not a completeness signal at all.
+
+    Ratings are deliberately exempt: that mail renders the latest rating and what changed
+    since the previous one, with no quarter scoping, so any row makes it renderable.
+    """
+    if doc_type != "presentation":
+        return True
+    t = (tables or {}).get("ppt_highlights")
+    if t is None or getattr(t, "empty", True) or "isin" not in t.columns:
+        return False
+    sub = t[t["isin"].astype(str).str.strip() == str(isin).strip()]
+    if sub.empty or "quarter" not in sub.columns:
+        return False
+    want = QT.norm_q(season)
+    return bool(sub["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want).any())
+
+
 def coverage(pf, queue: pd.DataFrame, season: str,
-             doc_types=("results", "presentation", "rating")) -> pd.DataFrame:
+             doc_types=("results", "presentation", "rating"),
+             tables: dict | None = None) -> pd.DataFrame:
     """One row per (holding, doc_type) for the season: status + counts.
 
     `pf` is [(isin, symbol, name)] as daily_brief.load_pf returns it.
@@ -93,8 +119,12 @@ def coverage(pf, queue: pd.DataFrame, season: str,
             st = s["status"].astype(str).str.lower()
             n_done, n_pend = int(st.isin(_DONE).sum()), int(st.eq("pending").sum())
             n_fail = int(st.isin(_FAILED).sum())
-            if n_done:
+            if n_done and has_season_rows(tables, isin, dt, season):
                 status = PRESENT
+            elif n_done:
+                # Processed, but nothing for THIS quarter — the mail would render
+                # nothing, so calling it "due" would promise a mail that never comes.
+                status = MISSING
             elif n_pend:
                 status = PENDING
             elif n_fail:
@@ -286,7 +316,7 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
                      normal (not every company issues either), so it is NOT a failure
     """
     on = on or date.today()
-    cov = coverage(pf, queue, season, doc_types=doc_types)
+    cov = coverage(pf, queue, season, doc_types=doc_types, tables=tables)
     latest = latest_doc_per_type(pf, queue, doc_types)
     mailed_docs = already_mailed_docs(ledger, season)
     legacy = already_mailed(ledger, season)
@@ -347,7 +377,7 @@ def season_rollup(rows: list[dict]) -> dict:
 def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFrame,
              season: str, on: date | None = None, window_days: int = 2,
              doc_types=("results", "presentation", "rating"),
-             require_calendar: bool = False) -> list[dict]:
+             require_calendar: bool = False, tables: dict | None = None) -> list[dict]:
     """Which holdings should be mailed now, and for what.
 
     A (holding, doc_type) is due when the document is PRESENT and it has not already been
@@ -356,7 +386,7 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
     which arrive on no calendar at all.
     """
     on = on or date.today()
-    cov = coverage(pf, queue, season, doc_types=doc_types)
+    cov = coverage(pf, queue, season, doc_types=doc_types, tables=tables)
     latest = latest_doc_per_type(pf, queue, doc_types)
     mailed_docs = already_mailed_docs(ledger, season)
     legacy = already_mailed(ledger, season)          # rows written before doc_id existed

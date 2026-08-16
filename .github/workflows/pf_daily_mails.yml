@@ -40,7 +40,7 @@ concurrency:
 jobs:
   mails:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -58,6 +58,7 @@ jobs:
           GMAIL_USER:              ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -69,6 +70,7 @@ jobs:
             echo "GMAIL_USER=$GMAIL_USER"
             echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
             echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
           } > .env
 
       - name: Install deps
@@ -83,6 +85,44 @@ jobs:
           python scripts/pf_coverage.py --self-test
           python scripts/pf_company_mails.py --self-test
           python scripts/pf_season_status.py --self-test
+
+      # DOCUMENT-TRIGGERED. Sweep first, so a deck or rating that appeared since the
+      # last run is discovered, downloaded and extracted BEFORE the mail step decides
+      # what is due. Without this the mails could only ever report what some other
+      # workflow happened to have ingested already.
+      #
+      # Screener is primary and already one row per quarter; NSE fills only the quarters
+      # Screener has nothing for (and is the ONLY source that reaches the SME holdings,
+      # which carry no bse_code). --one-per-quarter keeps this to one document per
+      # quarter per type instead of re-ingesting a company's whole history.
+      - name: Daily sweep — find new documents
+        run: >
+          python scripts/pf_docs_sweep.py --enqueue --nse --one-per-quarter
+          --days 30 --types presentation,rating,results
+        continue-on-error: true
+
+      - name: Fetch what the sweep found
+        run: python scripts/pf_docs_sweep.py --hydrate --limit 40
+        continue-on-error: true
+
+      # FREE_POOL, never the Phase-2 GEMINI_API_KEY pool — this must not compete with
+      # live concall extraction for quota. Bounded so a heavy day cannot run long.
+      - name: Extract new decks and ratings (FREE_POOL)
+        env:
+          FREE_POOL:           ${{ secrets.FREE_POOL }}
+          BACKFILL_GEMINI_KEY: ${{ secrets.BACKFILL_GEMINI_KEY }}
+        run: |
+          # multi-line secrets (KEY_N=value per line) flatten to one comma-joined line,
+          # the same shape backfill_nightly writes.
+          {
+            echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
+          } >> .env
+          python scripts/extract_presentation.py --teardown \
+            --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 25 --deadline-min 20 || true
+          python scripts/extract_rating.py \
+            --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 25 --deadline-min 20 || true
+        continue-on-error: true
 
       # Per-company presentation and rating mails.
       - name: Per-company mails (presentation, rating)
