@@ -305,6 +305,24 @@ def already_mailed_docs(ledger: pd.DataFrame, season: str) -> set[str]:
             and str(x).strip().lower() not in ("none", "nan")}
 
 
+def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
+    """{(isin, doc_type)} that have at least one ledger row CARRYING a doc_id.
+
+    Distinguishes "this company has never been mailed under the doc_id scheme" from
+    "the whole ledger is legacy". Without it the legacy fallback is all-or-nothing and
+    collapses the moment any single document is mailed under the new scheme.
+    """
+    if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
+        return set()
+    l = ledger[ledger["season"].astype(str) == str(season)]
+    out = set()
+    for _, r in l.iterrows():
+        d = str(r.get("doc_id") or "").strip()
+        if d and d.lower() not in ("none", "nan"):
+            out.add((str(r.get("isin") or "").strip(), str(r.get("doc_type") or "").strip()))
+    return out
+
+
 def already_mailed(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     """{(isin, doc_type)} already delivered for this season."""
     if ledger is None or ledger.empty:
@@ -483,6 +501,7 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
     latest = latest_doc_per_type(pf, queue, doc_types)
     mailed_docs = already_mailed_docs(ledger, season)
     legacy = already_mailed(ledger, season)          # rows written before doc_id existed
+    tracked = tracked_docs(ledger, season)           # ...and those written after
     reporting = reporting_on(calendar, pf, on, window_days)
 
     out = []
@@ -499,8 +518,17 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
             continue
         if not doc_id and (isin, r["doc_type"]) in legacy:
             continue
-        if doc_id and not mailed_docs and (isin, r["doc_type"]) in legacy:
-            continue                                  # legacy-only ledger: treat as sent
+        # The legacy fallback is per-COMPANY, not global, and that distinction is the
+        # whole guard. Keyed on `not mailed_docs` it held only while the ledger carried
+        # no doc_id at all — so the first genuinely-new document anywhere would put one
+        # doc_id in the set, switch the guard off for everyone, and re-send every other
+        # holding's latest deck and rating. Measured on the live ledger 2026-08-16: 67
+        # rows (28 presentation, 39 rating) written before doc_id existed, every one of
+        # them exposed. Asking whether THIS company has a doc_id-bearing row instead
+        # means each holding leaves the legacy regime only when it is genuinely re-mailed.
+        if doc_id and (isin, r["doc_type"]) in legacy \
+                and (isin, r["doc_type"]) not in tracked:
+            continue
         if require_calendar and r["doc_type"] == "results":
             if isin not in reporting:
                 continue
@@ -652,6 +680,51 @@ def _self_test() -> int:
     check("legacy ledger rows still suppress, no re-send flood",
           not mail_due([pf[0]], q_two, pd.DataFrame(), led_legacy, "Q1FY27",
                        on=date(2026, 8, 14)))
+
+    # THE FLOOD, reproduced. The live ledger on 2026-08-16 held 67 rows written before
+    # doc_id existed. Company B sits on such a legacy row; company A is then mailed a
+    # genuinely new document, which puts one doc_id into the ledger. Under an
+    # all-or-nothing legacy guard that single row switched the guard off for EVERYONE,
+    # and B's already-mailed deck went out again — 67 duplicate mails in one run.
+    pf_two = [pf[0], ("INE2", "BBB", "B Ltd")]
+    q_flood = _q([
+        {"isin": "INE1", "doc_type": "rating", "status": "done",
+         "announcement_date": "2026-08-10", "doc_id": "a_new"},
+        {"isin": "INE2", "doc_type": "rating", "status": "done",
+         "announcement_date": "2026-08-01", "doc_id": "b_old"},
+    ])
+    led_mixed = pd.DataFrame([
+        {"season": "Q1FY27", "isin": "INE1", "doc_type": "rating", "doc_id": "a_new"},
+        {"season": "Q1FY27", "isin": "INE2", "doc_type": "rating", "doc_id": ""},
+    ])
+    due_mixed = mail_due(pf_two, q_flood, pd.DataFrame(), led_mixed, "Q1FY27",
+                         on=date(2026, 8, 14))
+    check("one company's new doc_id does not re-send everyone else",
+          not any(d["isin"] == "INE2" for d in due_mixed))
+    check("and the company that was tracked stays suppressed too",
+          not any(d["isin"] == "INE1" for d in due_mixed))
+    check("tracked_docs sees only doc_id-bearing rows",
+          tracked_docs(led_mixed, "Q1FY27") == {("INE1", "rating")})
+    check("tracked_docs is empty for a wholly legacy ledger",
+          tracked_docs(led_legacy, "Q1FY27") == set())
+    check("tracked_docs ignores other seasons",
+          tracked_docs(led_mixed, "Q2FY27") == set())
+    # ...but a genuinely NEW document for the legacy company must still get through,
+    # or the guard would silence that company for the rest of the season.
+    q_flood2 = _q([
+        {"isin": "INE1", "doc_type": "rating", "status": "done",
+         "announcement_date": "2026-08-10", "doc_id": "a_new"},
+        {"isin": "INE2", "doc_type": "rating", "status": "done",
+         "announcement_date": "2026-08-12", "doc_id": "b_newer"},
+    ])
+    led_after = pd.DataFrame([
+        {"season": "Q1FY27", "isin": "INE1", "doc_type": "rating", "doc_id": "a_new"},
+        {"season": "Q1FY27", "isin": "INE2", "doc_type": "rating", "doc_id": "b_old"},
+    ])
+    check("a new document for a previously-tracked company is still due",
+          any(d["isin"] == "INE2" and d["doc_id"] == "b_newer"
+              for d in mail_due(pf_two, q_flood2, pd.DataFrame(), led_after, "Q1FY27",
+                                on=date(2026, 8, 14))))
 
     # ---- season status: four distinct states, each with a reason
     q_st = _q([
