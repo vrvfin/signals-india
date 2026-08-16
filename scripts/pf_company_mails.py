@@ -187,6 +187,8 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
         v, u = _esc(r.get("value"), 24), _esc(r.get("unit"), 10)
         return f"<b>{v}{u}</b>" if v else ""
 
+    out.append(_key_callouts(cur_hi))
+
     hi_rows = [[_esc(r.get("category"), 24), _esc(r.get("statement"), 220), _val(r)]
                for _, r in cur_hi.iterrows()
                if not _is_esg(r.get("statement"), r.get("category"))]
@@ -205,6 +207,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
                    f"(emissions, renewables, workforce) — no financial or operational "
                    f"guidance was given.</div>")
 
+    out.append(_consistency(isin, season, tables))
     out.append(_promised_vs_delivered(isin, tables))
     out.append(_deck_changed(isin, season, tables))
     out.append(f"<div style='color:{MUTED};font-size:11px;margin-top:10px'>Deck rows are "
@@ -216,6 +219,133 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
 _VERDICT_TONE = {"beat": UP, "exceeded": UP, "delivered": UP, "met": UP,
                  "inline": MUTED, "partial": AMBER, "too_early": MUTED, "na": MUTED,
                  "miss": DOWN, "missed": DOWN, "below": DOWN}
+
+
+_KEY_CATEGORIES = ("orderbook", "order book", "capacity", "utilisation", "utilization",
+                   "volume", "realisation", "realization", "margin", "demand",
+                   "expansion", "capex", "guidance")
+
+
+def _key_callouts(cur_hi) -> str:
+    """The three or four lines worth reading first.
+
+    A deck highlights table is long and flat. What a reader wants at the top is the
+    handful of statements that carry a NUMBER in a category that moves a thesis —
+    order book, capacity, utilisation, volume, realisation, margin. Everything else
+    stays below in the full table.
+    """
+    scored = []
+    for _, r in cur_hi.iterrows():
+        stmt, cat = str(r.get("statement") or ""), str(r.get("category") or "")
+        val, unit = str(r.get("value") or ""), str(r.get("unit") or "")
+        if _is_esg(stmt, cat):
+            continue
+        has_num = bool(val.strip()) and val.strip().lower() not in ("nan", "none")
+        in_key = any(k in (cat + " " + stmt).lower() for k in _KEY_CATEGORIES)
+        if not has_num:
+            continue
+        scored.append((2 if in_key else 1, stmt, val, unit, cat))
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: -x[0])
+    cards = ""
+    for _s, stmt, val, unit, cat in scored[:4]:
+        cards += (
+            f"<td style='vertical-align:top;padding:0 8px 0 0;width:25%'>"
+            f"<div style='border:1px solid #e0e6ea;border-left:3px solid {UP};"
+            f"background:#f6f8f9;padding:8px 10px'>"
+            f"<div style='font-size:10.5px;color:{MUTED};text-transform:uppercase;"
+            f"letter-spacing:.3px'>{_esc(cat, 22)}</div>"
+            f"<div style='font-size:17px;font-weight:700;color:#111;margin:2px 0'>"
+            f"{_esc(val, 18)}{_esc(unit, 8)}</div>"
+            f"<div style='font-size:11px;color:#444'>{_esc(stmt, 90)}</div>"
+            f"</div></td>")
+    return (_h("Key call-outs", "The numbers from this deck worth reading first.")
+            + f"<table cellpadding='0' cellspacing='0' style='{_TBL}'><tr>{cards}</tr>"
+              f"</table>")
+
+
+def _consistency(isin, season, tables) -> str:
+    """What the company keeps saying, and what it has quietly stopped saying.
+
+    Two halves, because they fail differently:
+      NUMBERS — a metric reported in several quarters, and how its value moved. A target
+                restated unchanged is a promise being kept; one revised down without
+                comment is the thing worth catching.
+      COMMENTARY — a theme repeated quarter after quarter is a consistent message; one
+                that ran for several quarters and then vanished is the cheapest early
+                warning there is, because companies stop mentioning bad news rather than
+                announcing it.
+    """
+    hi = _slice(tables.get("ppt_highlights"), isin)
+    if hi.empty or "quarter" not in hi.columns:
+        return ""
+    hi = hi.copy()
+    hi["_q"] = hi["quarter"].astype(str).map(QT.norm_q)
+    quarters = sorted({q for q in hi["_q"] if q}, key=QT.q_order)
+    if len(quarters) < 2:
+        return ""
+    cur, prev = quarters[-1], quarters[-2]
+
+    def _rows(q):
+        return hi[hi["_q"] == q]
+
+    # ---- numbers: same statement, different value
+    def _numkey(r):
+        return _PUNCT.sub(" ", str(r.get("statement") or "").lower()).strip()[:70]
+
+    cur_n = {_numkey(r): (str(r.get("value") or ""), str(r.get("unit") or ""))
+             for _, r in _rows(cur).iterrows() if str(r.get("value") or "").strip()}
+    prev_n = {_numkey(r): (str(r.get("value") or ""), str(r.get("unit") or ""))
+              for _, r in _rows(prev).iterrows() if str(r.get("value") or "").strip()}
+    same, moved = [], []
+    for k, (v, u) in cur_n.items():
+        if k not in prev_n:
+            continue
+        pv, _pu = prev_n[k]
+        if str(v).strip() == str(pv).strip():
+            same.append((k, v, u))
+        else:
+            moved.append((k, pv, v, u))
+
+    # ---- commentary: themes carried forward vs dropped
+    def _txt(q):
+        return {_PUNCT.sub(" ", str(r.get("statement") or "").lower()).strip()[:70]:
+                str(r.get("statement") or "")
+                for _, r in _rows(q).iterrows()
+                if not _is_esg(r.get("statement"), r.get("category"))}
+    ct, pt = _txt(cur), _txt(prev)
+    carried = [ct[k] for k in ct if k in pt][:4]
+    dropped = [pt[k] for k in pt if k not in ct][:5]
+
+    if not (same or moved or carried or dropped):
+        return ""
+
+    out = [_h("Consistent, and not",
+              f"{_esc(cur,10)} against {_esc(prev,10)} — the same claim restated, "
+              f"revised, or quietly dropped.")]
+    rows = []
+    for k, pv, v, u in moved[:6]:
+        rows.append([f"<span style='color:{AMBER};font-weight:700'>revised</span>",
+                     _esc(k, 70), _esc(pv, 20), f"{colour_num(v)}{_esc(u, 8)}"])
+    for k, v, u in same[:4]:
+        rows.append([f"<span style='color:{UP};font-weight:700'>restated</span>",
+                     _esc(k, 70), _esc(v, 20) + _esc(u, 8), "unchanged"])
+    if rows:
+        out.append(_rows_html(rows, ["Number", "What", f"{_esc(prev,9)}", f"{_esc(cur,9)}"]))
+    crows = []
+    for s in dropped:
+        crows.append([f"<span style='color:{DOWN};font-weight:700'>stopped saying</span>",
+                      _esc(s, 200)])
+    for s in carried:
+        crows.append([f"<span style='color:{UP};font-weight:700'>still saying</span>",
+                      _esc(s, 200)])
+    if crows:
+        out.append(_rows_html(crows, ["Commentary", "Statement"]))
+    return "".join(out)
+
+
+_PUNCT = __import__("re").compile(r"[^a-z0-9]+")
 
 
 def _promised_vs_delivered(isin, tables) -> str:
@@ -357,6 +487,36 @@ def rating_body(isin, symbol, name, tables) -> str:
            f"<span style='color:#888;font-weight:400'>&middot; {_esc(symbol, 20)}</span></h2>",
            f"<div style='color:#888;font-size:12px;margin:0 0 10px'>Credit rating "
            f"&middot; {_esc(cur.get('agency'), 24)} &middot; {_esc(cur['_d'], 12)}</div>"]
+
+    # KEY NUMBERS FIRST. A rating mail is mostly prose; the figures that actually get
+    # compared quarter to quarter are the rated amount, how long the rating has stood,
+    # and how the agency's own tally of strengths against concerns has moved.
+    _dr = _slice(tables.get("rating_drivers"), isin)
+    _cn2 = _slice(tables.get("rating_concerns"), isin)
+    _sn2 = _slice(tables.get("rating_sensitivity"), isin)
+    _amt = str(cur.get("rated_amount_cr") or "").strip()
+    _n_same = len(rt[rt["rating"].astype(str) == str(cur.get("rating"))])
+    _tiles = ""
+    for _lab, _v, _good in (
+            ("Rated amount", f"{_amt} Cr" if _amt else "", True),
+            ("Strengths cited", str(len(_dr)) if len(_dr) else "", True),
+            ("Concerns cited", str(len(_cn2)) if len(_cn2) else "", False),
+            ("Downgrade triggers", str(len(_sn2[_sn2.get("direction", pd.Series(dtype=str))
+                                               .astype(str).str.lower() == "down"]))
+             if len(_sn2) else "", False),
+            ("Quarters at this rating", str(_n_same) if _n_same else "", True)):
+        if not _v:
+            continue
+        _tiles += (f"<td style='vertical-align:top;padding:0 8px 0 0'>"
+                   f"<div style='border:1px solid #e0e6ea;background:#f6f8f9;"
+                   f"padding:7px 10px'>"
+                   f"<div style='font-size:10.5px;color:{MUTED};text-transform:uppercase;"
+                   f"letter-spacing:.3px'>{_lab}</div>"
+                   f"<div style='font-size:16px;margin-top:2px'>"
+                   f"{colour_num(_v, good_up=_good)}</div></div></td>")
+    if _tiles:
+        out.append(f"<table cellpadding='0' cellspacing='0' style='{_TBL}'>"
+                   f"<tr>{_tiles}</tr></table>")
 
     act = str(cur.get("rating_action") or "")
     col = DOWN if "downgrade" in act.lower() else UP if "upgrade" in act.lower() else MUTED
@@ -700,6 +860,43 @@ def _self_test() -> int:
     check("lower-is-better inverts", UP in colour_num("-8", good_up=False))
     check("text is not force-coloured", colour_num("n/a") == "n/a")
     check("empty stays empty", colour_num(None) == "")
+
+    # KEY CALL-OUTS: numbers in thesis-moving categories, lifted to the top.
+    T_kc = dict(T, ppt_highlights=pd.DataFrame([
+        {"isin": "INE1", "quarter": "Q1 FY27", "category": "orderbook",
+         "statement": "Order book at record", "value": "1200", "unit": "Cr"},
+        {"isin": "INE1", "quarter": "Q1 FY27", "category": "other",
+         "statement": "No number here", "value": "", "unit": ""}]))
+    kc = presentation_body("INE1", "AAA", "A Ltd", "Q1FY27", T_kc)
+    check("call-outs lift the numeric highlight", "Key call-outs" in kc)
+    check("the number is featured", "1200" in kc)
+    check("a statement with no number is not a call-out",
+          "No number here" not in kc.split("Key call-outs")[1].split("</table>")[0])
+
+    # CONSISTENCY: restated / revised / stopped saying, across two quarters.
+    T_cons = dict(T, ppt_highlights=pd.DataFrame([
+        {"isin": "INE1", "quarter": "Q4 FY26", "category": "capacity",
+         "statement": "Capacity target by FY28", "value": "8.0", "unit": "Mn"},
+        {"isin": "INE1", "quarter": "Q4 FY26", "category": "demand",
+         "statement": "Exports scaling strongly", "value": "", "unit": ""},
+        {"isin": "INE1", "quarter": "Q1 FY27", "category": "capacity",
+         "statement": "Capacity target by FY28", "value": "6.5", "unit": "Mn"},
+        {"isin": "INE1", "quarter": "Q1 FY27", "category": "demand",
+         "statement": "Domestic demand firm", "value": "", "unit": ""}]))
+    cs = presentation_body("INE1", "AAA", "A Ltd", "Q1FY27", T_cons)
+    check("consistency section renders", "Consistent, and not" in cs)
+    check("a quietly revised target is flagged", "revised" in cs)
+    check("both old and new values are shown", "8.0" in cs and "6.5" in cs)
+    check("a dropped theme is called out", "stopped saying" in cs)
+    check("the dropped statement is named", "Exports scaling strongly" in cs)
+
+    # RATING KEY NUMBERS
+    rk = rating_body("INE1", "AAA", "A Ltd", dict(T, rating_drivers=pd.DataFrame([
+        {"isin": "INE1", "agency": "CRISIL", "rating_date": "2026-06-01",
+         "driver": "Healthy order book"}])))
+    check("rated amount is a key number", "Rated amount" in rk)
+    check("strengths are counted", "Strengths cited" in rk)
+    check("downgrade triggers are counted", "Downgrade triggers" in rk)
 
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")
