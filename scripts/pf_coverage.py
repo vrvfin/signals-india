@@ -205,8 +205,77 @@ def already_mailed(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
 DELIVERED, DUE, AWAITING, NO_INFO = "delivered", "due", "awaiting", "no information"
 
 
+# The pipeline a document walks, in order. A gap is ALWAYS the first stage that failed,
+# which is what makes the diagnosis deterministic rather than a guess.
+STAGES = ("expected", "discovered", "fetched", "extracted", "structured", "mailed")
+
+
+def pipeline_trace(isin: str, doc_type: str, queue, tables: dict,
+                   expected: bool, mailed: bool) -> dict:
+    """Which stages this (company, doc_type) has cleared, and where it stopped.
+
+    Answers "why is this not in my inbox?" with a stage, not an adjective:
+        expected    the exchange calendar says it reports, or the type is due each quarter
+        discovered  a queue row exists (some source found the filing)
+        fetched     the PDF/HTML actually reached Drive (drive_file_id set)
+        extracted   an extractor processed it (status done/superseded)
+        structured  it produced rows in the table the mail reads
+        mailed      a mail went out for that document
+    """
+    q = queue
+    got = {"expected": bool(expected), "discovered": False, "fetched": False,
+           "extracted": False, "structured": False, "mailed": bool(mailed)}
+    detail = ""
+    if q is not None and not getattr(q, "empty", True) \
+            and {"isin", "doc_type"} <= set(q.columns):
+        sub = q[(q["isin"].astype(str).str.strip() == isin)
+                & (q["doc_type"].astype(str) == doc_type)]
+        if len(sub):
+            got["discovered"] = True
+            # Columns are read defensively: a caller may hand us a slice of the queue
+            # (the mails do), and an absent column must degrade, never raise.
+            got["fetched"] = ("drive_file_id" in sub.columns
+                              and bool((sub["drive_file_id"].astype(str).str.strip()
+                                        != "").any()))
+            if "status" not in sub.columns:
+                return {"stages": got, "stopped_at": "extracted", "detail": ""}
+            st = sub["status"].astype(str).str.lower()
+            got["extracted"] = bool(st.isin(_DONE).any())
+            if not got["extracted"]:
+                errs = sub[st.isin(_FAILED)]
+                if len(errs) and "last_error" in errs.columns:
+                    reasons = [str(x) for x in errs["last_error"]
+                               if str(x).strip() and str(x).lower() not in ("none", "nan")]
+                    detail = reasons[-1][:90] if reasons else "extractor error, reason not recorded"
+    # did it produce rows in the table the mail actually reads?
+    tbl = {"presentation": tables.get("ppt_highlights"),
+           "rating": tables.get("ratings")}.get(doc_type)
+    if doc_type == "results":
+        got["structured"] = got["extracted"]        # the teardown reads statements
+    elif tbl is not None and not getattr(tbl, "empty", True) and "isin" in tbl.columns:
+        got["structured"] = bool((tbl["isin"].astype(str).str.strip() == isin).any())
+
+    stopped = None
+    for s in STAGES:
+        if not got[s]:
+            stopped = s
+            break
+    return {"stages": got, "stopped_at": stopped, "detail": detail}
+
+
+_STAGE_WHY = {
+    "expected": "not scheduled and nothing filed — nothing to wait for",
+    "discovered": "no source has listed this document yet (Screener or NSE)",
+    "fetched": "listed but the file never downloaded (often an HTML page, not a PDF)",
+    "extracted": "downloaded but not yet processed by an extractor",
+    "structured": "processed but produced no usable rows for the mail",
+    "mailed": "ready — the mail goes on the next run",
+}
+
+
 def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
-                  doc_types=("results", "presentation", "rating")) -> list[dict]:
+                  doc_types=("results", "presentation", "rating"),
+                  tables: dict | None = None) -> list[dict]:
     """Per holding x doc_type: delivered / due / awaiting / no information, WITH a reason.
 
     The four states are deliberately distinct, because they need different actions:
@@ -231,14 +300,21 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
         sent = bool(doc_id and doc_id in mailed_docs) or \
             (not mailed_docs and (isin, dt) in legacy) or \
             (not doc_id and (isin, dt) in legacy)
+        expected = (dt in EXPECTED_PER_QUARTER) or (isin in reporting)
+        tr = pipeline_trace(isin, dt, queue, tables or {}, expected, sent)
+        stopped, detail = tr["stopped_at"], tr["detail"]
+
         if r["status"] == PRESENT and sent:
             state, why = DELIVERED, f"mailed · {doc.get('date','')}"
         elif r["status"] == PRESENT:
-            state, why = DUE, "processed, mail not sent yet"
+            # Everything the mail needs exists; only the send is outstanding. This is a
+            # QUEUE, not a gap — it clears itself on the next run with no intervention.
+            state, why = DUE, _STAGE_WHY["mailed"]
         elif r["status"] == PENDING:
-            state, why = AWAITING, "document fetched, extraction pending"
+            state, why = AWAITING, _STAGE_WHY["extracted"]
         elif r["status"] == FAILED:
-            state, why = AWAITING, "extraction failed — will retry"
+            state = AWAITING
+            why = detail or _STAGE_WHY["extracted"]
         elif dt == "results" and isin in reporting:
             state, why = AWAITING, f"calendar says reported {reporting[isin]}, no numbers yet"
         elif dt == "results":
@@ -248,7 +324,9 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
                                    else "no deck published this season")
         rows.append({"isin": isin, "symbol": r["symbol"], "name": r["name"],
                      "doc_type": dt, "state": state, "reason": why,
-                     "doc_date": doc.get("date", "")})
+                     "doc_date": doc.get("date", ""),
+                     "stages": tr["stages"], "stopped_at": stopped,
+                     "detail": detail})
     return rows
 
 

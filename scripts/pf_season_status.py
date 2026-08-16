@@ -93,36 +93,68 @@ def render(rows: list[dict], roll: dict, season: str, today: str) -> str:
     out = [head, f"<table cellpadding='5' cellspacing='0' style='{_TBL}'>"
                  f"<tr>{hdr}</tr>{body}</table>"]
 
-    # Anything not yet delivered, named with its reason. This is the actionable half —
-    # a company silently missing is exactly what this mail exists to prevent.
+    # What the two states MEAN, stated up front rather than left to inference.
+    out.append(
+        f"<div style='background:#f6f8f9;border:1px solid #e0e6ea;padding:9px 12px;"
+        f"margin:0 0 12px;font-size:12px'>"
+        f"<b style='color:{AMBER}'>due</b> &mdash; the document is in hand and processed; "
+        f"only the send is outstanding. <b>Clears itself on the next run, no action "
+        f"needed.</b><br>"
+        f"<b style='color:{RED}'>awaiting</b> &mdash; the document itself is missing, "
+        f"undownloaded or unprocessed. <b>This is the real gap</b>; the table names the "
+        f"exact stage it stopped at.<br>"
+        f"<b style='color:{GREY}'>no information</b> &mdash; the company published nothing "
+        f"of that kind this quarter. Normal for decks and ratings; not a failure."
+        f"</div>")
+
+    # THE PIPELINE TABLE. A tick per stage, so the gap is visible rather than asserted:
+    # the first empty column IS the reason.
     pend = [r for r in rows if r["state"] in (COV.DUE, COV.AWAITING)]
     if pend:
-        pend.sort(key=lambda r: (r["doc_type"], r["state"], r["symbol"]))
-        rws = "".join(
-            f"<tr><td><b>{_esc(r['symbol'], 16)}</b></td>"
-            f"<td>{_esc(r['doc_type'], 14)}</td>"
-            f"<td style='color:{_STATE_COLOUR[r['state']]};font-weight:700'>"
-            f"{_esc(r['state'], 16)}</td>"
-            f"<td style='color:#666'>{_esc(r['reason'], 90)}</td></tr>" for r in pend)
+        order = {COV.AWAITING: 0, COV.DUE: 1}
+        pend.sort(key=lambda r: (order.get(r["state"], 9), r["doc_type"], r["symbol"]))
+        stage_hdr = "".join(
+            f"<th style='border-bottom:1px solid #ccc;color:{GREY};font-size:10.5px;"
+            f"text-align:center'>{s}</th>" for s in COV.STAGES)
+        rws = ""
+        for r in pend:
+            st = r.get("stages", {})
+            cells = ""
+            for s in COV.STAGES:
+                if st.get(s):
+                    cells += f"<td style='text-align:center;color:{GREEN}'>&#10003;</td>"
+                elif s == r.get("stopped_at"):
+                    cells += (f"<td style='text-align:center;color:{RED};"
+                              f"font-weight:700'>&#10007;</td>")
+                else:
+                    cells += "<td style='text-align:center;color:#dfe4e7'>&middot;</td>"
+            rws += (f"<tr><td><b>{_esc(r['symbol'], 16)}</b></td>"
+                    f"<td>{_esc(r['doc_type'], 13)}</td>"
+                    f"<td style='color:{_STATE_COLOUR[r['state']]};font-weight:700'>"
+                    f"{_esc(r['state'], 14)}</td>{cells}"
+                    f"<td style='color:#666;font-size:11.5px'>"
+                    f"{_esc(r['reason'], 95)}</td></tr>")
         out.append(
             f"<h3 style='margin:14px 0 4px;font-size:13px;color:#34495e;"
             f"border-bottom:2px solid #34495e;padding-bottom:2px'>"
-            f"Not delivered yet ({len(pend)})</h3>"
+            f"Not delivered yet ({len(pend)}) &mdash; where each one stopped</h3>"
+            f"<div style='overflow-x:auto'>"
             f"<table cellpadding='5' cellspacing='0' style='{_TBL}'>"
             f"<tr><th style='text-align:left;border-bottom:1px solid #ccc;color:{GREY}'>Company</th>"
             f"<th style='text-align:left;border-bottom:1px solid #ccc;color:{GREY}'>Document</th>"
             f"<th style='text-align:left;border-bottom:1px solid #ccc;color:{GREY}'>State</th>"
+            f"{stage_hdr}"
             f"<th style='text-align:left;border-bottom:1px solid #ccc;color:{GREY}'>Why</th></tr>"
-            f"{rws}</table>")
+            f"{rws}</table></div>"
+            f"<div style='color:{GREY};font-size:11px;margin:-8px 0 12px'>"
+            f"&#10003; cleared &middot; <span style='color:{RED}'>&#10007;</span> stopped "
+            f"here &mdash; this is the gap &middot; &middot; not reached. Stages run left "
+            f"to right: the exchange expects it &rarr; a source listed it &rarr; the file "
+            f"downloaded &rarr; an extractor processed it &rarr; it produced rows the mail "
+            f"can read &rarr; the mail went out.</div>")
     else:
         out.append(f"<div style='color:{GREEN};font-weight:700;margin:10px 0'>"
                    f"Every holding is delivered or has nothing outstanding.</div>")
-
-    out.append(f"<div style='color:{GREY};font-size:11px;margin-top:10px'>"
-               f"&ldquo;No information&rdquo; means the company published nothing of that "
-               f"kind this quarter &mdash; normal for decks and ratings, and not counted "
-               f"as missing. &ldquo;Awaiting&rdquo; means it is expected and has not "
-               f"arrived, or is mid-processing.</div>")
     return f"<div style='{_WRAP}'>{''.join(out)}</div>"
 
 
@@ -177,7 +209,16 @@ def main() -> None:
             if ledger is not None and not ledger.empty else conv
         log(f"ledgers merged: {len(conv)} teardown row(s) + company-mail rows")
 
-    rows = COV.season_status(pf, queue, calendar, ledger, season, on=date.today())
+    # The tables the mails actually read — needed so the "structured" stage means
+    # "produced rows a mail can use", not merely "an extractor ran".
+    tables = {}
+    for name in ("ppt_highlights", "ratings"):
+        f = find_file(drive, idx, f"{name}.parquet")
+        tables[name] = (pd.read_parquet(io.BytesIO(download_bytes(drive, f)))
+                        if f else pd.DataFrame())
+
+    rows = COV.season_status(pf, queue, calendar, ledger, season, on=date.today(),
+                             tables=tables)
     roll = COV.season_rollup(rows)
     log(f"season={season} holdings={roll['_companies']} "
         f"results delivered={roll['_results_done']}/{roll['_results_total']}")
@@ -236,7 +277,20 @@ def _self_test() -> int:
     check("a due company is named too", "CCC" in html)
     check("no-information is not treated as missing", "AAA" not in html.split(
         "Not delivered yet")[-1] or "rating" not in html.split("Not delivered yet")[-1])
-    check("the four states are explained", "No information" in html)
+    check("due vs awaiting is explained up front, not left to inference",
+          "Clears itself on the next run" in html and "This is the real gap" in html)
+    check("no information is explained as normal, not a failure",
+          "not a failure" in html)
+    # The pipeline table is what makes a gap checkable rather than asserted.
+    rows2 = list(rows)
+    rows2[1] = dict(rows2[1], stages={"expected": True, "discovered": True,
+                                      "fetched": False, "extracted": False,
+                                      "structured": False, "mailed": False},
+                    stopped_at="fetched")
+    h3 = render(rows2, COV.season_rollup(rows2), "Q1FY27", "2026-08-16")
+    check("stage columns are rendered", "discovered" in h3 and "structured" in h3)
+    check("the stopped stage is marked", "&#10007;" in h3)
+    check("cleared stages are ticked", "&#10003;" in h3)
 
     all_done = [{"isin": "I1", "symbol": "AAA", "name": "A", "doc_type": "results",
                  "state": COV.DELIVERED, "reason": "mailed", "doc_date": ""}]
