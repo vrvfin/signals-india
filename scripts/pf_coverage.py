@@ -425,6 +425,7 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
     latest = latest_doc_per_type(pf, queue, doc_types)
     mailed_docs = already_mailed_docs(ledger, season)
     legacy = already_mailed(ledger, season)
+    tracked = tracked_docs(ledger, season)
     reporting = reporting_on(calendar, pf, on, window_days=120)   # whole season so far
     upcoming = scheduled_ahead(calendar, pf, on)                  # meetings still to come
 
@@ -433,9 +434,17 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
         isin, dt = str(r["isin"]).strip(), r["doc_type"]
         doc = latest.get((isin, dt)) or {}
         doc_id = doc.get("doc_id", "")
+        # The legacy fallback must be per-COMPANY here for the same reason it is in
+        # mail_due, and getting it wrong is louder in this mail than anywhere else. Keyed
+        # on `not mailed_docs`, ONE company mailed under the doc_id scheme flipped the
+        # whole report: the 15 Aug run mailed 67 holdings and wrote their rows before
+        # doc_id existed, so those rows carry the literal string "None" — 0 of 67 match a
+        # real document. The moment RISHABH was mailed with a real doc_id, this reported
+        # "4/51 complete" for a season that was actually 47/51, and named 43 delivered
+        # holdings as outstanding. A completeness mail that cries wolf is worse than none.
         sent = bool(doc_id and doc_id in mailed_docs) or \
-            (not mailed_docs and (isin, dt) in legacy) or \
-            (not doc_id and (isin, dt) in legacy)
+            (not doc_id and (isin, dt) in legacy) or \
+            ((isin, dt) in legacy and (isin, dt) not in tracked)
         expected = (dt in EXPECTED_PER_QUARTER) or (isin in reporting)
         tr = pipeline_trace(isin, dt, queue, tables or {}, expected, sent)
         stopped, detail = tr["stopped_at"], tr["detail"]
@@ -709,6 +718,27 @@ def _self_test() -> int:
           tracked_docs(led_legacy, "Q1FY27") == set())
     check("tracked_docs ignores other seasons",
           tracked_docs(led_mixed, "Q2FY27") == set())
+    # A doc_id written as the literal string "None" is what a missing column round-trips
+    # to through parquet. It must count as ABSENT, not as a tracked id.
+    led_none = pd.DataFrame([{"season": "Q1FY27", "isin": "INE2", "doc_type": "rating",
+                              "doc_id": "None"}])
+    check("string 'None' is not a real doc_id", tracked_docs(led_none, "Q1FY27") == set())
+    check("string 'None' is not a mailed doc", already_mailed_docs(led_none, "Q1FY27") == set())
+    check("...but the legacy (isin, doc_type) record still counts",
+          ("INE2", "rating") in already_mailed(led_none, "Q1FY27"))
+
+    # THE SAME BUG IN season_status, which is louder because it reports to the reader.
+    # One company mailed under the doc_id scheme must not turn every legacy holding into
+    # an outstanding gap — live, that read "4/51 complete" for a 47/51 season.
+    st_led = pd.DataFrame([
+        {"season": "Q1FY27", "isin": "INE1", "doc_type": "rating", "doc_id": "a_new"},
+        {"season": "Q1FY27", "isin": "INE2", "doc_type": "rating", "doc_id": "None"},
+    ])
+    st = season_status(pf_two, q_flood, pd.DataFrame(), st_led, "Q1FY27",
+                       on=date(2026, 8, 14), doc_types=("rating",))
+    by = {r["symbol"]: r["state"] for r in st}
+    check("legacy holding still reads delivered, not due", by.get("BBB") == DELIVERED)
+    check("doc_id-tracked holding reads delivered too", by.get("AAA") == DELIVERED)
     # ...but a genuinely NEW document for the legacy company must still get through,
     # or the guard would silence that company for the rest of the season.
     q_flood2 = _q([
