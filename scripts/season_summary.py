@@ -270,7 +270,7 @@ def _sub(title: str, note: str = "") -> str:
             + "</div>")
 
 
-def render_summary(s: dict) -> str:
+def render_summary(s: dict, include_deck: bool = True) -> str:
     """One company's season summary as HTML. Empty string when nothing was published."""
     parts = []
 
@@ -289,7 +289,13 @@ def render_summary(s: dict) -> str:
                          + f"<div style='font-size:11.5px;margin:0 0 6px'>"
                          + " &nbsp;&middot;&nbsp; ".join(cells) + "</div>")
 
-    if s["highlights"]:
+    # DECK CONTENT BELONGS TO THE DECK MAIL (user, 2026-08-16). The results teardown
+    # answers "how are the FINANCIALS behaving"; the presentation mail answers "how is
+    # the BUSINESS behaving". Rendering deck highlights, deck guidance and the deck diff
+    # inside the teardown duplicated the deck mail and blurred that split, so the
+    # teardown passes include_deck=False and keeps only the results release, the concall
+    # and the other filings.
+    if s["highlights"] and include_deck:
         rows = "".join(
             f"<tr><td style='color:{MUTED};white-space:nowrap'>{_esc(h['category'], 22)}</td>"
             f"<td>{_esc(h['statement'], 190)}"
@@ -301,7 +307,7 @@ def render_summary(s: dict) -> str:
         parts.append(_sub("Investor presentation", more)
                      + f"<table cellpadding='2' cellspacing='0' style='{_TBL}'>{rows}</table>")
 
-    if s["guidance"]:
+    if s["guidance"] and include_deck:
         rows = "".join(
             f"<tr><td><b>{_esc(g['metric'], 40)}</b></td>"
             f"<td>{_esc(g['value'], 30)}{_esc(g['unit'], 10)}</td>"
@@ -345,7 +351,7 @@ def render_summary(s: dict) -> str:
         parts.append(_sub("What else moved this quarter", more)
                      + f"<table cellpadding='2' cellspacing='0' style='{_TBL}'>{rows}</table>")
 
-    if s["deck_built"] and any(s["deck"].values()):
+    if include_deck and s["deck_built"] and any(s["deck"].values()):
         d = s["deck"]
         rows = "".join(
             f"<tr><td><b>{_esc(x.get('change_type', ''), 24)}</b></td>"
@@ -361,7 +367,7 @@ def render_summary(s: dict) -> str:
         if rows:
             parts.append(_sub("Deck vs the last deck")
                          + f"<table cellpadding='2' cellspacing='0' style='{_TBL}'>{rows}</table>")
-    elif s["highlights"] or s["guidance"]:
+    elif include_deck and (s["highlights"] or s["guidance"]):
         # MISSING IS NOT CLEAN. Say the pass has not run rather than imply the deck was
         # read and found honest.
         parts.append(f"<div style='color:{MUTED};font-size:11px;margin:4px 0 8px'>"

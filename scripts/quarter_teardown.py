@@ -1369,13 +1369,15 @@ def block_season(d: dict) -> str:
     s = d.get("season_summary")
     if not s:
         return ""
-    inner = SS.render_summary(s)
+    # include_deck=False: the deck has its own mail now. The teardown is the
+    # FINANCIAL view; duplicating the deck here blurred that split.
+    inner = SS.render_summary(s, include_deck=False)
     if not inner:
         return ""
     return _h("The quarter as the company told it",
-              "Results release, investor presentation, concall and other filings for "
-              "this quarter, as published by the company. Scoped to the season quarter "
-              "— nothing from another period appears here.") + inner
+              "The results release, the concall and every other material filing this "
+              "quarter, as published by the company. The investor deck has its own "
+              "mail — this page is the financial view.") + inner
 
 
 def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:

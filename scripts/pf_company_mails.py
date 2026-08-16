@@ -207,6 +207,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
                    f"(emissions, renewables, workforce) — no financial or operational "
                    f"guidance was given.</div>")
 
+    out.append(_business_view(isin, season, tables))
     out.append(_consistency(isin, season, tables))
     out.append(_promised_vs_delivered(isin, tables))
     out.append(_deck_changed(isin, season, tables))
@@ -263,6 +264,86 @@ def _key_callouts(cur_hi) -> str:
     return (_h("Key call-outs", "The numbers from this deck worth reading first.")
             + f"<table cellpadding='0' cellspacing='0' style='{_TBL}'><tr>{cards}</tr>"
               f"</table>")
+
+
+# The deck's job is the OPERATING picture: what the business is physically doing. The
+# statement says how the money behaved; these say how the business behaved. Categories
+# come from deck_teardown's controlled vocabulary plus the deck's own highlight buckets.
+_BUSINESS_VIEWS = (
+    ("Capacity and expansion", ("capacity", "expansion", "capex", "plant", "greenfield",
+                                "brownfield", "commission")),
+    ("Utilisation", ("utilisation", "utilization", "occupancy", "run rate")),
+    ("Order book and pipeline", ("orderbook", "order book", "pipeline", "backlog",
+                                 "tender", "win")),
+    ("Volume and realisation", ("volume", "realisation", "realization", "tonnage",
+                                "asp", "price")),
+    ("Segment mix", ("segment", "product mix", "category", "vertical")),
+    ("Geography", ("geo", "geograph", "export", "domestic", "region")),
+    ("Demand and macro", ("demand", "macro", "industry", "market size", "cycle",
+                          "consumption")),
+)
+
+
+def _business_view(isin, season, tables) -> str:
+    """How the BUSINESS is behaving — capacity, utilisation, orders, mix, geography, macro.
+
+    The deck is where the operating story lives, and it was being rendered as one flat
+    list of highlights. Grouping it into the views an analyst actually asks for turns the
+    same rows into an operating picture: is capacity going up, is it being used, is the
+    order book covering it, where is the volume coming from, and what is the company
+    saying about its market.
+
+    deck_metrics (the grounded teardown pass) is preferred where it exists, because every
+    row there had to quote the deck verbatim; ppt_highlights fills in otherwise.
+    """
+    hi = _slice(tables.get("ppt_highlights"), isin)
+    dm = _slice(tables.get("deck_metrics"), isin)
+    want = QT.norm_q(season)
+
+    items = []
+    if not dm.empty:
+        for _, r in dm.iterrows():
+            q = QT.norm_q(str(r.get("quarter") or ""))
+            if q and q != want:
+                continue
+            items.append((f"{r.get('category','')} {r.get('metric','')}",
+                          str(r.get("metric") or ""),
+                          f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}",
+                          str(r.get("slide_ref") or "")))
+    if not items and not hi.empty:
+        h = hi
+        if "quarter" in h.columns:
+            h = h[h["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+        for _, r in h.iterrows():
+            if _is_esg(r.get("statement"), r.get("category")):
+                continue
+            items.append((f"{r.get('category','')} {r.get('statement','')}",
+                          str(r.get("statement") or ""),
+                          f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}", ""))
+    if not items:
+        return ""
+
+    out, used = [], set()
+    for title, keys in _BUSINESS_VIEWS:
+        rows = []
+        for i, (blob, label, val, ref) in enumerate(items):
+            if i in used:
+                continue
+            if any(k in blob.lower() for k in keys):
+                used.add(i)
+                rows.append([_esc(label, 190),
+                             colour_num(val) if val else "",
+                             _esc(ref, 14)])
+        if rows:
+            out.append(_h(title) + _rows_html(rows[:6], ["What the deck says", "Value",
+                                                         "Slide"]))
+    if not out:
+        return ""
+    return (_h("How the business is behaving",
+               "The operating picture from the deck — capacity, utilisation, orders, "
+               "mix, geography and the market backdrop. The financial teardown covers "
+               "how the money behaved; this covers how the business did.")
+            + "".join(out))
 
 
 def _consistency(isin, season, tables) -> str:
@@ -386,6 +467,23 @@ def _promised_vs_delivered(isin, tables) -> str:
                           "dropped metric, because someone chose to make it.")
                        + _rows_html(rows, ["Period", "Metric", "Guided", "Actual",
                                            "Delta", "Verdict"]))
+
+    hist = _slice(tables.get("gf2_historical_guidance"), isin)
+    if not hist.empty:
+        rows = []
+        for _, r in hist.head(5).iterrows():
+            orig = _esc(r.get("original_guidance"), 120)
+            outc = _esc(r.get("actual_mentioned_outcome"), 120)
+            if not orig:
+                continue
+            rows.append([_esc(r.get("financial_qtr"), 12), orig, outc or "&mdash;",
+                         _esc(r.get("management_self_assessment"), 60)])
+        if rows:
+            out.append(_h("Historical guidance, revisited",
+                          "What management said in earlier quarters and how they have "
+                          "since described the outcome — in their own words.")
+                       + _rows_html(rows, ["Quarter", "Said then", "Outcome",
+                                           "Their assessment"]))
 
     # Consistency of the message itself — a team that guides accurately every quarter is
     # worth more than one that beats erratically, and the pattern is already computed.
@@ -685,7 +783,8 @@ def main() -> None:
               ("ppt_highlights", "ppt_guidance", "deck_metrics", "deck_diff",
                "ratings", "rating_concerns", "rating_sensitivity",
                # positives + promise-tracking: all already computed, never surfaced
-               "rating_drivers", "guidance_vs_actual", "mgmt_credibility")}
+               "rating_drivers", "guidance_vs_actual", "mgmt_credibility",
+               "gf2_historical_guidance")}
 
     if args.limit:
         due = due[: args.limit]
@@ -817,7 +916,11 @@ def _self_test() -> int:
         {"isin": "INE1", "quarter": "Q1 FY27", "category": "demand",
          "statement": "HR Coil tubes to grow faster", "value": float("nan"), "unit": None}]))
     pn = presentation_body("INE1", "AAA", "A Ltd", "Q1FY27", nan_t)
-    check("NaN value never renders as 'nanNone'", "nanNone" not in pn and "nan" not in pn)
+    # Substring "nan" also occurs inside "financial", so test the DEFECT: a NaN value
+    # or None unit reaching the page as literal text.
+    check("NaN value never renders as 'nanNone'",
+          "nanNone" not in pn and ">nan<" not in pn and ">None<" not in pn
+          and "nan</b>" not in pn)
 
     esg_t = dict(T, ppt_guidance=pd.DataFrame([
         {"isin": "INE1", "quarter": "Q1 FY27", "metric": "Scope 1 & 2 emissions",
