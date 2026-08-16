@@ -148,10 +148,71 @@ def _detect_agency(text: str) -> str:
     return "DATA_MISSING"
 
 
+# Canonical outlooks. Anything else in the outlook slot is NOT an outlook — most often
+# it is the short-term rating from a combined "AA+(Stable)/A1+" symbol, which is how
+# 107+ rows ended up with an "outlook" of A1+, A2+ or [ICRA]A1+.
+_VALID_OUTLOOKS = {
+    "stable": "Stable", "positive": "Positive", "negative": "Negative",
+    "developing": "Developing", "watch": "Watch",
+    "watch developing": "Watch Developing", "watch negative": "Watch Negative",
+    "watch positive": "Watch Positive", "rating watch": "Watch",
+    "cwn": "Watch Negative", "cwp": "Watch Positive", "rwn": "Watch Negative",
+    "rwp": "Watch Positive",
+}
+
+# Agencies rename and abbreviate themselves; CARE alone appeared as CARE, "CARE Ratings"
+# and CareEdge, splitting one agency's history into three and breaking any
+# "what changed since last time" comparison, which keys on the agency.
+_AGENCY_CANON = (
+    ("crisil", "CRISIL"), ("icra", "ICRA"), ("care", "CARE"), ("careedge", "CARE"),
+    ("india ratings", "India Ratings"), ("ind-ra", "India Ratings"),
+    ("fitch", "Fitch"), ("brickwork", "Brickwork"), ("acuite", "Acuite"),
+    ("infomerics", "Infomerics"), ("smera", "SMERA"), ("crest", "CREST"),
+)
+
+
+def canon_agency(raw: str) -> str:
+    """One agency, one name — so a rating history is not split across spellings."""
+    low = str(raw or "").strip().lower()
+    if not low or low in ("na", "none", "data_missing"):
+        return "DATA_MISSING"
+    for token, name in _AGENCY_CANON:
+        if token in low:
+            return name
+    return str(raw).strip()[:40]
+
+
+def canon_outlook(raw: str) -> str | None:
+    """Return a real outlook, or None. A short-term rating is not an outlook."""
+    low = str(raw or "").strip().lower().strip("()[]. ")
+    if not low:
+        return None
+    low = re.sub(r"^(rating\s+)?outlook[:\s]*", "", low).strip()
+    if low in _VALID_OUTLOOKS:
+        return _VALID_OUTLOOKS[low]
+    for k, v in _VALID_OUTLOOKS.items():
+        if re.search(rf"\b{re.escape(k)}\b", low):
+            return v
+    return None
+
+
 def _detect_rating(text: str) -> str:
-    """Find the first SEBI/NIC rating symbol in text (e.g. AAA, AA+, BBB-)."""
+    """Find the first SEBI/NIC rating symbol in text (e.g. AAA, AA+, BBB-).
+
+    TWO REGEX BUGS FIXED (2026-08-16), both silent and both at scale:
+
+    * `C` and `D` had a LEADING word boundary and no trailing one, so `\bC` matched the
+      C of "CARE", "CRISIL" and "Cash Credit". 294 rows were stored as rating "C" and
+      100 as "D" — the single commonest values in the table, and almost all wrong.
+    * The alternation was not longest-first: `AA` preceded `AA-`, and `BBB` preceded
+      `BBB-`, so every minus-notch rating was silently recorded a notch higher.
+
+    Symbols now match longest-first and are anchored on both sides.
+    """
     m = re.search(
-        r"\b(AAA|AA\+|AA|AA-|A\+|A\b|A-|BBB\+|BBB|BBB-|BB\+|BB|BB-|B|C|D)"
+        r"(?<![A-Za-z0-9+-])"
+        r"(AAA|AA\+|AA-|AA|A\+|A-|BBB\+|BBB-|BBB|BB\+|BB-|BB|B\+|B-|B|C|D|A)"
+        r"(?![A-Za-z0-9])"
         r"(?:\s*/\s*(Stable|Positive|Negative|Watch|CWN|CWP))?",
         text, re.IGNORECASE
     )
@@ -177,7 +238,7 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
     facts: dict = {c: None for c in RATINGS_COLS}
     facts.update({
         "isin": isin, "symbol": symbol, "company_name": company,
-        "agency": _detect_agency(text),
+        "agency": canon_agency(_detect_agency(text)),
         "rating": _detect_rating(text),
         "rating_date": str(row.get("announcement_date", ""))[:10] or None,
         "processed_at": now_str, "source_doc_id": doc_id,
@@ -205,16 +266,27 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
             if agency_col is not None and agency_col < len(cells):
                 raw = clean_val(cells[agency_col])
                 if raw != "NA":
-                    facts["agency"] = raw
+                    facts["agency"] = canon_agency(raw)
 
             if rating_col < len(cells):
                 raw = clean_val(cells[rating_col])
                 if raw != "NA":
-                    # Separate "AA+/Stable" → rating + outlook
+                    # "AA+/Stable" -> rating + outlook. But the second half is NOT always
+                    # an outlook: "[ICRA]AA+(Stable)/A1+" carries the SHORT-TERM rating
+                    # there, which is how A1+ / A2+ / [ICRA]A1+ ended up stored as
+                    # outlooks on 107+ rows. Only a recognised outlook is accepted, and
+                    # a parenthesised one is preferred since that is where agencies put it.
                     parts = raw.split("/")
-                    facts["rating"]  = parts[0].strip()
-                    if len(parts) > 1:
-                        facts["outlook"] = parts[1].strip()
+                    facts["rating"] = parts[0].strip()
+                    ol = canon_outlook(
+                        (re.search(r"\(([^)]*)\)", raw) or [None, ""])[1]
+                        if re.search(r"\(([^)]*)\)", raw) else "")
+                    if not ol and len(parts) > 1:
+                        ol = canon_outlook(parts[1])
+                    if not ol:
+                        ol = canon_outlook(raw)
+                    if ol:
+                        facts["outlook"] = ol
                     # Detect action from the text around the rating
                     low_raw = raw.lower()
                     if "upgrad" in low_raw or "upgrade" in low_raw:
@@ -539,5 +611,67 @@ def main() -> None:
         print("Output: company_repo/_daily/rating_DD_MMMYYYY.md")
 
 
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print(f"  FAIL {name}")
+
+    # THE BUG THAT PRODUCED 294 "C" RATINGS: C with no trailing boundary matched the
+    # C of CARE / CRISIL / Cash Credit.
+    check("agency name is not read as a rating",
+          _detect_rating("CARE Ratings has assigned") != "C")
+    check("CRISIL is not read as a rating",
+          _detect_rating("CRISIL Ratings Limited") != "C")
+    check("'Cash Credit' is not read as a rating",
+          _detect_rating("Cash Credit facility of Rs 50 crore") != "C")
+    check("'Debt' is not read as rating D",
+          _detect_rating("Debt service coverage remains") != "D")
+    # A real C or D must still be found.
+    check("a genuine C rating is found", _detect_rating("rated CRISIL C") in ("C", "C/"))
+    check("a genuine D rating is found", "D" in _detect_rating("downgraded to D"))
+
+    # LONGEST-FIRST: a minus notch must not be recorded a notch higher.
+    check("AA- stays AA-", _detect_rating("[ICRA]AA-").startswith("AA-"))
+    check("BBB- stays BBB-", _detect_rating("CARE BBB-").startswith("BBB-"))
+    check("AA+ stays AA+", _detect_rating("CRISIL AA+").startswith("AA+"))
+    check("AAA is not truncated", _detect_rating("IND AAA").startswith("AAA"))
+
+    # OUTLOOK: a short-term rating is not an outlook.
+    check("A1+ is rejected as an outlook", canon_outlook("A1+") is None)
+    check("[ICRA]A1+ is rejected", canon_outlook("[ICRA]A1+") is None)
+    check("Stable is accepted", canon_outlook("Stable") == "Stable")
+    check("(Stable) is accepted", canon_outlook("(Stable)") == "Stable")
+    check("'Outlook: Positive' is accepted", canon_outlook("Outlook: Positive") == "Positive")
+    check("CWN maps to Watch Negative", canon_outlook("CWN") == "Watch Negative")
+    check("empty is None", canon_outlook("") is None)
+
+    # AGENCY: one agency, one name.
+    check("CARE Ratings canonicalises", canon_agency("CARE Ratings") == "CARE")
+    check("CareEdge canonicalises", canon_agency("CareEdge Ratings") == "CARE")
+    check("ICRA canonicalises", canon_agency("ICRA Limited") == "ICRA")
+    check("Ind-Ra canonicalises", canon_agency("Ind-Ra") == "India Ratings")
+    check("blank is DATA_MISSING", canon_agency("") == "DATA_MISSING")
+
+    # END TO END on the shape that caused the live defect.
+    md = ("| Agency | Instrument | Rating/Outlook |\n|---|---|---|\n"
+          "| CareEdge Ratings | Cash Credit | [ICRA]AA+(Stable)/A1+ |\n")
+    f = parse_gemini_response(md, pd.Series({"isin": "I", "symbol": "S",
+                                             "announcement_date": "2026-06-01"}))
+    check("e2e agency canonical", f["agency"] == "CARE")
+    check("e2e outlook is the real outlook", f["outlook"] == "Stable")
+    check("e2e outlook is NOT the short-term rating", f["outlook"] != "A1+")
+
+    print(f"\nextract_rating self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
     main()
