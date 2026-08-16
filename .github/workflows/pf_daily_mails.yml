@@ -19,7 +19,11 @@ name: pf_daily_mails
 
 on:
   schedule:
-    - cron: "35 3 * * 1-6"          # 09:05 IST, Mon-Sat, after the nightly chain
+    # 09:05 IST, EVERY day, after the nightly chain. Mon-Sat until 2026-08-16: a deck
+    # filed on a Saturday evening or a Sunday then waited until Monday, which is exactly
+    # what happened to RISHABH's Q1FY27 deck. Companies file at weekends; the run is
+    # cheap and no-ops when nothing is due, so there is no reason to skip a day.
+    - cron: "35 3 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
