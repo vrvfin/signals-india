@@ -309,7 +309,9 @@ def build_facts(isin: str, symbol: str, name: str, stmts: pd.DataFrame,
                          ("wc_days", "days"), ("ccc_days", "days"),
                          # build_derived_metrics has always emitted these two; H1 simply
                          # never read them. The cash-flow panel needs them.
-                         ("fcf", "Cr"), ("fcf_sales_pct", "%")):
+                         ("fcf", "Cr"), ("fcf_sales_pct", "%"),
+                         # already emitted by build_derived_metrics, never read here
+                         ("payable_days", "days")):
         m = _derived_map(derived, isin, metric)
         ser = _ordered_annual(m)
         if not ser:
@@ -322,6 +324,20 @@ def build_facts(isin: str, symbol: str, name: str, stmts: pd.DataFrame,
         H1[metric] = Fact(v, "financials_derived.parquet", metric, p, ANNUAL,
                           SCREENER, unit, key=isin)
         H1[metric + "_series"] = ser[-6:]
+    # DuPont needs equity and the annual P&L, all on the SAME annual grain as the
+    # balance sheet — mixing a quarterly profit into an annual ROE would be meaningless.
+    for item in ("Equity Capital", "Reserves"):
+        H1[item + "_series"] = _ordered_annual(_bs_series(stmts, item))[-5:]
+    for item in ("Sales", "Net Profit", "Tax %"):
+        _a = stmts[(stmts["statement"] == "annual_pl")
+                   & (stmts["line_item"].astype(str).str.strip() == item)]
+        _m = {}
+        for _, _r in _a.iterrows():
+            try:
+                _m[str(_r["period"])] = float(_r["value"])
+            except (TypeError, ValueError):
+                continue
+        H1["annual_" + item + "_series"] = _ordered_annual(_m)[-5:]
     for item in ("Borrowings", "CWIP", "Fixed Assets", "Total Assets"):
         ser = _ordered_annual(_bs_series(stmts, item))
         H1[item + "_series"] = ser[-5:]
@@ -1183,6 +1199,166 @@ def block_d(d: dict) -> str:
 _WRAP = "font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222"
 
 
+def block_financials(d: dict) -> str:
+    """How the FINANCIALS are behaving — the statement pulled apart, deterministically.
+
+    Block B asks whether the quarter's profit is real. This asks how the business's
+    economics are trending: what actually drives the return on equity, whether growth is
+    being funded by the customer or by the balance sheet, what tax is really costing, and
+    whether the auditor has said anything.
+
+    GRAIN IS NOT NEGOTIABLE. The DuPont bridge and the working-capital cycle are ANNUAL,
+    because Screener publishes no quarterly balance sheet — so they are FY-stamped and
+    never placed beside a quarterly figure without saying so. Mixing them would produce a
+    number that looks precise and means nothing.
+    """
+    H1 = d.get("H1") or {}
+    A = d.get("A") or {}
+    fy = esc(str(H1.get("_fy") or ""), 12)
+    out = [_h("F &middot; How the financials are behaving",
+              "The statement pulled apart: what drives the return, how growth is being "
+              "funded, what tax costs, and anything the auditor flagged. Balance-sheet "
+              "and cycle figures are ANNUAL and stamped as such.")]
+
+    # ---- ROE bridge (DuPont). ROE = margin x asset turnover x leverage.
+    def _last(name):
+        ser = H1.get(name + "_series") or []
+        return (ser[-1][0], ser[-1][1]) if ser else (None, None)
+
+    p_np, np_ = _last("annual_Net Profit")
+    p_sa, sales = _last("annual_Sales")
+    p_ta, ta = _last("Total Assets")
+    _, eq_cap = _last("Equity Capital")
+    _, res = _last("Reserves")
+    equity = (eq_cap or 0) + (res or 0)
+    rows = []
+    if np_ and sales and ta and equity:
+        margin = np_ / sales * 100
+        turns = sales / ta
+        lev = ta / equity
+        roe = np_ / equity * 100
+        rows = [
+            ["Net margin", f"{margin:,.2f}%", "profit per rupee of sales"],
+            ["&#215; Asset turnover", f"{turns:,.2f}x", "sales per rupee of assets"],
+            ["&#215; Leverage", f"{lev:,.2f}x", "assets per rupee of equity"],
+            [f"<b>= Return on equity</b>", f"<b>{roe:,.2f}%</b>",
+             f"<b>{esc(p_np or '', 10)}</b> &middot; ties out by construction"],
+        ]
+        out.append(_tbl([f"DuPont bridge &middot; annual {fy}", "Value",
+                         "What it means"], rows))
+        # Where the return actually comes from decides how fragile it is.
+        driver = max(("margin", margin / 10), ("turnover", turns * 10),
+                     ("leverage", (lev - 1) * 20), key=lambda x: x[1])[0]
+        note = {"margin": "return is driven by MARGIN — protected by pricing or mix, and "
+                          "vulnerable to input costs",
+                "turnover": "return is driven by ASSET TURNOVER — capital-light, and "
+                            "vulnerable to a demand slowdown",
+                "leverage": "return is driven by LEVERAGE — the most fragile of the "
+                            "three, because it survives only while debt is serviceable"}
+        out.append(f"<div style='color:{MUTED};font-size:11.5px;margin:-8px 0 14px'>"
+                   f"{note[driver]}.</div>")
+    else:
+        out.append(f"<div style='color:{MUTED};font-size:12px;margin:0 0 12px'>"
+                   f"ROE bridge not computable &mdash; annual P&amp;L or equity rows "
+                   f"missing for this company.</div>")
+
+    # ---- growth
+    rev = A.get("revenue") or {}
+    grow = []
+    if isinstance(rev, dict) and rev.get("value") is not None:
+        grow.append(["Revenue, this quarter", fmt_val(rev.get("value")),
+                     f"{signed_pct(rev.get('yoy'))} YoY &middot; "
+                     f"{signed_pct(rev.get('qoq'))} QoQ"])
+    cagr = H1.get("rev_cagr_3y_pct")
+    if cagr is not None and getattr(cagr, "present", False):
+        grow.append(["Revenue CAGR, 3 years", f"{cagr.num:,.1f}%",
+                     "the trend the quarter is measured against"])
+    if grow:
+        out.append(_tbl(["Growth", "Value", "Context"], grow))
+
+    # ---- working capital: is growth funded by the customer, or by the balance sheet?
+    wc_rows = []
+    for label, key, good_up in (("Debtor days", "receivable_days", False),
+                                ("Inventory days", "inventory_days", False),
+                                ("Payable days", "payable_days", True),
+                                ("Cash conversion cycle", "ccc_days", False)):
+        f_ = H1.get(key)
+        if f_ is None or not getattr(f_, "present", False):
+            continue
+        ser = H1.get(key + "_series") or []
+        prev = ser[-2][1] if len(ser) >= 2 else None
+        move = ""
+        if prev is not None:
+            diff = f_.num - prev
+            col = UP if ((diff < 0) == (not good_up)) else DOWN
+            if abs(diff) < 0.5:
+                col = MUTED
+            move = (f"<span style='color:{col};font-weight:700'>{diff:+,.0f}</span> "
+                    f"vs {prev:,.0f}")
+        wc_rows.append([label, f"{f_.num:,.0f} days", move])
+    if wc_rows:
+        out.append(_tbl([f"Working capital &middot; annual {fy}", "Value",
+                         "Change on last year"], wc_rows))
+        out.append(f"<div style='color:{MUTED};font-size:11.5px;margin:-8px 0 14px'>"
+                   f"A lengthening cycle means growth is being funded by the balance "
+                   f"sheet rather than by the customer.</div>")
+
+    # ---- tax and one-offs
+    B = d.get("B") or {}
+    tax_rows = []
+    tc, tm = B.get("tax_cur"), B.get("tax_mean")
+    if tc is not None and getattr(tc, "present", False):
+        base = (f"{tm.num:.2f}% prior-4Q average"
+                if tm is not None and getattr(tm, "present", False) else "")
+        tax_rows.append(["Effective tax rate, this quarter", f"{tc.num:.1f}%", base])
+    ois = B.get("oi_share")
+    if ois is not None and getattr(ois, "present", False):
+        tax_rows.append(["Other income &divide; PBT", f"{ois.num:.2f}%",
+                         "the usual home of a one-off"])
+    if tax_rows:
+        out.append(_tbl(["Tax and one-offs", "Value", "Reference"], tax_rows))
+    # A blind spot named, not silently skipped.
+    out.append(f"<div style='color:{MUTED};font-size:11.5px;margin:-8px 0 14px'>"
+               f"Screener's quarterly P&amp;L exposes no separate exceptional-items line, "
+               f"so a one-off can only be inferred from the other-income share and the "
+               f"tax rate. A genuinely exceptional charge booked inside expenses is not "
+               f"visible here.</div>")
+
+    # ---- auditor
+    reg = d.get("register")
+    aud = []
+    if reg is not None and not getattr(reg, "empty", True) and "kind" in reg.columns:
+        a = reg[reg["kind"].astype(str).isin(
+            ["auditor_qualification", "emphasis_of_matter", "caro_adverse"])]
+        for _, r in a.head(4).iterrows():
+            aud.append([esc(str(r.get("kind", "")).replace("_", " "), 30),
+                        esc(r.get("label") or r.get("detail"), 200),
+                        esc(r.get("period"), 12)])
+    if aud:
+        out.append(_tbl(["Auditor call-out", "What was said", "FY"], aud))
+        out.append(f"<div style='color:{MUTED};font-size:11.5px;margin:-8px 0 14px'>"
+                   f"From the annual report, so FY-stamped &mdash; a flag raised for FY25 "
+                   f"is months old by Q3 FY27 and should be discounted accordingly.</div>")
+    else:
+        out.append(f"<div style='color:{MUTED};font-size:12px'>"
+                   f"No auditor qualification, emphasis of matter or adverse CARO remark "
+                   f"on record. Note that a company whose annual report has not been "
+                   f"processed shows the same thing &mdash; absence here is not a "
+                   f"clean opinion.</div>")
+    return "".join(out)
+
+
+def fmt_val(v, dp=0):
+    return "&mdash;" if v is None else f"{v:,.{dp}f}"
+
+
+def signed_pct(v, dp=1):
+    if v is None:
+        return "&mdash;"
+    col = UP if v >= 0 else DOWN
+    return f"<span style='color:{col};font-weight:700'>{v:+,.{dp}f}%</span>"
+
+
 def block_season(d: dict) -> str:
     """Everything the company itself published about this quarter, in one block.
 
@@ -1213,6 +1389,7 @@ def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
             f"{esc(d['isin'], 16)} &middot; generated "
             f"{datetime.now().strftime('%d %b %Y')}</div>")
     body = (block_a(d) + block_b(d) + block_ladder(d, stmts) + block_h1(d, rich)
+            + block_financials(d)
             + block_h2(d) + block_deck(d) + block_d(d) + block_season(d))
     foot = (
         f"<div style='margin-top:22px;padding-top:12px;border-top:1px solid #ddd;"
