@@ -98,7 +98,7 @@ def doc_quarter_map(queue) -> dict:
 
 
 def has_season_rows(tables: dict, isin: str, doc_type: str, season: str,
-                    qmap: dict | None = None) -> bool:
+                    qmap: dict | None = None, symbol: str = "") -> bool:
     """Does the table the MAIL reads hold rows for this company and quarter?
 
     `coverage()` used to mark a company PRESENT whenever any document of that type had
@@ -111,6 +111,25 @@ def has_season_rows(tables: dict, isin: str, doc_type: str, season: str,
     Ratings are deliberately exempt: that mail renders the latest rating and what changed
     since the previous one, with no quarter scoping, so any row makes it renderable.
     """
+    if doc_type == "results":
+        # THE RESULTS TEARDOWN READS fundamentals/statements, NOT THE QUEUE. Testing the
+        # queue asked "was a results PDF ingested?", which is a different question and
+        # gave the wrong answer for 7 of 10 holdings: NETWEB, CGPOWER, WELCORP, FREDUN,
+        # DEEPINDS, TATVA and E2E all had complete Q1 FY27 numbers on Screener while
+        # being reported as awaiting, purely because no results PDF had been queued for
+        # them. Coverage must test the source the renderer uses.
+        sm = (tables or {}).get("statements") or {}
+        st = sm.get(symbol) if symbol else None
+        if st is not None and not getattr(st, "empty", True):
+            lbl = QT.latest_quarter_label(st)
+            if lbl and QT.norm_q(lbl) == QT.norm_q(season):
+                return True
+        # SCREENER IS A LAGGING MIRROR. OBSCP and VMARCIND filed Q1 FY27 on 12-13 Aug and
+        # were mailed FROM THE FILING, while Screener still read Q4 FY26 — so a
+        # statements-only test reported two DELIVERED holdings as awaiting. The filing
+        # fallback is a first-class source of coverage, exactly as it is for the mail.
+        fil = (tables or {}).get("filings") or {}
+        return str(isin).strip() in fil
     if doc_type != "presentation":
         return True
     t = (tables or {}).get("ppt_highlights")
@@ -159,7 +178,11 @@ def coverage(pf, queue: pd.DataFrame, season: str,
             st = s["status"].astype(str).str.lower()
             n_done, n_pend = int(st.isin(_DONE).sum()), int(st.eq("pending").sum())
             n_fail = int(st.isin(_FAILED).sum())
-            if n_done and has_season_rows(tables, isin, dt, season, qmap):
+            # Results live in Screener's statements, which arrive with no queue row of
+            # their own — so the statements alone can make a company covered.
+            if dt == "results" and has_season_rows(tables, isin, dt, season, qmap, sym):
+                status = PRESENT
+            elif n_done and has_season_rows(tables, isin, dt, season, qmap, sym):
                 status = PRESENT
             elif n_done:
                 # Processed, but nothing for THIS quarter — the mail would render
@@ -511,6 +534,14 @@ def _self_test() -> int:
     def _q(rows):
         return pd.DataFrame([{c: r.get(c) for c in Q} for r in rows])
 
+    # Results coverage is driven by Screener STATEMENTS (what the teardown reads), not by
+    # a queued PDF — so tests that assert a company is covered on results must supply
+    # them, exactly as production does.
+    def _st(*symbols, period="Jun 2026"):
+        return {"statements": {s: pd.DataFrame(
+            [{"statement": "quarterly_pl", "line_item": "Sales",
+              "period": period, "value": 100.0}]) for s in symbols}}
+
     queue = _q([
         {"isin": "INE1", "doc_type": "results", "status": "done"},
         {"isin": "INE1", "doc_type": "presentation", "status": "pending"},
@@ -518,13 +549,20 @@ def _self_test() -> int:
         {"isin": "INE2", "doc_type": "presentation", "status": "done"},
         # INE3 has nothing at all
     ])
-    cov = coverage(pf, queue, "Q1FY27")
+    cov = coverage(pf, queue, "Q1FY27", tables=_st('AAA', 'BBB'))
     def st(isin, dt):
         m = cov[(cov.isin_ == isin) if False else (cov["isin"] == isin)]
         return m[m["doc_type"] == dt]["status"].iloc[0]
     check("done -> present", st("INE1", "results") == PRESENT)
     check("pending -> pending", st("INE1", "presentation") == PENDING)
-    check("error -> failed", st("INE2", "results") == FAILED)
+    # A failed PDF no longer makes a company "failed" on RESULTS when Screener already
+    # carries the numbers — the teardown reads the statements, so it IS covered.
+    check("statements beat a failed results PDF", st("INE2", "results") == PRESENT)
+    _cf = coverage(pf, _q([{"isin": "INE2", "doc_type": "presentation",
+                            "status": "error"}]), "Q1FY27", tables=_st("BBB"))
+    check("error -> failed where the queue IS the source (presentation)",
+          _cf[(_cf["isin"] == "INE2")
+              & (_cf["doc_type"] == "presentation")]["status"].iloc[0] == FAILED)
     check("nothing queued -> missing", st("INE3", "results") == MISSING)
     check("rating is never 'expected'",
           not cov[cov["doc_type"] == "rating"]["expected"].any())
@@ -533,7 +571,7 @@ def _self_test() -> int:
     # one good document is enough, even beside failures
     q2 = _q([{"isin": "INE1", "doc_type": "results", "status": "error"},
              {"isin": "INE1", "doc_type": "results", "status": "done"}])
-    c2 = coverage([pf[0]], q2, "Q1FY27")
+    c2 = coverage([pf[0]], q2, "Q1FY27", tables=_st('AAA'))
     check("a later success beats an earlier failure",
           c2[c2["doc_type"] == "results"]["status"].iloc[0] == PRESENT)
 
@@ -561,7 +599,8 @@ def _self_test() -> int:
 
     # ---- mail_due
     led = pd.DataFrame([{"season": "Q1FY27", "isin": "INE2", "doc_type": "presentation"}])
-    due = mail_due(pf, queue, cal, led, "Q1FY27", on=date(2026, 8, 14))
+    due = mail_due(pf, queue, cal, led, "Q1FY27", on=date(2026, 8, 14),
+                   tables=_st("AAA", "BBB"))
     kinds = {(d["isin"], d["doc_type"]) for d in due}
     check("present + unmailed is due", ("INE1", "results") in kinds)
     check("already mailed is suppressed", ("INE2", "presentation") not in kinds)
@@ -570,16 +609,16 @@ def _self_test() -> int:
 
     # require_calendar gates RESULTS only
     due2 = mail_due(pf, queue, cal, pd.DataFrame(), "Q1FY27",
-                    on=date(2026, 8, 14), require_calendar=True)
+                    on=date(2026, 8, 14), require_calendar=True, tables=_st("AAA"))
     k2 = {(d["isin"], d["doc_type"]) for d in due2}
     check("results needs a calendar date when required", ("INE1", "results") in k2)
     q3 = _q([{"isin": "INE2", "doc_type": "results", "status": "done"}])
     due3 = mail_due(pf, q3, cal, pd.DataFrame(), "Q1FY27",
-                    on=date(2026, 8, 14), require_calendar=True)
+                    on=date(2026, 8, 14), require_calendar=True, tables=_st("BBB"))
     check("a holding not reporting today is gated out",
           ("INE2", "results") not in {(d["isin"], d["doc_type"]) for d in due3})
     due4 = mail_due(pf, q3, cal, pd.DataFrame(), "Q1FY27",
-                    on=date(2026, 8, 14), require_calendar=False)
+                    on=date(2026, 8, 14), require_calendar=False, tables=_st("BBB"))
     check("without the gate it is due", ("INE2", "results")
           in {(d["isin"], d["doc_type"]) for d in due4})
 
@@ -624,7 +663,8 @@ def _self_test() -> int:
                             "purpose": "Financial Results"}])
     led_st = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1",
                             "doc_type": "results", "doc_id": "r1"}])
-    st = season_status(pf, q_st, cal_st, led_st, "Q1FY27", on=date(2026, 8, 14))
+    st = season_status(pf, q_st, cal_st, led_st, "Q1FY27", on=date(2026, 8, 14),
+                       tables=_st("AAA"))
     def _state(sym, dt):
         return [r for r in st if r["symbol"] == sym and r["doc_type"] == dt][0]
     check("mailed document -> delivered", _state("AAA", "results")["state"] == DELIVERED)

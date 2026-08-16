@@ -216,6 +216,21 @@ def main() -> None:
         f = find_file(drive, idx, f"{name}.parquet")
         tables[name] = (pd.read_parquet(io.BytesIO(download_bytes(drive, f)))
                         if f else pd.DataFrame())
+    # Screener statements — the source the RESULTS teardown actually reads. Without
+    # these, coverage asked "was a results PDF queued?", which reported 7 fully-covered
+    # holdings as awaiting.
+    from build_gallery import _bulk_parquet, _folder
+    _syms = sorted({s for _i, s, _n in pf if s})
+    tables["statements"] = _bulk_parquet(drive, _folder(drive, "fundamentals/statements"),
+                                         _syms)
+    # The filing fallback counts as coverage too — Screener lags, and a holding mailed
+    # from its own filing is delivered, not awaiting.
+    import filing_results as FR
+    try:
+        tables["filings"] = FR.load_filing_results(drive, idx, season, queue=queue)
+    except Exception as e:
+        tables["filings"] = {}
+        log(f"filing fallback unavailable ({str(e)[:60]})")
 
     rows = COV.season_status(pf, queue, calendar, ledger, season, on=date.today(),
                              tables=tables)
