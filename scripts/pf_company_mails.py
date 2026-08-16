@@ -208,6 +208,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
                    f"guidance was given.</div>")
 
     out.append(_business_view(isin, season, tables))
+    out.append(_risks_and_changes(isin, season, tables))
     out.append(_consistency(isin, season, tables))
     out.append(_promised_vs_delivered(isin, tables))
     out.append(_deck_changed(isin, season, tables))
@@ -284,6 +285,79 @@ _BUSINESS_VIEWS = (
 )
 
 
+BLUE, PURPLE = "#1f4d6b", "#6b4d8f"
+
+# Themes an operating line can belong to, each with the colour it is emphasised in.
+# Order matters: the first match wins, so the more specific themes are listed first.
+_THEMES = (
+    ("guidance", PURPLE, ("guidance", "target", "outlook", "expect", "aim", "plan to",
+                          "by fy", "we will", "on track")),
+    ("risk", DOWN, ("risk", "headwind", "pressure", "decline", "slowdown", "delay",
+                    "deferred", "shortfall", "weak", "challenge", "impact of")),
+    ("capacity", BLUE, ("capacity", "expansion", "capex", "commission", "plant",
+                        "greenfield", "brownfield", "debottleneck", "utilisation",
+                        "utilization")),
+    ("growth", UP, ("growth", "grew", "increase", "record", "highest", "up ", "demand",
+                    "order", "volume", "market share", "new product", "launch")),
+)
+
+
+def theme_of(text: str) -> tuple[str, str]:
+    """(theme, colour) for an operating line — so a risk never reads green."""
+    low = str(text or "").lower()
+    for name, col, keys in _THEMES:
+        if any(k in low for k in keys):
+            return name, col
+    return "", MUTED
+
+
+def _chip(label: str, colour: str) -> str:
+    return (f"<span style='background:{colour};color:#fff;border-radius:3px;"
+            f"padding:1px 6px;font-size:10px;font-weight:700;text-transform:uppercase;"
+            f"letter-spacing:.3px'>{label}</span>")
+
+
+def _risks_and_changes(isin, season, tables) -> str:
+    """Risks and management changes — which the DECK will not tell you.
+
+    deck_metrics bans financial words and decks rarely volunteer bad news, so neither
+    risk nor a management change appears there. Both have real sources elsewhere:
+      framing flags   deck_flags      — how the deck is staged (truncated axes, etc.)
+      commentary      gf4_quality_flags — contradictory or promotional concall language
+      management      announcement_ledger event_type='management_change'
+    Sourcing them honestly is better than implying the deck disclosed them.
+    """
+    rows = []
+    df = _slice(tables.get("deck_flags"), isin)
+    if not df.empty:
+        for _, r in df.head(4).iterrows():
+            rows.append([_chip("framing", AMBER),
+                         _esc(str(r.get("flag_type") or "").replace("_", " "), 40),
+                         _esc(r.get("evidence"), 170)])
+    gf4 = _slice(tables.get("gf4_quality_flags"), isin)
+    if not gf4.empty:
+        for _, r in gf4.head(3).iterrows():
+            rows.append([_chip("commentary", AMBER),
+                         _esc(r.get("flag_type"), 40), _esc(r.get("evidence"), 170)])
+    ann = tables.get("announcement_ledger")
+    if ann is not None and not getattr(ann, "empty", True) and "event_type" in ann.columns:
+        a = ann[(ann["isin"].astype(str).str.strip() == str(isin).strip())
+                & (ann["event_type"].astype(str) == "management_change")]
+        if "ann_date" in a.columns:
+            a = a.sort_values("ann_date", ascending=False)
+        for _, r in a.head(3).iterrows():
+            rows.append([_chip("management", PURPLE),
+                         _esc(str(r.get("ann_date"))[:10], 12),
+                         _esc(r.get("summary") or r.get("headline"), 170)])
+    if not rows:
+        return ""
+    return (_h("Risks and changes",
+               "Not from the deck — companies rarely put these in one. Framing flags "
+               "come from the deck teardown, commentary flags from the concall, and "
+               "management changes from exchange filings.")
+            + _rows_html(rows, ["", "What", "Detail"]))
+
+
 def _business_view(isin, season, tables) -> str:
     """How the BUSINESS is behaving — capacity, utilisation, orders, mix, geography, macro.
 
@@ -331,12 +405,14 @@ def _business_view(isin, season, tables) -> str:
                 continue
             if any(k in blob.lower() for k in keys):
                 used.add(i)
-                rows.append([_esc(label, 190),
+                th, tcol = theme_of(label)
+                rows.append([_chip(th, tcol) if th else "",
+                             _esc(label, 190),
                              colour_num(val) if val else "",
                              _esc(ref, 14)])
         if rows:
-            out.append(_h(title) + _rows_html(rows[:6], ["What the deck says", "Value",
-                                                         "Slide"]))
+            out.append(_h(title) + _rows_html(rows[:6], ["", "What the deck says",
+                                                         "Value", "Slide"]))
     if not out:
         return ""
     return (_h("How the business is behaving",
@@ -784,7 +860,9 @@ def main() -> None:
                "ratings", "rating_concerns", "rating_sensitivity",
                # positives + promise-tracking: all already computed, never surfaced
                "rating_drivers", "guidance_vs_actual", "mgmt_credibility",
-               "gf2_historical_guidance")}
+               "gf2_historical_guidance",
+               # risks + management changes: the deck does not carry these
+               "deck_flags", "gf4_quality_flags", "announcement_ledger")}
 
     if args.limit:
         due = due[: args.limit]
@@ -1000,6 +1078,38 @@ def _self_test() -> int:
     check("rated amount is a key number", "Rated amount" in rk)
     check("strengths are counted", "Strengths cited" in rk)
     check("downgrade triggers are counted", "Downgrade triggers" in rk)
+
+    # THEME EMPHASIS: a risk must never read green just because it sits in a deck.
+    check("a risk line is themed red", theme_of("Margin pressure from input costs")[1] == DOWN)
+    check("a growth line is themed green", theme_of("Order book at record high")[1] == UP)
+    check("a capacity fact is themed blue",
+          theme_of("Capacity at 8 Mn tonnes across 12 plants")[1] == BLUE)
+    # A capacity TARGET is guidance, not a capacity fact — it is a promise to track,
+    # and that is the more useful label of the two.
+    check("a capacity TARGET is themed as guidance",
+          theme_of("Capacity expansion by FY28")[0] == "guidance")
+    check("a guidance line is themed distinctly",
+          theme_of("We expect 15% growth by FY28")[1] == PURPLE)
+    check("guidance beats growth when both words appear",
+          theme_of("We expect strong growth")[0] == "guidance")
+    check("risk beats capacity when both appear",
+          theme_of("Capacity expansion delayed")[0] == "risk")
+    check("an unthemed line stays neutral", theme_of("Board met on Tuesday")[1] == MUTED)
+
+    # RISKS AND CHANGES come from real sources, not the deck.
+    T_rc = dict(T, deck_flags=pd.DataFrame([
+        {"isin": "INE1", "flag_type": "axis_truncated", "evidence": "Chart on slide 7"}]),
+        gf4_quality_flags=pd.DataFrame([
+            {"isin": "INE1", "flag_type": "Promotional Commentary",
+             "evidence": "best ever quarter"}]),
+        announcement_ledger=pd.DataFrame([
+            {"isin": "INE1", "ann_date": "2026-08-02", "event_type": "management_change",
+             "headline": "CFO resigns", "summary": "CFO stepped down"}]))
+    rc = presentation_body("INE1", "AAA", "A Ltd", "Q1FY27", T_rc)
+    check("framing flag surfaced", "axis truncated" in rc)
+    check("commentary flag surfaced", "Promotional Commentary" in rc)
+    check("management change surfaced", "CFO" in rc)
+    check("their sources are named, not implied to be the deck", "Not from the deck" in rc)
 
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")
