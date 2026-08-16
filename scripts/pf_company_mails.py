@@ -100,6 +100,40 @@ def _is_esg(*fields) -> bool:
     return any(w in blob for w in _ESG_WORDS)
 
 
+_NUM_RE = __import__("re").compile(r"^\s*([+-]?)\s*([\d,]+(?:\.\d+)?)\s*(%|x|bps|Cr|cr)?\s*$")
+
+
+def colour_num(text, good_up: bool = True, bold: bool = True) -> str:
+    """Render a number with a colour that carries its MEANING.
+
+    Green/red is not decoration — it is the fastest way to read a table of mixed
+    signals. `good_up=False` inverts it for metrics where lower is better (debt, days,
+    a downgrade count), so a falling number reads green there.
+    Non-numeric text passes through untouched rather than being force-coloured.
+    """
+    s = _esc(text, 40)
+    if not s:
+        return ""
+    m = _NUM_RE.match(str(text).strip())
+    if not m:
+        return s
+    sign, digits, unit = m.group(1), m.group(2), m.group(3) or ""
+    try:
+        val = float(digits.replace(",", ""))
+    except ValueError:
+        return s
+    if sign == "-":
+        val = -val
+    if abs(val) < 1e-9:
+        col = MUTED
+    else:
+        positive = val > 0
+        col = UP if (positive == good_up) else DOWN
+    shown = f"{sign}{digits}{unit}"
+    weight = "font-weight:700;" if bold else ""
+    return f"<span style='color:{col};{weight}'>{_esc(shown, 40)}</span>"
+
+
 def _h(title: str, sub: str = "") -> str:
     return (f"<h3 style='margin:16px 0 4px;font-size:14px;color:#34495e;"
             f"border-bottom:2px solid #34495e;padding-bottom:3px'>{title}</h3>"
@@ -171,10 +205,81 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
                    f"(emissions, renewables, workforce) — no financial or operational "
                    f"guidance was given.</div>")
 
+    out.append(_promised_vs_delivered(isin, tables))
     out.append(_deck_changed(isin, season, tables))
     out.append(f"<div style='color:{MUTED};font-size:11px;margin-top:10px'>Deck rows are "
                f"quoted from the presentation itself; anything not evidenced in it is "
                f"dropped at extraction.</div></div>")
+    return "".join(out)
+
+
+_VERDICT_TONE = {"beat": UP, "exceeded": UP, "delivered": UP, "met": UP,
+                 "inline": MUTED, "partial": AMBER, "too_early": MUTED, "na": MUTED,
+                 "miss": DOWN, "missed": DOWN, "below": DOWN}
+
+
+def _promised_vs_delivered(isin, tables) -> str:
+    """What management SAID they would do, against what actually happened.
+
+    "A KPI stopped being reported" is only half the signal. The half that matters more is
+    a promise that was made and then quietly not kept: a margin target missed, a capacity
+    date pushed out, a guidance range revised down. guidance_vs_actual already holds the
+    join (guided / actual / delta / verdict) and mgmt_credibility holds the pattern; both
+    were computed and never surfaced in a per-company mail.
+    """
+    gva = _slice(tables.get("guidance_vs_actual"), isin)
+    cred = _slice(tables.get("mgmt_credibility"), isin)
+    out = []
+
+    if not gva.empty:
+        g = gva.copy()
+        if "period" in g.columns:
+            g = g.sort_values("period")
+        rows = []
+        for _, r in g.tail(8).iloc[::-1].iterrows():
+            v = str(r.get("verdict") or "").strip().lower().replace(" ", "_")
+            tone = _VERDICT_TONE.get(v, MUTED)
+            delta = r.get("delta")
+            rows.append([
+                _esc(r.get("period"), 12),
+                f"<b>{_esc(r.get('metric'), 34)}</b>",
+                _esc(r.get("guided"), 34),
+                _esc(r.get("actual"), 34) or "&mdash;",
+                colour_num(delta) if str(delta or "").strip() else "",
+                f"<span style='color:{tone};font-weight:700'>"
+                f"{_esc(str(r.get('verdict') or '').upper(), 12)}</span>",
+            ])
+        if rows:
+            out.append(_h("Promised vs delivered",
+                          "Management's own prior guidance, joined to what actually "
+                          "happened. A missed promise is a stronger signal than a "
+                          "dropped metric, because someone chose to make it.")
+                       + _rows_html(rows, ["Period", "Metric", "Guided", "Actual",
+                                           "Delta", "Verdict"]))
+
+    # Consistency of the message itself — a team that guides accurately every quarter is
+    # worth more than one that beats erratically, and the pattern is already computed.
+    if not cred.empty:
+        pat = ""
+        for c in ("pattern", "recurring_miss", "strongest_area"):
+            if c in cred.columns:
+                vals = [str(x).strip() for x in cred[c]
+                        if str(x).strip() and str(x).lower() not in ("none", "nan")]
+                if vals:
+                    label = {"pattern": "Guidance pattern",
+                             "recurring_miss": "Recurring miss",
+                             "strongest_area": "Most reliable on"}[c]
+                    tone = (UP if c == "strongest_area" else
+                            DOWN if c == "recurring_miss" else MUTED)
+                    pat += (f"<tr><td style='color:{MUTED}'>{label}</td>"
+                            f"<td style='color:{tone};font-weight:700'>"
+                            f"{_esc(vals[-1], 90)}</td></tr>")
+        if pat:
+            out.append(_h("Is the commentary consistent?",
+                          "Whether this management guides reliably, and where it "
+                          "habitually falls short.")
+                       + f"<table cellpadding='4' cellspacing='0' style='{_TBL}'>"
+                         f"{pat}</table>")
     return "".join(out)
 
 
@@ -293,6 +398,35 @@ def rating_body(isin, symbol, name, tables) -> str:
                           "The agency's own words on what could go wrong.")
                        + _rows_html(rows, ["Concern"]))
 
+    # ---- WHAT IS WORKING. The agency's own stated strengths — order book, market
+    # position, promoter support, margin resilience. A rating mail that lists only
+    # concerns and downgrade triggers reads as uniformly bearish even when the agency's
+    # case is largely favourable, which misrepresents the document.
+    dr = _slice(tables.get("rating_drivers"), isin)
+    if not dr.empty:
+        dcol = ("driver" if "driver" in dr.columns else
+                "evidence" if "evidence" in dr.columns else dr.columns[-1])
+        if "rating_date" in dr.columns:
+            dr = dr.copy()
+            dr["_d"] = dr["rating_date"].astype(str).str.slice(0, 10)
+            latest_d = dr["_d"].max()
+            dr = dr[dr["_d"] == latest_d]          # the current rationale only
+        seen, rows = set(), []
+        for _, r in dr.iterrows():
+            txt = str(r.get(dcol) or "").strip()
+            key = txt.lower()[:60]
+            if not txt or key in seen:
+                continue
+            seen.add(key)
+            rows.append([f"<span style='color:{UP}'>&#9679;</span> {_esc(txt, 240)}"])
+            if len(rows) >= 6:
+                break
+        if rows:
+            out.append(_h("What the agency says is working",
+                          "Strengths cited in the current rationale — the other half of "
+                          "the credit view.")
+                       + _rows_html(rows, ["Strength"]))
+
     # ---- the most underused table in the repo: what would trigger a downgrade
     sn = _slice(tables.get("rating_sensitivity"), isin)
     if not sn.empty:
@@ -301,10 +435,20 @@ def rating_body(isin, symbol, name, tables) -> str:
                 "sensitivity" if "sensitivity" in sn.columns else sn.columns[-1])
         down = sn[sn[dcol].astype(str).str.lower() == "down"] if dcol else sn
         if not down.empty:
-            rows = [[_esc(r.get(tcol), 240)] for _, r in down.head(6).iterrows()]
+            rows = [[f"<span style='color:{DOWN}'>&#9660;</span> {_esc(r.get(tcol), 240)}"]
+                    for _, r in down.head(6).iterrows()]
             out.append(_h("What would cause a downgrade",
                           "The agency stating, in its own words, exactly what it is "
                           "watching. A pre-written early-warning tripwire.")
+                       + _rows_html(rows, ["Trigger"]))
+        # The upgrade side is equally pre-written and never shown anywhere.
+        up_ = sn[sn[dcol].astype(str).str.lower() == "up"] if dcol else sn.iloc[0:0]
+        if not up_.empty:
+            rows = [[f"<span style='color:{UP}'>&#9650;</span> {_esc(r.get(tcol), 240)}"]
+                    for _, r in up_.head(5).iterrows()]
+            out.append(_h("What would earn an upgrade",
+                          "The conditions the agency has committed to rewarding — worth "
+                          "tracking against the company's own guidance.")
                        + _rows_html(rows, ["Trigger"]))
 
     out.append("</div>")
@@ -379,7 +523,9 @@ def main() -> None:
 
     tables = {n: _read(drive, idx, f"{n}.parquet") for n in
               ("ppt_highlights", "ppt_guidance", "deck_metrics", "deck_diff",
-               "ratings", "rating_concerns", "rating_sensitivity")}
+               "ratings", "rating_concerns", "rating_sensitivity",
+               # positives + promise-tracking: all already computed, never surfaced
+               "rating_drivers", "guidance_vs_actual", "mgmt_credibility")}
 
     if args.limit:
         due = due[: args.limit]
@@ -497,8 +643,13 @@ def _self_test() -> int:
     check("rating: what-changed section present", "What changed since" in r)
     check("rating: prior rating shown as 'was'", "A-" in r)
     check("rating: downgrade trigger surfaced", "Debt/EBITDA above 3.5x" in r)
-    check("rating: up-trigger NOT shown under downgrade",
-          "Sustained margin above 15%" not in r.split("What would cause a downgrade")[-1])
+    # Up-triggers must NOT sit under the downgrade heading, but they SHOULD now have
+    # their own — the agency's upgrade conditions were computed and never shown.
+    _dn = r.split("What would cause a downgrade")[-1].split("What would earn an upgrade")[0]
+    check("rating: up-trigger not filed under downgrade",
+          "Sustained margin above 15%" not in _dn)
+    check("rating: upgrade triggers get their own section",
+          "What would earn an upgrade" in r and "Sustained margin above 15%" in r)
     check("rating: concern surfaced", "Working capital intensity" in r)
 
     # THE RENDER DEFECTS from the first live run against APLAPOLLO.
@@ -518,6 +669,37 @@ def _self_test() -> int:
     check("ESG-only decks say so explicitly", "ESG commitments only" in pe)
     check("real guidance still shows", "revenue growth" in
           presentation_body("INE1", "AAA", "A Ltd", "Q1FY27", T))
+
+    # POSITIVES: a rating mail listing only concerns misreads a favourable rationale.
+    T_pos = dict(T, rating_drivers=pd.DataFrame([
+        {"isin": "INE1", "agency": "CRISIL", "rating_date": "2026-06-01",
+         "driver": "Healthy order book providing revenue visibility"},
+        {"isin": "INE1", "agency": "CRISIL", "rating_date": "2026-06-01",
+         "driver": "Established market position"}]))
+    rp = rating_body("INE1", "AAA", "A Ltd", T_pos)
+    check("rating: strengths are surfaced", "Healthy order book" in rp)
+    check("rating: strengths get their own heading", "says is working" in rp)
+
+    # PROMISED VS DELIVERED — the half that matters more than a dropped KPI.
+    T_gva = dict(T, guidance_vs_actual=pd.DataFrame([
+        {"isin": "INE1", "period": "Q4FY26", "metric": "EBITDA margin",
+         "guided": "18%", "actual": "16.1%", "delta": "-1.9", "verdict": "MISS"}]),
+        mgmt_credibility=pd.DataFrame([
+            {"isin": "INE1", "quarter": "Q1 FY27", "pattern": "Optimistic Bias",
+             "recurring_miss": "margin", "strongest_area": "revenue"}]))
+    pg = presentation_body("INE1", "AAA", "A Ltd", "Q1FY27", T_gva)
+    check("promise vs outcome is shown", "Promised vs delivered" in pg)
+    check("the missed promise is named", "EBITDA margin" in pg)
+    check("the verdict is carried", "MISS" in pg)
+    check("commentary consistency is reported", "Optimistic Bias" in pg)
+    check("a recurring miss is called out", "Recurring miss" in pg)
+
+    # COLOUR CARRIES MEANING, and only for real numbers.
+    check("a gain is green", UP in colour_num("+12.5%"))
+    check("a loss is red", DOWN in colour_num("-3.2%"))
+    check("lower-is-better inverts", UP in colour_num("-8", good_up=False))
+    check("text is not force-coloured", colour_num("n/a") == "n/a")
+    check("empty stays empty", colour_num(None) == "")
 
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")

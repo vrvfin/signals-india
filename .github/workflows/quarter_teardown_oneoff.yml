@@ -88,7 +88,9 @@ jobs:
             # --by-day gives one compact row per company; full_detail gives the whole
             # teardown per company (bridge, ladder, divergence rails, register).
             if [ "${{ inputs.full_detail }}" = "true" ]; then
-              ARGS="--pf --mail --force --since-hours ${{ inputs.since_hours }}"
+              # --per-company: ONE MAIL PER COMPANY. The combined body reached 90,957 B
+              # on a 42-company catch-up, past Gmail's clip threshold.
+              ARGS="--per-company --force --since-hours ${{ inputs.since_hours }}"
             else
               ARGS="--pf --mail --by-day --force --since-hours ${{ inputs.since_hours }}"
             fi
