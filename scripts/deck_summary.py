@@ -215,6 +215,20 @@ def parse_summary(payload, row, quarter: str, now_str: str) -> dict:
                  quote the deck AND must not be generic filler.
     """
     obj = payload if isinstance(payload, dict) else _first_json_object(_s(payload, 400_000))
+    salvaged_from_truncation = False
+    if not obj and not isinstance(payload, dict):
+        # SALVAGE A TRUNCATED RESPONSE. `_first_json_object` needs balanced braces, so a
+        # response cut off at the output-token ceiling parses to nothing and the whole
+        # deck is thrown away. Measured on the first full backfill: 45 of 202 decks —
+        # 22%, and concentrated on the CURRENT quarter, because the fullest decks are the
+        # ones that overrun. Every row here is a flat object, so the complete ones
+        # survive an unterminated enclosing array; only the partial tail row is lost.
+        # This is what project rule 8 means by "parse JSON with salvage + dedupe".
+        from _extractor_base import salvage_json_objects
+        rows_out = [o for o in salvage_json_objects(str(payload or ""))
+                    if isinstance(o, dict) and (o.get("section") or o.get("label"))]
+        if rows_out:
+            obj, salvaged_from_truncation = {"summary": rows_out}, True
     if not obj:
         return {"rows": [], "dropped": {"unparseable_response": 1}}
 
@@ -326,6 +340,12 @@ def parse_summary(payload, row, quarter: str, now_str: str) -> dict:
     # is where the annexure sat — a reader wants the note, not the slide deck's shuffle.
     _rank = {s: i for i, s in enumerate(SECTIONS)}
     kept.sort(key=lambda r: _rank.get(r["section"], 99))
+
+    if salvaged_from_truncation:
+        # Recorded, not hidden: these rows came out of a response that did not finish, so
+        # the deck's tail sections may be genuinely missing rather than absent from the
+        # deck. The coverage count in the mail should be read with that in mind.
+        dropped["salvaged_from_truncated_response"] = 1
 
     return {"rows": kept, "dropped": dropped}
 
@@ -579,6 +599,32 @@ def _self_test() -> int:
            '"evidence": "Won a marquee OEM customer in North America"}]}\n```')
     check("fenced raw text parsed", len(P(raw)["rows"]) == 1)
     check("unparseable logged", P("not json at all")["dropped"].get("unparseable_response") == 1)
+
+    # --- TRUNCATION SALVAGE. 45 of 202 decks on the first full backfill returned a
+    # response cut off at the token ceiling; balanced-brace parsing threw all of them
+    # away whole. The complete row objects are still there and must be recovered.
+    trunc = ('{"quarter": "Q1FY27", "summary": [\n'
+             '{"section": "financials", "label": "Revenue", "value": 5289, "unit": "cr",'
+             ' "period": "Q1FY27", "evidence": "Revenue 5,289 cr"},\n'
+             '{"section": "risks", "label": "Input cost", "value": null,'
+             ' "detail": "HRC volatility can compress spreads", "evidence": "HRC prices rose"},\n'
+             '{"section": "capex", "label": "Capex", "value": 500, "unit": "cr", "eviden')
+    r = P(trunc)
+    check("truncated response salvaged, not discarded", len(r["rows"]) == 2)
+    check("salvage keeps the complete rows",
+          {x["label"] for x in r["rows"]} == {"Revenue", "Input cost"})
+    check("partial trailing row dropped",
+          not any(x["label"] == "Capex" for x in r["rows"]))
+    check("salvage is recorded so coverage is read with care",
+          r["dropped"].get("salvaged_from_truncated_response") == 1)
+    check("salvaged numbers still have to be grounded",
+          all(grounded(x["value"], x["evidence"], tolerance_pct=1.0)
+              for x in r["rows"] if x["value"] is not None))
+    check("a clean response is NOT marked as salvaged",
+          "salvaged_from_truncated_response" not in P({"summary": [dup]})["dropped"])
+    check("genuinely unparseable text still reports unparseable",
+          P("the model refused to answer")["dropped"].get("unparseable_response") == 1)
+    check("empty response still safe", P("")["dropped"].get("unparseable_response") == 1)
     check("empty payload safe", P({"summary": []})["rows"] == [])
     check("missing key safe", P({})["rows"] == [])
 
