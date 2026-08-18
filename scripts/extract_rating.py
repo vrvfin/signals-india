@@ -171,6 +171,43 @@ _AGENCY_CANON = (
 )
 
 
+# A rating action is only ever claimed when the document SAYS it. Both detection branches
+# used to end in `else: "Reaffirmed"`, so a rationale whose keyword fell outside the search
+# window was recorded as a reaffirmation — an assertion, not a gap.
+#
+# Measured on live PF data 2026-08-18: 160 rating rows held 146 "Reaffirmed", 14 "Upgrade"
+# and ZERO downgrades. Tatva Chintan's 10 Jun 2025 rationale opens "Long Term Rating Crisil
+# BBB+/Stable (Downgraded from 'Crisil A-/Negative')" and was stored as Reaffirmed. A
+# downgrade reported as a reaffirmation is the worst error this pipeline can make: it is
+# precisely the alert the reader needs, turned into an all-clear.
+#
+# "downgrad" is tested first because a rationale that mentions both actions ("upgraded in
+# 2023, downgraded now") must report the current one, and the current one leads the header.
+def _strip_markup(blob: str) -> str:
+    """Visible text from an HTML rationale. CRISIL/ICRA/Brickwork serve these as
+    HTML, so the action line is buried in tags that a substring search would miss."""
+    import html as _html
+    t = re.sub(r"<script[^>]*>.*?</script>", " ", str(blob or ""),
+               flags=re.S | re.I)
+    t = re.sub(r"<style[^>]*>.*?</style>", " ", t, flags=re.S | re.I)
+    t = _html.unescape(re.sub(r"<[^>]+>", " ", t))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+_ACTION_WORDS = (("downgrad", "Downgrade"), ("upgrad", "Upgrade"),
+                 ("reaffirm", "Reaffirmed"), ("assigned", "Assigned"),
+                 ("withdraw", "Withdrawn"), ("suspend", "Suspended"))
+
+
+def _action_from(blob: str) -> str:
+    """The rating action a document states, or "" when it states none."""
+    low = str(blob or "").lower()
+    for word, action in _ACTION_WORDS:
+        if word in low:
+            return action
+    return ""
+
+
 def canon_agency(raw: str) -> str:
     """One agency, one name — so a rating history is not split across spellings."""
     low = str(raw or "").strip().lower()
@@ -223,7 +260,8 @@ def _detect_rating(text: str) -> str:
     return "DATA_MISSING"
 
 
-def parse_gemini_response(text: str, row: pd.Series) -> dict:
+def parse_gemini_response(text: str, row: pd.Series,
+                          source_text: str = "") -> dict:
     """Extract rating metadata from the forensic credit report.
 
     The rating_prompt produces a Section 1 table with Agency, Instrument,
@@ -287,14 +325,12 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
                         ol = canon_outlook(raw)
                     if ol:
                         facts["outlook"] = ol
-                    # Detect action from the text around the rating
-                    low_raw = raw.lower()
-                    if "upgrad" in low_raw or "upgrade" in low_raw:
-                        facts["rating_action"] = "Upgrade"
-                    elif "downgrad" in low_raw:
-                        facts["rating_action"] = "Downgrade"
-                    else:
-                        facts["rating_action"] = "Reaffirmed"
+                    # Detect action from the text around the rating. UNKNOWN is a
+                    # valid answer — see _action_from() for why asserting "Reaffirmed"
+                    # by default is the most dangerous thing this file can do.
+                    act = _action_from(raw)
+                    if act:
+                        facts["rating_action"] = act
 
             if instrument_col is not None and instrument_col < len(cells):
                 raw = clean_val(cells[instrument_col])
@@ -313,15 +349,16 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
         if m:
             facts["outlook"] = m.group(1).title()
 
-    # Detect rating action from header text
+    # Detect the action from the header. The window was 500 chars, shorter than the
+    # preamble on a CRISIL rationale, so the word that matters routinely fell outside it.
+    # Widened, and silence now means UNKNOWN rather than "Reaffirmed".
     if not facts.get("rating_action"):
-        low = text[:500].lower()
-        if "upgrad" in low:
-            facts["rating_action"] = "Upgrade"
-        elif "downgrad" in low:
-            facts["rating_action"] = "Downgrade"
-        else:
-            facts["rating_action"] = "Reaffirmed"
+        # The model's SUMMARY is searched first, then the source document itself.
+        # The action lives in the document header ("Downgraded from 'Crisil
+        # A-/Negative'") and a 123k-char summary often paraphrases it away —
+        # which is how a real Tatva Chintan downgrade came back as no action at all.
+        facts["rating_action"] = (_action_from(text[:4000])
+                                 or _action_from(_strip_markup(source_text)[:4000]))
 
     return facts
 
@@ -534,7 +571,12 @@ def main() -> None:
                 counts["processed"] += 1
                 continue
 
-            facts = parse_gemini_response(markdown_text, row)
+            # HTML/text rationales only: a real PDF would need a text extraction pass,
+            # and the agencies that bury the action in markup are exactly the ones
+            # serving HTML.
+            _src = ("" if pdf_bytes[:4] == b"%PDF"
+                    else pdf_bytes.decode("utf-8", "ignore"))
+            facts = parse_gemini_response(markdown_text, row, source_text=_src)
             log(f"  Parsed: agency={facts['agency']}, rating={facts['rating']}, "
                 f"outlook={facts['outlook']}, action={facts['rating_action']}")
 
@@ -666,6 +708,54 @@ def _self_test() -> int:
     check("e2e agency canonical", f["agency"] == "CARE")
     check("e2e outlook is the real outlook", f["outlook"] == "Stable")
     check("e2e outlook is NOT the short-term rating", f["outlook"] != "A1+")
+
+    # ---- rating action: never assert what the document does not say
+    check("downgrade detected",
+          _action_from("Long Term Rating Crisil BBB+/Stable "
+                       "(Downgraded from 'Crisil A-/Negative')") == "Downgrade")
+    check("upgrade detected", _action_from("Rating upgraded to CRISIL A") == "Upgrade")
+    check("reaffirmation only when stated",
+          _action_from("CRISIL A-/Stable Reaffirmed") == "Reaffirmed")
+    check("assignment detected", _action_from("Rating assigned at CARE BBB") == "Assigned")
+    check("withdrawal detected", _action_from("The rating has been withdrawn") == "Withdrawn")
+    # THE BUG: silence used to become "Reaffirmed", turning Tatva Chintan's real
+    # A-/Negative -> BBB+/Stable downgrade into an all-clear.
+    check("silence is UNKNOWN, not Reaffirmed",
+          _action_from("Total Bank Loan Facilities Rated Rs.245 Crore") == "")
+    check("empty input safe", _action_from("") == "" and _action_from(None) == "")
+    check("downgrade wins when both words appear",
+          _action_from("upgraded in 2023, downgraded now") == "Downgrade")
+    check("case insensitive", _action_from("DOWNGRADED FROM CRISIL A-") == "Downgrade")
+    # The header window was 500 chars; on a real CRISIL rationale the word that matters
+    # sits past it, which is why the live data held zero downgrades across 160 rows.
+    hdr = ("Rating Action Total Bank Loan Facilities Rated Rs.245 Crore " + ("x " * 260)
+           + "Long Term Rating Crisil BBB+/Stable (Downgraded from A-/Negative)")
+    check("old 500-char window would have missed it", _action_from(hdr[:500]) == "")
+    check("widened window catches it", _action_from(hdr[:4000]) == "Downgrade")
+
+    # ---- the action lives in the SOURCE document, not in the model summary
+    crisil = ("<html><body><table><tr><td>Rating Action</td></tr>"
+              "<tr><td>Long Term Rating</td><td>Crisil BBB+/Stable "
+              "(Downgraded from &#39;Crisil A-/Negative&#39;)</td></tr>"
+              "</table></body></html>")
+    check("markup stripped to visible text",
+          "Downgraded from" in _strip_markup(crisil))
+    check("entities unescaped", "'Crisil A-/Negative'" in _strip_markup(crisil))
+    check("script and style discarded",
+          "hidden" not in _strip_markup("<style>.a{x:hidden}</style><p>ok</p>"))
+    check("action read out of the HTML source",
+          _action_from(_strip_markup(crisil)[:4000]) == "Downgrade")
+    # A summary that paraphrases the action away must NOT block the source lookup.
+    row_ = pd.Series({"isin": "I", "symbol": "TATVA", "announcement_date": "2025-06-10"})
+    quiet = ("| Agency | Instrument | Rating/Outlook |" + chr(10)
+             + "|---|---|---|" + chr(10)
+             + "| CRISIL | CC | BBB+/Stable |" + chr(10))
+    f_no = parse_gemini_response(quiet, row_)
+    check("no source, no invented action", f_no["rating_action"] == "")
+    f_src = parse_gemini_response(quiet, row_, source_text=crisil)
+    check("source supplies the downgrade", f_src["rating_action"] == "Downgrade")
+    check("the rating itself is unchanged by the source lookup",
+          f_src["rating"] == f_no["rating"])
 
     print(f"\nextract_rating self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
