@@ -868,7 +868,7 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <h1>__TITLE__ — __N__ charts — __DATE__ (rendered in your browser)</h1>
 <div style="font-size:11px;color:#888;margin:-2px 8px 10px">Candlesticks + volume · <b style="color:#2962FF">EMA20</b> · <b style="color:#FF6D00">EMA50</b></div>
-<div class="grid">__CARDS__</div>
+__PRELUDE__<div class="grid">__CARDS__</div>
 <script>
 const D=__PAYLOAD__;
 function mk(id){
@@ -890,7 +890,11 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
 
 
 def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
-               annot=None, resample=None):
+               annot=None, resample=None, prelude=""):
+    """`prelude` is optional page furniture rendered ABOVE the card grid (the
+    watchlist summary table uses it). It defaults to "" and the placeholder sits
+    flush against <div class="grid">, so every existing caller emits a
+    byte-identical page."""
     annot = annot or {}
     card_html, data = [], {}
     for j, (_, rr) in enumerate(ranked.iterrows()):
@@ -945,7 +949,8 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
                 .replace("__CARDS__", "".join(card_html))
                 .replace("__N__", str(len(card_html)))
                 .replace("__TITLE__", title)
-                .replace("__DATE__", datetime.now().strftime("%d %b %Y %H:%M")))
+                .replace("__DATE__", datetime.now().strftime("%d %b %Y %H:%M"))
+                .replace("__PRELUDE__", prelude or ""))
 
 
 # ─────────────────────── guidance-strength scoring ──────────────────────────
@@ -1267,11 +1272,207 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
     return annot
 
 
+# ───────────────────── guidance watchlist (--mode watchlist) ────────────────
+# Rendered from company_repo/_index/guidance_watchlist.parquet, which
+# build_guidance_watchlist.py writes. Cards come from the SHARED build_html, so
+# a watchlist card is identical to a gallery.html card; only the summary table
+# above the grid and the chip row are new.
+_WL_VERDICT_CHIP = {
+    "CONFIRMED": ("✓ confirmed", "#1a7a3a"),
+    "CONSISTENT": ("≈ consistent", "#2e7d32"),
+    "CONTRADICTED": ("✗ contradicted", "#c0392b"),
+    "NO_EVIDENCE": ("? unverified", "#a66300"),
+}
+
+
+def _wl_pre_tracking(r) -> bool:
+    """Is this row's PREVIOUS quarter before the watchlist started tracking?
+
+    Without this a fresh table (floored at Q1FY27 because Q4FY26 measured 64%
+    empty cells) would show every name as 'no concall last quarter', which reads
+    as a coverage gap when it is really just our own start date.
+    """
+    tf = str(r.get("tracking_from") or "").strip()
+    if not tf:
+        return False
+    m = re.match(r"\s*Q([1-4])\D*?(\d{2,4})", str(r.get("quarter") or ""))
+    if not m:
+        return False
+    q, fy = int(m.group(1)), int(m.group(2)) % 100
+    # _q_order is fy*100+q, so plain arithmetic on it is NOT quarter arithmetic:
+    # the quarter before Q1FY27 is Q4FY26, not "2701 - 1".
+    prev = f"Q4 FY{fy - 1:02d}" if q == 1 else f"Q{q - 1} FY{fy:02d}"
+    return _q_order(prev) < _q_order(tf)
+
+
+def _wl_num(v, dp=0):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    return "" if f != f else f"{f:,.{dp}f}"
+
+
+def _wl_table(wl) -> str:
+    """The 100-row summary above the cards.
+
+    `Base ₹cr` and `Evidence` are load-bearing columns, not decoration: nothing
+    is capped (2026-08-21 decision), so the base and the transcript verdict are
+    what tell you a large CAGR is real.
+    """
+    if wl is None or wl.empty:
+        return ""
+    head = ["#", "Symbol", "Company", "ISIN", "BSE", "Qtr", "Added", "CAGR%",
+            "Metric", "Src", "Horizon", "Base ₹cr", "Evidence", "#Stmts",
+            "Prev-Q", "#Qtrs", "Streak", "Cred"]
+    th = "".join(
+        f'<th style="position:sticky;top:0;background:#1a3d6e;color:#fff;'
+        f'font-size:11px;padding:4px 6px;text-align:left;white-space:nowrap">{h}</th>'
+        for h in head)
+    rows = []
+    for j, (_, r) in enumerate(wl.iterrows()):
+        sym = str(r.get("nse_symbol") or r.get("symbol") or "")
+        cag = pd.to_numeric(r.get("cagr_pct"), errors="coerce")
+        css = G.cell_css(G.grade_growth(cag)) if pd.notna(cag) else ""
+        vlabel, vcol = _WL_VERDICT_CHIP.get(str(r.get("validation_verdict") or ""),
+                                            ("", "#777"))
+        if r.get("in_prev_quarter"):
+            prev = '<span style="color:#1a7a3a;font-weight:700">✓</span>'
+        elif _wl_pre_tracking(r):
+            # the table simply does not go back that far — saying "gap" here
+            # would blame the company for our own start date
+            prev = '<span style="color:#999" title="the previous quarter is ' \
+                   'before this watchlist started tracking">–</span>'
+        elif r.get("prev_quarter_had_guidance"):
+            prev = '<span style="color:#c0392b">✗</span>'
+        else:
+            prev = '<span style="color:#a66300" title="no concall extracted ' \
+                   'last quarter — a coverage gap, not a churn-out">⚠</span>'
+        base = _wl_num(r.get("base_ttm_cr"))
+        nq = r.get("base_quarters")
+        if base and pd.notna(nq) and int(nq) < 4:
+            # an annualised partial window assumes the missing quarters look like
+            # the present ones — seasonality is ignored, so say so
+            base += (f'<span style="color:#a66300" title="built from {int(nq)} '
+                     f'of 4 quarters, scaled x{r.get("base_scale")} — ignores '
+                     f'seasonality"> ({int(nq)}q&times;{r.get("base_scale")})</span>')
+        if r.get("base_suspect"):
+            base = (f'<span style="color:#c0392b" title="tiny TTM base — any '
+                    f'target looks explosive against it">{base} ⚠</span>')
+        cells = [
+            f"{j + 1}",
+            f'<a href="#ch{j}" style="color:#1a3d6e;font-weight:700;'
+            f'text-decoration:none">{sym}</a>',
+            str(r.get("nse_name") or r.get("company_name") or "")[:34],
+            str(r.get("isin") or ""),
+            str(r.get("bse_code") or ""),
+            str(r.get("quarter") or ""),
+            str(r.get("date_added") or ""),
+            f'<span style="{css};font-weight:800;padding:0 4px;border-radius:3px">'
+            f'{_wl_num(cag, 0)}%</span>',
+            str(r.get("score_metric") or ""),
+            "deck" if str(r.get("guidance_source")) == "presentation" else "call",
+            str(r.get("horizon_fy") or ""),
+            base,
+            f'<span style="color:{vcol};font-weight:700">{vlabel}</span>',
+            # how many SEPARATE statements cleared the bar -- 3 consistent cells
+            # is firmer than one borderline line
+            (f'<b style="color:#1a7a3a">{int(r.get("n_rows_over_min") or 1)}</b>'
+             if (r.get("n_rows_over_min") or 1) > 1
+             else str(int(r.get("n_rows_over_min") or 1))),
+            prev,
+            str(int(r.get("n_quarters") or 0)),
+            str(int(r.get("quarter_streak") or 0)),
+            _wl_num(r.get("cred_score"), 1),
+        ]
+        tds = "".join(f'<td style="font-size:11.5px;padding:3px 6px;'
+                      f'border-bottom:1px solid #eef1f5;white-space:nowrap">{c}</td>'
+                      for c in cells)
+        rows.append(f"<tr>{tds}</tr>")
+    return ('<div style="max-width:1100px;margin:0 auto 16px">'
+            '<div class="card" style="overflow-x:auto;max-height:70vh;'
+            'overflow-y:auto">'
+            f'<table><thead><tr>{th}</tr></thead><tbody>{"".join(rows)}'
+            '</tbody></table></div></div>')
+
+
+def _wl_annot(wl) -> dict:
+    """SYMBOL -> the two chip lines that sit under each card header."""
+    out = {}
+    if wl is None or wl.empty:
+        return out
+    for _, r in wl.iterrows():
+        sym = str(r.get("nse_symbol") or r.get("symbol") or "").upper()
+        if not sym:
+            continue
+        cag = pd.to_numeric(r.get("cagr_pct"), errors="coerce")
+        detail = " · ".join(x for x in [
+            str(r.get("score_metric") or "").title(),
+            str(r.get("score_rule") or "").replace("_", " "),
+        ] if x)
+        line1 = (f'<div style="background:#0d2f5c;color:#fff;border-radius:6px;'
+                 f'padding:4px 10px;font-size:13px;font-weight:700;margin:3px 0">'
+                 f'🎯 Guided CAGR ~{cag:.0f}%'
+                 f'<span style="font-weight:500;opacity:.85"> · {detail}'
+                 f' · {r.get("value_type") or ""} · {r.get("horizon_fy") or ""}'
+                 f'</span></div>') if pd.notna(cag) else ""
+
+        bits = [f'📅 added {r.get("date_added") or ""}'
+                + (_fresh_badge(str(r.get("date_added") or "")) or ""),
+                f'<b>{r.get("quarter") or ""}</b>']
+        if r.get("in_prev_quarter"):
+            bits.append('<span style="color:#1a7a3a;font-weight:700">'
+                        '↩ also last qtr</span>')
+        elif _wl_pre_tracking(r):
+            bits.append('<span style="color:#999">start of tracking</span>')
+        elif r.get("prev_quarter_had_guidance"):
+            bits.append('<span style="color:#777">first time</span>')
+        else:
+            # a coverage hole must never read as a company that stopped guiding
+            bits.append('<span style="color:#a66300">no concall last qtr</span>')
+        nst = int(r.get("n_rows_over_min") or 1)
+        if nst > 1:
+            bits.append(f'<span style="color:#1a7a3a;font-weight:700">'
+                        f'{nst} statements agree</span>')
+        if str(r.get("guidance_source")) == "presentation":
+            bits.append('<span style="color:#7b4fa8">from deck</span>')
+        nq = int(r.get("n_quarters") or 0)
+        if nq:
+            bits.append(f'★ {nq}× in filter')
+        st = int(r.get("quarter_streak") or 0)
+        if st >= 2:
+            bits.append(f'🔥 {st}q streak')
+        vlabel, vcol = _WL_VERDICT_CHIP.get(str(r.get("validation_verdict") or ""),
+                                            ("", "#777"))
+        if vlabel:
+            bits.append(f'<span style="color:{vcol};font-weight:700">{vlabel}</span>')
+        if r.get("base_suspect"):
+            bits.append('<span style="color:#c0392b;font-weight:700">'
+                        '⚠ tiny base</span>')
+        cs = pd.to_numeric(r.get("cred_score"), errors="coerce")
+        if pd.notna(cs):
+            bits.append(f'cred {cs:.1f}')
+        line2 = (f'<div style="font-size:12px;color:#333;margin:2px 0;'
+                 f'line-height:1.6">{" · ".join(bits)}</div>')
+        out[sym] = line1 + line2
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["signals", "pf", "guidance"], default="signals",
+    ap.add_argument("--mode", choices=["signals", "pf", "guidance", "watchlist"],
+                    default="signals",
                     help="signals=ranked signal gallery; pf=portfolio holdings; "
-                         "guidance=top companies by implied guidance CAGR.")
+                         "guidance=top companies by implied guidance CAGR; "
+                         "watchlist=the running >50%%-CAGR guidance watchlist "
+                         "(needs build_guidance_watchlist.py first), newest "
+                         "idea first.")
+    ap.add_argument("--quarter", default="auto",
+                    help="watchlist mode: which quarter to show "
+                         "(default auto = the newest present in the table)")
+    ap.add_argument("--min-cagr", type=float, default=0.0,
+                    help="watchlist mode: extra CAGR floor on top of whatever "
+                         "the table was built with (0 = show everything in it)")
     ap.add_argument("--view", choices=["full", "additions", "drops", "ipo"],
                     default="full",
                     help="signals mode: full=all ranked (existing limits); "
@@ -1332,7 +1533,7 @@ def main():
             except Exception:
                 pass
 
-    title, annot = "📊 Signals gallery", {}
+    title, annot, prelude = "📊 Signals gallery", {}, ""
     out_default = "gallery.html"
 
     # Meta-line inputs (52wH, returns+ranks, tenure) — used by signals AND pf modes
@@ -1394,6 +1595,44 @@ def main():
                           + (f' <span style="font-weight:500;opacity:.9">· {detail}</span>'
                              if detail else "") + "</div>")
         log(f"  scored {len(scores)} companies with guidance; top {len(ranked)}")
+
+    elif args.mode == "watchlist":
+        out_default = "gallery_guidance_watchlist.html"
+        wl = _read_parquet(drive, idx, "guidance_watchlist.parquet")
+        if wl.empty:
+            log("No guidance_watchlist.parquet — run "
+                "scripts/build_guidance_watchlist.py first.")
+            return
+        wl = wl.copy()
+        wl["_qo"] = wl["quarter"].map(_q_order)
+        q = (str(wl.sort_values("_qo")["quarter"].iloc[-1])
+             if args.quarter.lower() == "auto" else args.quarter)
+        # ONE quarter only, and that is structural rather than a preference: the
+        # table holds one row per (isin, quarter), so a multi-quarter view would
+        # render the same symbol — and the same chart — two or three times.
+        wl = wl[wl["quarter"].astype(str).str.replace(" ", "")
+                == str(q).replace(" ", "")]
+        if args.min_cagr > 0 and "cagr_pct" in wl.columns:
+            wl = wl[pd.to_numeric(wl["cagr_pct"], errors="coerce") >= args.min_cagr]
+        top = args.max if args.max > 0 else 100
+        # newest idea on top; CAGR breaks a same-day tie so the order is stable
+        wl = wl.sort_values(["date_added", "cagr_pct"], ascending=[False, False],
+                            na_position="last").head(top).reset_index(drop=True)
+        if wl.empty:
+            log(f"Nothing in the watchlist for {q}."); return
+        ranked = wl.copy()
+        ranked["symbol"] = [str(s or t or "") for s, t in
+                            zip(wl.get("symbol", ""), wl.get("nse_symbol", ""))]
+        # a name with no resolvable symbol still belongs on the list — _pfname
+        # makes it render as a LABELLED card instead of "(unknown)"
+        ranked["_pfname"] = wl.get("nse_name", wl.get("company_name", ""))
+        annot = _wl_annot(wl)
+        prelude = _wl_table(wl)
+        floor = wl["min_cagr_used"].dropna()
+        floor = float(floor.iloc[0]) if len(floor) else args.min_cagr
+        title = (f"🎯 Guidance watchlist — {q} — revenue/PAT guided "
+                 f">{floor:.0f}% CAGR — newest first")
+        log(f"  {len(wl)} names in the watchlist for {q}")
 
     else:  # signals
         if args.view == "drops":
@@ -1466,7 +1705,8 @@ def main():
     cards = Cards(grades, stmts, guidance, gf1, ann, research=res_idx, news=news_map)
     log("assembling HTML…")
     html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
-                      title=title, annot=annot, resample=resample)
+                      title=title, annot=annot, resample=resample,
+                      prelude=prelude)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     log(f"wrote {out_path}  ({len(html) / 1e6:.1f} MB, {len(syms)} charts)")
