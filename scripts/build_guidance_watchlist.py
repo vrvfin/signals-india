@@ -66,7 +66,8 @@ import guidance_validate as GVAL
 import quarterly_table as QT
 from _extractor_base import (acquire_lock, download_bytes, find_file, get_drive,
                              get_or_create_subfolder, isin_symbol_map,
-                             load_parquet, log, release_lock, save_parquet)
+                             load_parquet, load_portfolio_isins, log,
+                             release_lock, save_parquet)
 
 GW_NAME = "guidance_watchlist.parquet"
 GW_KEY = ["isin", "quarter"]
@@ -89,7 +90,7 @@ GW_COLS = [
     "validation_verdict", "evidence_stmt", "evidence_num", "evidence_delta_pct",
     # --- provenance ---------------------------------------------------------
     "symbol", "company_name", "guidance_source", "source_doc_id",
-    "quarter_source", "cred_score", "n_rows_over_min",
+    "quarter_source", "cred_score", "n_rows_over_min", "in_pf",
     # --- run bookkeeping ----------------------------------------------------
     "min_cagr_used", "max_stale_q_used", "tracking_from", "date_added_source",
     "first_qualified_at", "last_seen_at", "as_of",
@@ -446,7 +447,7 @@ def score_quarter(guid_q: pd.DataFrame, base_rev: dict, base_pat: dict,
 
 def build_rows(winners: dict, ident: dict, cred_by: dict, quarter: str,
                proc_by: dict, qsrc_by: dict, args, now: str,
-               base_meta: dict | None = None) -> list:
+               base_meta: dict | None = None, pf_isins=None) -> list:
     """One GW_COLS dict per qualifying company."""
     rows = []
     for isin, w in winners.items():
@@ -493,6 +494,11 @@ def build_rows(winners: dict, ident: dict, cred_by: dict, quarter: str,
             "source_doc_id": str(w.get("source_doc_id") or ""),
             "quarter_source": qsrc_by.get((str(isin), quarter), "table_a"),
             "cred_score": cred_by.get(str(isin)),
+            # do I already own this? load_portfolio_isins returns None when no
+            # holdings file is on Drive -- that is "unknown", not "not held",
+            # so it must not render as a confident No.
+            "in_pf": (None if pf_isins is None
+                      else bool(str(isin) in pf_isins)),
             "n_rows_over_min": int(w.get("n_over", 1)),
             "min_cagr_used": args.min_cagr,
             "max_stale_q_used": args.max_stale_q,
@@ -649,6 +655,12 @@ def main() -> int:                                            # noqa: C901
     ap.add_argument("--dump-rejects", default="",
                     help="write every cell the cleaner refused to score, with the "
                          "rule that refused it, so nothing is discarded invisibly")
+    ap.add_argument("--lock-wait-min", type=float, default=0.0,
+                    help="minutes to wait for the shared _extract.lock before "
+                         "giving up (default 0 = skip immediately). Phase 2 and "
+                         "the backfill hold this lock for long stretches during "
+                         "extraction, so a 0-wait run can lose the race for "
+                         "hours; 15 is a sensible value for a scheduled run.")
     ap.add_argument("--dry-run", action="store_true",
                     help="compute and report; no Drive write, no lock")
     ap.add_argument("--self-test", action="store_true")
@@ -665,7 +677,7 @@ def main() -> int:                                            # noqa: C901
 
     if not args.dry_run:
         if not acquire_lock(drive, idx, _LOCK_NAME, _LOCK_OWNER,
-                            max_age_min=360, wait_min=0):
+                            max_age_min=360, wait_min=args.lock_wait_min):
             log("  lock unavailable — exiting cleanly, the next run resumes")
             return 0
         atexit.register(release_lock, drive, idx, _LOCK_NAME)
@@ -696,6 +708,10 @@ def main() -> int:                                            # noqa: C901
     sym2isin = symbol_isin_map(uni, guid)
     sum_rev, sum_pat = summary_base_maps(summ, sym2isin)
     log(f"  TTM bases resolved: revenue {len(sum_rev)} · pat {len(sum_pat)} isins")
+
+    pf_isins = load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"])
+    log(f"  portfolio: {len(pf_isins) if pf_isins is not None else 'no holdings file'} "
+        f"{'holdings' if pf_isins is not None else '(in_pf left unknown)'}")
 
     cred_by = {}
     if not cred.empty and {"isin", "cred_score"} <= set(cred.columns):
@@ -767,7 +783,7 @@ def main() -> int:                                            # noqa: C901
             qsrc_by.setdefault(k, getattr(r, "quarter_source", "table_a"))
 
         rows = build_rows(kept, ident, cred_by, q, proc_by, qsrc_by, args,
-                          _now(), b_meta)
+                          _now(), b_meta, pf_isins)
         all_rows.extend(rows)
         for isin, lst in rejects.items():
             for x in lst:
