@@ -1305,6 +1305,18 @@ def _wl_pre_tracking(r) -> bool:
     return _q_order(prev) < _q_order(tf)
 
 
+def _wl_pf_cell(v) -> str:
+    """Do I already own this? None means no holdings file was on Drive, which is
+    UNKNOWN -- it must not render as a confident No."""
+    if v is True:
+        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
+                'border-radius:4px;font-weight:800" title="in your portfolio">'
+                '◉ PF</span>')
+    if v is False:
+        return '<span style="color:#ccc" title="not held">–</span>'
+    return '<span style="color:#ccc" title="no holdings file on Drive">?</span>'
+
+
 def _wl_num(v, dp=0):
     try:
         f = float(v)
@@ -1322,9 +1334,9 @@ def _wl_table(wl) -> str:
     """
     if wl is None or wl.empty:
         return ""
-    head = ["#", "Symbol", "Company", "ISIN", "BSE", "Qtr", "Added", "CAGR%",
-            "Metric", "Src", "Horizon", "Base ₹cr", "Evidence", "#Stmts",
-            "Prev-Q", "#Qtrs", "Streak", "Cred"]
+    head = ["#", "PF", "Symbol", "Company", "ISIN", "BSE", "Qtr", "Added",
+            "CAGR%", "Metric", "Src", "Horizon", "Base ₹cr", "Evidence",
+            "#Stmts", "Prev-Q", "#Qtrs", "Streak", "Cred"]
     th = "".join(
         f'<th style="position:sticky;top:0;background:#1a3d6e;color:#fff;'
         f'font-size:11px;padding:4px 6px;text-align:left;white-space:nowrap">{h}</th>'
@@ -1361,6 +1373,7 @@ def _wl_table(wl) -> str:
                     f'target looks explosive against it">{base} ⚠</span>')
         cells = [
             f"{j + 1}",
+            _wl_pf_cell(r.get("in_pf")),
             f'<a href="#ch{j}" style="color:#1a3d6e;font-weight:700;'
             f'text-decoration:none">{sym}</a>',
             str(r.get("nse_name") or r.get("company_name") or "")[:34],
@@ -1417,9 +1430,13 @@ def _wl_annot(wl) -> dict:
                  f' · {r.get("value_type") or ""} · {r.get("horizon_fy") or ""}'
                  f'</span></div>') if pd.notna(cag) else ""
 
-        bits = [f'📅 added {r.get("date_added") or ""}'
-                + (_fresh_badge(str(r.get("date_added") or "")) or ""),
-                f'<b>{r.get("quarter") or ""}</b>']
+        bits = []
+        if r.get("in_pf") is True:
+            bits.append('<span style="background:#1a7a3a;color:#fff;padding:1px 7px;'
+                        'border-radius:6px;font-weight:800">◉ IN PF</span>')
+        bits += [f'📅 added {r.get("date_added") or ""}'
+                 + (_fresh_badge(str(r.get("date_added") or "")) or ""),
+                 f'<b>{r.get("quarter") or ""}</b>']
         if r.get("in_prev_quarter"):
             bits.append('<span style="color:#1a7a3a;font-weight:700">'
                         '↩ also last qtr</span>')
@@ -1630,8 +1647,11 @@ def main():
         prelude = _wl_table(wl)
         floor = wl["min_cagr_used"].dropna()
         floor = float(floor.iloc[0]) if len(floor) else args.min_cagr
-        title = (f"🎯 Guidance watchlist — {q} — revenue/PAT guided "
-                 f">{floor:.0f}% CAGR — newest first")
+        n_pf = int(wl["in_pf"].fillna(False).sum()) if "in_pf" in wl.columns else 0
+        title = (f"🎯 GUIDANCE WATCHLIST — {q} — management guided "
+                 f"revenue or PAT above {floor:.0f}%/yr — transcript-checked "
+                 f"— newest guidance first"
+                 + (f" — {n_pf} already in PF" if n_pf else ""))
         log(f"  {len(wl)} names in the watchlist for {q}")
 
     else:  # signals

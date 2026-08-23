@@ -86,6 +86,14 @@ def diff_against_ledger(wl: pd.DataFrame, ledger: pd.DataFrame):
     return ent, left, still
 
 
+def _pf_chip(v) -> str:
+    """None means no holdings file was on Drive -- unknown, not 'not held'."""
+    if v is True:
+        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 7px;'
+                'border-radius:6px;font-weight:800;font-size:11px">◉ IN PF</span> ')
+    return ""
+
+
 def _row_html(r) -> str:
     cag = pd.to_numeric(r.get("cagr_pct"), errors="coerce")
     nst = int(r.get("n_rows_over_min") or 1)
@@ -100,8 +108,11 @@ def _row_html(r) -> str:
     return (
         f'<tr>'
         f'<td style="padding:6px 8px;border-bottom:1px solid #eef1f5;white-space:nowrap">'
+        f'{_pf_chip(r.get("in_pf"))}'
         f'<b style="font-size:14px;color:#1a3d6e">{_esc(r.get("nse_symbol") or r.get("symbol"))}</b>'
-        f'<div style="font-size:11px;color:#777">{_esc(str(r.get("nse_name") or "")[:38])}</div></td>'
+        f'<div style="font-size:11px;color:#777">{_esc(str(r.get("nse_name") or "")[:38])}</div>'
+        f'<div style="font-size:10.5px;color:#999;margin-top:2px">'
+        f'{_esc(r.get("quarter"))} &middot; added {_esc(r.get("date_added"))}</div></td>'
         f'<td style="padding:6px 8px;border-bottom:1px solid #eef1f5;text-align:right;'
         f'font-size:17px;font-weight:800;color:#0d2f5c;white-space:nowrap">'
         f'{"" if pd.isna(cag) else f"{cag:,.0f}%"}</td>'
@@ -114,12 +125,18 @@ def _row_html(r) -> str:
 
 def build_html(ent: pd.DataFrame, left: pd.DataFrame, still: pd.DataFrame,
                quarter: str) -> str:
+    n_pf = 0
+    for d in (ent, still):
+        if len(d) and "in_pf" in d.columns:
+            n_pf += int(d["in_pf"].fillna(False).sum())
     p = [f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
          f'color:#222;max-width:860px">'
          f'<h2 style="margin:0 0 2px;font-size:18px">🎯 Guidance watchlist — {_esc(quarter)}</h2>'
          f'<div style="font-size:12px;color:#777;margin-bottom:14px">'
          f'revenue or PAT guided above 50% a year, each number checked against the '
-         f'concall transcript · {len(ent) + len(still)} names on the list</div>']
+         f'concall transcript · {len(ent) + len(still)} names on the list'
+         + (f' · <b style="color:#1a7a3a">◉ {n_pf} already in PF</b>'
+            if n_pf else "") + '</div>']
 
     if len(ent):
         p.append('<h3 style="font-size:15px;color:#1a7a3a;margin:16px 0 4px">'
@@ -145,8 +162,9 @@ def build_html(ent: pd.DataFrame, left: pd.DataFrame, still: pd.DataFrame,
                  f'Still on the list ({len(still)})</h3>'
                  '<div style="font-size:12.5px;color:#555;line-height:1.8">')
         p.append(" · ".join(
-            f'<b>{_esc(r.get("nse_symbol"))}</b> '
-            f'{pd.to_numeric(r.get("cagr_pct"), errors="coerce"):,.0f}%'
+            ("◉" if r.get("in_pf") is True else "")
+            + f'<b>{_esc(r.get("nse_symbol"))}</b> '
+            + f'{pd.to_numeric(r.get("cagr_pct"), errors="coerce"):,.0f}%'
             for _, r in still.sort_values("cagr_pct", ascending=False).iterrows()))
         p.append("</div>")
 

@@ -179,7 +179,7 @@ jobs:
       # It takes the shared _extract.lock and exits 0 if Phase 2 holds it, so a
       # collision costs one night, not a corrupt table.
       - name: Guidance watchlist table (>50% guided CAGR)
-        run: python scripts/build_guidance_watchlist.py --from-quarter Q1FY27
+        run: python scripts/build_guidance_watchlist.py --from-quarter Q1FY27 --lock-wait-min 15
         continue-on-error: true
 
       # Silent unless a name ENTERED or LEFT since the last mail.
