@@ -183,6 +183,84 @@ _AGENCY_CANON = (
 #
 # "downgrad" is tested first because a rationale that mentions both actions ("upgraded in
 # 2023, downgraded now") must report the current one, and the current one leads the header.
+def _source_text(blob: bytes) -> str:
+    """Readable text from the source document, PDF or HTML.
+
+    The rating ACTION is stated in the document header and nowhere else reliable, so this
+    has to work for both shapes: CRISIL and Brickwork serve HTML, while ICRA's real
+    document sits behind a PDF endpoint. Handling only HTML left every ICRA rationale with
+    no action at all. Six pages is ample — the action is on page one, and reading a
+    120-page annexure would cost time for nothing.
+    """
+    if not blob:
+        return ""
+    if blob[:4] == b"%PDF":
+        try:
+            import fitz
+            with fitz.open(stream=blob, filetype="pdf") as doc:
+                return chr(10).join(pg.get_text() for pg in list(doc)[:6])
+        except Exception:
+            return ""
+    return blob.decode("utf-8", "ignore")
+
+
+def _fetch_doc(drive, drive_fid: str, row) -> bytes:
+    """The document bytes, from Drive if it is still there and from the SOURCE if
+    it is not.
+
+    Retention rule 1 deletes stored documents two days after processing, so a
+    re-extract months later finds a `drive_file_id` that 404s. Measured on a random
+    12 of the 410 PF rating rows (2026-08-21): 5 dead, 7 alive — about 42% of the
+    history unreachable through Drive alone. Every queue row still carries the
+    agency URL it came from, and CRISIL/ICRA rationale pages stay published, so the
+    source is the reliable copy for anything older than two days.
+
+    Nothing is re-uploaded: the bytes are used for this one call and dropped, which
+    keeps retention satisfied by construction rather than by a later cleanup.
+    """
+    try:
+        return download_bytes(drive, drive_fid)
+    except Exception as exc:
+        url = str(row.get("pdf_url") or "").strip()
+        if not url or url.lower() == "nan":
+            raise
+        log(f"  Drive copy gone ({str(exc)[:40]}) - refetching from source")
+        from ingest_company_docs import download_pdf, screener_session
+        global _SRC_SESSION
+        if _SRC_SESSION is None:
+            _SRC_SESSION = screener_session()
+        # ICRA serves a JS-rendered page at the rationale URL; the actual document
+        # sits behind a separate PDF endpoint. backfill_company_docs already worked
+        # this out, so reuse it rather than rediscovering it (rule 4).
+        from backfill_company_docs import _resolve_doc_url
+        blob = download_pdf(_SRC_SESSION, _resolve_doc_url(url))
+        if not blob:
+            raise RuntimeError(f"Drive copy deleted and source refetch failed: {url[:80]}")
+        return blob
+
+
+def _rating_col(hdrs) -> int | None:
+    """Index of the column holding the RATING, never the one naming the agency.
+
+    The old test was `"rating" in h or "outlook" in h`, and the model's own table leads
+    with a column headed "Rating Agency" — which contains "rating". So the agency name was
+    read as the rating, which is how 115 of 160 PF rows came to hold "ICRA", "CRISIL" and
+    "CareEdge" instead of a rating. Verified against a live ICRA table whose headers are:
+    Rating Agency | Instrument Type | Rated Amount | Current Rating/Outlook | FY2025 ...
+
+    A "current" column wins over a historical one, because the mail reports what the
+    rating IS, not what it was two years ago.
+    """
+    cands = [i for i, h in enumerate(hdrs)
+             if ("rating" in h or "outlook" in h) and "agency" not in h]
+    if not cands:
+        return None
+    for i in cands:
+        if "current" in hdrs[i]:
+            return i
+    return cands[0]
+
+
 def _strip_markup(blob: str) -> str:
     """Visible text from an HTML rationale. CRISIL/ICRA/Brickwork serve these as
     HTML, so the action line is buried in tags that a substring search would miss."""
@@ -194,9 +272,16 @@ def _strip_markup(blob: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-_ACTION_WORDS = (("downgrad", "Downgrade"), ("upgrad", "Upgrade"),
-                 ("reaffirm", "Reaffirmed"), ("assigned", "Assigned"),
-                 ("withdraw", "Withdrawn"), ("suspend", "Suspended"))
+_SRC_SESSION = None   # lazily created; one HTTP session for the whole run
+
+
+# PARTICIPLES, not stems. Every rationale carries a "Rating Sensitivities" section
+# saying things like "sustained weakening MAY LEAD TO A DOWNGRADE" — the noun describes a
+# hypothetical, the participle describes something that happened. Matching the stem
+# "downgrad" would fire on the hypothetical and invent a downgrade that never occurred.
+_ACTION_WORDS = (("downgraded", "Downgrade"), ("upgraded", "Upgrade"),
+                 ("reaffirmed", "Reaffirmed"), ("assigned", "Assigned"),
+                 ("withdrawn", "Withdrawn"), ("suspended", "Suspended"))
 
 
 def _action_from(blob: str) -> str:
@@ -288,8 +373,7 @@ def parse_gemini_response(text: str, row: pd.Series,
         hdrs = [h.lower() for h in t["headers"]]
         # Identify columns
         agency_col    = next((i for i, h in enumerate(hdrs) if "agency" in h), None)
-        rating_col    = next((i for i, h in enumerate(hdrs)
-                              if "rating" in h or "outlook" in h), None)
+        rating_col    = _rating_col(hdrs)
         instrument_col = next((i for i, h in enumerate(hdrs)
                                if "instrument" in h or "facility" in h), None)
         amount_col    = next((i for i, h in enumerate(hdrs)
@@ -315,7 +399,12 @@ def parse_gemini_response(text: str, row: pd.Series,
                     # outlooks on 107+ rows. Only a recognised outlook is accepted, and
                     # a parenthesised one is preferred since that is where agencies put it.
                     parts = raw.split("/")
-                    facts["rating"] = parts[0].strip()
+                    # Through _detect_rating, not raw. The cell is "[ICRA]AA+(Stable)"
+                    # or "Crisil BBB+" depending on the agency, and storing it verbatim is
+                    # how the agency's own name ended up in the rating field. The detector
+                    # already returns DATA_MISSING for a cell holding no rating symbol,
+                    # which is the honest answer for a mis-picked column.
+                    facts["rating"] = _detect_rating(parts[0].strip())
                     ol = canon_outlook(
                         (re.search(r"\(([^)]*)\)", raw) or [None, ""])[1]
                         if re.search(r"\(([^)]*)\)", raw) else "")
@@ -357,8 +446,14 @@ def parse_gemini_response(text: str, row: pd.Series,
         # The action lives in the document header ("Downgraded from 'Crisil
         # A-/Negative'") and a 123k-char summary often paraphrases it away —
         # which is how a real Tatva Chintan downgrade came back as no action at all.
-        facts["rating_action"] = (_action_from(text[:4000])
-                                 or _action_from(_strip_markup(source_text)[:4000]))
+        # THE SOURCE IS AUTHORITATIVE and is searched FIRST. Measured on two live
+        # documents: APL Apollo's ICRA rationale (truth: reaffirmed) contains the string
+        # "downgrad" ZERO times, yet the model's 123k-char summary discusses downgrades
+        # in the abstract — searching the summary first labelled a reaffirmation as a
+        # downgrade. Tatva Chintan's CRISIL rationale (truth: downgraded) carries
+        # "downgraded to"/"downgraded from" four times, all inside the header.
+        facts["rating_action"] = (_action_from(_strip_markup(source_text)[:4000])
+                                 or _action_from(text[:4000]))
 
     return facts
 
@@ -555,7 +650,7 @@ def main() -> None:
         doc_id = str(row.get("doc_id", ""))
 
         try:
-            pdf_bytes = download_bytes(drive, drive_fid)
+            pdf_bytes = _fetch_doc(drive, drive_fid, row)
             log(f"  PDF: {len(pdf_bytes):,} bytes")
 
             display_name = f"{row.get('symbol', 'DOC')}_{doc_id[:12]}.pdf"
@@ -574,8 +669,7 @@ def main() -> None:
             # HTML/text rationales only: a real PDF would need a text extraction pass,
             # and the agencies that bury the action in markup are exactly the ones
             # serving HTML.
-            _src = ("" if pdf_bytes[:4] == b"%PDF"
-                    else pdf_bytes.decode("utf-8", "ignore"))
+            _src = _source_text(pdf_bytes)
             facts = parse_gemini_response(markdown_text, row, source_text=_src)
             log(f"  Parsed: agency={facts['agency']}, rating={facts['rating']}, "
                 f"outlook={facts['outlook']}, action={facts['rating_action']}")
@@ -756,6 +850,92 @@ def _self_test() -> int:
     check("source supplies the downgrade", f_src["rating_action"] == "Downgrade")
     check("the rating itself is unchanged by the source lookup",
           f_src["rating"] == f_no["rating"])
+
+    # ---- document fetch: Drive first, SOURCE when retention has deleted it
+    class _OKDrive:
+        pass
+    _live = {"id1": b"%PDF-1.4 real bytes"}
+    import extract_rating as _ER
+    _orig_db = _ER.download_bytes
+    try:
+        _ER.download_bytes = lambda drv, fid: _live[fid]
+        r_ok = pd.Series({"pdf_url": "http://agency/x.html"})
+        check("Drive copy used when alive",
+              _ER._fetch_doc(None, "id1", r_ok) == b"%PDF-1.4 real bytes")
+        # Drive gone + no url -> the original error must surface, not a silent empty doc
+        def _boom(drv, fid):
+            raise RuntimeError("HttpError 404")
+        _ER.download_bytes = _boom
+        raised = False
+        try:
+            _ER._fetch_doc(None, "id1", pd.Series({"pdf_url": ""}))
+        except Exception:
+            raised = True
+        check("no source url -> error surfaces", raised)
+        raised2 = False
+        try:
+            _ER._fetch_doc(None, "id1", pd.Series({"pdf_url": "nan"}))
+        except Exception:
+            raised2 = True
+        check("literal nan url is not a url", raised2)
+    finally:
+        _ER.download_bytes = _orig_db
+
+    # ---- the rating column is never the agency column
+    live = ["rating agency", "instrument type", "rated amount (rs. crore)",
+            "current rating/outlook (feb 26, 2026)", "fy2025 rating/outlook"]
+    check("agency column rejected", _rating_col(live) == 3)
+    check("current beats historical",
+          _rating_col(["fy2024 rating", "current rating/outlook"]) == 1)
+    check("plain rating column still found",
+          _rating_col(["instrument", "rating/outlook"]) == 1)
+    check("outlook-only header works", _rating_col(["instrument", "outlook"]) == 1)
+    check("no rating column -> None", _rating_col(["instrument", "amount"]) is None)
+    check("agency-only header is not a rating column",
+          _rating_col(["rating agency", "amount"]) is None)
+
+    # ---- hypothetical downgrades in Rating Sensitivities must not become actions
+    sens = ("Rating Sensitivities Negative factors: sustained weakening in margins "
+            "may lead to a downgrade of the ratings")
+    check("hypothetical downgrade ignored", _action_from(sens) == "")
+    check("hypothetical upgrade ignored",
+          _action_from("an upgrade could follow sustained improvement") == "")
+    check("real downgrade still caught",
+          _action_from("Ratings downgraded to Crisil BBB+/Stable") == "Downgrade")
+    check("real reaffirmation still caught",
+          _action_from("[ICRA]AA+(Stable); reaffirmed for enhanced amount") == "Reaffirmed")
+
+    # ---- the SOURCE outranks the model summary, which paraphrases
+    src_reaff = "<p>[ICRA]AA+(Stable) /[ICRA]A1+; reaffirmed for enhanced amount</p>"
+    summary_says_downgrade = ("| Rating Agency | Current Rating/Outlook |" + chr(10)
+                              + "|---|---|" + chr(10)
+                              + "| ICRA | [ICRA]AA+(Stable) |" + chr(10)
+                              + "A downgraded peer was discussed at length." + chr(10))
+    row2 = pd.Series({"isin": "I", "symbol": "APLAPOLLO", "announcement_date": "2026-06-28"})
+    f2 = parse_gemini_response(summary_says_downgrade, row2, source_text=src_reaff)
+    check("source reaffirmation beats summary downgrade talk",
+          f2["rating_action"] == "Reaffirmed")
+    check("agency name is NOT stored as the rating", f2["rating"] != "ICRA")
+    check("the real rating is stored", "AA+" in f2["rating"])
+
+    # ---- the rating cell is normalised, never stored verbatim
+    icra_tbl = ("| Rating Agency | Current Rating/Outlook |" + chr(10)
+                + "|---|---|" + chr(10)
+                + "| ICRA | [ICRA]AA+(Stable)/[ICRA]A1+ |" + chr(10))
+    row3 = pd.Series({"isin": "I", "symbol": "APLAPOLLO", "announcement_date": "2026-06-28"})
+    f3 = parse_gemini_response(icra_tbl, row3)
+    check("ICRA bracket prefix stripped", f3["rating"] == "AA+")
+    check("short-term rating not stored as outlook", f3["outlook"] != "A1+")
+    check("outlook still read", f3["outlook"] == "Stable")
+    check("agency still ICRA", f3["agency"] == "ICRA")
+    # A mis-picked column holding no rating symbol reports DATA_MISSING, not the text.
+    check("agency name never becomes a rating", _detect_rating("CareEdge") == "DATA_MISSING")
+
+    # ---- source text works for PDFs as well as HTML
+    check("html source decoded", "reaffirmed" in _source_text(b"<p>reaffirmed</p>"))
+    check("empty source safe", _source_text(b"") == "" and _source_text(None) == "")
+    check("undecodable pdf degrades to empty, not a crash",
+          _source_text(b"%PDF-1.4 not really a pdf") == "")
 
     print(f"\nextract_rating self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
