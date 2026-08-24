@@ -81,6 +81,19 @@ jobs:
           pip install -r scripts/requirements.txt
 
       # Reads guidance_tracker + ppt_guidance + ar_guidance + mgmt_credibility +
+      # Order-inflow actuals FIRST, because build_guidance_progress reads
+      # announcement_ledger.order_value_cr and a company that guided "Rs 12,000 cr of
+      # FY27 order inflow" otherwise shows 0% booked purely because the amounts were
+      # never parsed. ingest_announcements only started capturing the value on
+      # 2026-08-15, so every earlier order_win row reads NaN without this.
+      #
+      # Safe to run every week: it is a pure regex pass over summary text already on the
+      # ledger — no Gemini quota, no network, and idempotent (rows that already carry a
+      # value are left alone unless --overwrite).
+      - name: Backfill order values on the announcement ledger
+        run: python scripts/backfill_order_values.py
+        continue-on-error: true
+
       # financials_3stmt + announcement_ledger; writes guidance_progress.parquet
       # and appends this Monday to guidance_progress_history.parquet.
       - name: Build guidance progress (weekly snapshot)

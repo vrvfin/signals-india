@@ -51,6 +51,8 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              RateLimitExhausted)  # Stage 3 event tags · alt fallback
 from gemini_pool import (BucketPool, load_keys, AllBucketsExhausted,
                          FatalCallError)
+from guidance_value import USDINR                    # order-value currency (2026-08-15)
+from order_value import parse_order_value            # prose fallback for the same
 
 SUMMARY_PROMPT = (
     "You are an equity analyst. This is a BSE corporate filing. In 3-5 crisp "
@@ -61,7 +63,11 @@ SUMMARY_PROMPT = (
     "fences, no other text) classifying the filing:\n"
     '{"event_type":"<one of: results|order_win|capex|mna|fundraise|debt|rating|'
     'litigation|management_change|buyback|dividend|expansion|regulatory|other>",'
-    '"materiality":"high|med|low","direction":"bull|bear|neutral"}')
+    '"materiality":"high|med|low","direction":"bull|bear|neutral",'
+    '"order_value_cr":<value of the NEW order/contract in Rs crore, as a plain '
+    'number; null unless this filing announces an order/contract win AND states '
+    'its value. Never the existing order book or a revenue figure.>,'
+    '"order_currency":"INR or USD — the currency as WRITTEN in the filing"}')
 
 # Stage 3 event-tag vocab (LLM-derived, ADDITIVE to the BSE category/subcategory).
 _EVENT_TYPES = {"results", "order_win", "capex", "mna", "fundraise", "debt", "rating",
@@ -71,24 +77,58 @@ _MATERIALITY = {"high", "med", "low"}
 _DIRECTION = {"bull", "bear", "neutral"}
 
 
+def _order_value(o: dict, text: str) -> tuple[float | None, str]:
+    """(order_value_cr, order_currency) from the JSON tail, falling back to a regex
+    read of the prose (user 2026-08-15).
+
+    The model is asked for the value in Rs crore, but it does drop the field or
+    return it in the source currency. So: take a usable number from the tail, and
+    when the tail says USD convert it here rather than trusting the model to have;
+    when the tail gives nothing, parse the summary text. Anything unparseable stays
+    None — never a zero, because a null order and a genuinely zero order must not
+    look the same to the tracker.
+    """
+    cur = str(o.get("order_currency") or "").strip().upper()
+    cur = cur if cur in ("INR", "USD") else ""
+    raw = o.get("order_value_cr")
+    try:
+        val = float(str(raw).replace(",", "").strip()) if raw not in (None, "", "null") else None
+    except (TypeError, ValueError):
+        val = None
+    if val is not None and val > 0:
+        # the field is SPECIFIED in Rs crore; if the model answered in USD anyway,
+        # its own currency tag is the only signal we have that it did
+        if cur == "USD":
+            return (round(val * USDINR / 10.0, 4), "USD")
+        return (round(val, 4), cur or "INR")
+    p = parse_order_value(text)
+    return (p["value_cr"], p["currency"]) if p else (None, "")
+
+
 def _parse_event_tags(resp: str) -> tuple[dict, str]:
     """Return (tags, clean_summary). Pull the JSON tail (event_type/materiality/
-    direction) via the shared salvage helper; strip it from the stored summary text.
-    Defaults are safe ('other'/'low'/'neutral') so a missing/garbled tail never breaks
-    the existing summary path."""
-    tags = {"event_type": "other", "materiality": "low", "direction": "neutral"}
+    direction, plus order_value_cr/order_currency from 2026-08-15) via the shared
+    salvage helper; strip it from the stored summary text.
+    Defaults are safe ('other'/'low'/'neutral', order value None) so a missing or
+    garbled tail never breaks the existing summary path."""
+    tags = {"event_type": "other", "materiality": "low", "direction": "neutral",
+            "order_value_cr": None, "order_currency": ""}
     summary = resp or ""
+    # strip any {...} json object(s) from the human summary
+    clean = re.sub(r"\{[^{}]*\}", "", summary).strip()
     for o in salvage_json_objects(resp):
         if "event_type" in o or "direction" in o:
             tags = {
                 "event_type": clamp(o.get("event_type"), _EVENT_TYPES, "other"),
                 "materiality": clamp(o.get("materiality"), _MATERIALITY, "low"),
                 "direction": clamp(o.get("direction"), _DIRECTION, "neutral"),
+                "order_value_cr": None, "order_currency": "",
             }
+            if tags["event_type"] == "order_win":
+                v, c = _order_value(o, clean)
+                tags["order_value_cr"], tags["order_currency"] = v, c
             break
-    # strip any {...} json object(s) from the human summary
-    summary = re.sub(r"\{[^{}]*\}", "", summary).strip()
-    return tags, summary
+    return tags, clean
 DAILY_KEEP_DAYS = 35      # keep ~1 month+ of daily_update_summary_*.md history
 
 ANN_API = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
@@ -121,7 +161,13 @@ LEDGER_COLS = ["newsid", "isin", "symbol", "scrip_cd", "ann_date", "category",
                "subcategory", "flag", "headline", "attachment", "pdf_sha",
                "summary", "status", "discovered_at", "processed_at",
                # Stage 3: LLM event tags (ADDITIVE; old rows read NaN).
-               "event_type", "materiality", "direction"]
+               "event_type", "materiality", "direction",
+               # Order value (ADDITIVE 2026-08-15; old rows read NaN until
+               # backfill_order_values.py fills them). Always Rs crore whatever
+               # currency the filing used; order_currency records which it was.
+               # Feeds guidance_progress: the ONLY actuals source for an
+               # order-inflow commitment.
+               "order_value_cr", "order_currency"]
 
 
 def _folder(drive, parts: str) -> str:
@@ -571,7 +617,9 @@ def main() -> None:
                           "discovered_at": now, "processed_at": now,
                           "event_type": _tags["event_type"],
                           "materiality": _tags["materiality"],
-                          "direction": _tags["direction"]})
+                          "direction": _tags["direction"],
+                          "order_value_cr": _tags["order_value_cr"],
+                          "order_currency": _tags["order_currency"]})
         digest.append((k["symbol"], k["category"], k["ann_date"],
                        k["headline"], summary))
         # store PDF for the 2-day retention sweep + append company_page section
