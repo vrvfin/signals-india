@@ -31,6 +31,9 @@ WHAT IT DOES
                       distinguish them, so it never feeds growth)   unit "%"
     level_pct         a % in an FY-headed column = a LEVEL target for that FY
     absolute_inr      "INR530 crores", "26,000 million"    -> Rs cr, unit "INR_cr"
+    absolute_usd      "USD 10 mn", "$550k - $600k"         -> USD mn, unit "USD_mn"
+                      (2026-08-15; also fills value_num_inr_cr via USDINR. Before
+                       this, USD was silently stamped INR_cr at the rupee scale.)
     absolute_units    "115,000 MTPA", "60k sites"          -> qty,   unit as written
     multiple          "double", "3x (Tripling)"            -> 2.0/3.0, unit "x"
     qualitative       "Double-digit", "Flattish"           -> None
@@ -82,14 +85,77 @@ _RE_PCT_TOKEN = re.compile(r"%")
 _RE_BARE = re.compile(rf"^\s*({_NUM})\s*$")
 _RE_COMMA_GROUPED = re.compile(r"\d,\d")
 
-# currency -> multiplier into Rs crore (1 cr = 10 million)
-_CUR_SCALE = (
-    (re.compile(r"\bcrores?\b|\bcr\b", re.I), 1.0),
-    (re.compile(r"\blakhs?\b", re.I), 0.01),
-    (re.compile(r"\bbillions?\b|\bbn\b", re.I), 100.0),
-    (re.compile(r"\bmillions?\b|\bmn\b", re.I), 0.1),
-    (re.compile(r"\bthousand\b|\bk\b", re.I), 0.0001),
+# --- currency + magnitude (rewritten 2026-08-15) ----------------------------------
+# THE BUG THIS FIXES: every absolute currency amount was stamped "INR_cr" whatever
+# the currency was actually written in, and the magnitude word was only recognised
+# in its SPACED form. Verified on live guidance_tracker order_book rows:
+#     "ABS: USD 10 mn"              -> 1.0    INR_cr   (real: ~Rs 88 cr)
+#     "ABS: $30,000"                -> 30000  INR_cr   (real: ~Rs 0.26 cr)
+#     "ABS: $550k - $600k"          -> 550    INR_cr   (\bk\b cannot match "550k":
+#                                                       no word boundary digit->k)
+#     "ABS: USD 0.55-0.60 Mn/month" -> 0.055  INR_cr
+# 10 of 15 sampled order_book rows are USD, so rupee order targets were unusable.
+#
+# An INR marker always WINS when both currencies appear ("USD 10mn (INR 88 cr)"),
+# so a cell that was already rupees keeps its old classification exactly.
+_RE_INR = re.compile(r"₹|\brs\.?\b|\binr\b|\brupees?\b", re.I)
+_RE_USD = re.compile(r"\busd\b|\bus\s?\$|\$|\bdollars?\b", re.I)
+# LaTeX math delimiters leak out of PDF text extraction ("$\ge$ 10%", "$\sim$5%").
+# The '$' there is a delimiter, not a dollar sign — stripped before any currency
+# test so the cell types as the growth rate it actually is.
+_RE_LATEX = re.compile(r"\$\s*\\[a-zA-Z]+\s*\$")
+
+# Approximate USD->INR. Guidance is a forward target with range/rounding noise far
+# wider than FX drift, so a constant is honest here — a live rate would imply a
+# precision the source text does not have. Bump it when it drifts materially.
+USDINR = 88.0
+
+# Magnitude words, in the SPACED form ("10 mn") and the number-ATTACHED form
+# ("550k", "3.5M", "530cr") that the old \b-anchored patterns could never match.
+# Order matters: bn before mn so "10bn" is not read as millions.
+_MAG_PATTERNS = (
+    (re.compile(r"\bcrores?\b|\bcr\b|\d\s*crs?\b", re.I), "cr"),
+    (re.compile(r"\blakhs?\b|\d\s*lakhs?\b", re.I), "lakh"),
+    (re.compile(r"\bbillions?\b|\bbn\b|\d\s*bn?\b", re.I), "bn"),
+    (re.compile(r"\bmillions?\b|\bmn\b|\d\s*mn?\b", re.I), "mn"),
+    (re.compile(r"\bthousand\b|\bk\b|\d\s*k\b", re.I), "k"),
 )
+# magnitude -> multiplier into the currency's NATURAL unit:
+#   INR -> crore (1 cr = 10 million)      USD -> million
+_SCALE_INR = {"cr": 1.0, "lakh": 0.01, "bn": 100.0, "mn": 0.1, "k": 0.0001,
+              None: 1.0}          # bare INR in a guidance cell has always meant crore
+_SCALE_USD = {"cr": 10.0, "lakh": 0.1, "bn": 1000.0, "mn": 1.0, "k": 0.001,
+              None: 1e-6}         # bare "$30,000" is literally dollars
+
+
+def _magnitude(text: str):
+    """The magnitude word in `text`: 'cr'|'lakh'|'bn'|'mn'|'k', or None."""
+    for rx, tag in _MAG_PATTERNS:
+        if rx.search(text):
+            return tag
+    return None
+
+
+def _currency(text: str) -> str:
+    """'USD' only when a dollar marker is present and no rupee marker is."""
+    if _RE_INR.search(text):
+        return "INR"
+    return "USD" if _RE_USD.search(text) else "INR"
+
+
+def _money(text: str, base: float) -> tuple[str, float, str, float]:
+    """(value_type, value_num, value_unit, value_num_inr_cr) for an absolute amount.
+
+    `base` is the raw number already chosen from the text (single or range midpoint).
+    """
+    cur = _currency(text)
+    mag = _magnitude(text)
+    if cur == "USD":
+        usd_mn = round(base * _SCALE_USD[mag], 4)
+        # 1 USD mn * rate = that many INR mn = rate/10 INR cr
+        return ("absolute_usd", usd_mn, "USD_mn", round(usd_mn * USDINR / 10.0, 4))
+    inr_cr = round(base * _SCALE_INR[mag], 4)
+    return ("absolute_inr", inr_cr, "INR_cr", inr_cr)
 # HARD currency markers — these unambiguously mean money.
 _RE_CURRENCY_HARD = re.compile(r"₹|\brs\.?\b|\binr\b|\$|\busd\b|\bcrores?\b|\bcr\b", re.I)
 # Magnitude words. "lakh"/"million" are SCALE, not currency: "5.25 lakh units" and
@@ -160,10 +226,15 @@ def _pct_from_text(text: str) -> float | None:
 
 
 def _result(value_type: str, value_num: float | None, value_unit: str,
-            growth_pct: float | None, raw: str, note: str = "") -> dict:
+            growth_pct: float | None, raw: str, note: str = "",
+            inr_cr: float | None = None) -> dict:
+    """`value_num_inr_cr` (2026-08-15) is the amount in Rs crore whatever currency
+    the cell was written in — None for anything that is not an absolute amount. It
+    is an ADDITIONAL key: every caller reads specific keys, never **unpacks, so old
+    consumers are unaffected."""
     return {"value_type": value_type, "value_num": value_num,
             "value_unit": value_unit, "growth_pct": growth_pct,
-            "raw": raw, "note": note}
+            "raw": raw, "note": note, "value_num_inr_cr": inr_cr}
 
 
 def parse_guidance_value(raw, metric: str = "", horizon: str = "",
@@ -184,7 +255,7 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
     `growth_pct` is non-None ONLY for a genuine growth rate — that is the single
     value any grower/ranker should consume.
     """
-    text = str(raw or "").strip()
+    text = _RE_LATEX.sub(" ", str(raw or "")).strip()
     metric = str(metric or "").strip().lower()
     horizon = str(horizon or "").strip().upper()
     if not text or text.upper() in ("NA", "N/A", "NONE", "-", "--"):
@@ -206,13 +277,12 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
                     _RE_CURRENCY_SCALE.search(body) and not _body_phys):
                 nums = _numbers(body)
                 if nums:
-                    scale = 1.0
-                    for rx, mult in _CUR_SCALE:
-                        if rx.search(body):
-                            scale = mult
-                            break
-                    return _result("absolute_inr", round(nums[0] * scale, 4),
-                                   "INR_cr", None, text, "declared ABS")
+                    # nums[0], NOT the range midpoint — this branch has always taken
+                    # the first bound and range handling is not what the currency fix
+                    # is for. Keeping it means a declared-ABS rupee cell is untouched.
+                    vt, vn, vu, inr = _money(body, nums[0])
+                    return _result(vt, vn, vu, None, text, "declared ABS",
+                                   inr_cr=inr)
             phys_m = _RE_PHYS.search(body)
             nums = _numbers(body)
             return _result("absolute_units", round(nums[0], 4) if nums else None,
@@ -249,17 +319,14 @@ def parse_guidance_value(raw, metric: str = "", horizon: str = "",
     if has_cur and not (has_pct and not _RE_CURRENCY.search(text.split("%")[0])):
         nums = _numbers(text)
         if nums:
-            scale = 1.0
-            for rx, mult in _CUR_SCALE:
-                if rx.search(text):
-                    scale = mult
-                    break
             rng = _RE_RANGE.search(text)
             base = ((_to_float(rng.group(1)) + _to_float(rng.group(2))) / 2
                     if rng and _to_float(rng.group(1)) is not None
                     and _to_float(rng.group(2)) is not None else nums[0])
-            return _result("absolute_inr", round(base * scale, 4), "INR_cr", None,
-                           text, "rupee target")
+            vt, vn, vu, inr = _money(text, base)
+            return _result(vt, vn, vu, None, text,
+                           "rupee target" if vt == "absolute_inr" else "USD target",
+                           inr_cr=inr)
         return _result("qualitative", None, "", None, text, "currency, no number")
 
     # 2) physical / count units -> absolute quantity
@@ -369,6 +436,10 @@ def describe(parsed: dict) -> str:
         return f"{n:.1f}% level"
     if t == "absolute_inr":
         return f"Rs {n:,.0f}cr target"
+    if t == "absolute_usd":
+        inr = parsed.get("value_num_inr_cr")
+        return (f"$ {n:,.2f}mn target".replace(".00mn", "mn")
+                + (f" (~Rs {inr:,.0f}cr)" if inr else ""))
     if t == "absolute_units":
         return f"{n:,.0f} {u}"
     if t == "multiple":
@@ -376,3 +447,92 @@ def describe(parsed: dict) -> str:
     if t == "ambiguous_absolute":
         return f"{n:,.0f} (unit unclear)"
     return str(parsed.get("raw", ""))[:40]
+
+
+# --------------------------------------------------------------------------- #
+#  self-test — offline, no Drive, no network                                    #
+# --------------------------------------------------------------------------- #
+
+# (raw, metric, horizon, expected value_type, expected value_num, expected unit)
+# The USD block is the 2026-08-15 fix; every other case is a REGRESSION guard —
+# these are the classifications the live table already relies on and they must not
+# move. Rupee cases were verified against live guidance_tracker rows.
+_CASES = [
+    # --- the fix: USD is never silently INR ---------------------------------
+    ("ABS: USD 10 mn",              "order_book", "1Y",  "absolute_usd", 10.0,   "USD_mn"),
+    ("ABS: $30,000 (small)",        "order_book", "1Y",  "absolute_usd", 0.03,   "USD_mn"),
+    ("ABS: $550k - $600k",          "order_book", "NEXT_QTR", "absolute_usd", 0.55, "USD_mn"),
+    ("ABS: USD 0.55-0.60 Mn/month", "order_book", "NEXT_QTR", "absolute_usd", 0.55, "USD_mn"),
+    ("ABS: $1.5 million",           "order_book", "1Y",  "absolute_usd", 1.5,    "USD_mn"),
+    ("ABS: $3.5-4.0M",              "order_book", "1Y",  "absolute_usd", 3.5,    "USD_mn"),
+    ("USD 25 billion",              "revenue",    "3Y",  "absolute_usd", 25000.0, "USD_mn"),
+    ("$100,000,000",                "revenue",    "1Y",  "absolute_usd", 100.0,  "USD_mn"),
+    # LaTeX delimiter, NOT dollars — must stay a growth rate
+    (r"$\ge$ 10%",                  "revenue",    "1Y",  "growth_pct",   10.0,   "%"),
+    # an INR marker WINS when both appear -> unchanged rupee classification
+    ("ABS: USD 10mn (INR 88 cr)",   "order_book", "1Y",  "absolute_inr", 10.0,   "INR_cr"),
+    # --- regression: rupee cells must classify exactly as before -------------
+    ("ABS: INR 530 crores",         "revenue",    "1Y",  "absolute_inr", 530.0,  "INR_cr"),
+    ("ABS: INR 5300 cr (to be executed)", "order_book", "1Y", "absolute_inr", 5300.0, "INR_cr"),
+    ("ABS: INR 20000 cr",           "order_book", "3Y+", "absolute_inr", 20000.0, "INR_cr"),
+    ("ABS: >INR 357.63 cr",         "order_book", "1Y",  "absolute_inr", 357.63, "INR_cr"),
+    ("INR978.75 crores (Derived)",  "revenue",    "1Y",  "absolute_inr", 978.75, "INR_cr"),
+    ("Rs 26,000 million",           "revenue",    "1Y",  "absolute_inr", 2600.0, "INR_cr"),
+    ("INR 100 cr/year (STC)",       "order_book", "1Y",  "absolute_inr", 100.0,  "INR_cr"),
+    # --- regression: non-currency typing is untouched ------------------------
+    ("19% - 26% (CAGR)",            "revenue",    "3Y",  "growth_pct",   22.5,   "%"),
+    ("32.5% CAGR",                  "revenue",    "1Y",  "growth_pct",   32.5,   "%"),
+    ("6.5% (CAGR 2026-2030)",       "revenue",    "3Y",  "growth_pct",   6.5,    "%"),
+    ("LVL: 23.5% (EBITDA margin)",  "margin",     "1Y",  "margin_pct",   23.5,   "%"),
+    ("LVL: 75% (utilisation)",      "capacity",   "1Y",  "utilisation_pct", 75.0, "%"),
+    ("ABS: 115,000 MTPA",           "capacity",   "1Y",  "absolute_units", 115000.0, "MTPA"),
+    ("ABS: 5.25 lakh units",        "volume",     "1Y",  "absolute_units", 5.25, "UNITS"),
+    ("ABS: 1,409+ trains",          "order_book", "1Y",  "absolute_units", 1409.0, ""),
+    ("ABS: 37 GW",                  "order_book", "3Y+", "absolute_units", 37.0,  "GW"),
+    ("Double-digit",                "revenue",    "1Y",  "qualitative",  None,   ""),
+    ("3x (Tripling)",               "revenue",    "3Y",  "multiple",     3.0,    "x"),
+    ("178,000",                     "capacity",   "1Y",  "ambiguous_absolute", 178000.0, ""),
+    ("NA",                          "revenue",    "1Y",  "unparsed",     None,   ""),
+]
+
+
+def _self_test() -> int:
+    fails = []
+    for raw, metric, hz, want_t, want_n, want_u in _CASES:
+        got = parse_guidance_value(raw, metric=metric, horizon=hz, typed_prompt=True)
+        ok = (got["value_type"] == want_t
+              and got["value_unit"] == want_u
+              and (want_n is None) == (got["value_num"] is None)
+              and (want_n is None or abs(got["value_num"] - want_n) < 0.01))
+        if not ok:
+            fails.append(f"  {raw!r}\n     want {want_t}/{want_n}/{want_u!r}\n"
+                         f"     got  {got['value_type']}/{got['value_num']}/"
+                         f"{got['value_unit']!r}")
+    # USD -> INR conversion must be populated and sane
+    u = parse_guidance_value("ABS: USD 10 mn", metric="order_book", horizon="1Y")
+    if u.get("value_num_inr_cr") != round(10.0 * USDINR / 10.0, 4):
+        fails.append(f"  USD->INR conversion wrong: {u.get('value_num_inr_cr')}")
+    # a rupee amount reports itself in rupees
+    r = parse_guidance_value("ABS: INR 530 crores", metric="revenue", horizon="1Y")
+    if r.get("value_num_inr_cr") != 530.0:
+        fails.append(f"  INR passthrough wrong: {r.get('value_num_inr_cr')}")
+    # a non-amount carries no rupee figure at all
+    g = parse_guidance_value("19% - 26%", metric="revenue", horizon="3Y")
+    if g.get("value_num_inr_cr") is not None:
+        fails.append(f"  growth row should have no inr_cr: {g.get('value_num_inr_cr')}")
+
+    total = len(_CASES) + 3
+    if fails:
+        print(f"FAIL {len(fails)}/{total}")
+        print("\n".join(fails))
+        return 1
+    print(f"OK  {total}/{total} guidance_value cases pass  (USDINR={USDINR})")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
+    for _a in sys.argv[1:]:
+        print(f"{_a!r}\n  {parse_guidance_value(_a)}")
