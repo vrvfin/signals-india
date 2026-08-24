@@ -50,6 +50,8 @@ MAIL_KEYS = {                      # key -> human label (app.py shows these)
     "pf_decision":     "PF decision scorecard: index + movers + buy/sell/hold verdicts + sold relook",
     "infra_health":    "Infra code-red: broken keys/cookies + fix steps (CRIT bypasses this)",
     "quarter_teardown": "Quarterly teardown: clean PAT + divergence engine + red-flag register + deck",
+    # the only WEEKLY mail — runs Monday in its own workflow, not the 19:00 batch
+    "guidance_progress": "WEEKLY guidance progress: how far along each promise is + what moved this week",
 }
 
 

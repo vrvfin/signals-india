@@ -1,0 +1,93 @@
+name: guidance_progress
+
+# WEEKLY — how far along is each promise management made?
+#
+# The watchlist (t4_nightly) answers "who is promising big". This answers the
+# other half: "who is actually keeping the promise". It measures a commitment
+# MID-FLIGHT rather than waiting for a terminal verdict —
+#   pct_of_target = actual_to_date / guided
+#   time_pct      = quarters_elapsed / quarters
+#   pace_ratio    = pct_of_target / time_pct     (>1 = running ahead)
+#
+# Every other mail in this repo is daily and rides the 19:00 IST batch. This one
+# is weekly by design: the "moved this week" section needs a prior Monday
+# snapshot to diff against, and the financial feeds only move when companies
+# report, so a daily cadence would send the same numbers six days running.
+#
+# Monday 04:00 UTC = 09:30 IST. Deliberately AFTER fundamentals.yml
+# (01:00 UTC Monday = 06:30 IST, full universe), because the actuals come from
+# financials_3stmt which that job refreshes.
+#
+# No _extract.lock is taken: build_guidance_progress writes only its own two
+# tables (guidance_progress + guidance_progress_history) and nothing else in the
+# repo writes them, so there is no contention with Phase 2 or the backfill.
+#
+# Steps deliberately do NOT use continue-on-error, unlike the t4 chain. This
+# workflow exists solely to produce one mail — if the table build fails, the
+# mail would report LAST week's numbers under this week's date, which is worse
+# than no mail. A failure should be visible in the Actions list.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"          # 04:00 UTC Monday = 09:30 IST Monday
+  workflow_dispatch:
+    inputs:
+      pf_only:
+        description: "Portfolio holdings only (yes/no)"
+        default: "no"
+
+concurrency:
+  group: guidance-progress
+  cancel-in-progress: false      # never two passes at once (parquet writes)
+
+jobs:
+  progress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          # write the token to BOTH paths — get_drive() detects a refresh_token
+          # in the client-secret path and uses it, but any script that reads
+          # GDRIVE_OAUTH_TOKEN_PATH first needs a real file there too.
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      # Reads guidance_tracker + ppt_guidance + ar_guidance + mgmt_credibility +
+      # financials_3stmt + announcement_ledger; writes guidance_progress.parquet
+      # and appends this Monday to guidance_progress_history.parquet.
+      - name: Build guidance progress (weekly snapshot)
+        run: python scripts/build_guidance_progress.py
+
+      # Toggle key 'guidance_progress' in mail_settings.json (app sidebar).
+      - name: Send weekly guidance progress mail
+        run: >
+          python scripts/run_guidance_progress_mail.py
+          ${{ github.event.inputs.pf_only == 'yes' && '--pf-only' || '' }}
