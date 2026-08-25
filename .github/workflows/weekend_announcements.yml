@@ -1,0 +1,96 @@
+name: weekend_announcements
+
+# WEEKEND-ONLY companion to daily.yml.
+#
+# Companies file at weekends — board meetings on Saturdays, rating actions dated Sunday,
+# order wins announced when the market is shut. daily.yml carries the announcement summary
+# and the PF brief, but it runs `30 10 * * 1-5` because the rest of that pipeline (OHLCV,
+# features, eight strategies) has nothing to do when the market is closed.
+#
+# The weekday lookback of 4 days means a Saturday filing is not LOST — it is picked up on
+# Monday. This workflow is about latency, not loss: you hear about it on the day.
+#
+# Deliberately NOT a 7-day cron on daily.yml. That would run hours of OHLCV and strategy
+# work against a market that did not trade, for no output.
+#
+# Runs exactly the two steps that matter at a weekend, in the same order and with the same
+# arguments as the weekday run, so there is one behaviour to reason about, not two.
+
+on:
+  schedule:
+    # 16:00 IST Saturday and Sunday — the same wall-clock slot as the weekday run.
+    - cron: "30 10 * * 6,0"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Announcement lookback in days"
+        default: "4"
+
+concurrency:
+  # Shares a group with nothing else on purpose: if a weekday run is somehow still going,
+  # the announcement ledger's own newsid dedupe makes a concurrent pass harmless.
+  group: weekend-announcements
+  cancel-in-progress: false
+
+jobs:
+  announcements:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      # Same arguments as daily.yml. newsid dedupe means a filing already summarised on
+      # Friday is skipped, so the overlapping lookback costs nothing.
+      - name: BSE announcement summaries
+        run: >
+          python scripts/ingest_announcements.py
+          --lookback-days "${{ inputs.lookback_days || '4' }}"
+          --top-n 300 --limit 300
+        continue-on-error: true
+        env:
+          FREE_POOL:           ${{ secrets.FREE_POOL }}
+          BACKFILL_GEMINI_KEY: ${{ secrets.BACKFILL_GEMINI_KEY }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY:    ${{ secrets.CEREBRAS_API_KEY }}
+
+      # Reads the ledger the step above just refreshed. Pure reader — no Gemini spend.
+      - name: PF Daily Brief email
+        run: >
+          python scripts/daily_brief.py
+          --research-days 30 --news-days 21 --fda-days 60 --rbi-days 7
+        continue-on-error: true
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:       ${{ secrets.NOTIFY_EMAIL }}

@@ -296,6 +296,26 @@ def scheduled_ahead(calendar: pd.DataFrame, pf, on: date | None = None,
     return {str(i).strip(): by_sym[_norm(s)] for i, s, _n in pf if _norm(s) in by_sym}
 
 
+def mailed_content_keys(ledger: pd.DataFrame, season: str) -> dict:
+    """{doc_id: content_key} for ledger rows that recorded one.
+
+    A row written before `content_key` existed returns nothing, which is what keeps the
+    change check from firing on the entire back catalogue the first time it runs.
+    """
+    if ledger is None or ledger.empty:
+        return {}
+    if "doc_id" not in ledger.columns or "content_key" not in ledger.columns:
+        return {}
+    l = ledger[ledger["season"].astype(str) == str(season)]
+    out = {}
+    for _, r in l.iterrows():
+        d = str(r.get("doc_id") or "").strip()
+        k = str(r.get("content_key") or "").strip()
+        if d and k and k.lower() not in ("none", "nan"):
+            out[d] = k
+    return out
+
+
 def already_mailed_docs(ledger: pd.DataFrame, season: str) -> set[str]:
     """Set of doc_ids already mailed this season."""
     if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
@@ -497,7 +517,8 @@ def season_rollup(rows: list[dict]) -> dict:
 def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFrame,
              season: str, on: date | None = None, window_days: int = 2,
              doc_types=("results", "presentation", "rating"),
-             require_calendar: bool = False, tables: dict | None = None) -> list[dict]:
+             require_calendar: bool = False, tables: dict | None = None,
+             content_keys: dict | None = None) -> list[dict]:
     """Which holdings should be mailed now, and for what.
 
     A (holding, doc_type) is due when the document is PRESENT and it has not already been
@@ -511,6 +532,7 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
     mailed_docs = already_mailed_docs(ledger, season)
     legacy = already_mailed(ledger, season)          # rows written before doc_id existed
     tracked = tracked_docs(ledger, season)           # ...and those written after
+    prev_keys = mailed_content_keys(ledger, season)  # what the mail actually SAID
     reporting = reporting_on(calendar, pf, on, window_days)
 
     out = []
@@ -523,8 +545,21 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
         # A document is due when THIS document has not been mailed. Falling back to the
         # old (isin, doc_type) key only for ledger rows written before doc_id existed
         # stops a one-off flood of re-sends on the first run under the new scheme.
+        resend = False
         if doc_id and doc_id in mailed_docs:
-            continue
+            # ALREADY MAILED IS NOT THE SAME AS ALREADY TOLD CORRECTLY. Re-reading a
+            # document can change what it says — Tatva Chintan was mailed as rating "D,
+            # Reaffirmed" and is genuinely "BBB+, Downgraded"; Yasho and Univastu went out
+            # as defaults and are upgrades. Under a pure doc_id check those corrections
+            # could never reach the reader, because the document had "been mailed".
+            #
+            # Both keys must be present to fire: a blank stored key means the row predates
+            # this field, and treating unknown as changed would re-send the back catalogue.
+            prev = prev_keys.get(doc_id, "")
+            cur = (content_keys or {}).get(doc_id, "")
+            if not (prev and cur and prev != cur):
+                continue
+            resend = True
         if not doc_id and (isin, r["doc_type"]) in legacy:
             continue
         # The legacy fallback is per-COMPANY, not global, and that distinction is the
@@ -542,7 +577,7 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
             if isin not in reporting:
                 continue
         out.append({"isin": r["isin"], "symbol": r["symbol"], "name": r["name"],
-                    "doc_type": r["doc_type"], "season": season,
+                    "doc_type": r["doc_type"], "season": season, "resend": resend,
                     "doc_id": doc_id, "doc_date": doc.get("date", ""),
                     "doc_title": doc.get("title", ""),
                     "reported_on": reporting.get(isin, "")})
@@ -821,6 +856,46 @@ def _self_test() -> int:
           set(coverage(pf, pd.DataFrame(), "Q1FY27")["status"]) == {MISSING})
     check("no calendar is empty, not an error", reporting_on(None, pf, date(2026, 8, 14)) == {})
     check("no ledger means nothing mailed", already_mailed(None, "Q1FY27") == set())
+
+    # ---- a corrected re-extract must be re-notified
+    q_corr = _q([{"isin": "INE1", "doc_type": "rating", "status": "done",
+                  "announcement_date": "2026-06-10", "doc_id": "tatva1"}])
+    led_corr = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                              "doc_id": "tatva1",
+                              "content_key": "CRISIL|D|STABLE|REAFFIRMED"}])
+    # unchanged content -> still suppressed
+    same = mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                    on=date(2026, 8, 14),
+                    content_keys={"tatva1": "CRISIL|D|STABLE|REAFFIRMED"})
+    check("unchanged content stays suppressed", not same)
+    # THE REAL CASE: stored D/Reaffirmed, re-read says BBB+/Downgrade
+    corr = mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                    on=date(2026, 8, 14),
+                    content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"})
+    check("changed content is due again", len(corr) == 1)
+    check("and is flagged as a resend", corr[0].get("resend") is True)
+    # a first send is not a resend
+    first = mail_due([pf[0]], q_corr, pd.DataFrame(), pd.DataFrame(), "Q1FY27",
+                     on=date(2026, 8, 14),
+                     content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"})
+    check("a first send is not flagged as a resend",
+          len(first) == 1 and first[0].get("resend") is False)
+    # NO FLOOD: a ledger row written before content_key existed must not re-fire
+    led_legacy_k = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1",
+                                  "doc_type": "rating", "doc_id": "tatva1"}])
+    check("legacy row with no key never re-sends",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_legacy_k, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"}))
+    check("no current key means no re-send either",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                       on=date(2026, 8, 14), content_keys={}))
+    check("mailed_content_keys reads what was stored",
+          mailed_content_keys(led_corr, "Q1FY27") == {"tatva1": "CRISIL|D|STABLE|REAFFIRMED"})
+    check("mailed_content_keys ignores other seasons",
+          mailed_content_keys(led_corr, "Q2FY27") == {})
+    check("mailed_content_keys tolerates a missing column",
+          mailed_content_keys(led_legacy_k, "Q1FY27") == {})
 
     print(f"\npf_coverage self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

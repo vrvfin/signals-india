@@ -64,7 +64,7 @@ LEDGER_NAME = "pf_company_mails.parquet"
 # every later one was silently swallowed — a rating DOWNGRADE arriving after a routine
 # reaffirmation would never have reached the reader.
 LEDGER_COLS = ["season", "isin", "symbol", "doc_type", "period", "doc_id",
-               "mailed_at", "subject"]
+               "mailed_at", "subject", "content_key"]
 MAIL_KEY = "pf_company_mails"
 MAX_HTML_BYTES = 90_000
 
@@ -248,6 +248,39 @@ def standalone_summary(isin, season, tables) -> str:
     out.append(f"<table cellpadding='4' cellspacing='0' style='{_TBL}'>"
                + "".join(body) + "</table>")
     return "".join(out)
+
+
+def content_key(doc_type: str, isin: str, tables: dict) -> str:
+    """A fingerprint of WHAT THE MAIL ASSERTS, so a correction can be detected.
+
+    "Already mailed" and "already told correctly" are different things, and the ledger
+    only knew the first. Tatva Chintan was mailed as rating "D, Reaffirmed" and is
+    genuinely "BBB+, Downgraded"; Yasho and Univastu went out as defaults and are both
+    upgrades. Keyed on doc_id alone those corrections could never reach the reader,
+    because the document had "been mailed".
+
+    DERIVED FROM THE DATA, NOT THE RENDERED HTML. Hashing the body would be simpler and
+    would re-send every holding the first time anyone edited a template — a cosmetic
+    change is not news.
+
+    RATINGS ONLY, for now. That is where the failure was proven, and where the assertion
+    is small enough to fingerprint honestly: agency, symbol, outlook, action. Returning ""
+    for the other types leaves their behaviour exactly as it was — no change detection,
+    and no risk of a spurious re-send from a key nobody has validated.
+    """
+    if doc_type != "rating":
+        return ""
+    rt = _slice(tables.get("ratings"), isin)
+    if rt.empty:
+        return ""
+    if "rating_date" in rt.columns:
+        rt = rt.sort_values("rating_date")
+    cur = rt.iloc[-1]
+
+    def _v(k):
+        return str(cur.get(k) or "").strip().upper()
+
+    return "|".join((_v("agency"), _v("rating"), _v("outlook"), _v("rating_action")))
 
 
 def presentation_body(isin, symbol, name, season, tables) -> str:
@@ -939,9 +972,20 @@ def main() -> None:
     # coverage tested only that an extractor had run, which reported 16 presentations
     # as due and then skipped every one as "nothing renderable".
     _pre = {n: _read(drive, idx, f"{n}.parquet") for n in ("ppt_highlights", "ratings")}
+    # What the mail WOULD assert right now, per document — compared against what it
+    # asserted when it was last sent, so a corrected re-extract is re-notified.
+    _latest = COV.latest_doc_per_type(pf, queue, tuple(want))
+    _keys = {}
+    for (_i, _dt), _d in _latest.items():
+        _did = str(_d.get("doc_id") or "").strip()
+        if _did:
+            _k = content_key(_dt, _i, _pre)
+            if _k:
+                _keys[_did] = _k
     due = COV.mail_due(pf, queue, calendar, ledger, season, on=today,
                        window_days=args.window_days, doc_types=tuple(want),
-                       require_calendar=args.require_calendar, tables=_pre)
+                       require_calendar=args.require_calendar, tables=_pre,
+                       content_keys=_keys)
     log(f"season={season} pf={len(pf)} due={len(due)} "
         f"({', '.join(sorted({d['doc_type'] for d in due})) or 'nothing'})")
     if not due:
@@ -968,7 +1012,8 @@ def main() -> None:
             subject = f"📊 {sym} — investor presentation, {QT.qtr_label(season)}"
         elif dt == "rating":
             body = rating_body(isin, sym, name, tables)
-            subject = f"🏷 {sym} — credit rating update"
+            subject = (f"🏷 {sym} — credit rating CORRECTED"
+                       if d.get("resend") else f"🏷 {sym} — credit rating update")
         else:
             body = ""       # results teardown is rendered by quarter_teardown itself
             subject = ""
@@ -1001,7 +1046,8 @@ def main() -> None:
                               "doc_type": dt, "period": season,
                               "doc_id": d.get("doc_id", ""),
                               "mailed_at": datetime.now().isoformat(timespec="seconds"),
-                              "subject": subject[:200]})
+                              "subject": subject[:200],
+                              "content_key": _keys.get(str(d.get("doc_id") or ""), "")})
 
     # Ledger advances ONLY on confirmed sends — a failed mail must stay due.
     if sent_rows:
@@ -1249,6 +1295,29 @@ def _self_test() -> int:
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")
     check("no ratings renders nothing", rating_body("INE_NONE", "X", "X", T) == "")
+
+    # ---- content_key: the fingerprint that makes a correction detectable
+    rt_d = pd.DataFrame([{"isin": "INE1", "agency": "CRISIL", "rating": "D",
+                          "outlook": "Stable", "rating_action": "Reaffirmed",
+                          "rating_date": "2025-06-10"}])
+    rt_fixed = pd.DataFrame([{"isin": "INE1", "agency": "CRISIL", "rating": "BBB+",
+                              "outlook": "Stable", "rating_action": "Downgrade",
+                              "rating_date": "2025-06-10"}])
+    k_old = content_key("rating", "INE1", {"ratings": rt_d})
+    k_new = content_key("rating", "INE1", {"ratings": rt_fixed})
+    check("content key is built from the data", k_old == "CRISIL|D|STABLE|REAFFIRMED")
+    check("the Tatva correction changes the key", k_old != k_new)
+    check("an identical re-read keeps the same key",
+          content_key("rating", "INE1", {"ratings": rt_d.copy()}) == k_old)
+    check("newest rating wins when several exist",
+          content_key("rating", "INE1", {"ratings": pd.concat([rt_d, rt_fixed])}) == k_new)
+    check("unknown company has no key", content_key("rating", "INE9", {"ratings": rt_d}) == "")
+    check("no ratings table is safe", content_key("rating", "INE1", {}) == "")
+    # Other doc types are deliberately NOT fingerprinted yet, so their behaviour is
+    # unchanged and no unvalidated key can trigger a spurious re-send.
+    check("presentation has no key yet", content_key("presentation", "INE1", T) == "")
+    check("results have no key yet", content_key("results", "INE1", T) == "")
+    check("content_key is in the ledger schema", "content_key" in LEDGER_COLS)
 
     print(f"\npf_company_mails self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
