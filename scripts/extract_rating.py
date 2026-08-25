@@ -235,6 +235,14 @@ def _fetch_doc(drive, drive_fid: str, row) -> bytes:
         from backfill_company_docs import _resolve_doc_url
         blob = download_pdf(_SRC_SESSION, _resolve_doc_url(url))
         if not blob:
+            # download_pdf returns None for anything without a %PDF header, which strands
+            # every agency that publishes HTML — and CRISIL, the most common source here,
+            # publishes nothing else. Measured: YASHO and UNIVASTU both failed to refetch
+            # with "not a PDF (got b\'<html xmlns...\')" while their stored rating was an
+            # unverified "D". pf_docs_sweep._fetch_raw already handles this exact case.
+            from pf_docs_sweep import _fetch_raw
+            blob = _fetch_raw(_SRC_SESSION, url)
+        if not blob:
             raise RuntimeError(f"Drive copy deleted and source refetch failed: {url[:80]}")
         return blob
 
@@ -345,6 +353,20 @@ def _detect_rating(text: str) -> str:
     return "DATA_MISSING"
 
 
+def rating_symbol(detected: str) -> str:
+    """The bare rating symbol, with any adjacent outlook removed.
+
+    `_detect_rating` returns "A-/Stable" when the outlook sits next to the symbol and
+    plain "AA+" when it does not, so the stored value depended on the agency's house
+    style. That inconsistency is not cosmetic: pf_company_mails decides "what changed
+    since the last rationale" by comparing these strings, so the same A- rating written
+    two ways would have reported a rating change that never happened. The outlook has its
+    own column and does not belong here twice.
+    """
+    t = str(detected or "").strip()
+    return t.split("/")[0].strip() if t and t != "DATA_MISSING" else (t or "DATA_MISSING")
+
+
 def parse_gemini_response(text: str, row: pd.Series,
                           source_text: str = "") -> dict:
     """Extract rating metadata from the forensic credit report.
@@ -362,7 +384,7 @@ def parse_gemini_response(text: str, row: pd.Series,
     facts.update({
         "isin": isin, "symbol": symbol, "company_name": company,
         "agency": canon_agency(_detect_agency(text)),
-        "rating": _detect_rating(text),
+        "rating": rating_symbol(_detect_rating(text)),
         "rating_date": str(row.get("announcement_date", ""))[:10] or None,
         "processed_at": now_str, "source_doc_id": doc_id,
     })
@@ -404,7 +426,7 @@ def parse_gemini_response(text: str, row: pd.Series,
                     # how the agency's own name ended up in the rating field. The detector
                     # already returns DATA_MISSING for a cell holding no rating symbol,
                     # which is the honest answer for a mis-picked column.
-                    facts["rating"] = _detect_rating(parts[0].strip())
+                    facts["rating"] = rating_symbol(_detect_rating(parts[0].strip()))
                     ol = canon_outlook(
                         (re.search(r"\(([^)]*)\)", raw) or [None, ""])[1]
                         if re.search(r"\(([^)]*)\)", raw) else "")
@@ -936,6 +958,22 @@ def _self_test() -> int:
     check("empty source safe", _source_text(b"") == "" and _source_text(None) == "")
     check("undecodable pdf degrades to empty, not a crash",
           _source_text(b"%PDF-1.4 not really a pdf") == "")
+
+    # ---- the rating field holds the symbol only; the outlook has its own column
+    check("adjacent outlook stripped", rating_symbol("A-/Stable") == "A-")
+    check("bare symbol untouched", rating_symbol("AA+") == "AA+")
+    check("DATA_MISSING preserved", rating_symbol("DATA_MISSING") == "DATA_MISSING")
+    check("empty becomes DATA_MISSING", rating_symbol("") == "DATA_MISSING")
+    check("None safe", rating_symbol(None) == "DATA_MISSING")
+    check("whitespace tolerated", rating_symbol(" BBB- / Negative ") == "BBB-")
+    # YASHO and UNIVASTU both came back "A-/Stable" and "BBB-/Stable" from the live
+    # re-extract, while TATVA came back "BBB+" — the same field, two shapes.
+    y = ("| Rating Agency | Current Rating/Outlook |" + chr(10) + "|---|---|" + chr(10)
+         + "| CRISIL | Crisil A-/Stable |" + chr(10))
+    fy = parse_gemini_response(y, pd.Series({"isin": "I", "symbol": "YASHO",
+                                             "announcement_date": "2026-07-29"}))
+    check("live YASHO shape stores a bare symbol", fy["rating"] == "A-")
+    check("and the outlook is still captured", fy["outlook"] == "Stable")
 
     print(f"\nextract_rating self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
