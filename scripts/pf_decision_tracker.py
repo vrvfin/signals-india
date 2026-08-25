@@ -1036,44 +1036,47 @@ def _pct(v, signed=True):
     return f"<span style='color:{col}'>{v:+.1f}%</span>" if signed else f"{v:.1f}%"
 
 
-# The tables repeat the same dozen inline styles ~2,000 times; that alone is ~60 KB
-# and pushes the body past Gmail's ~102 KB clip, which silently truncates the mail.
-# Swapping the exact literals for classes in one pass keeps every table identical to
-# the byte but roughly halves the body. Longest first so no literal eats a prefix of
-# another. If a client strips <style>, the tables still render — just unpadded.
-_CSS_CLASSES = [
-    ("align='right' style='padding:2px 6px;color:#888'",  "class='r g'"),
-    ("align='right' style='padding:2px 8px;color:#888'",  "class='r8 g'"),
-    ("align='right' style='padding:2px 6px;color:#777'",  "class='r g2'"),
-    ("align='center' style='padding:2px 6px;color:#777'", "class='c g2'"),
-    ("align='center' style='padding:3px 10px;color:#555'", "class='c10 g3'"),
-    ("align='right' style='padding:2px 6px'",   "class='r'"),
-    ("align='right' style='padding:2px 8px'",   "class='r8'"),
-    ("align='center' style='padding:2px 6px'",  "class='c'"),
-    ("align='center' style='padding:3px 10px'", "class='c10'"),
-    ("style='padding:2px 6px;font-size:11px'",  "class='sm'"),
-    ("style='padding:2px 8px'",                 "class='p8'"),
-    ("style='color:#1a7a3c'",                   "class='up'"),
-    ("style='color:#c0392b'",                   "class='dn'"),
-    ("style='color:#bbb'",                      "class='g4'"),
+# The tables repeat the same per-cell padding ~2,000 times; that alone is ~40 KB and
+# pushes the body past Gmail's ~102 KB clip, which silently truncates the mail.
+#
+# An earlier version hoisted these into a <style> block. That was wrong twice over:
+# `mailer.send_email` sends the body as a BARE FRAGMENT (no <html>/<head>), so clients
+# that drop stray <style> lost every bit of padding AND colour; and `_strip_html`
+# strips tags but not tag CONTENTS, so the raw CSS became the first 400 characters of
+# the plain-text alternative — which is exactly what Gmail shows as the inbox preview
+# line. Hence: no <style> anywhere.
+#
+# Instead the padding moves to the table's `cellpadding` attribute — plain HTML that
+# no mail client strips — and only colour stays inline, where it always survives.
+_TABLE_OPEN = ("<table style='border-collapse:collapse",
+               "<table cellpadding='4' cellspacing='0' style='border-collapse:collapse")
+_STYLE_TRIM = [
+    ("align='right' style='padding:2px 6px;color:#888'",   "align='right' style='color:#888'"),
+    ("align='right' style='padding:2px 8px;color:#888'",   "align='right' style='color:#888'"),
+    ("align='right' style='padding:2px 6px;color:#777'",   "align='right' style='color:#777'"),
+    ("align='center' style='padding:2px 6px;color:#777'",  "align='center' style='color:#777'"),
+    ("align='center' style='padding:3px 10px;color:#555'", "align='center' style='color:#555'"),
+    ("align='right' style='padding:2px 6px'",   "align='right'"),
+    ("align='right' style='padding:2px 8px'",   "align='right'"),
+    ("align='center' style='padding:2px 6px'",  "align='center'"),
+    ("align='center' style='padding:3px 10px'", "align='center'"),
+    ("align='left' style='padding:3px 8px'",    "align='left'"),
+    ("style='padding:2px 6px;font-size:11px'",  "style='font-size:11px'"),
+    ("style='padding:2px 8px'", ""),
+    ("style='padding:2px 6px'", ""),
+    ("style='padding:3px 8px'", ""),
+    (" style='padding:3px 10px;text-align:center'", " align='center'"),
 ]
-_CSS_BLOCK = ("<style>"
-              ".r{padding:2px 6px;text-align:right}"
-              ".r8{padding:2px 8px;text-align:right}"
-              ".c{padding:2px 6px;text-align:center}"
-              ".c10{padding:3px 10px;text-align:center}"
-              ".p8{padding:2px 8px}"
-              ".sm{padding:2px 6px;font-size:11px}"
-              ".g{color:#888}.g2{color:#777}.g3{color:#555}.g4{color:#bbb}"
-              ".up{color:#1a7a3c}.dn{color:#c0392b}"
-              "</style>")
 
 
 def shrink_html(html: str) -> str:
-    """Fold the repeated inline styles into classes. Size only — no visual change."""
-    for literal, cls in sorted(_CSS_CLASSES, key=lambda x: -len(x[0])):
-        html = html.replace(literal, cls)
-    return _CSS_BLOCK + html
+    """Drop the repeated per-cell padding (now carried by the table's cellpadding) so
+    the body stays under Gmail's clip limit. Colour stays inline. Emits no <style>:
+    see the note above for why that broke both the layout and the preview line."""
+    html = html.replace(*_TABLE_OPEN)
+    for literal, repl in sorted(_STYLE_TRIM, key=lambda x: -len(x[0])):
+        html = html.replace(literal, repl)
+    return html.replace("<td >", "<td>").replace("<th >", "<th>")
 
 
 def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,

@@ -69,10 +69,31 @@ jobs:
           pip install -r scripts/requirements.txt
           pip install openpyxl xlrd            # .xlsx / legacy .xls holdings parse
 
+      # "Daily Pipeline Execution" runs TWICE a day — once from an external
+      # repository_dispatch (~10:30 UTC) and once from its own schedule (~11:00 UTC).
+      # Both succeed, so this workflow's workflow_run trigger fired twice and mailed
+      # twice. Rather than touch the shared daily.yml (its double-run may be
+      # deliberate redundancy for the data pipeline), dedupe here: at most one
+      # mail per UTC day. A manual dispatch always runs, so previews still work.
+      - name: One mail per day
+        id: dedupe
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          today=$(date -u +%F)
+          n=$(gh run list --workflow=pf_tracker.yml --status=success --limit 30 \
+                --json createdAt --jq "[.[]|select(.createdAt|startswith(\"$today\"))]|length")
+          echo "done_today=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" -gt 0 ]; then
+            echo "::notice::pf_tracker already succeeded $n time(s) today — skipping to avoid a duplicate mail."
+          fi
+
       # A preview dispatch adds --no-write: the mail goes out, but the snapshot,
       # the decision ledger and every derived table are left untouched. The
       # scheduled workflow_run path never sets it, so nightly behaviour is unchanged.
       - name: Run PF decision tracker
+        if: github.event_name == 'workflow_dispatch' || steps.dedupe.outputs.done_today == '0'
         run: |
           python scripts/pf_decision_tracker.py \
             ${{ (github.event_name == 'workflow_dispatch' && inputs.no_write) && '--no-write' || '' }}
