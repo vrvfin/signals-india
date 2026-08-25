@@ -171,7 +171,10 @@ def resolve_quarters(guid: pd.DataFrame, queue: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
-_RE_CAL_YEAR = __import__("re").compile(r"^\s*(20\d{2})\s*$")
+import re as _re
+_RE_CAL_YEAR = _re.compile(r"^\s*(20\d{2})\s*$")
+# "FY27E" / "FY2027P" -- the trailing E/P is an estimate marker, not a year
+_RE_FY_EST = _re.compile(r"^\s*FY\s?(\d{2,4})\s*[EPAF]?\s*$", _re.I)
 
 
 def normalise_ppt(ppt: pd.DataFrame) -> pd.DataFrame:
@@ -206,9 +209,28 @@ def normalise_ppt(ppt: pd.DataFrame) -> pd.DataFrame:
         return v
 
     def hz(v):
+        """Deck horizons are free text. Normalise the recoverable spellings and
+        leave the genuinely vague ones alone so they are refused, not guessed.
+
+        Measured 2026-08-23 on the Q1FY27 window: 'FY27E' (the E is an estimate
+        marker, not a different year) and 'long-term' (the vague-horizon table
+        keys on LONG_TERM, so a hyphen missed it) were both being dropped as
+        unresolvable. 'null' and 'next two to three years' stay unresolved.
+        """
         s = str(v or "").strip()
         m = _RE_CAL_YEAR.match(s)
-        return f"FY{int(m.group(1)) % 100:02d}" if m else s
+        if m:                                   # bare calendar year: 2030 -> FY30
+            return f"FY{int(m.group(1)) % 100:02d}"
+        m = _RE_FY_EST.match(s)                 # FY27E / FY27P / FY2027E
+        if m:
+            return f"FY{int(m.group(1)) % 100:02d}"
+        # long-term / near term / medium term -> the LONG_TERM keys resolve_window
+        # already understands
+        k = _re.sub(r"[\s-]+", "_", s).upper()
+        if k in ("LONG_TERM", "MEDIUM_TERM", "NEAR_TERM", "SHORT_TERM",
+                 "IMMEDIATE", "STRATEGIC"):
+            return k
+        return s
 
     out = pd.DataFrame({
         "isin": p["isin"], "symbol": p.get("symbol", ""),
@@ -441,8 +463,59 @@ def score_quarter(guid_q: pd.DataFrame, base_rev: dict, base_pat: dict,
             sl = gf1_q[(gf1_q["isin"].astype(str) == str(isin))
                        & (gf1_q["_qn"] == QT.norm_q(w.get("quarter")))]
         w["validation"] = GVAL.validate(w, sl)
+        _apply_cumulative(w, guid_q, isin)
         winners[isin] = w
     return winners, rejects
+
+
+def _apply_cumulative(w: dict, guid_q: pd.DataFrame, isin: str) -> None:
+    """Re-derive an absolute target the QUOTE says is a multi-year pot.
+
+    ZENTEC's Table_A reads revenue 1Y = "ABS: INR 1000 cr", 2Y = "ABS: INR
+    4000 cr", and the quote says "cumulative Rs.4000 Crores ... in FY2027 and
+    FY2028 together". Read as a single-year FY29 target the money is spread over
+    an extra year; read as the pot it is, FY28 = 4000 - 1000 = 3000.
+
+    The SIBLING CELL is better evidence than an equal split: the company already
+    told us FY27 is 1000, so assuming 2000/2000 would contradict its own number.
+    Falls back to an equal split only when no shorter-horizon cell exists.
+    """
+    if w.get("kind") != "absolute" or not w.get("target_cr"):
+        return
+    span = GVAL.statement_is_cumulative((w.get("validation") or {}).get("evidence_stmt"))
+    if not span:
+        return
+    n_years, first_fy = span
+    pot = float(w["target_cr"])
+
+    # the shortest-horizon absolute for the same metric = the FIRST year of the pot
+    sib = None
+    sub = guid_q[(guid_q["isin"].astype(str) == str(isin))
+                 & (guid_q["metric"].astype(str) == str(w.get("metric")))]
+    for _, r in sub.iterrows():
+        amt = GS.normalise_amount(r.get("value"), r.get("metric"), r.get("horizon_fy"))
+        yrs = GS.horizon_years(r.get("horizon_fy"), r.get("quarter"))
+        if not amt or yrs is None or yrs >= (w.get("years") or 0):
+            continue
+        if sib is None or yrs < sib[0]:
+            sib = (yrs, amt["inr_cr"])
+
+    if sib and sib[1] < pot:
+        tgt, rule = pot - sib[1], "cumulative_minus_sibling"
+    else:
+        tgt, rule = pot / float(n_years), "cumulative_split_%dy" % n_years
+
+    yrs = GS.horizon_years("FY%02d" % (first_fy + n_years - 1), w.get("quarter"))
+    if yrs is None:
+        return
+    yrs = max(yrs, GS.MIN_ABSOLUTE_YEARS)
+    base = w.get("base_cr")
+    if not base or tgt <= base:
+        return
+    w["target_cr"] = tgt
+    w["years"] = yrs
+    w["rule"] = rule
+    w["cagr_pct"] = ((tgt / base) ** (1.0 / yrs) - 1.0) * 100.0
 
 
 def build_rows(winners: dict, ident: dict, cred_by: dict, quarter: str,

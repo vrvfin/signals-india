@@ -144,6 +144,34 @@ def is_negated(stmt: str) -> bool:
     """Does the sentence say the number will NOT be met?"""
     return bool(_RE_NEGATION.search(str(stmt or "")))
 
+
+# "cumulative Rs.4000 Crores of revenue in FY2027 and FY2028 together" — ONE pot
+# spanning several years. Table_A has no cell form for that: the grid is one cell
+# per (metric x horizon) and the format spec allows only a growth %, ABS: or LVL:.
+# So the extractor puts the pot in the 2Y column as a bare "ABS: INR 4000 cr" and
+# the qualifier survives only in the verbatim statement — which is why this test
+# lives here rather than in the cell cleaner.
+_RE_CUMULATIVE_STMT = re.compile(
+    r"\bcumulative(?:ly)?\b|\bcombined\b|\btogether\b|\bin aggregate\b"
+    r"|\baggregate of\b|\bput together\b", re.I)
+_RE_STMT_FY = re.compile(r"\bFY\s?'?(\d{2,4})\b", re.I)
+
+
+def statement_is_cumulative(stmt: str):
+    """(n_years, earliest_fy) when the QUOTE says one pot spans several years.
+
+    None for an ordinary single-period target. Requires both the cumulative word
+    AND two or more distinct fiscal years, so "cumulative order book" or a lone
+    "FY28 together with the ramp" does not trigger it.
+    """
+    s = str(stmt or "")
+    if not _RE_CUMULATIVE_STMT.search(s):
+        return None
+    fys = sorted({int(m.group(1)) % 100 for m in _RE_STMT_FY.finditer(s)})
+    if len(fys) < 2:
+        return None
+    return (fys[-1] - fys[0] + 1, fys[0])
+
 # Agreement bands. Absolute targets get a wider band than percentages because a
 # statement often rounds ("about Rs 500 crores" vs a 496.3 table cell).
 TOL_CONFIRMED = 0.01        # 1% relative
@@ -472,6 +500,18 @@ def _self_test() -> int:
          "considering the capacities that we are ready with in Ratlam."),
     ]:
         chk("keeps " + label, scope_is_segment(stmt), None)
+
+    # --- cumulative pot detected from the QUOTE (ZENTEC) --------------------
+    chk("ZENTEC quote is cumulative",
+        statement_is_cumulative("we have a target of cumulative Rs.4000 Crores "
+                                "of revenue in FY2027 and FY2028 together"),
+        (2, 27))
+    chk("ordinary target is not cumulative",
+        statement_is_cumulative("So we expect INR7,500 crores in FY28."), None)
+    chk("cumulative word but ONE year is not a span",
+        statement_is_cumulative("cumulative order book of Rs 900 cr by FY28"), None)
+    chk("two years but no cumulative word",
+        statement_is_cumulative("we expect growth in FY27 and FY28"), None)
 
     # --- negation -----------------------------------------------------------
     chk("negation caught",

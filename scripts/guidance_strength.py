@@ -219,7 +219,13 @@ def classify_cell(raw, metric: str = "", horizon: str = "") -> str:
 
     text = _strip_prefix(raw_text)
     has_pct = bool(_RE_PCT.search(text))
-    says_growth = bool(_RE_GROWTH_WORD.search(text))
+    # The METRIC NAME counts as growth language too. Investor decks label the
+    # row "revenue growth" / "pat growth" and put a bare "28.0%" in the cell, so
+    # reading only the cell called it a level and threw the row away -- measured
+    # 2026-08-23: 10 of 22 deck rows in the window, including UNIPARTS at 64%
+    # PAT growth, which clears the bar on its own.
+    says_growth = bool(_RE_GROWTH_WORD.search(text)
+                       or _RE_GROWTH_WORD.search(str(metric or "")))
 
     # The override: explicit growth language + a percentage beats the header.
     if has_pct and says_growth:
