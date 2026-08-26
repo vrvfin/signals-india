@@ -1695,7 +1695,7 @@ LEDGER_NAME = "quarter_teardown_mailed.parquet"
 # Screener ladder, so the filing-sourced version can be superseded by the real
 # teardown once the statements land instead of being suppressed as already-mailed.
 LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on",
-               "date_source", "data_source", "mailed_at",
+               "date_source", "data_source", "mailed_at", "content_key",
                # `mail_mode` added 2026-08-15 (ADDITIVE — old rows read None, treated as
                # "combined"). Two paths now send teardowns: t4_nightly's --daily combined
                # body, and --per-company. They shared one ledger, so whichever ran first
@@ -1804,6 +1804,40 @@ def _write_and_send(args, drive, idx, season, pages, reported, body, subject, lo
                       else "combined")
 
 
+def results_content_key(d: dict) -> str:
+    """A fingerprint of the NUMBERS this teardown asserts.
+
+    Results are not an LLM read — they come from Screener's statements or from the
+    company's own filing — so unlike a deck they can be fingerprinted exactly, and a
+    change means the numbers really were restated. Screener does restate: a revenue or
+    PAT that moves after publication is precisely what a reader needs told twice.
+
+    Handles both shapes a page can take. A Screener teardown carries d["A"] with the full
+    ladder; a filing-sourced card carries d["filing"] and no ladder at all, and pretending
+    otherwise would key every filing card to the same empty string.
+    """
+    q = str(d.get("quarter") or "").strip()
+    src = str(d.get("data_source") or "screener").strip()
+
+    def _n(v):
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return ""
+
+    A = d.get("A") or {}
+    if A:
+        rev = _n((A.get("revenue") or {}).get("cur"))
+        pat = _n((A.get("pat") or {}).get("cur"))
+    else:
+        fil = d.get("filing") or {}
+        rev = _n(fil.get("revenue_cr"))
+        pat = _n(fil.get("pat_cr"))
+    if not q or (not rev and not pat):
+        return ""          # nothing solid to fingerprint; no key means no change check
+    return f"{q}|{src}|{rev}|{pat}"
+
+
 def _stamp_ledger(drive, idx, season, pages, reported, log, mode="combined") -> None:
     """Record what was mailed, AFTER a confirmed send. `mode` keeps the combined and
     per-company paths from suppressing each other — see LEDGER_COLS."""
@@ -1816,6 +1850,7 @@ def _stamp_ledger(drive, idx, season, pages, reported, log, mode="combined") -> 
                      "quarter_label": d["quarter"], "reported_on": when,
                      "date_source": src,
                      "data_source": d.get("data_source", "screener"),
+                     "content_key": results_content_key(d),
                      "mailed_at": now, "mail_mode": mode})
     if not rows:
         return
@@ -2120,6 +2155,41 @@ def _self_test() -> int:
             else:
                 os.environ[k] = v
 
+    # ---- results content key: exact, because results are NOT an LLM read
+    d_scr = {"quarter": "Q1 FY27", "data_source": "screener",
+             "A": {"revenue": {"cur": 5289.0}, "pat": {"cur": 412.0}}}
+    k_scr = results_content_key(d_scr)
+    check("screener shape keys on the numbers", k_scr == "Q1 FY27|screener|5289.00|412.00")
+    # A RESTATEMENT is exactly what should re-notify: Screener does revise after
+    # publication, and a moved PAT is news the reader was already told wrongly.
+    d_restated = {"quarter": "Q1 FY27", "data_source": "screener",
+                  "A": {"revenue": {"cur": 5289.0}, "pat": {"cur": 388.0}}}
+    check("a restated PAT changes the key", results_content_key(d_restated) != k_scr)
+    check("an unchanged re-read keeps the key",
+          results_content_key(dict(d_scr)) == k_scr)
+    check("float noise below a paisa does not fire",
+          results_content_key({"quarter": "Q1 FY27", "data_source": "screener",
+                               "A": {"revenue": {"cur": 5289.001},
+                                     "pat": {"cur": 412.0}}}) == k_scr)
+    # THE FILING CARD has no ladder at all; keying it off d["A"] would collapse every
+    # filing-sourced holding to the same empty string.
+    d_fil = {"quarter": "Q1 FY27", "data_source": "filing",
+             "filing": {"revenue_cr": 555.51, "pat_cr": None}}
+    k_fil = results_content_key(d_fil)
+    check("filing shape is keyed too", k_fil == "Q1 FY27|filing|555.51|")
+    check("filing and screener keys differ for the same quarter", k_fil != k_scr)
+    check("a missing PAT does not void the key", k_fil != "")
+    # Nothing solid to fingerprint -> no key -> the old fast path, no change check.
+    check("no quarter, no key", results_content_key({"A": {"revenue": {"cur": 1.0}}}) == "")
+    check("no numbers, no key",
+          results_content_key({"quarter": "Q1 FY27", "A": {}}) == "")
+    check("empty dict is safe", results_content_key({}) == "")
+    check("non-numeric values are ignored",
+          results_content_key({"quarter": "Q1 FY27",
+                               "A": {"revenue": {"cur": "NA"},
+                                     "pat": {"cur": "NA"}}}) == "")
+    check("content_key is in the ledger schema", "content_key" in LEDGER_COLS)
+
     print(f"\nquarter_teardown self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 
@@ -2220,6 +2290,10 @@ def main() -> None:
             log(f"  {len(targets)} of {pf_n} PF holding(s) have a {season} report date "
                 f"in the last {args.since_hours:g}h")
 
+        # {isin: content_key} for holdings already mailed WITH a key recorded. Populated
+        # below; declared here because --force skips that block and the post-load check
+        # reads it either way.
+        prev_keys: dict = {}
         if not args.force:
             from _extractor_base import load_parquet
             led = load_parquet(drive, idx, LEDGER_NAME, LEDGER_COLS)
@@ -2240,6 +2314,15 @@ def main() -> None:
                     # teardown (bridge, divergence rails, register) still owes it a
                     # mail once Screener publishes the ladder.
                     if str(r.get("data_source") or "screener").strip() == "filing":
+                        continue
+                    # A ROW CARRYING A content_key IS NOT DECIDED HERE. Its numbers may
+                    # have been restated since, and the only way to know is to build the
+                    # page and compare — which happens after load, below. Rows written
+                    # before the column existed keep the old fast path exactly, so the
+                    # back catalogue is never re-sent.
+                    _k = str(r.get("content_key") or "").strip()
+                    if _k and _k.lower() not in ("none", "nan"):
+                        prev_keys[str(r["isin"]).strip()] = _k
                         continue
                     done.add(str(r["isin"]).strip())
             before = len(targets)
@@ -2354,6 +2437,16 @@ def main() -> None:
         d["season_summary"] = SS.build_summary(
             isin, season, filing=filings.get(isin), deck=tables["deck"],
             **tables["season"])
+        # Unchanged numbers, already mailed -> nothing to say. Changed numbers -> the
+        # restatement is the news, and the mail goes again.
+        _prev = prev_keys.get(isin, "")
+        if _prev:
+            _cur = results_content_key(d)
+            if _cur and _cur == _prev:
+                log(f"  {symbol}: already mailed and the numbers are unchanged — skipped")
+                continue
+            log(f"  {symbol}: numbers RESTATED since the last mail "
+                f"({_prev} -> {_cur}) — re-sending")
         html = render(d, stmts, rich=args.html)
         pages.append((symbol, d, html))
         log(f"  {symbol}: {d['quarter']} · {len(d['facts'])} facts · "

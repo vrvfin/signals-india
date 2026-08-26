@@ -250,6 +250,22 @@ def standalone_summary(isin, season, tables) -> str:
     return "".join(out)
 
 
+def _deck_key(isin: str, tables: dict) -> str:
+    """Coarse deck fingerprint: the quarter, and whether there is usable content.
+
+    Row counts and section counts are deliberately NOT in the key — they drift run to run
+    on an unchanged deck (measured: 35 rows then 33 for the same document), and a key that
+    moves on its own would re-send the portfolio on every backfill.
+    """
+    parts = []
+    for name in ("deck_summary", "ppt_highlights", "ppt_guidance"):
+        t = _slice(tables.get(name), isin)
+        parts.append("1" if not t.empty else "0")
+    if parts == ["0", "0", "0"]:
+        return ""          # nothing to fingerprint; no key means no change check
+    return "deck|" + "".join(parts)
+
+
 def content_key(doc_type: str, isin: str, tables: dict) -> str:
     """A fingerprint of WHAT THE MAIL ASSERTS, so a correction can be detected.
 
@@ -263,11 +279,28 @@ def content_key(doc_type: str, isin: str, tables: dict) -> str:
     would re-send every holding the first time anyone edited a template — a cosmetic
     change is not news.
 
-    RATINGS ONLY, for now. That is where the failure was proven, and where the assertion
-    is small enough to fingerprint honestly: agency, symbol, outlook, action. Returning ""
-    for the other types leaves their behaviour exactly as it was — no change detection,
-    and no risk of a spurious re-send from a key nobody has validated.
+    TWO TYPES, TWO DIFFERENT KEYS, because the two extractions fail differently.
+
+    A RATING is four short fields read out of a document that states them plainly, so the
+    key is the assertion itself: agency, rating, outlook, action. Any change is real.
+
+    A DECK is an LLM pass over slides, and it DRIFTS. The same RISHABH deck, same prompt,
+    two runs minutes apart, returned 35 rows and then 33, with the strategy section going
+    from 3 rows to 1. Fingerprinting deck CONTENT would therefore mark almost every
+    re-extract as "changed" and re-send the entire portfolio on every backfill. So the
+    deck key is deliberately COARSE: the quarter, and whether the deck yields usable
+    content at all.
+
+    That is precision over recall, chosen on evidence. It catches the case that actually
+    happened — 45 of 202 decks returned ZERO rows because a truncated response was
+    discarded whole, and the salvage fix in 4a201c3 turned them into real content. A
+    reader told "this company published nothing usable" deserves to hear when that stops
+    being true. It will NOT catch a deck whose numbers shifted between extractions, and
+    that is the honest trade: a false correction is worse than a missed one, because it
+    trains the reader to ignore the word.
     """
+    if doc_type == "presentation":
+        return _deck_key(isin, tables)
     if doc_type != "rating":
         return ""
     rt = _slice(tables.get("ratings"), isin)
@@ -971,7 +1004,10 @@ def main() -> None:
     # The same tables the renderers read, so "due" means "will actually send" —
     # coverage tested only that an extractor had run, which reported 16 presentations
     # as due and then skipped every one as "nothing renderable".
-    _pre = {n: _read(drive, idx, f"{n}.parquet") for n in ("ppt_highlights", "ratings")}
+    # deck_summary/ppt_guidance join the pre-load because content_key needs them BEFORE
+    # mail_due decides what is due; they are small and read-only.
+    _pre = {n: _read(drive, idx, f"{n}.parquet") for n in
+            ("ppt_highlights", "ratings", "deck_summary", "ppt_guidance")}
     # What the mail WOULD assert right now, per document — compared against what it
     # asserted when it was last sent, so a corrected re-extract is re-notified.
     _latest = COV.latest_doc_per_type(pf, queue, tuple(want))
@@ -1009,7 +1045,9 @@ def main() -> None:
         isin, sym, name, dt = d["isin"], d["symbol"], d["name"], d["doc_type"]
         if dt == "presentation":
             body = presentation_body(isin, sym, name, season, tables)
-            subject = f"📊 {sym} — investor presentation, {QT.qtr_label(season)}"
+            subject = (f"📊 {sym} — investor presentation UPDATED, "
+                       f"{QT.qtr_label(season)}" if d.get("resend")
+                       else f"📊 {sym} — investor presentation, {QT.qtr_label(season)}")
         elif dt == "rating":
             body = rating_body(isin, sym, name, tables)
             subject = (f"🏷 {sym} — credit rating CORRECTED"
@@ -1315,7 +1353,40 @@ def _self_test() -> int:
     check("no ratings table is safe", content_key("rating", "INE1", {}) == "")
     # Other doc types are deliberately NOT fingerprinted yet, so their behaviour is
     # unchanged and no unvalidated key can trigger a spurious re-send.
-    check("presentation has no key yet", content_key("presentation", "INE1", T) == "")
+    # ---- deck key: coarse ON PURPOSE, because the extraction drifts
+    ds_full = pd.DataFrame([{"isin": "INE1", "quarter": "Q1FY27", "section": "financials",
+                             "label": "Revenue", "value": 100.0, "unit": "cr",
+                             "period": "Q1FY27", "detail": "", "evidence": "100"}])
+    k_deck = content_key("presentation", "INE1", {"deck_summary": ds_full})
+    check("a deck with content has a key", k_deck != "")
+    check("a company with no deck rows has no key",
+          content_key("presentation", "INE9", {"deck_summary": ds_full}) == "")
+    # THE DRIFT CASE. Same deck, re-extracted: 35 rows became 33 and one section
+    # emptied. That must NOT read as a correction, or every backfill re-mails the book.
+    ds_drift = pd.concat([ds_full] * 12, ignore_index=True)
+    check("row-count drift does not change the key",
+          content_key("presentation", "INE1", {"deck_summary": ds_drift}) == k_deck)
+    ds_other = ds_full.copy()
+    ds_other.loc[0, "value"] = 999.0
+    ds_other.loc[0, "section"] = "capex"
+    check("a changed value does not fire either (precision over recall)",
+          content_key("presentation", "INE1", {"deck_summary": ds_other}) == k_deck)
+    # THE CASE IT EXISTS FOR: 45 decks returned zero rows before the salvage fix.
+    empty = pd.DataFrame(columns=["isin", "quarter", "section"])
+    check("no content at all yields no key",
+          content_key("presentation", "INE1", {"deck_summary": empty}) == "")
+    check("gaining content changes the key from nothing to something",
+          content_key("presentation", "INE1", {"deck_summary": empty}) != k_deck)
+    # which table supplied the content is part of the key, so a deck that gains a
+    # standalone summary on top of highlights is a real change
+    hi_only = pd.DataFrame([{"isin": "INE1", "quarter": "Q1FY27", "category": "demand",
+                             "statement": "x", "value": 1, "unit": "%"}])
+    k_hi = content_key("presentation", "INE1", {"ppt_highlights": hi_only})
+    check("highlights-only differs from summary-only", k_hi != k_deck and k_hi != "")
+    check("both together differ from either alone",
+          content_key("presentation", "INE1",
+                      {"deck_summary": ds_full, "ppt_highlights": hi_only})
+          not in ("", k_hi, k_deck))
     check("results have no key yet", content_key("results", "INE1", T) == "")
     check("content_key is in the ledger schema", "content_key" in LEDGER_COLS)
 
