@@ -102,6 +102,57 @@ EXIT_COLS  = ["symbol", "isin", "name", "first_seen", "sell_date",
 SPELL_COLS = ["isin", "symbol", "name", "spell_start", "spell_end", "status",
               "weight_at_entry", "weight_at_exit"]
 
+# A corporate action (face-value split/consolidation) changes a company's ISIN.
+# Identity is keyed on ISIN, so without this the old code reads the swap as a SELL
+# of the whole position followed by a BUY. Persisted so an alias is auditable.
+ALIAS_COLS = ["old_isin", "new_isin", "symbol", "changed_on"]
+
+# Monthly frozen baskets: the portfolio's composition at each month start, held
+# untouched. Comparing it against the real index answers "did my trading help?".
+COHORT_COLS = ["cohort_month", "snapshot_date", "isin", "symbol", "weight_pct"]
+COHORT_RET_COLS = ["cohort_month", "asof", "horizon_m", "days", "frozen_ret_pct",
+                   "actual_ret_pct", "delta_pp", "n_priced", "n_total", "partial"]
+COHORT_HORIZONS = [1, 2, 3, 6, 12]
+COHORT_MAIL_N = 6                 # cohorts shown in the mail; parquet keeps them all
+
+# ADD/TRIM band: a weight change counts as a real trade only if it exceeds the
+# drift-implied weight by BOTH an absolute (pp) and a relative margin.
+ADD_TRIM_ABS_PP  = 0.5
+ADD_TRIM_REL     = 0.20
+
+# Calendar length of each return window — used to GATE windows longer than a
+# stock has actually been held (a 6M number is meaningless a week after you buy).
+WINDOW_DAYS = {1: 30, 2: 61, 3: 91, 6: 182, 12: 365}
+MIN_ANNUALISE_DAYS = 91          # don't annualise anything shorter than a quarter
+
+# Stagnancy is defined ONLY as "how many consecutive trading days has the close
+# stayed inside ±band of today's close" — two bands, no fuzzy composite rule.
+FLAT_BANDS = (0.05, 0.10)
+
+
+# Goal tracking: the annual return you're aiming for, expressed as the weekly pace
+# it demands. 50%/yr => (1.5)^(7/365)-1 = ~0.78%/week.
+TARGET_CAGR_PCT = 50.0
+
+# Benchmarks from data/indices/ (Phase-1 `ingest_indices_macro.py`). First is primary.
+BENCHMARKS = ["NIFTY_500", "NIFTY_SMALLCAP_100"]
+# Short column prefixes for the per-stock index columns, so a widened table stays
+# readable: NIFTY_500 -> n500_ret_pct / vs_n500_pp.
+BENCH_KEY = {"NIFTY_500": "n500", "NIFTY_SMALLCAP_100": "sc100"}
+PRIMARY_KEY = BENCH_KEY[BENCHMARKS[0]]
+
+# Allocation review: a "winner" is top-quartile pace; "underweight" is below equal
+# weight. The pair flags positions whose sizing capped their impact.
+WINNER_Q = 0.75
+
+# Pace over a day or two is noise amplified by the ^(7/days) exponent — a name up
+# 1% on its first day annualises to ~7.5%/week. Positions younger than this are
+# shown with their numbers but never FLAGGED fast / underweight / below-target,
+# and are excluded from the quantile that defines "fast".
+MIN_PACE_DAYS = 5
+REVIEW_MIN_DAYS    = 10   # a decision must be this old before REVIEW-NOW judges it
+REVIEW_MIN_MOVE_PP = 3.0  # ...and have moved this much; kills ~0% quartile noise
+
 # ADD/TRIM band: a weight change counts as a real trade only if it exceeds the
 # drift-implied weight by BOTH an absolute (pp) and a relative margin.
 ADD_TRIM_ABS_PP  = 0.5
@@ -470,6 +521,62 @@ def derive_decisions(snaps: pd.DataFrame, decs: pd.DataFrame, asof: date,
     else:
         log(f"  Holdings changed on {cur_d} but no BUY/SELL/ADD/TRIM crossed the band.")
     return decs
+
+
+# ── ISIN continuity across corporate actions ─────────────────────────────────
+
+def build_isin_alias(snaps: pd.DataFrame) -> pd.DataFrame:
+    """Detect ISIN changes so a corporate action doesn't read as a sell + a buy.
+
+    TDPOWERSYS moved INE419M01027 -> INE419M01035 on 2026-08-26. Nothing was
+    traded, but keying identity on ISIN made the old one's disappearance a SELL of
+    a 9.65% position and the new one's arrival a BUY.
+
+    Rule: on snapshot date D, if ISIN A was present at D-1 and absent at D, while
+    ISIN B was absent at D-1 and present at D, and both carry the same non-blank
+    symbol, then B is the same position as A. Returns the alias table; the map is
+    applied by `apply_isin_alias` before spells/decisions/cohorts are derived.
+
+    Deliberately conservative: it fires only on a same-day swap of a shared symbol,
+    and the result is persisted so a wrong alias is visible rather than silent."""
+    if snaps.empty:
+        return pd.DataFrame(columns=ALIAS_COLS)
+    dates = sorted(snaps["snapshot_date"].unique())
+    by_date = {d: snaps[snaps["snapshot_date"] == d] for d in dates}
+    rows = []
+    for prev_d, cur_d in zip(dates, dates[1:]):
+        prev, cur = by_date[prev_d], by_date[cur_d]
+        gone = set(prev["isin"]) - set(cur["isin"])
+        new = set(cur["isin"]) - set(prev["isin"])
+        if not gone or not new:
+            continue
+        psym = {r.isin: str(r.symbol).strip().upper() for r in prev.itertuples()}
+        csym = {r.isin: str(r.symbol).strip().upper() for r in cur.itertuples()}
+        for a in gone:
+            s = psym.get(a, "")
+            if not s or s == "NAN":
+                continue
+            match = [b for b in new if csym.get(b, "") == s]
+            if len(match) == 1:                       # unambiguous swap only
+                rows.append(dict(old_isin=a, new_isin=match[0], symbol=s,
+                                 changed_on=cur_d))
+    return pd.DataFrame(rows, columns=ALIAS_COLS)
+
+
+def apply_isin_alias(df: pd.DataFrame, alias: pd.DataFrame) -> pd.DataFrame:
+    """Rewrite every new_isin back to its original isin, so one company keeps one
+    identity for its whole life. Chains are followed (A->B->C all become A)."""
+    if df is None or df.empty or alias is None or alias.empty or "isin" not in df.columns:
+        return df
+    m = dict(zip(alias["new_isin"], alias["old_isin"]))
+    def _root(i, seen=None):
+        seen = seen or set()
+        while i in m and i not in seen:
+            seen.add(i); i = m[i]
+        return i
+    out = df.copy()
+    out["isin"] = out["isin"].map(_root)
+    return out
 
 
 # ── Holding spells (contiguous ownership runs) ───────────────────────────────
@@ -1027,6 +1134,105 @@ def compute_exits_view(spells: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
     return out[cols].sort_values("opportunity_pp", ascending=False, na_position="last")
 
 
+# ── Monthly cohorts: the frozen-basket counterfactual ────────────────────────
+
+def build_cohorts(snaps: pd.DataFrame, cohorts: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """Freeze the book's composition at each month start. APPEND-ONLY — a cohort is
+    a historical fact and is never recomputed once written.
+
+    The cohort date is the FIRST SNAPSHOT ON/AFTER the 1st, because there is no
+    snapshot every day. Since snapshot dates are sorted, the first date seen for a
+    month IS that snapshot. The earliest cohort therefore starts at inception
+    (2026-07-23), which doubles as the since-inception frozen basket."""
+    cols = COHORT_COLS
+    if snaps.empty:
+        return (cohorts if cohorts is not None else pd.DataFrame(columns=cols)), False
+    have = set(cohorts["cohort_month"]) if cohorts is not None and not cohorts.empty else set()
+    rows = []
+    for d in sorted(snaps["snapshot_date"].unique()):
+        m = str(d)[:7]
+        if m in have:
+            continue
+        have.add(m)
+        for r in snaps[snaps["snapshot_date"] == d].itertuples():
+            rows.append(dict(cohort_month=m, snapshot_date=d, isin=r.isin,
+                             symbol=r.symbol, weight_pct=r.weight_pct))
+    if not rows:
+        return cohorts, False
+    out = pd.concat([cohorts if cohorts is not None else pd.DataFrame(columns=cols),
+                     pd.DataFrame(rows, columns=cols)], ignore_index=True)
+    new_months = sorted({r["cohort_month"] for r in rows})
+    log(f"  Cohorts: froze {len(new_months)} new basket(s) — {', '.join(new_months)}")
+    return out[cols], True
+
+
+def _frozen_return(members: pd.DataFrame, start_ts, end_ts, price_cache,
+                   drive, ohlcv_id) -> tuple[float | None, int, int]:
+    """Buy-and-hold return of a frozen basket: put wᵢ into each name at the cohort
+    date and never touch it again, so
+
+        return = Σ wᵢ·rᵢ / Σ wᵢ
+
+    which is exactly the value of that basket today versus its cost. Names without
+    a price are dropped from BOTH sides of the ratio, so the number is never
+    silently diluted — `n_priced` vs `n_total` exposes how many were dropped."""
+    num = den = 0.0
+    n_priced = 0
+    for r in members.itertuples():
+        w = float(r.weight_pct) if pd.notna(r.weight_pct) else 0.0
+        if w <= 0:
+            continue
+        ret = fwd_return(load_close_series(drive, ohlcv_id, r.symbol, price_cache),
+                         start_ts, end_ts)
+        if ret is None:
+            continue
+        num += w * ret
+        den += w
+        n_priced += 1
+    return ((num / den) if den > 0 else None), n_priced, len(members)
+
+
+def compute_cohort_returns(cohorts: pd.DataFrame, idx: pd.DataFrame, price_cache: dict,
+                           drive, ohlcv_id, asof: date) -> pd.DataFrame:
+    """Frozen basket vs what the portfolio ACTUALLY did, per cohort × horizon.
+
+        delta_pp = actual − frozen
+
+    Positive means the trading you did since that month start beat leaving the book
+    alone; negative means doing nothing would have won. Fully derived from the
+    cohorts + prices + pf_index, so it is regenerated (overwritten) every run.
+
+    Horizons that have not elapsed produce NO ROW — the mail renders those cells
+    blank rather than showing a zero that reads as "no difference"."""
+    if cohorts is None or cohorts.empty:
+        return pd.DataFrame(columns=COHORT_RET_COLS)
+    pf_ser = None
+    if idx is not None and not idx.empty and "pf_index" in idx.columns:
+        pf_ser = (idx.assign(_d=pd.to_datetime(idx["date"]))
+                     .set_index("_d")["pf_index"].astype(float).sort_index())
+    end_ts = pd.Timestamp(asof)
+    rows = []
+    for m, g in cohorts.groupby("cohort_month"):
+        start = str(g["snapshot_date"].iloc[0])
+        start_ts = pd.Timestamp(start)
+        windows = [(h, start_ts + relativedelta(months=h), False) for h in COHORT_HORIZONS]
+        windows = [w for w in windows if w[1] <= end_ts]
+        windows.append((np.nan, end_ts, True))          # the live, partial window
+        for h, win_end, partial in windows:
+            frozen, n_priced, n_total = _frozen_return(
+                g, start_ts, win_end, price_cache, drive, ohlcv_id)
+            actual = fwd_return(pf_ser, start_ts, win_end) if pf_ser is not None else None
+            rows.append(dict(
+                cohort_month=m, asof=str(asof), horizon_m=h,
+                days=int((win_end - start_ts).days),
+                frozen_ret_pct=frozen if frozen is not None else np.nan,
+                actual_ret_pct=actual if actual is not None else np.nan,
+                delta_pp=((actual - frozen) if (actual is not None and frozen is not None)
+                          else np.nan),
+                n_priced=n_priced, n_total=n_total, partial=partial))
+    return pd.DataFrame(rows, columns=COHORT_RET_COLS)
+
+
 # ── HTML digest ──────────────────────────────────────────────────────────────
 
 def _pct(v, signed=True):
@@ -1080,7 +1286,7 @@ def shrink_html(html: str) -> str:
 
 
 def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,
-               hold=None, matched=None):
+               hold=None, matched=None, cohort_ret=None):
     H = []
     H.append(f"<h2 style='margin:0'>PF Decision Tracker — {asof}</h2>")
     H.append(f"<p style='color:#666;margin:2px 0 14px'>{len(pf)} holdings · "
@@ -1443,13 +1649,69 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                 f"<td style='padding:2px 8px'>{esc(r.verdict)}</td></tr>")
         H.append("</table>")
 
+    # 8) Monthly cohorts — has trading beaten leaving the book alone?
+    if cohort_ret is not None and not cohort_ret.empty:
+        H.append("<h3>8 · Trading vs doing nothing (monthly frozen baskets)</h3>")
+
+        # The earliest cohort is inception, so this line works from day one.
+        first = cohort_ret[cohort_ret["partial"]].sort_values("cohort_month")
+        if not first.empty:
+            r0 = first.iloc[0]
+            if pd.notna(r0["delta_pp"]):
+                verb = "added" if r0["delta_pp"] >= 0 else "cost"
+                col = "#1a7a3c" if r0["delta_pp"] >= 0 else "#c0392b"
+                H.append(
+                    f"<p style='margin:4px 0'>Your book as it stood on "
+                    f"<b>{esc(str(r0['cohort_month']))}</b>, frozen and never traded, would be "
+                    f"<b>{_pct(r0['frozen_ret_pct'])}</b>. You actually did "
+                    f"<b>{_pct(r0['actual_ret_pct'])}</b> over the same {int(r0['days'])} days "
+                    f"— so trading has <b style='color:{col}'>{verb} "
+                    f"{abs(r0['delta_pp']):.2f} pp</b>.</p>")
+
+        H.append(
+            "<p style='color:#888;font-size:12px'>On the first snapshot of each month the "
+            "book's composition is photographed and left to run untouched. Each cell is "
+            "<b>what you actually made minus what that frozen photo made</b> over the same "
+            "window. <span style='color:#1a7a3c'>Green = your buying and selling earned its "
+            "keep</span>; <span style='color:#c0392b'>red = you'd have done better leaving it "
+            "alone</span>. Blank means that horizon hasn't elapsed yet — not zero.</p>")
+
+        order = [("1M", 1), ("2M", 2), ("3M", 3), ("6M", 6), ("12M", 12)]
+        dash = "<span style='color:#bbb'>—</span>"   # section 1's copy is scoped to it
+        head = "".join(f"<th style='padding:3px 10px'>{lbl}</th>" for lbl, _ in order)
+        rows = []
+        for m in sorted(cohort_ret["cohort_month"].unique(), reverse=True)[:COHORT_MAIL_N]:
+            g = cohort_ret[cohort_ret["cohort_month"] == m]
+            cells = []
+            for _, h in order:
+                v = g[(~g["partial"]) & (g["horizon_m"] == h)]["delta_pp"]
+                cells.append(f"<td align='center' style='padding:3px 10px'>"
+                             f"{_pct(v.iloc[0]) if len(v) and pd.notna(v.iloc[0]) else dash}</td>")
+            liv = g[g["partial"]]
+            now = (f"{_pct(liv.iloc[0]['delta_pp'])} "
+                   f"<span style='color:#aaa'>({int(liv.iloc[0]['days'])}d)</span>"
+                   if len(liv) and pd.notna(liv.iloc[0]["delta_pp"]) else dash)
+            rows.append(f"<tr><td align='left' style='padding:3px 8px'><b>{esc(str(m))}</b></td>"
+                        f"{''.join(cells)}"
+                        f"<td align='center' style='padding:3px 10px'>{now}</td></tr>")
+        H.append("<table style='border-collapse:collapse;font-size:13px'>"
+                 f"<tr><th align='left' style='padding:3px 8px'>Frozen on</th>{head}"
+                 "<th style='padding:3px 10px'>Now</th></tr>"
+                 + "".join(rows) + "</table>")
+
+        n_months = cohort_ret["cohort_month"].nunique()
+        if n_months < 3:
+            H.append(f"<p style='color:#888;font-size:12px'>Only {n_months} month of tracked "
+                     f"history so far — the grid fills in as months accrue. Full history is in "
+                     f"the workbook's <i>Cohort Returns</i> sheet.</p>")
+
     H.append("<p style='color:#aaa;font-size:11px;margin-top:16px'>Signals only — human-in-the-loop. "
              "Decision dates are snapshot-observation dates. Weightage-only: no rupee P&L.</p>")
     return shrink_html("".join(H))
 
 
 def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None,
-                      spells=None) -> bytes:
+                      spells=None, cohorts=None, cohort_ret=None) -> bytes:
     """Detailed tables as a multi-sheet .xlsx (the email is the summary; this is the
     drill-down). One sheet per view; header frozen + light auto-width."""
     holdings = pf[["isin", "symbol", "name", "weight_pct"]].copy()
@@ -1473,6 +1735,10 @@ def build_excel_bytes(pf, idx, movers, score, relook, decs, hold=None,
         "Exits":              relook,
         "Holding Spells":     (spells if spells is not None
                                else pd.DataFrame(columns=SPELL_COLS)),
+        "Cohorts":            (cohorts if cohorts is not None
+                               else pd.DataFrame(columns=COHORT_COLS)),
+        "Cohort Returns":     (cohort_ret if cohort_ret is not None
+                               else pd.DataFrame(columns=COHORT_RET_COLS)),
         "Decisions Log":      decs,
         "PF Index":           idx,
     }
@@ -1502,6 +1768,10 @@ def main() -> None:
                     help="Send the email but persist NOTHING to Drive — a real preview "
                          "mail that leaves the ledgers untouched (the mirror of --no-mail).")
     ap.add_argument("--asof", default=None, help="Recompute as of YYYY-MM-DD (default: today).")
+    ap.add_argument("--rebuild-decisions", action="store_true",
+                    help="Re-derive the WHOLE decision ledger from the snapshots. Needed "
+                         "once after an ISIN alias is found, to clear events a corporate "
+                         "action faked (decisions are derived; snapshots are the truth).")
     args = ap.parse_args()
 
     asof = (datetime.strptime(args.asof, "%Y-%m-%d").date() if args.asof else date.today())
@@ -1536,14 +1806,44 @@ def main() -> None:
     # 2. Load ledgers.
     snaps = load_parquet(drive, out_id, "pf_snapshots.parquet", SNAP_COLS)
     decs = load_parquet(drive, out_id, "pf_decisions.parquet", DEC_COLS)
+    cohorts = load_parquet(drive, out_id, "pf_cohorts.parquet", COHORT_COLS)
     price_cache: dict = {}
 
     # 3. Snapshot capture (change-gated) + decision diff.
     snaps, changed = append_snapshot(drive, out_id, snaps, pf, asof, target["name"],
                                      not persist)
+
+    # A corporate action swaps a company's ISIN. Collapse the new ISIN back onto the
+    # old one BEFORE anything is derived, so the swap reads as one continuous holding
+    # instead of a sell followed by a buy. Applied to today's parsed book too, so the
+    # snapshot just captured lines up with the history.
+    alias = build_isin_alias(snaps)
+    if not alias.empty:
+        for a in alias.itertuples():
+            log(f"  ISIN change: {a.symbol} {a.old_isin} -> {a.new_isin} on {a.changed_on} "
+                f"— treated as the SAME holding, not a sell+buy.")
+        snaps = apply_isin_alias(snaps, alias)
+        decs = apply_isin_alias(decs, alias)
+        cohorts = apply_isin_alias(cohorts, alias)
+        pf = apply_isin_alias(pf, alias)
+        if persist:
+            save_parquet(drive, out_id, "pf_isin_alias.parquet", alias)
+
     decs_before = len(decs)
-    decs = derive_decisions(snaps, decs, asof, price_cache, drive, ohlcv_id)
-    if persist and len(decs) != decs_before:
+    if args.rebuild_decisions:
+        # Events a corporate action faked are already in the ledger. Decisions are
+        # DERIVED data, so the honest repair is to regenerate them from the snapshots
+        # rather than hand-patch rows.
+        log("  --rebuild-decisions: re-deriving the full ledger from snapshots…")
+        decs = pd.DataFrame(columns=DEC_COLS)
+        all_dates = sorted(snaps["snapshot_date"].unique())
+        for i in range(len(all_dates)):
+            decs = derive_decisions(snaps[snaps["snapshot_date"].isin(all_dates[:i + 1])],
+                                    decs, asof, price_cache, drive, ohlcv_id)
+        log(f"  Rebuilt {len(decs)} decision event(s) (was {decs_before}).")
+    else:
+        decs = derive_decisions(snaps, decs, asof, price_cache, drive, ohlcv_id)
+    if persist and (args.rebuild_decisions or len(decs) != decs_before):
         save_parquet(drive, out_id, "pf_decisions.parquet", decs)
 
     # 4. Compute everything. Benchmarks come from Phase-1 data/indices/.
@@ -1594,6 +1894,20 @@ def main() -> None:
         log(f"  {len(relook)} exit(s) in the last 12M; net cost of selling "
             f"{net:+.2f} pp vs holding on.")
 
+    # Monthly frozen baskets — the cumulative verdict on trading. Cohorts are
+    # append-only history; their returns are derived and regenerated every run.
+    cohorts, cohorts_new = build_cohorts(snaps, cohorts)
+    if persist and cohorts_new:
+        save_parquet(drive, out_id, "pf_cohorts.parquet", cohorts)
+    cohort_ret = compute_cohort_returns(cohorts, idx, price_cache, drive, ohlcv_id, asof)
+    if not cohort_ret.empty:
+        live = cohort_ret[cohort_ret["partial"]]
+        for r in live.itertuples():
+            log(f"  Cohort {r.cohort_month}: frozen {r.frozen_ret_pct:+.2f}% vs actual "
+                f"{r.actual_ret_pct:+.2f}% over {r.days}d -> trading "
+                f"{'added' if r.delta_pp >= 0 else 'cost'} {abs(r.delta_pp):.2f} pp "
+                f"({r.n_priced}/{r.n_total} priced)")
+
     # 5. Persist derived tables (overwrite; idempotent).
     if not persist:
         log("  Drive writes suppressed — ledgers and derived tables left untouched.")
@@ -1604,12 +1918,13 @@ def main() -> None:
         save_parquet(drive, out_id, "pf_holdings_view.parquet", hold)
         save_parquet(drive, out_id, "pf_exits.parquet", relook)
         save_parquet(drive, out_id, "pf_spells.parquet", spells)
+        save_parquet(drive, out_id, "pf_cohort_returns.parquet", cohort_ret)
         log("  Wrote pf_index / pf_decision_scorecard / pf_movers / pf_holdings_view "
-            "/ pf_exits / pf_spells.")
+            "/ pf_exits / pf_spells / pf_cohort_returns.")
 
     # 6. Digest (HTML findings) + Excel workbook (detailed tables).
     html = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook,
-                      decs, hold, matched)
+                      decs, hold, matched, cohort_ret)
     # Gmail clips a message body past ~102 KB — surface the size instead of finding
     # out from a truncated mail.
     kb = len(html.encode("utf-8")) / 1024.0
@@ -1622,7 +1937,8 @@ def main() -> None:
         subject = f"PF Tracker — {asof} ({len(pf)} holdings)"
     if args.no_write:
         subject = "[PREVIEW] " + subject
-    xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold, spells)
+    xlsx = build_excel_bytes(pf, idx, movers, score, relook, decs, hold, spells,
+                             cohorts, cohort_ret)
     xlsx_name = f"pf_tracker_{asof}.xlsx"
     XLSX_MIME = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
