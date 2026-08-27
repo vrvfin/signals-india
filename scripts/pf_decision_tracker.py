@@ -102,6 +102,19 @@ EXIT_COLS  = ["symbol", "isin", "name", "first_seen", "sell_date",
 SPELL_COLS = ["isin", "symbol", "name", "spell_start", "spell_end", "status",
               "weight_at_entry", "weight_at_exit"]
 
+# A corporate action (face-value split/consolidation) changes a company's ISIN.
+# Identity is keyed on ISIN, so without this the old code reads the swap as a SELL
+# of the whole position followed by a BUY. Persisted so an alias is auditable.
+ALIAS_COLS = ["old_isin", "new_isin", "symbol", "changed_on"]
+
+# Monthly frozen baskets: the portfolio's composition at each month start, held
+# untouched. Comparing it against the real index answers "did my trading help?".
+COHORT_COLS = ["cohort_month", "snapshot_date", "isin", "symbol", "weight_pct"]
+COHORT_RET_COLS = ["cohort_month", "asof", "horizon_m", "days", "frozen_ret_pct",
+                   "actual_ret_pct", "delta_pp", "n_priced", "n_total", "partial"]
+COHORT_HORIZONS = [1, 2, 3, 6, 12]
+COHORT_MAIL_N = 6                 # cohorts shown in the mail; parquet keeps them all
+
 # ADD/TRIM band: a weight change counts as a real trade only if it exceeds the
 # drift-implied weight by BOTH an absolute (pp) and a relative margin.
 ADD_TRIM_ABS_PP  = 0.5
@@ -115,6 +128,11 @@ MIN_ANNUALISE_DAYS = 91          # don't annualise anything shorter than a quart
 # Stagnancy is defined ONLY as "how many consecutive trading days has the close
 # stayed inside ±band of today's close" — two bands, no fuzzy composite rule.
 FLAT_BANDS = (0.05, 0.10)
+
+# How far behind the market a close series may sit before it is called stalled.
+# Mirrors OHLCV_MAX_STALE_DAYS in pipeline_healthcheck.py:52 and build_gallery.py —
+# 4 calendar days is too tight for India's long holiday weekends.
+OHLCV_MAX_STALE_DAYS = 6
 
 # Goal tracking: the annual return you're aiming for, expressed as the weekly pace
 # it demands. 50%/yr => (1.5)^(7/365)-1 = ~0.78%/week.
@@ -470,6 +488,62 @@ def derive_decisions(snaps: pd.DataFrame, decs: pd.DataFrame, asof: date,
     else:
         log(f"  Holdings changed on {cur_d} but no BUY/SELL/ADD/TRIM crossed the band.")
     return decs
+
+
+# ── ISIN continuity across corporate actions ─────────────────────────────────
+
+def build_isin_alias(snaps: pd.DataFrame) -> pd.DataFrame:
+    """Detect ISIN changes so a corporate action doesn't read as a sell + a buy.
+
+    TDPOWERSYS moved INE419M01027 -> INE419M01035 on 2026-08-26. Nothing was
+    traded, but keying identity on ISIN made the old one's disappearance a SELL of
+    a 9.65% position and the new one's arrival a BUY.
+
+    Rule: on snapshot date D, if ISIN A was present at D-1 and absent at D, while
+    ISIN B was absent at D-1 and present at D, and both carry the same non-blank
+    symbol, then B is the same position as A. Returns the alias table; the map is
+    applied by `apply_isin_alias` before spells/decisions/cohorts are derived.
+
+    Deliberately conservative: it fires only on a same-day swap of a shared symbol,
+    and the result is persisted so a wrong alias is visible rather than silent."""
+    if snaps.empty:
+        return pd.DataFrame(columns=ALIAS_COLS)
+    dates = sorted(snaps["snapshot_date"].unique())
+    by_date = {d: snaps[snaps["snapshot_date"] == d] for d in dates}
+    rows = []
+    for prev_d, cur_d in zip(dates, dates[1:]):
+        prev, cur = by_date[prev_d], by_date[cur_d]
+        gone = set(prev["isin"]) - set(cur["isin"])
+        new = set(cur["isin"]) - set(prev["isin"])
+        if not gone or not new:
+            continue
+        psym = {r.isin: str(r.symbol).strip().upper() for r in prev.itertuples()}
+        csym = {r.isin: str(r.symbol).strip().upper() for r in cur.itertuples()}
+        for a in gone:
+            s = psym.get(a, "")
+            if not s or s == "NAN":
+                continue
+            match = [b for b in new if csym.get(b, "") == s]
+            if len(match) == 1:                       # unambiguous swap only
+                rows.append(dict(old_isin=a, new_isin=match[0], symbol=s,
+                                 changed_on=cur_d))
+    return pd.DataFrame(rows, columns=ALIAS_COLS)
+
+
+def apply_isin_alias(df: pd.DataFrame, alias: pd.DataFrame) -> pd.DataFrame:
+    """Rewrite every new_isin back to its original isin, so one company keeps one
+    identity for its whole life. Chains are followed (A->B->C all become A)."""
+    if df is None or df.empty or alias is None or alias.empty or "isin" not in df.columns:
+        return df
+    m = dict(zip(alias["new_isin"], alias["old_isin"]))
+    def _root(i, seen=None):
+        seen = seen or set()
+        while i in m and i not in seen:
+            seen.add(i); i = m[i]
+        return i
+    out = df.copy()
+    out["isin"] = out["isin"].map(_root)
+    return out
 
 
 # ── Holding spells (contiguous ownership runs) ───────────────────────────────
@@ -1027,6 +1101,105 @@ def compute_exits_view(spells: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
     return out[cols].sort_values("opportunity_pp", ascending=False, na_position="last")
 
 
+# ── Monthly cohorts: the frozen-basket counterfactual ────────────────────────
+
+def build_cohorts(snaps: pd.DataFrame, cohorts: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """Freeze the book's composition at each month start. APPEND-ONLY — a cohort is
+    a historical fact and is never recomputed once written.
+
+    The cohort date is the FIRST SNAPSHOT ON/AFTER the 1st, because there is no
+    snapshot every day. Since snapshot dates are sorted, the first date seen for a
+    month IS that snapshot. The earliest cohort therefore starts at inception
+    (2026-07-23), which doubles as the since-inception frozen basket."""
+    cols = COHORT_COLS
+    if snaps.empty:
+        return (cohorts if cohorts is not None else pd.DataFrame(columns=cols)), False
+    have = set(cohorts["cohort_month"]) if cohorts is not None and not cohorts.empty else set()
+    rows = []
+    for d in sorted(snaps["snapshot_date"].unique()):
+        m = str(d)[:7]
+        if m in have:
+            continue
+        have.add(m)
+        for r in snaps[snaps["snapshot_date"] == d].itertuples():
+            rows.append(dict(cohort_month=m, snapshot_date=d, isin=r.isin,
+                             symbol=r.symbol, weight_pct=r.weight_pct))
+    if not rows:
+        return cohorts, False
+    out = pd.concat([cohorts if cohorts is not None else pd.DataFrame(columns=cols),
+                     pd.DataFrame(rows, columns=cols)], ignore_index=True)
+    new_months = sorted({r["cohort_month"] for r in rows})
+    log(f"  Cohorts: froze {len(new_months)} new basket(s) — {', '.join(new_months)}")
+    return out[cols], True
+
+
+def _frozen_return(members: pd.DataFrame, start_ts, end_ts, price_cache,
+                   drive, ohlcv_id) -> tuple[float | None, int, int]:
+    """Buy-and-hold return of a frozen basket: put wᵢ into each name at the cohort
+    date and never touch it again, so
+
+        return = Σ wᵢ·rᵢ / Σ wᵢ
+
+    which is exactly the value of that basket today versus its cost. Names without
+    a price are dropped from BOTH sides of the ratio, so the number is never
+    silently diluted — `n_priced` vs `n_total` exposes how many were dropped."""
+    num = den = 0.0
+    n_priced = 0
+    for r in members.itertuples():
+        w = float(r.weight_pct) if pd.notna(r.weight_pct) else 0.0
+        if w <= 0:
+            continue
+        ret = fwd_return(load_close_series(drive, ohlcv_id, r.symbol, price_cache),
+                         start_ts, end_ts)
+        if ret is None:
+            continue
+        num += w * ret
+        den += w
+        n_priced += 1
+    return ((num / den) if den > 0 else None), n_priced, len(members)
+
+
+def compute_cohort_returns(cohorts: pd.DataFrame, idx: pd.DataFrame, price_cache: dict,
+                           drive, ohlcv_id, asof: date) -> pd.DataFrame:
+    """Frozen basket vs what the portfolio ACTUALLY did, per cohort × horizon.
+
+        delta_pp = actual − frozen
+
+    Positive means the trading you did since that month start beat leaving the book
+    alone; negative means doing nothing would have won. Fully derived from the
+    cohorts + prices + pf_index, so it is regenerated (overwritten) every run.
+
+    Horizons that have not elapsed produce NO ROW — the mail renders those cells
+    blank rather than showing a zero that reads as "no difference"."""
+    if cohorts is None or cohorts.empty:
+        return pd.DataFrame(columns=COHORT_RET_COLS)
+    pf_ser = None
+    if idx is not None and not idx.empty and "pf_index" in idx.columns:
+        pf_ser = (idx.assign(_d=pd.to_datetime(idx["date"]))
+                     .set_index("_d")["pf_index"].astype(float).sort_index())
+    end_ts = pd.Timestamp(asof)
+    rows = []
+    for m, g in cohorts.groupby("cohort_month"):
+        start = str(g["snapshot_date"].iloc[0])
+        start_ts = pd.Timestamp(start)
+        windows = [(h, start_ts + relativedelta(months=h), False) for h in COHORT_HORIZONS]
+        windows = [w for w in windows if w[1] <= end_ts]
+        windows.append((np.nan, end_ts, True))          # the live, partial window
+        for h, win_end, partial in windows:
+            frozen, n_priced, n_total = _frozen_return(
+                g, start_ts, win_end, price_cache, drive, ohlcv_id)
+            actual = fwd_return(pf_ser, start_ts, win_end) if pf_ser is not None else None
+            rows.append(dict(
+                cohort_month=m, asof=str(asof), horizon_m=h,
+                days=int((win_end - start_ts).days),
+                frozen_ret_pct=frozen if frozen is not None else np.nan,
+                actual_ret_pct=actual if actual is not None else np.nan,
+                delta_pp=((actual - frozen) if (actual is not None and frozen is not None)
+                          else np.nan),
+                n_priced=n_priced, n_total=n_total, partial=partial))
+    return pd.DataFrame(rows, columns=COHORT_RET_COLS)
+
+
 # ── HTML digest ──────────────────────────────────────────────────────────────
 
 def _pct(v, signed=True):
@@ -1079,13 +1252,96 @@ def shrink_html(html: str) -> str:
     return html.replace("<td >", "<td>").replace("<th >", "<th>")
 
 
+def _price_freshness(price_cache: dict):
+    """-> (market_date, [(symbol, last_close_date, days_behind), ...])
+
+    The reference date is the MODE of every cached series' last close, i.e. what
+    the book as a whole last traded on. Self-calibrating, so there is no NSE
+    holiday calendar to maintain and a long weekend simply looks normal.
+
+    NOTE the population is price_cache, which is wider than the current book: it
+    also holds EXITED names, because the sold-relook and decision scoring price
+    them too. Hence "priced series", not "holdings" — on a 55-name book this is
+    typically ~70 series.
+
+    This matters more here than on a chart page: every return, quartile and
+    verdict in this mail is computed off these closes, so a holding whose feed
+    stopped three weeks ago is being judged on a three-week-old price without
+    saying so.
+    """
+    last = {}
+    for sym, ser in (price_cache or {}).items():
+        if ser is None or len(ser) == 0:
+            continue
+        try:
+            last[sym] = pd.Timestamp(ser.index[-1]).date()
+        except Exception:
+            continue
+    if not last:
+        return None, []
+    modes = pd.Series(list(last.values())).mode()
+    if modes.empty:
+        return None, []
+    mkt = modes.iloc[0]
+    stale = sorted(((s, d, (mkt - d).days) for s, d in last.items() if d < mkt),
+                   key=lambda t: -t[2])
+    return mkt, stale
+
+
+def _freshness_block(mkt_date, asof, stale, n_priced) -> str:
+    """Inline-styled banner (no CSS classes — mail clients strip <style>)."""
+    if not mkt_date:
+        return ("<div style='background:#fdecea;border:1px solid #f5c6c0;color:#96231a;"
+                "border-radius:6px;padding:9px 12px;margin:8px 0'>"
+                "<b>&#9888; No price data behind this report</b> — every return below is "
+                "unreliable.</div>")
+    lag = (pd.Timestamp(asof).date() - mkt_date).days
+    when, gen = mkt_date.strftime("%a %d %b %Y"), pd.Timestamp(asof).strftime("%a %d %b %Y")
+    plural = "day" if lag == 1 else "days"
+    if lag <= 0:
+        bg, br, fg = "#e8f5e9", "#c3e6c8", "#1b5e20"
+        head = (f"&#10003; Generated {gen} &middot; prices to {when} &mdash; up to date")
+    elif lag > OHLCV_MAX_STALE_DAYS:
+        bg, br, fg = "#fdecea", "#f5c6c0", "#96231a"
+        head = (f"&#9888; Generated {gen} &middot; prices only to {when} &mdash; {lag} "
+                f"{plural} behind. Every return below is computed on stale closes.")
+    else:
+        why = (" (today's close may not be ingested yet)" if lag == 1
+               else " (weekend / holiday gap is normal)" if lag <= 4 else "")
+        bg, br, fg = "#fff7e6", "#ffd591", "#8a5300"
+        head = (f"&#9888; Generated {gen} &middot; prices to {when} &mdash; {lag} "
+                f"{plural} behind{why}")
+    body = ""
+    if stale:
+        # Name them: these specific holdings are being judged on an old price.
+        bad = [t for t in stale if t[2] > OHLCV_MAX_STALE_DAYS]
+        items = ", ".join(f"<b>{esc(s)}</b> ({n}d, to {d.strftime('%d %b')})"
+                          for s, d, n in stale[:12])
+        more = f" +{len(stale) - 12} more" if len(stale) > 12 else ""
+        body = (f"<div style='margin-top:6px;font-size:12px'>"
+                f"{len(stale)} of {n_priced} priced series behind {when}"
+                + (f" — <b>{len(bad)} by more than {OHLCV_MAX_STALE_DAYS} days</b>"
+                   if bad else "")
+                + f": {items}{more}</div>")
+    else:
+        body = (f"<div style='margin-top:6px;font-size:12px'>"
+                f"all {n_priced} priced series current to {when}</div>")
+    return (f"<div style='background:{bg};border:1px solid {br};color:{fg};"
+            f"border-radius:6px;padding:9px 12px;margin:8px 0'>{head}{body}</div>")
+
+
 def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,
-               hold=None, matched=None):
+               hold=None, matched=None, price_cache=None):
     H = []
     H.append(f"<h2 style='margin:0'>PF Decision Tracker — {asof}</h2>")
     H.append(f"<p style='color:#666;margin:2px 0 14px'>{len(pf)} holdings · "
              f"weightage col: <code>{esc(str(wcol))}</code> · judged vs your own book's median · "
              f"detailed tables in the attached Excel</p>")
+
+    # What date is this actually computed on? Stated before any number is shown.
+    _mkt, _stale = _price_freshness(price_cache or {})
+    _n_priced = sum(1 for v in (price_cache or {}).values() if v is not None and len(v))
+    H.append(_freshness_block(_mkt, asof, _stale, _n_priced))
 
     # REVIEW NOW — recent buys sinking / recent sells that ran up (short horizon).
     warn, seen = [], set()
@@ -1609,7 +1865,7 @@ def main() -> None:
 
     # 6. Digest (HTML findings) + Excel workbook (detailed tables).
     html = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook,
-                      decs, hold, matched)
+                      decs, hold, matched, price_cache=price_cache)
     # Gmail clips a message body past ~102 KB — surface the size instead of finding
     # out from a truncated mail.
     kb = len(html.encode("utf-8")) / 1024.0
