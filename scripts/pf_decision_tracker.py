@@ -1412,7 +1412,9 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                  f"<b>vs idx</b> is a like-for-like gap over identical days (smallcap column is in "
                  f"the workbook). "
                  f"<b>Contrib</b> = points of PF growth actually delivered (weight × return). "
-                 f"1M/3M/12M are market trailing windows, shown as context only.</p>")
+                 f"Trailing market windows (1M/3M/12M) and the flat-day counts are in "
+                 f"the workbook — they pre-date most holdings and were only ever context, "
+                 f"and dropping them keeps this mail under Gmail's clip limit.</p>")
         H.append("<table style='border-collapse:collapse;font-size:12px'>"
                  "<tr><th style='padding:2px 6px'>#</th><th align='left'>Symbol</th>"
                  "<th style='padding:2px 6px'>Wt%</th><th style='padding:2px 6px'>From</th>"
@@ -1420,8 +1422,7 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                  "<th style='padding:2px 6px'>%/wk</th><th style='padding:2px 6px'>vs med</th>"
                  "<th style='padding:2px 6px'>Idx</th><th style='padding:2px 6px'>vs idx</th>"
                  "<th style='padding:2px 6px'>Contrib</th>"
-                 "<th style='padding:2px 6px'>1M</th><th style='padding:2px 6px'>3M</th>"
-                 "<th style='padding:2px 6px'>12M</th><th style='padding:2px 6px'>±5%</th>"
+                 "<th style='padding:2px 6px'>±5%</th>"
                  "<th style='padding:2px 6px'>±10%</th>"
                  "<th align='left' style='padding:2px 6px'>Flags</th></tr>")
         for r in hold.itertuples():
@@ -1444,9 +1445,6 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                 f"{_pct(r.n500_ret_pct)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.vs_bench_pp)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{_pct(r.contrib_pp)}</td>"
-                f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_1m_pct)}</td>"
-                f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_3m_pct)}</td>"
-                f"<td align='right' style='padding:2px 6px;color:#888'>{_pct(r.return_12m_pct)}</td>"
                 f"<td align='right' style='padding:2px 6px'>{f5}</td>"
                 f"<td align='right' style='padding:2px 6px'>{f10}</td>"
                 f"<td style='padding:2px 6px;font-size:11px'>{fl}</td></tr>")
