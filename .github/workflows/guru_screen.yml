@@ -64,13 +64,23 @@ jobs:
           restore-keys: |
             guru-data-
 
-      - name: Write Drive credentials
+      # Same credential handoff as daily.yml: _extractor_base.get_drive() reads
+      # GDRIVE_OAUTH_CLIENT_SECRET_PATH / _TOKEN_PATH out of a repo-root .env,
+      # so writing the JSON alone is not enough — the paths must be exported too.
+      - name: Write credentials from secrets
         env:
-          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GDRIVE_FOLDER_ID:                ${{ secrets.GDRIVE_FOLDER_ID }}
           GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON:         ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
         run: |
-          echo "$GDRIVE_OAUTH_TOKEN_JSON" > token.json
-          echo "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > client_secret.json
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON"        > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/cs.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+          } > .env
 
       # Rules + config live on PRIVATE Drive, not in this public repo.
       - name: Fetch rules & config from Drive
