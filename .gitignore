@@ -76,3 +76,10 @@ scripts/_eval_out/
 # generated teardown previews (local only, never committed)
 teardown_preview/
 quarter_teardown_*.html
+
+# Project Guru — commit the SCRIPTS only. Data (27GB), rules and results stay
+# out of this PUBLIC repo; rules live on private Drive (guru/config_sync.py).
+guru/data/
+guru/backtest/
+guru/*.bak
+guru/**/*.bak

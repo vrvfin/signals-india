@@ -1,0 +1,68 @@
+=================================================================
+ PROJECT GURU - HOW TO RUN / RESUME  (keep this file)
+=================================================================
+
+GOLDEN RULES
+- EVERYTHING is resume-only. Every pipeline tracks progress in a ledger and
+  writes one file per item. Closing a window, rebooting, or a crash loses at
+  most the single item in flight. Just double-click the same .bat again -
+  finished work is detected and skipped. Nothing is ever re-done or deleted.
+- All local. No cloud, no internet (except the NSE/BSE data pulls), no cost.
+- Python used by every bat: C:\Users\vaido\.conda\envs\signals-india\python.exe
+
+IF THIS CLAUDE (CHAT) WINDOW CLOSES
+- Jobs Claude started for you in the background STOP when the chat closes.
+- Jobs you started by double-clicking a .bat run in THEIR OWN cmd windows and
+  keep running regardless of the chat.
+- To be safe after any close/reboot: double-click the .bat for whatever was
+  running (see "WHICH STAGE" below). It resumes from where it stopped.
+- To check a stage without running it, open a terminal and add --status, e.g.
+  C:\Users\vaido\.conda\envs\signals-india\python.exe D:\EMA_Screener\claude\signals-india\guru\exit_analysis.py --status
+
+=================================================================
+ THE PIPELINE (in order) - which .bat resumes each stage
+=================================================================
+DATA (done):
+  run_nse_dump.bat ............ pull NSE quarterly results (index+details+xbrl)
+
+BACKTEST (done):
+  run_backtest_parallel.bat ... backtest all 2,088 rules (4 workers)
+  run_backtest.bat ............ same, single worker (fallback)
+  update_excel.bat ............ rebuild backtest\scorecard.xlsx anytime
+
+PROFILING - Feature B (done):
+  run_profiling_parallel.bat .. winner/loser profiling + filter lifts (4 workers)
+  run_profiling.bat ........... single worker; also rebuilds profiles_summary.xlsx
+
+FUNNEL - Feature A (done):  built inside run_night_batch.bat
+
+VALIDATION - #12 (done):
+  run_validation_all.bat ...... ONE-CLICK: validation -> summary -> noise floor
+  run_validation_parallel.bat . just the 4-worker validation
+  run_validation_summary.bat .. rebuild validation_summary.xlsx
+  run_validation_noise.bat .... just the shuffled-date noise floor
+
+COMBOS - Feature C (RUNNING NOW, ~600 combos, several hours):
+  >> run_combos_parallel.bat .. RESUME THIS if combos interrupted
+  score_combos.bat ............ after combos finish -> combos_summary.xlsx
+
+EXITS - #7 (RUNNING NOW, nearly done):
+  (no dedicated bat yet - resume with:)
+  C:\Users\vaido\.conda\envs\signals-india\python.exe D:\EMA_Screener\claude\signals-india\guru\exit_analysis.py
+  then for the Excel:
+  ...\python.exe ...\guru\exit_analysis.py --summary-only
+
+CHARTS (on demand):
+  make_charts.bat ............. enter rule IDs -> charts per rule folder
+
+=================================================================
+ RIGHT NOW, TWO THINGS ARE RUNNING
+=================================================================
+1. Exits (#7): ~done. If interrupted, run exit_analysis.py (line above).
+2. Combos (Feature C): ~600 combos backtesting. If interrupted, double-click
+   run_combos_parallel.bat . When its 4 windows all say RUN COMPLETE, run
+   score_combos.bat .
+
+So if you must close everything: it is fine. Later, double-click
+run_combos_parallel.bat (resumes combos) and run exit_analysis.py (resumes exits).
+=================================================================
