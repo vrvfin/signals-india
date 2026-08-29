@@ -42,9 +42,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas pyarrow numpy openpyxl requests \
-                      google-api-python-client google-auth google-auth-oauthlib \
-                      python-dotenv
+          # Same install as every other workflow: guru/ reuses
+          # scripts/_extractor_base.py for Drive access, and that module imports
+          # google.genai at import time -- so the screen needs the full pinned
+          # set even though it makes no LLM calls itself.
+          pip install -r requirements.txt
+          # openpyxl: reads rule_template.xlsx, writes DAILY_SCREEN_*.xlsx.
+          # Kept out of root requirements.txt (Streamlit Cloud diet).
+          pip install openpyxl
 
       # Cache the price/statement cache between runs so we only pull what
       # changed on Drive (sync_from_drive + daily_screen both check modifiedTime).
