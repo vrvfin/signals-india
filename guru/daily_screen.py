@@ -39,6 +39,7 @@ import numpy as np, pandas as pd
 GURU = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(GURU, "data")
 LIVE = os.path.join(DATA, "live_ohlcv")
+BT = os.path.join(GURU, "backtest")
 SCRIPTS = os.path.join(os.path.dirname(GURU), "scripts")
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
@@ -272,6 +273,9 @@ def main():
     ap.add_argument("--min-turnover", type=float, default=1.0,
                     help="minimum avg 20d traded value, Rs cr/day")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--no-publish", action="store_true",
+                    help="skip uploading guru_picks.parquet to Drive "
+                         "(the local copy is always written)")
     args = ap.parse_args()
 
     status = []
@@ -510,6 +514,36 @@ def main():
                                                            index=False)
     log(f"DAILY SCREEN -> {out}")
     print(stat.to_string(index=False))
+
+    # ---- publish the picks so the gallery can render them --------------------
+    # The xlsx is the human artefact; this parquet is the machine one. Same
+    # split the guidance watchlist uses: a builder writes a table to Drive
+    # _index/, and build_gallery.py renders it. Written locally either way, so
+    # the gallery still works offline from the last run.
+    picks = conv.copy()
+    picks["as_of"] = str(M["last_date"].max().date())
+    picks["min_mcap_cr"] = float(args.min_mcap)
+    picks["min_turnover_cr"] = float(args.min_turnover)
+    picks_p = os.path.join(BT, "guru_picks.parquet")
+    os.makedirs(BT, exist_ok=True)
+    picks.to_parquet(picks_p, index=False)
+    log(f"picks table -> {picks_p} ({len(picks):,} rows)")
+    if not args.no_publish:
+        try:
+            from _extractor_base import (get_drive, get_or_create_subfolder,
+                                         upload_bytes)
+            d = get_drive()
+            repo = get_or_create_subfolder(d, os.environ["GDRIVE_FOLDER_ID"],
+                                           "company_repo")
+            iid = get_or_create_subfolder(d, repo, "_index")
+            with open(picks_p, "rb") as fh:
+                upload_bytes(d, iid, "guru_picks.parquet", fh.read(),
+                             "application/octet-stream")
+            log("published guru_picks.parquet -> Drive company_repo/_index/")
+        except Exception as e:
+            # Never fail the screen over a publish hiccup — the xlsx and the
+            # mail are the deliverables; the gallery can use the local copy.
+            log(f"publish SKIPPED ({type(e).__name__}: {e})")
 
 
 if __name__ == "__main__":
