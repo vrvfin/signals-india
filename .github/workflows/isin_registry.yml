@@ -1,11 +1,17 @@
 name: isin_registry
 
-# Keeps a dated copy of the exchange's own ticker->ISIN list and compares it with
-# yesterday's. A company's ISIN can change while its ticker stays the same; without
-# a dated copy there is nothing to compare against and the change is invisible until
-# a company's history has already split in two.
+# Compares the exchange's own ticker->ISIN list against universe/isin_state.csv --
+# ONE small file holding what we last saw, overwritten each run. A company's ISIN can
+# change while its ticker stays the same, and without that comparison the change is
+# invisible until the company's history has already split in two.
 #
-# RECORDS ONLY. No existing table, ledger or folder is modified by this workflow.
+# For each change it also FIXES THE FOLDER, one company at a time: renames the old
+# folder when nothing has been filed under the new ISIN yet, or appends the old into
+# the new when both exist. Every change is appended to
+# company_repo/_index/isin_changes.parquet and mailed.
+#
+# Nothing is ever deleted, and DATA TABLES ARE NOT REPOINTED here -- that stays a
+# deliberate, separate run of repoint_isin.py.
 # Deliberately separate from universe_refresh.yml, which also runs a full 2-year BSE
 # OHLCV backfill and so cannot cheaply be made daily.
 
@@ -56,5 +62,5 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
-      - name: Snapshot the exchange list, then compare with yesterday
-        run: python scripts/isin_registry.py --snapshot --detect --mail
+      - name: Detect ISIN changes, fix folders, track and mail
+        run: python scripts/isin_watch.py
