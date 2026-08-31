@@ -51,15 +51,50 @@ def log(m):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
 
 
-def load_picks(drive) -> tuple[pd.DataFrame, str]:
-    """Local copy first (fast, and what you just screened); Drive as fallback so
-    a gallery built here can render a screen that only ever ran in CI."""
+def load_picks(drive, prefer: str = "newest") -> tuple[pd.DataFrame, str]:
+    """Take whichever copy is NEWER — local or Drive.
+
+    This matters because nothing in gallery_all.bat re-runs the screen: CI
+    refreshes Drive every weekday evening, so on any day you have not screened
+    locally the Drive copy is the fresh one and the local copy is yesterday's.
+    Preferring 'local' blindly would quietly render stale picks.
+    """
     local = os.path.join(BT, PICKS)
-    if os.path.exists(local):
-        return pd.read_parquet(local), "local"
+    l_mt = (datetime.utcfromtimestamp(os.path.getmtime(local))
+            if os.path.exists(local) else None)
     idx = BG._folder(drive, "company_repo/_index")
-    df = BG._read_parquet(drive, idx, PICKS)
-    return df, "Drive"
+    d_mt, fid = None, None
+    try:
+        from _extractor_base import find_file
+        fid = find_file(BG._drive(drive) if hasattr(BG, "_drive") else drive,
+                        idx, PICKS)
+    except Exception:
+        fid = None
+    if fid:
+        try:
+            meta = drive.files().get(fileId=fid, fields="modifiedTime").execute()
+            d_mt = datetime.strptime(meta["modifiedTime"][:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            d_mt = None
+    if prefer == "local" and l_mt:
+        pick = "local"
+    elif prefer == "drive" and d_mt:
+        pick = "Drive"
+    elif l_mt and d_mt:
+        pick = "local" if l_mt >= d_mt else "Drive"
+    elif l_mt:
+        pick = "local"
+    elif d_mt:
+        pick = "Drive"
+    else:
+        return pd.DataFrame(), "nowhere"
+    stamp = {"local": l_mt, "Drive": d_mt}[pick]
+    other = {"local": d_mt, "Drive": l_mt}[pick]
+    note = f"{pick} (written {stamp:%Y-%m-%d %H:%M} UTC"
+    note += f"; the other copy is {other:%Y-%m-%d %H:%M} UTC)" if other else ")"
+    if pick == "local":
+        return pd.read_parquet(local), note
+    return BG._read_parquet(drive, idx, PICKS), note
 
 
 def _fmt(v, dp=1, dash="–"):
@@ -77,37 +112,83 @@ def annot_for(picks: pd.DataFrame) -> dict:
         sym = str(r.get("symbol", "") or "")
         if not sym:
             continue
-        bits = [f"Conviction {_fmt(r.get('conviction_score'), 0)}",
-                f"{int(r.get('n_rules') or 0)} rules"]
+        bits = []
+        fs = str(r.get("first_seen", "") or "").strip()
+        if fs:
+            d = r.get("days_on_list")
+            d = int(d) if pd.notna(pd.to_numeric(pd.Series([d]),
+                                                 errors="coerce").iloc[0]) else None
+            age = ("NEW today" if d == 0 else
+                   f"on list {d}d (since {fs})" if d is not None else f"since {fs}")
+            bits.append(age)
+        bits += [f"Conviction {_fmt(r.get('conviction_score'), 0)}",
+                 f"{int(r.get('n_rules') or 0)} rules"]
         br = r.get("best_rule_return")
         if pd.notna(pd.to_numeric(br, errors="coerce")):
             bits.append(f"best rule +{_fmt(br)}%")
         rare = r.get("rarest_rule_hits")
         if pd.notna(pd.to_numeric(rare, errors="coerce")):
             bits.append(f"rarest hits {int(float(rare))}")
-        names = str(r.get("rule_names", "") or "").strip()
-        detail = (f' <span style="font-weight:500;opacity:.9">· {names[:180]}'
-                  f'{"…" if len(names) > 180 else ""}</span>') if names else ""
-        out[sym] = ('<div style="background:#1b4332;color:#fff;border-radius:6px;'
-                    'padding:4px 10px;font-size:13px;font-weight:700;margin:3px 0">'
-                    f'🎯 {" · ".join(bits)}{detail}</div>')
+        head = ('<div style="background:#1b4332;color:#fff;border-radius:6px 6px 0 0;'
+                'padding:4px 10px;font-size:13px;font-weight:700;margin:3px 0 0 0">'
+                f'🎯 {" · ".join(bits)}</div>')
+        out[sym] = head + why_block(r)
     return out
+
+
+def why_block(r) -> str:
+    """The 'why' under the badge: every rule this stock passed, and the stock's
+    OWN numbers against that rule's thresholds. Falls back to the rule names
+    alone for a picks table written before evidence was captured."""
+    why = str(r.get("why", "") or "").strip()
+    if not why:
+        names = str(r.get("rule_names", "") or "").strip()
+        if not names:
+            return ""
+        items = [n.strip() for n in names.split("|") if n.strip()]
+    else:
+        items = [n.strip() for n in why.split("¦") if n.strip()]
+    rows = []
+    for it in items:
+        if "→" in it:
+            rule, ev = it.split("→", 1)
+            rows.append(
+                f'<li style="margin:2px 0"><span style="color:#1b4332;'
+                f'font-weight:600">{rule.strip()}</span>'
+                f'<span style="color:#555"> — {ev.strip()}</span></li>')
+        else:
+            rows.append(f'<li style="margin:2px 0"><span style="color:#1b4332;'
+                        f'font-weight:600">{it}</span></li>')
+    return ('<details open style="background:#f2f7f4;border:1px solid #cfe3d8;'
+            'border-top:none;border-radius:0 0 6px 6px;padding:6px 10px;'
+            'margin:0 0 3px 0;font-size:12px">'
+            '<summary style="cursor:pointer;color:#1b4332;font-weight:600;'
+            f'font-size:12px">why it was picked ({len(rows)})</summary>'
+            f'<ul style="margin:6px 0 2px 0;padding-left:18px">{"".join(rows)}'
+            '</ul></details>')
 
 
 def prelude_for(picks: pd.DataFrame, as_of: str) -> str:
     """Summary table above the card grid — the whole shortlist at a glance,
     so the page is useful before you scroll a single chart."""
-    head = ["#", "Stock", "Conviction", "Rules", "MCap (cr)", "Turnover (cr/d)",
-            "12M %", "Rules satisfied"]
+    head = ["#", "Stock", "Added", "Days", "Conviction", "Rules", "MCap (cr)",
+            "Turnover (cr/d)", "12M %", "Rules satisfied"]
     th = "".join(
         f'<th style="text-align:left;padding:6px 10px;border-bottom:2px solid #ccc;'
         f'font-size:12px;color:#333;white-space:nowrap">{h}</th>' for h in head)
     rows = []
     for i, (_, r) in enumerate(picks.iterrows(), 1):
         names = str(r.get("rule_names", "") or "")
+        d = pd.to_numeric(pd.Series([r.get("days_on_list")]),
+                          errors="coerce").iloc[0]
+        added = str(r.get("first_seen", "") or "–")
+        if pd.notna(d) and int(d) == 0:
+            added = f'<b style="color:#0a7d33">{added}</b>'
         cells = [str(i),
                  f'<b>{r.get("name", "") or r.get("symbol", "")}</b> '
                  f'<span style="color:#777">{r.get("symbol", "")}</span>',
+                 added,
+                 "–" if pd.isna(d) else str(int(d)),
                  _fmt(r.get("conviction_score"), 0),
                  str(int(r.get("n_rules") or 0)),
                  _fmt(r.get("market_cap_cr"), 0),
@@ -137,6 +218,16 @@ def main():
     ap.add_argument("--min-rules", type=int, default=0,
                     help="only stocks satisfying at least this many rules")
     ap.add_argument("--min-conviction", type=float, default=0.0)
+    ap.add_argument("--sort", choices=["new", "conviction"], default="new",
+                    help="new = newest onto the list first (default), "
+                         "conviction ties broken by score; "
+                         "conviction = highest score first")
+    ap.add_argument("--source", choices=["newest", "local", "drive"],
+                    default="newest",
+                    help="which picks table to render (default: whichever of "
+                         "the local and Drive copies is newer)")
+    ap.add_argument("--new-only", action="store_true",
+                    help="only stocks that first appeared in the latest run")
     ap.add_argument("--timeframe-days", type=int, default=252)
     ap.add_argument("--resample", choices=["D", "W", "M"], default="D")
     ap.add_argument("--out", default="")
@@ -156,7 +247,7 @@ def main():
         log(f"parquet cache purged ({cache.root})")
 
     drive = BG._drive()
-    picks, src = load_picks(drive)
+    picks, src = load_picks(drive, prefer=args.source)
     if picks.empty:
         log("No guru_picks.parquet (local or Drive) — run "
             "guru/daily_screen.py first.")
@@ -170,8 +261,22 @@ def main():
     if args.min_conviction > 0 and "conviction_score" in picks.columns:
         picks = picks[pd.to_numeric(picks["conviction_score"], errors="coerce")
                       >= args.min_conviction]
-    picks = picks.sort_values("conviction_score", ascending=False,
-                              na_position="last")
+    if args.new_only and "days_on_list" in picks.columns:
+        picks = picks[pd.to_numeric(picks["days_on_list"], errors="coerce") == 0]
+    # Newest onto the list first — a name that appeared today is the one you
+    # have not looked at yet. Conviction breaks ties, so within a given day the
+    # order is still strongest-first. --sort conviction restores the old order.
+    if args.sort == "new" and "first_seen" in picks.columns:
+        picks["_fs"] = pd.to_datetime(picks["first_seen"], errors="coerce")
+        picks = picks.sort_values(["_fs", "conviction_score"],
+                                  ascending=[False, False], na_position="last")
+        picks = picks.drop(columns=["_fs"])
+    else:
+        if args.sort == "new":
+            log("no first_seen column in this picks table (written before the "
+                "ledger existed) — falling back to conviction order")
+        picks = picks.sort_values("conviction_score", ascending=False,
+                                  na_position="last")
     if args.max > 0:
         picks = picks.head(args.max)
     picks = picks.reset_index(drop=True)
@@ -189,9 +294,12 @@ def main():
     ranked["_exch"] = ranked["symbol"].map(exch).fillna("NSE")
     syms = [s for s in ranked["symbol"].tolist() if s]
 
-    n_rules_total = int(picks["n_rules"].max()) if "n_rules" in picks else 0
-    title = (f"🎯 GURU SCREEN — {as_of} — {len(picks)} stocks — ranked by "
-             f"conviction — up to {n_rules_total} rules satisfied")
+    n_new = int((pd.to_numeric(picks.get("days_on_list"), errors="coerce") == 0).sum()) \
+        if "days_on_list" in picks.columns else 0
+    order = ("newest onto the list first" if args.sort == "new"
+             else "highest conviction first")
+    title = (f"🎯 GURU SCREEN — {as_of} — {len(picks)} stocks — {order}"
+             + (f" — {n_new} new today" if n_new else ""))
     prelude = prelude_for(picks, as_of)
     annot = annot_for(picks)
 
