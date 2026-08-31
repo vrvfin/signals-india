@@ -16,12 +16,15 @@ name: isin_registry
 # OHLCV backfill and so cannot cheaply be made daily.
 
 on:
-  # MANUAL ONLY until the first live run has been watched. This job RENAMES and
-  # MERGES company folders unattended, which no other scheduled job here does, so
-  # the first one should be triggered deliberately. Re-enable the daily schedule by
-  # uncommenting the two lines below once you are happy with what it did.
-  # schedule:
-  #   - cron: '45 1 * * *'      # 01:45 UTC = 07:15 IST, before the market opens
+  # Daily. This job RENAMES and MERGES company folders unattended — the only
+  # scheduled job here that changes structure without a human — so the actions are
+  # deliberately the reversible ones: a rename can be undone, an append copies and
+  # skips name collisions, and nothing is ever deleted. Data tables are NOT
+  # repointed here; that stays an explicit run of repoint_isin.py.
+  # First live run was dispatched manually on 2026-08-31 and passed (3,140
+  # securities checked, no changes, state refreshed).
+  schedule:
+    - cron: '45 1 * * *'        # 01:45 UTC = 07:15 IST, before the market opens
   workflow_dispatch:
 
 concurrency:
