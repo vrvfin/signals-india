@@ -39,6 +39,7 @@ import numpy as np, pandas as pd
 GURU = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(GURU, "data")
 LIVE = os.path.join(DATA, "live_ohlcv")
+BT = os.path.join(GURU, "backtest")
 SCRIPTS = os.path.join(os.path.dirname(GURU), "scripts")
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
@@ -272,6 +273,9 @@ def main():
     ap.add_argument("--min-turnover", type=float, default=1.0,
                     help="minimum avg 20d traded value, Rs cr/day")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--no-publish", action="store_true",
+                    help="skip uploading guru_picks.parquet to Drive "
+                         "(the local copy is always written)")
     args = ap.parse_args()
 
     status = []
@@ -379,10 +383,29 @@ def main():
         n = min(_WINDOWS, key=lambda w: abs(w - n))
         return f"price_return_{n}m_pct"
 
+    # Pretty names for the evidence line — the raw column names are ours, not
+    # something a reader should have to decode on a chart.
+    _PRETTY = {"roce_pct": "ROCE", "roe_pct": "ROE", "opm_pct": "OPM",
+               "npm_pct": "net margin", "debt_to_equity": "debt/equity",
+               "interest_coverage_ratio": "interest cover",
+               "sales_yoy_pct": "sales YoY", "eps_yoy_pct": "EPS YoY",
+               "pat_yoy_pct": "PAT YoY", "price_return_1m_pct": "1M return",
+               "price_return_3m_pct": "3M return", "price_return_6m_pct": "6M return",
+               "price_return_12m_pct": "12M return", "market_cap_cr": "market cap",
+               "turnover_20d_cr": "turnover", "pe_ratio": "P/E",
+               "promoter_holding_pct": "promoter holding"}
+
+    def _pretty(m):
+        return _PRETTY.get(m, str(m).replace("_pct", "").replace("_", " "))
+
     hits = []
     for rid, g in cl[cl.rule_id.isin(chosen.rule_id.unique())].groupby("rule_id"):
         mask = pd.Series(True, index=M.index)
         usable = True
+        # (display label, column to read the actual value from, operator,
+        #  threshold, is_streak) — what makes this rule fire, kept so each hit
+        #  can show its own numbers rather than just the rule's title.
+        spec = []
         for _, c in g.iterrows():
             met, op, thr = c["metric"], str(c["operator"]).strip(), c["threshold_value"]
             met = resolve_metric(met, names.get(rid, ""))
@@ -395,12 +418,16 @@ def main():
                 col = f"sales_yoy_streak_{int(float(thr))}"
                 if col in M.columns:
                     mask &= (M[col] >= off + 1)
+                    spec.append((f"sales YoY ≥{int(float(thr))}%", col,
+                                 "≥", off + 1, True))
                     continue
                 usable = False; break
             if met == "eps_yoy_pct" and off > 0:
                 col = f"eps_yoy_streak_{int(float(thr))}"
                 if col in M.columns:
                     mask &= (M[col] >= off + 1)
+                    spec.append((f"EPS YoY ≥{int(float(thr))}%", col,
+                                 "≥", off + 1, True))
                     continue
                 usable = False; break
             # sustained interest-coverage clauses -> streak metric
@@ -408,6 +435,8 @@ def main():
                 col = f"icr_streak_{10 if float(thr) >= 10 else 5}"
                 if col in M.columns:
                     mask &= (M[col] >= off + 1)
+                    spec.append((f"interest cover ≥{10 if float(thr) >= 10 else 5}",
+                                 col, "≥", off + 1, True))
                     continue
                 usable = False; break
             if met not in M.columns:
@@ -418,11 +447,48 @@ def main():
                 usable = False; break
             mask &= ({">": v > t, ">=": v >= t, "<": v < t, "<=": v <= t,
                       "==": v == t}.get(op, v >= t)).fillna(False)
+            spec.append((_pretty(met), met,
+                         {">=": "≥", "<=": "≤"}.get(op, op), t, False))
         if not usable:
             continue
         sel = M[mask]
+
+        # An N-quarter rule contributes one clause PER quarter (period_offset
+        # 0..N-1), all reading the same streak column. Only the longest is
+        # binding, so collapse them — otherwise the evidence line repeats
+        # itself eight times with a rising "needs".
+        _seen, _spec = {}, []
+        for item in spec:
+            label, col, o, t, is_streak = item
+            if not is_streak:
+                _spec.append(item)
+                continue
+            if col not in _seen:
+                _seen[col] = len(_spec)
+                _spec.append(item)
+            elif t > _spec[_seen[col]][3]:
+                _spec[_seen[col]] = item
+        spec = _spec
+
+        def _evidence(row) -> str:
+            """This stock's own numbers against the rule's thresholds — the
+            'why', not just the rule's title."""
+            out = []
+            for label, col, o, t, is_streak in spec:
+                val = pd.to_numeric(pd.Series([row.get(col)]),
+                                    errors="coerce").iloc[0]
+                if pd.isna(val):
+                    continue
+                if is_streak:
+                    out.append(f"{label} for {int(val)}q running "
+                               f"(rule needs {int(t)})")
+                else:
+                    out.append(f"{label} {val:,.1f} {o} {t:g}")
+            return " · ".join(out)
+
         for _, s in sel.iterrows():
             hits.append({"rule_id": rid, "rule_name": names.get(rid, "")[:70],
+                         "evidence": _evidence(s),
                          "symbol": s["symbol"], "name": s["name"],
                          "market_cap_cr": s.get("market_cap_cr"),
                          "turnover_20d_cr": round(float(s.get("turnover_20d_cr", np.nan)), 2),
@@ -481,6 +547,19 @@ def main():
     conv = conv.sort_values(["conviction_score", "n_rules"], ascending=False)
     status.append(("unique stocks surfaced", len(conv)))
 
+    # ---- WHY: each rule the stock passed, with the stock's OWN numbers ----
+    # Heaviest (rarest x best-returning) rules first, so a truncated list still
+    # shows the strongest evidence. The gallery renders this under each chart.
+    WHY_MAX = 8
+    _H = H.sort_values("weight", ascending=False).copy()
+    _ev = _H["evidence"].fillna("").astype(str)
+    _H["_line"] = np.where(_ev.str.len() > 0,
+                           _H["rule_name"] + " → " + _ev, _H["rule_name"])
+    why = (_H.groupby("symbol")["_line"]
+           .apply(lambda s: " ¦ ".join(s.head(WHY_MAX)))
+           .rename("why").reset_index())
+    conv = conv.merge(why, on="symbol", how="left")
+
     # ---- LIST B: coverage (>=N unique stocks per rule, avoiding repeats) ----
     used, cover = set(), []
     for rid, g in H.groupby("rule_id"):
@@ -510,6 +589,87 @@ def main():
                                                            index=False)
     log(f"DAILY SCREEN -> {out}")
     print(stat.to_string(index=False))
+
+    # ---- publish the picks so the gallery can render them --------------------
+    # The xlsx is the human artefact; this parquet is the machine one. Same
+    # split the guidance watchlist uses: a builder writes a table to Drive
+    # _index/, and build_gallery.py renders it. Written locally either way, so
+    # the gallery still works offline from the last run.
+    picks = conv.copy()
+    as_of = str(M["last_date"].max().date())
+    picks["as_of"] = as_of
+    picks["min_mcap_cr"] = float(args.min_mcap)
+    picks["min_turnover_cr"] = float(args.min_turnover)
+    os.makedirs(BT, exist_ok=True)
+
+    # ---- FIRST-SEEN LEDGER --------------------------------------------------
+    # "When did this stock come onto the list?" cannot be derived from a single
+    # run, so it has to be remembered. One row per symbol, carried forward:
+    # first_seen never moves, last_seen tracks the newest run it appeared in.
+    # Kept next to the picks and published with them, so a CI run and a local
+    # run share one history instead of each keeping a private one.
+    seen_p = os.path.join(BT, "guru_seen.parquet")
+    seen = pd.DataFrame(columns=["symbol", "first_seen", "last_seen", "times_seen"])
+    if os.path.exists(seen_p):
+        try:
+            seen = pd.read_parquet(seen_p)
+        except Exception as e:
+            log(f"first-seen ledger unreadable, starting fresh ({e})")
+    elif not args.no_publish:
+        try:                                   # no local copy — try Drive's
+            from _extractor_base import (get_drive, get_or_create_subfolder,
+                                         find_file, download_bytes)
+            _d = get_drive()
+            _repo = get_or_create_subfolder(_d, os.environ["GDRIVE_FOLDER_ID"],
+                                            "company_repo")
+            _iid = get_or_create_subfolder(_d, _repo, "_index")
+            _f = find_file(_d, _iid, "guru_seen.parquet")
+            if _f:
+                seen = pd.read_parquet(io.BytesIO(download_bytes(_d, _f)))
+                log(f"first-seen ledger pulled from Drive ({len(seen):,} symbols)")
+        except Exception as e:
+            log(f"first-seen ledger not on Drive ({type(e).__name__}) — starting fresh")
+
+    prev = dict(zip(seen.get("symbol", []), seen.get("first_seen", [])))
+    cnt = dict(zip(seen.get("symbol", []), seen.get("times_seen", [])))
+    cur = picks["symbol"].astype(str).tolist()
+    n_new = sum(1 for s in cur if s not in prev)
+    rows = [{"symbol": s, "first_seen": prev.get(s, as_of), "last_seen": as_of,
+             "times_seen": int(cnt.get(s, 0)) + 1} for s in cur]
+    # symbols that dropped off today keep their history untouched
+    gone = [r for r in seen.to_dict("records")
+            if str(r.get("symbol")) not in set(cur)]
+    seen = pd.DataFrame(rows + gone)
+    seen.to_parquet(seen_p, index=False)
+    log(f"first-seen ledger -> {len(seen):,} symbols "
+        f"({n_new:,} first appeared today)")
+
+    picks = picks.merge(seen[["symbol", "first_seen", "times_seen"]],
+                        on="symbol", how="left")
+    picks["days_on_list"] = (pd.to_datetime(as_of)
+                             - pd.to_datetime(picks["first_seen"],
+                                              errors="coerce")).dt.days
+    picks_p = os.path.join(BT, "guru_picks.parquet")
+    picks.to_parquet(picks_p, index=False)
+    log(f"picks table -> {picks_p} ({len(picks):,} rows)")
+    if not args.no_publish:
+        try:
+            from _extractor_base import (get_drive, get_or_create_subfolder,
+                                         upload_bytes)
+            d = get_drive()
+            repo = get_or_create_subfolder(d, os.environ["GDRIVE_FOLDER_ID"],
+                                           "company_repo")
+            iid = get_or_create_subfolder(d, repo, "_index")
+            for p in (picks_p, seen_p):
+                with open(p, "rb") as fh:
+                    upload_bytes(d, iid, os.path.basename(p), fh.read(),
+                                 "application/octet-stream")
+            log("published guru_picks.parquet + guru_seen.parquet "
+                "-> Drive company_repo/_index/")
+        except Exception as e:
+            # Never fail the screen over a publish hiccup — the xlsx and the
+            # mail are the deliverables; the gallery can use the local copy.
+            log(f"publish SKIPPED ({type(e).__name__}: {e})")
 
 
 if __name__ == "__main__":
