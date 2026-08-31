@@ -16,8 +16,12 @@ name: isin_registry
 # OHLCV backfill and so cannot cheaply be made daily.
 
 on:
-  schedule:
-    - cron: '45 1 * * *'        # 01:45 UTC = 07:15 IST, before the market opens
+  # MANUAL ONLY until the first live run has been watched. This job RENAMES and
+  # MERGES company folders unattended, which no other scheduled job here does, so
+  # the first one should be triggered deliberately. Re-enable the daily schedule by
+  # uncommenting the two lines below once you are happy with what it did.
+  # schedule:
+  #   - cron: '45 1 * * *'      # 01:45 UTC = 07:15 IST, before the market opens
   workflow_dispatch:
 
 concurrency:
