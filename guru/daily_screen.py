@@ -273,6 +273,9 @@ def main():
     ap.add_argument("--min-turnover", type=float, default=1.0,
                     help="minimum avg 20d traded value, Rs cr/day")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--diagnose", action="store_true",
+                    help="report, per chosen rule, whether it fired and if not "
+                         "WHICH clause blocked it — then exit without writing")
     ap.add_argument("--no-publish", action="store_true",
                     help="skip uploading guru_picks.parquet to Drive "
                          "(the local copy is always written)")
@@ -399,9 +402,13 @@ def main():
         return _PRETTY.get(m, str(m).replace("_pct", "").replace("_", " "))
 
     hits = []
+    diag = {}          # rule_id -> (verdict, detail) for --diagnose
     for rid, g in cl[cl.rule_id.isin(chosen.rule_id.unique())].groupby("rule_id"):
         mask = pd.Series(True, index=M.index)
         usable = True
+        # per-clause pass counts, so a rule with zero hits can name the clause
+        # that actually blocked it rather than just reporting "no matches"
+        clause_pass = []
         # (display label, column to read the actual value from, operator,
         #  threshold, is_streak) — what makes this rule fire, kept so each hit
         #  can show its own numbers rather than just the rule's title.
@@ -417,41 +424,68 @@ def main():
             if met == "sales_yoy_pct" and off > 0:
                 col = f"sales_yoy_streak_{int(float(thr))}"
                 if col in M.columns:
-                    mask &= (M[col] >= off + 1)
+                    _cm = (M[col] >= off + 1)
+                    mask &= _cm
+                    clause_pass.append((f"sales YoY ≥{int(float(thr))}% for {off+1}q",
+                                        int(_cm.sum())))
                     spec.append((f"sales YoY ≥{int(float(thr))}%", col,
                                  "≥", off + 1, True))
                     continue
-                usable = False; break
+                usable = False
+                diag[rid] = ("UNUSABLE", f"needs streak column {col!r} (not built)")
+                break
             if met == "eps_yoy_pct" and off > 0:
                 col = f"eps_yoy_streak_{int(float(thr))}"
                 if col in M.columns:
-                    mask &= (M[col] >= off + 1)
+                    _cm = (M[col] >= off + 1)
+                    mask &= _cm
+                    clause_pass.append((f"EPS YoY ≥{int(float(thr))}% for {off+1}q",
+                                        int(_cm.sum())))
                     spec.append((f"EPS YoY ≥{int(float(thr))}%", col,
                                  "≥", off + 1, True))
                     continue
-                usable = False; break
+                usable = False
+                diag[rid] = ("UNUSABLE", f"needs streak column {col!r} (not built)")
+                break
             # sustained interest-coverage clauses -> streak metric
             if met == "interest_coverage_ratio" and off > 0:
                 col = f"icr_streak_{10 if float(thr) >= 10 else 5}"
                 if col in M.columns:
-                    mask &= (M[col] >= off + 1)
+                    _cm = (M[col] >= off + 1)
+                    mask &= _cm
+                    clause_pass.append((f"interest cover for {off+1}q", int(_cm.sum())))
                     spec.append((f"interest cover ≥{10 if float(thr) >= 10 else 5}",
                                  col, "≥", off + 1, True))
                     continue
-                usable = False; break
+                usable = False
+                diag[rid] = ("UNUSABLE", f"needs streak column {col!r} (not built)")
+                break
             if met not in M.columns:
-                usable = False; break
+                usable = False
+                diag[rid] = ("UNUSABLE", f"metric {met!r} is not computed by the daily path")
+                break
             v = pd.to_numeric(M[met], errors="coerce")
             t = float(thr) if str(thr).replace(".", "").replace("-", "").isdigit() else np.nan
             if np.isnan(t):
-                usable = False; break
-            mask &= ({">": v > t, ">=": v >= t, "<": v < t, "<=": v <= t,
-                      "==": v == t}.get(op, v >= t)).fillna(False)
+                usable = False
+                diag[rid] = ("UNUSABLE", f"threshold {thr!r} is not numeric")
+                break
+            _cm = ({">": v > t, ">=": v >= t, "<": v < t, "<=": v <= t,
+                    "==": v == t}.get(op, v >= t)).fillna(False)
+            mask &= _cm
+            clause_pass.append((f"{_pretty(met)} {op} {t:g}", int(_cm.sum())))
             spec.append((_pretty(met), met,
                          {">=": "≥", "<=": "≤"}.get(op, op), t, False))
         if not usable:
             continue
         sel = M[mask]
+        if sel.empty:
+            worst = min(clause_pass, key=lambda x: x[1]) if clause_pass else ("?", 0)
+            diag[rid] = ("NO MATCH",
+                         f"blocking clause: {worst[0]} — only {worst[1]:,} stocks pass it"
+                         + (f" (all clauses: {clause_pass})" if len(clause_pass) > 1 else ""))
+        else:
+            diag[rid] = ("FIRED", f"{len(sel):,} stocks")
 
         # An N-quarter rule contributes one clause PER quarter (period_offset
         # 0..N-1), all reading the same streak column. Only the longest is
@@ -495,6 +529,29 @@ def main():
                          "price": round(s.get("close", np.nan), 2),
                          "ret_12m_pct": round(s.get("price_return_12m_pct", np.nan), 1),
                          "latest_quarter": s.get("latest_quarter", "")})
+    if args.diagnose:
+        print()
+        print("=" * 78)
+        print("RULE DIAGNOSIS — why each chosen rule did or did not produce hits")
+        print("=" * 78)
+        order = {"UNUSABLE": 0, "NO MATCH": 1, "FIRED": 2}
+        for rid in sorted(chosen.rule_id.unique(),
+                          key=lambda r: (order.get(diag.get(r, ("?",))[0], 9), r)):
+            verdict, detail = diag.get(rid, ("NOT EVALUATED", "rule_id absent from Clauses"))
+            print()
+            print(f"[{verdict}] {rid}")
+            print(f"    {str(names.get(rid, ''))[:96]}")
+            print(f"    {detail}")
+        n_ok = sum(1 for v in diag.values() if v[0] == "FIRED")
+        print()
+        print("=" * 78)
+        print(f"{n_ok} fired | "
+              f"{sum(1 for v in diag.values() if v[0] == 'NO MATCH')} no match | "
+              f"{sum(1 for v in diag.values() if v[0] == 'UNUSABLE')} unusable | "
+              f"of {chosen.rule_id.nunique()} chosen")
+        print("=" * 78)
+        return
+
     H = pd.DataFrame(hits)
     log(f"(rule, stock) hits: {len(H):,} across {H.rule_id.nunique() if len(H) else 0} rules")
     status.append(("rules that produced hits", H.rule_id.nunique() if len(H) else 0))
