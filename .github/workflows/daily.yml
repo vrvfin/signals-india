@@ -1,15 +1,24 @@
 name: Daily Pipeline Execution
 
 on:
-  schedule:
-    - cron: '30 10 * * 1-5'  # Mon-Fri 16:00 IST — daily run (OHLCV, features,
-                             # strategies, aggregate). Fundamentals/market-cap run
-                             # separately in fundamentals.yml (weekly, Mon).
-    # UTC 10:30 is pre-US-business-hours (off-peak GitHub), so runner queue wait
-    # is ~15-30 min → data consistently ready by IST 17:00-17:30.
+  # NO `schedule:` block. GitHub's own cron fired this workflow between 4h35m
+  # and 10h42m LATE on 2026-08-27 / 08-28 / 08-31 / 09-01 (createdAt == startedAt
+  # on every run, so it is the scheduler itself, not runner queue wait). Those
+  # late runs landed at ~02:30 IST and then caused the real 16:00 IST run to be
+  # skipped as a same-IST-day duplicate (Aug 28: "already ran today (IST) —
+  # 732m ago"). cron-job.org's repository_dispatch fired within 6 seconds of
+  # 10:30:30 UTC every single day, so it is the only trigger we keep.
   workflow_dispatch:          # manual trigger from GitHub UI
   repository_dispatch:
-    types: [trigger-phase1]   # triggered by cron-job.org every weekday at 16:00 IST
+    types: [trigger-phase1]   # cron-job.org, every weekday 10:30 UTC = 16:00 IST
+
+# One Phase 1 at a time. The two triggers previously BOTH ran and overlapped for
+# 30-60 minutes every weekday (Aug 13-26), writing the same Drive files
+# concurrently, and the second run's diff_vs_yesterday compared against the first
+# run from 30 minutes earlier rather than against yesterday.
+concurrency:
+  group: phase1-daily
+  cancel-in-progress: false
 
 jobs:
   pipeline:
@@ -97,6 +106,20 @@ jobs:
         run: python scripts/fetch_bse_eod_api.py --workers 16
         continue-on-error: true
 
+      # Listing dates — must run AFTER both OHLCV steps, since new names are
+      # dated from the first bar of data/ohlcv when NSE has no date for them.
+      # DAILY mode only touches names with no row yet (typically a handful), so
+      # this is seconds: the one-off ~45m sweep is `--backfill`, run manually.
+      # Feeds the IPO view, which previously read master_list.listing_date and
+      # was blind to every BSE (0/2,479) and NSE SME (0/576) name.
+      - name: Update listing dates
+        if: steps.fresh.outputs.skip != 'true'
+        run: |
+          python scripts/build_listing_dates.py --watch
+          python scripts/build_listing_dates.py
+          python scripts/build_listing_dates.py --classify
+        continue-on-error: true
+
       - name: Ingest indices + macro
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/ingest_indices_macro.py
@@ -173,6 +196,15 @@ jobs:
       - name: Strategy - CANSLIM
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/strategy_canslim.py
+        continue-on-error: true
+
+      # Refresh the results feed BEFORE PEAD consumes it. results.parquet was
+      # previously refreshed only by pead.yml at 16:00 UTC (21:30 IST) — i.e.
+      # AFTER this workflow read it at ~16:00 IST — so strategy_pead.py anchored
+      # on a feed up to ~18.5h stale and saw the freshest declarations a day late.
+      - name: Refresh results feed (for PEAD)
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/scrape_results_table.py
         continue-on-error: true
 
       - name: Strategy - PEAD

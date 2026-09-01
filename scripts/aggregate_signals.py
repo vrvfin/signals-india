@@ -334,8 +334,17 @@ def main():
         print("  Change breakdown:")
         print(diff["change"].value_counts().to_string())
 
-    # 5. Write all outputs
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 5. Write all outputs. The dated snapshot is named for the SESSION it
+    # describes (ref_date = the features bar date), not the runner's UTC wall
+    # clock. build_signal_membership.py derives per-symbol tenure from these
+    # filenames, so a mislabelled snapshot silently corrupts "days on list".
+    if ref_date is not None and pd.notna(ref_date):
+        today_str = pd.Timestamp(ref_date).strftime("%Y-%m-%d")
+        log(f"dated snapshot named for bar date {today_str}")
+    else:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        log(f"WARNING: no features bar date — dated snapshot falls back to "
+            f"wall clock {today_str}")
     upload_csv(drive, agg_id, "latest.csv", unified,
                find_file(drive, agg_id, "latest.csv"))
     upload_csv(drive, agg_id, f"{today_str}.csv", unified,

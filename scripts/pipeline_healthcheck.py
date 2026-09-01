@@ -51,6 +51,12 @@ MIN_FEATURE_ROWS_FLOOR = 3500
 MIN_FEATURE_ROWS_PCT = 0.68
 OHLCV_MAX_STALE_DAYS = 6   # 4 calendar days too tight for India's long holiday weekends
 FRESH_WINDOW_HOURS = 24
+# Aggregator sanity band. Measured range 2026-08-28 to 09-01: 3,112 unified rows
+# (1,762 conviction) and 1,586 conviction. The band exists to catch "the
+# aggregator emitted nothing" or "a filter stopped filtering" — not to encode a
+# view on selectivity, which is the ranking work's job.
+AGG_MIN_ROWS = 200
+AGG_MAX_ROWS = 12000
 
 
 def log(msg):
@@ -243,6 +249,11 @@ def main():
                     record("OHLCV freshness", "CRITICAL", ok,
                            f"latest bar {latest_date} "
                            f"({stale_days}d old, max {OHLCV_MAX_STALE_DAYS}d)")
+                    # First-class field, not just prose in `detail`:
+                    # pipeline_skip_check.py keys its phase-1 decision off the
+                    # SESSION this run processed, not the wall-clock date the run
+                    # started on.
+                    report["bar_date"] = str(latest_date)
 
     # --- per-strategy signal freshness (CRITICAL: a stale strategy would
     # otherwise ship yesterday's signals as today's — the aggregator now skips
@@ -263,6 +274,39 @@ def main():
                     record(f"strategy:{sub['name']}", "CRITICAL",
                            age_h <= FRESH_WINDOW_HOURS,
                            f"latest.csv age {age_h:.1f}h")
+
+    # --- aggregated output (CRITICAL) — the pipeline's actual deliverable.
+    # Every other check could pass while the aggregator emitted nothing, or
+    # emitted half the market. Bounds are deliberately wide: this catches a
+    # regression (empty file, or a filter that stopped filtering), not a
+    # judgement about how selective the list should be. ---
+    if signals_id:
+        agg_id = find_subfolder(drive, signals_id, "aggregated")
+        if not agg_id:
+            record("signals/aggregated", "CRITICAL", False, "folder missing")
+        else:
+            fid, mtime = get_file_meta(drive, agg_id, "latest.csv")
+            if not fid:
+                record("aggregated/latest.csv", "CRITICAL", False, "file missing")
+            else:
+                age_h = hours_since(mtime)
+                try:
+                    req = drive.files().get_media(fileId=fid)
+                    fh = io.BytesIO()
+                    dl = MediaIoBaseDownload(fh, req)
+                    done = False
+                    while not done:
+                        _, done = dl.next_chunk()
+                    fh.seek(0)
+                    nrows = len(pd.read_csv(fh))
+                except Exception as e:
+                    nrows = -1
+                ok = (age_h <= FRESH_WINDOW_HOURS
+                      and AGG_MIN_ROWS <= nrows <= AGG_MAX_ROWS)
+                record("aggregated/latest.csv", "CRITICAL", ok,
+                       f"age {age_h:.1f}h, {nrows} rows "
+                       f"(need <{FRESH_WINDOW_HOURS}h & "
+                       f"{AGG_MIN_ROWS}-{AGG_MAX_ROWS} rows)")
 
     # --- market_state freshness (WARNING) ---
     data_id = find_subfolder(drive, folder_id, "data")

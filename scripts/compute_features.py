@@ -11,7 +11,7 @@ indicators — they read this file.
 
 Usage:
     python scripts/compute_features.py                  # process full universe
-    python scripts/compute_features.py --limit 50       # debug on a small slice
+    python scripts/compute_features.py --limit 50 --no-upload   # safe debug slice
 """
 
 from __future__ import annotations
@@ -300,6 +300,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None,
                         help="Process only first N symbols (debug)")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="compute and summarise but write NOTHING to Drive. "
+                             "Required for any --limit run: uploading a limited "
+                             "frame would overwrite features/latest.parquet with "
+                             "a partial universe and break every downstream "
+                             "strategy plus the health check.")
+    parser.add_argument("--out", type=str, default=None,
+                        help="with --no-upload, also save the frame locally for "
+                             "inspection (parquet path)")
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel OHLCV-download workers (default 8). Reads are "
                              "independent per symbol and results are collected in the "
@@ -355,6 +364,8 @@ def main() -> None:
             return sym, None, str(e)[:60]
 
     rows: list[dict] = []
+    errors: list[tuple[str, str]] = []      # (symbol, error text)
+    too_short: list[str] = []               # compute_features_one returned None
     t_start = time.time()
     done = 0
 
@@ -363,7 +374,11 @@ def main() -> None:
         sym, r, err = res
         if err is not None:
             missing.append(f"{sym}({err})")
-        elif r is not None:
+            errors.append((sym, err))
+        elif r is None:
+            # <60 bars — a real, countable outcome, not an invisible drop.
+            too_short.append(sym)
+        else:
             rows.append(r)
         done += 1
         if done % 200 == 0:
@@ -382,6 +397,20 @@ def main() -> None:
 
     feat_df = pd.DataFrame(rows)
     log(f"Computed features for {len(feat_df)} symbols. Missing: {len(missing)}")
+    # Attrition was previously invisible: 5,316 symbols with OHLCV produced 4,798
+    # feature rows and the ~518 lost were only printed if fewer than 20. A
+    # systematic feed regression looked identical to normal attrition.
+    log(f"attrition: {len(present)} attempted -> {len(feat_df)} computed | "
+        f"{len(too_short)} too short (<60 bars) | {len(errors)} errored")
+    if errors:
+        from collections import Counter
+        kinds = Counter(e.split(":")[0].strip()[:60] for _, e in errors)
+        log("  error breakdown (type -> count):")
+        for kind, n in kinds.most_common(10):
+            log(f"    {n:>5}  {kind}")
+        log(f"  first 10 failing symbols: {[sym for sym, _ in errors[:10]]}")
+    if too_short:
+        log(f"  first 10 too-short symbols: {too_short[:10]}")
 
     # Penny-stock filter FIRST — sub-₹10 names must not shape the RS
     # percentiles they are about to be dropped from.
@@ -392,16 +421,42 @@ def main() -> None:
     # Add RS rank + excess returns (ranks only current/previous trading date)
     feat_df = add_relative_strength(feat_df, nifty500_df)
 
-    # Output
+    # Output. The dated snapshot is named for the SESSION it describes, not the
+    # runner's UTC wall clock: a run that lands after 00:00 UTC would otherwise
+    # label the previous session's bars with tomorrow's date, and
+    # build_signal_membership.py derives tenure from these filenames.
     features_folder_id = get_or_create_subfolder(drive, folder_id, "features")
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    bar_dates = pd.to_datetime(feat_df["date"], errors="coerce")
+    bar_date = bar_dates.max()
+    if pd.isna(bar_date):
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        log(f"WARNING: no usable bar date in features — falling back to wall "
+            f"clock {today_str}")
+    else:
+        today_str = pd.Timestamp(bar_date).strftime("%Y-%m-%d")
+        log(f"dated snapshot named for bar date {today_str}")
     filename = f"{today_str}.parquet"
-    upload_parquet(drive, features_folder_id, filename, feat_df,
-                   find_file(drive, features_folder_id, filename))
-    log(f"Wrote features/{filename}")
-    upload_parquet(drive, features_folder_id, "latest.parquet", feat_df,
-                   find_file(drive, features_folder_id, "latest.parquet"))
-    log(f"Wrote features/latest.parquet")
+    if args.no_upload:
+        log(f"--no-upload: NOT writing features/{filename} or "
+            f"features/latest.parquet ({len(feat_df)} rows computed)")
+        if args.out:
+            feat_df.to_parquet(args.out, index=False)
+            log(f"saved local copy -> {args.out}")
+    else:
+        if args.limit:
+            # A limited frame is a partial universe. Publishing it as
+            # latest.parquet silently starves every strategy and trips the
+            # health check's row gate.
+            raise SystemExit(
+                "REFUSING to upload a --limit run: features/latest.parquet would "
+                "be overwritten with a partial universe. Re-run with --no-upload "
+                "(add --out <path> to inspect the frame), or drop --limit.")
+        upload_parquet(drive, features_folder_id, filename, feat_df,
+                       find_file(drive, features_folder_id, filename))
+        log(f"Wrote features/{filename}")
+        upload_parquet(drive, features_folder_id, "latest.parquet", feat_df,
+                       find_file(drive, features_folder_id, "latest.parquet"))
+        log(f"Wrote features/latest.parquet")
 
     # Summary
     print("-" * 50)

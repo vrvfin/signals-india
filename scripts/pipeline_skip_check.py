@@ -27,8 +27,10 @@ status from Drive and decides whether the run should proceed or be skipped.
 │  The ±75 min window radius absorbs those delays reliably.               │
 └─────────────────────────────────────────────────────────────────────────┘
 
-Phase 1 skip logic (unchanged):
-  Skip if last run was today (same calendar date, IST).
+Phase 1 skip logic:
+  Skip only if the last run already processed the session we would process now
+  (report["bar_date"] >= the latest session whose bars should exist). Falls back
+  to the old same-IST-calendar-day rule when the report predates bar_date.
 
 Exit behaviour:
   - Writes skip=true  to $GITHUB_OUTPUT → caller skips pipeline steps
@@ -47,7 +49,7 @@ import io
 import json
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -78,6 +80,10 @@ OFFSEASON_WINDOW_RADIUS_MIN = 75           # ±75 min absorbs GitHub job delays
 # Skip thresholds: if queue is empty AND last run was this recent → skip
 PHASE2_PEAK_SKIP_MIN     = 45   # peak: process as fast as queue allows
 PHASE2_OFFSEASON_SKIP_MIN = 90   # off-season: at most 1 run per window
+
+# Phase 1: the IST hour from which a session's bars should be on Drive. The
+# pipeline is triggered at 16:00 IST, after the 15:30 IST close.
+PHASE1_SESSION_CUTOFF_IST_HOUR = 16
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -149,6 +155,23 @@ def age_minutes(iso_ts: str) -> float:
 
 # ── seasonal helpers ──────────────────────────────────────────────────────────
 # _is_peak_season is imported from seasons.py (single source of truth).
+
+
+def _expected_bar_date(ist_now: datetime) -> date:
+    """The most recent trading session whose bars should already exist.
+
+    Before PHASE1_SESSION_CUTOFF_IST_HOUR today's bars are not published yet, so
+    the expectation rolls back a day; weekends roll back to Friday. Exchange
+    holidays are deliberately NOT modelled: on a holiday the expected date has no
+    bar, the comparison below fails, and we run again. Re-running is idempotent,
+    whereas skipping a real session loses a day of signals — so the fail-safe
+    direction is to run."""
+    d = ist_now.date()
+    if ist_now.hour < PHASE1_SESSION_CUTOFF_IST_HOUR:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:                 # Sat=5, Sun=6 → back to Friday
+        d -= timedelta(days=1)
+    return d
 
 
 def _in_offseason_window(ist_now: datetime) -> bool:
@@ -235,12 +258,36 @@ def check_phase1(drive, folder_id: str) -> None:
     if age >= 23 * 60:
         return proceed()
 
+    ist_now = datetime.now(timezone.utc) + IST_OFFSET
+
+    # Prefer the SESSION the last run actually processed over the wall-clock date
+    # it happened to start on. A run that begins at 02:30 IST is processing the
+    # PREVIOUS session, but its calendar date is today — which is how the real
+    # 16:00 IST run came to be skipped as a duplicate on 2026-08-28.
+    bar_date = report.get("bar_date")
+    if bar_date:
+        try:
+            last_bar = date.fromisoformat(str(bar_date)[:10])
+        except ValueError:
+            last_bar = None
+        if last_bar is not None:
+            want = _expected_bar_date(ist_now)
+            if last_bar >= want:
+                return skip_run(f"session {last_bar} already processed "
+                                f"(expected {want}) — {age:.0f}m ago")
+            log(f"last run processed session {last_bar}, expected {want} "
+                f"— proceeding")
+            return proceed()
+
+    # Fallback for reports written before bar_date existed: the original
+    # same-IST-calendar-day rule.
     dt_last   = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
-    today_ist = (datetime.now(timezone.utc) + IST_OFFSET).date()
+    today_ist = ist_now.date()
     last_ist  = (dt_last + IST_OFFSET).date()
 
     if last_ist == today_ist:
-        return skip_run(f"Phase 1 already ran today (IST) — {age:.0f}m ago")
+        return skip_run(f"Phase 1 already ran today (IST) — {age:.0f}m ago "
+                        f"(no bar_date in report)")
 
     proceed()
 
