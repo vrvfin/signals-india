@@ -584,6 +584,10 @@ def main() -> None:
     parser.add_argument("--key-prefix", type=str, default=None,
                         help="T8: load keys from this env prefix (e.g. "
                              "BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
+    parser.add_argument("--symbols", default="",
+                        help="Restrict to these NSE symbols (comma separated). --limit "
+                             "caps a count but cannot choose WHICH company, so this is "
+                             "what makes a single-company test or re-read possible.")
     parser.add_argument("--max-age-hours", type=float, default=None,
                         help="T8: only rows discovered within N hours (guards "
                              "against draining quota on stale legacy rows).")
@@ -687,6 +691,13 @@ def main() -> None:
                        if str(queue.loc[i, "discovered_at"]) >= cutoff]
         log(f"  After {args.max_age_hours:.0f}h freshness filter: "
             f"{len(pending_idx)}/{before} to process")
+
+    if args.symbols:
+        _want = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        _before = len(pending_idx)
+        pending_idx = [i for i in pending_idx
+                       if str(queue.loc[i, "symbol"]).strip().upper() in _want]
+        log(f"  After --symbols {sorted(_want)}: {len(pending_idx)}/{_before} to process")
 
     # Portfolio filter: skip non-portfolio companies (rows stay pending for
     # future runs). T8 --all-companies bypasses (every fresh AR gets judged).

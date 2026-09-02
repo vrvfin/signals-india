@@ -82,7 +82,7 @@ def is_thin(n_chars: int, text: str, min_chars: int = MIN_CHARS) -> bool:
 
 
 def select(queue: pd.DataFrame, isins: set | None,
-           symbols: set | None = None) -> pd.DataFrame:
+           symbols: set | None = None, include_errors: bool = False) -> pd.DataFrame:
     """Processed annual_report rows that are candidates for a re-read.
 
     `error` rows are deliberately EXCLUDED, exactly as in requeue_pf_ratings: this is a
@@ -91,8 +91,9 @@ def select(queue: pd.DataFrame, isins: set | None,
     """
     if queue is None or queue.empty:
         return pd.DataFrame(columns=QUEUE_COLS)
+    keep = ["done", "superseded"] + (["error"] if include_errors else [])
     q = queue[(queue["doc_type"].astype(str) == "annual_report")
-              & (queue["status"].astype(str).isin(["done", "superseded"]))].copy()
+              & (queue["status"].astype(str).isin(keep))].copy()
     if isins:
         q = q[q["isin"].astype(str).str.strip().isin(isins)]
     if symbols:
@@ -113,6 +114,11 @@ def main() -> None:
     ap.add_argument("--min-chars", type=int, default=MIN_CHARS,
                     help=f"Below this many stored characters the analysis is treated as "
                          f"a failed generation (default {MIN_CHARS}).")
+    ap.add_argument("--include-errors", action="store_true",
+                    help="Also re-read rows already marked error. Off by default: an "
+                         "error row carries a recorded reason and requeue_error_docs "
+                         "cycles it. Useful when a re-read itself failed on a deleted "
+                         "PDF and you want to retry it now rather than next night.")
     ap.add_argument("--all-companies", action="store_true",
                     help="Scan the whole repo, not just portfolio holdings.")
     ap.add_argument("--self-test", action="store_true")
@@ -133,7 +139,7 @@ def main() -> None:
     queue = load_parquet(drive, idx, "processing_queue.parquet", QUEUE_COLS)
     syms = {s.strip() for s in args.symbols.split(",") if s.strip()} or None
 
-    cand = select(queue, isins, syms)
+    cand = select(queue, isins, syms, args.include_errors)
     if args.limit:
         cand = cand.head(max(args.limit * 6, args.limit))   # scan wider than we requeue
     log(f"annual_report rows to inspect: {len(cand)}")
@@ -174,9 +180,17 @@ def main() -> None:
         hit = queue["doc_id"].astype(str).isin(ids)
         queue.loc[hit, "status"] = "pending"
         queue.loc[hit, "processed_at"] = ""
+        # THE PDF IS USUALLY ALREADY GONE. Retention rule 1 deletes a source PDF two days
+        # after it is processed, so a row requeued weeks later points at a Drive file id
+        # that 404s - measured on APL Apollo 2026-09-02, both re-reads failed on exactly
+        # that. Clearing drive_file_id puts the row back in the state pf_docs_sweep
+        # --hydrate already knows how to resolve: it re-downloads from pdf_url. That step
+        # runs every 3 hours in pf_daily_mails, so no new fetching machinery is needed.
+        if "drive_file_id" in queue.columns:
+            queue.loc[hit, "drive_file_id"] = ""
         save_parquet(drive, idx, "processing_queue.parquet", queue)
-        log(f"{hit.sum()} annual_report row(s) set to pending — run "
-            f"extract_annual_report to re-read them.")
+        log(f"{hit.sum()} annual_report row(s) set to pending with drive_file_id "
+            f"cleared — run pf_docs_sweep.py --hydrate, then extract_annual_report.")
     finally:
         release_lock(drive, idx, "_extract.lock")
 
@@ -228,6 +242,8 @@ def _self_test() -> int:
     check("the symbol filter applies",
           set(select(q, None, {"ccc"})["doc_id"]) == {"d"})
     check("an empty queue is handled", select(pd.DataFrame(), None).empty)
+    check("error rows are included only when asked",
+          set(select(q, None, None, True)["doc_id"]) == {"a", "b", "d"})
 
     print(f"\nrequeue_thin_ars self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

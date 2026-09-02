@@ -221,16 +221,32 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
     pn = _norm(period)
     kws = _SECTION_KW.get(doc_type, (doc_type,))
 
+    def _walk(i):
+        region = [sections[i]]
+        for h2, body2 in sections[i + 1:]:
+            if _is_boundary(h2, body2):
+                break
+            region.append((h2, body2))
+        return region
+
+    # THE LAST MATCH WINS, NOT THE FIRST. A re-extraction can leave TWO sections for one
+    # document: extract_annual_report._replace_ar_section looks the old section up by its
+    # FY heading, and once _extract_fy_year started labelling correctly it no longer
+    # matches the stale wrongly-labelled one, so it APPENDS. APL Apollo now carries both
+    # "## FY22 Annual Report - Annual Report 2026 from bse" (the old truncated text, which
+    # still holds the doc marker) and "## FY26 Annual Report - ..." (the good re-read).
+    # Sections are appended chronologically, so the last is the freshest.
+    # COLLECT EVERY IDENTIFICATION, THEN TAKE THE FRESHEST. Trying the doc marker first
+    # and returning on it was wrong in exactly the case that matters: a re-extraction
+    # leaves the STALE section holding the marker (append_company_page stamped it) while
+    # the good re-read is appended under a correct heading with NO marker, because
+    # _replace_ar_section drops it on the supersede path. APL Apollo carried both - the
+    # marker match returned the old 764-char text and the fresh 20k-char report was
+    # ignored. Sections are appended chronologically, so the highest index is newest.
+    cands = []
     if doc_id:
         marker = f"<!-- doc:{str(doc_id).strip()} -->"
-        for i, (h, b) in enumerate(sections):
-            if marker in b or marker in h:
-                region = [sections[i]]
-                for h2, body2 in sections[i + 1:]:
-                    if _is_boundary(h2, body2):
-                        break
-                    region.append((h2, body2))
-                return region
+        cands += [i for i, (h, b) in enumerate(sections) if marker in b or marker in h]
 
     def _starts_here(hn: str) -> bool:
         if not (pn and pn in hn and any(_norm(k) in hn for k in kws)):
@@ -239,11 +255,11 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
             return False
         return True
 
+    cands += [i for i, (h, _b) in enumerate(sections) if _starts_here(_norm(h))]
+    if cands:
+        return _walk(max(cands))
+
     start = None
-    for i, (h, _b) in enumerate(sections):
-        if _starts_here(_norm(h)):
-            start = i
-            break
     if start is None:                                # fallback: period-only match
         for i, (h, _b) in enumerate(sections):
             hn = _norm(h)

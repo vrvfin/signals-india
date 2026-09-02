@@ -456,9 +456,17 @@ def _digest_prose(text: str) -> str:
 #                                    whole report stayed ONE block and the section
 #                                    priority below had nothing to choose between
 #   "**2. FINANCIAL PERFORMANCE**"   bolded
+# STRICT. The first version allowed the leading marker to be EMPTY, so any capitalised
+# prose line of the right length was treated as a heading; the report shattered into
+# fragments and the mail carried a sentence like 'Specific details on the nature of
+# "Other financial assets" (non-'. A heading must now be explicitly marked as one:
 _SECTION_HEAD_RE = re.compile(
-    r"^\s*(?:#{1,4}\s+|\*{0,2}\s*)(?:[0-9]{1,2}[A-Za-z]?[.)]\s+|[A-Z]-[0-9]\s+)?"
-    r"\*{0,2}[A-Z][A-Za-z0-9 &/,'\-()]{6,80}\*{0,2}\s*:?\s*$")
+    r"^\s*(?:"
+    r"#{1,4}\s+\S"                                     # ### 2. FINANCIAL PERFORMANCE
+    r"|\*\*[^*]{4,90}\*\*\s*:?\s*$"                    # **A-3) Forward Guidance**
+    r"|(?:[0-9]{1,2}[A-Z]?[.)]|[A-Z]-[0-9][.)]?)\s+"     # 2. / 5B. / A-1
+    r"[A-Z][A-Za-z0-9 &/,'\-()]{4,80}\s*:?\s*$"
+    r")")
 
 
 def _subsections(region) -> list:
