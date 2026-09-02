@@ -254,7 +254,12 @@ def latest_doc_per_type(pf, queue: pd.DataFrame,
     if queue is None or queue.empty:
         return out
     q = queue.copy()
-    for c in ("isin", "doc_type", "status", "announcement_date", "doc_id", "title"):
+    for c in ("isin", "doc_type", "status", "announcement_date", "doc_id", "title",
+              # ADDITIVE (2026-09-02). `period` labels a concall's section on
+              # company_page.md; discovered_at/processed_at are the only PIPELINE dates on
+              # the row. An AR's announcement_date is the FY-END, months before the report
+              # is filed, so it can never answer "did this arrive recently?".
+              "period", "discovered_at", "processed_at"):
         if c not in q.columns:
             q[c] = ""
     q = q[q["status"].astype(str).str.lower().isin(_DONE)]
@@ -268,7 +273,10 @@ def latest_doc_per_type(pf, queue: pd.DataFrame,
         g = grp.sort_values("_d")
         r = g.iloc[-1]
         out[(isin, dt)] = {"doc_id": str(r["doc_id"]).strip(),
-                           "date": str(r["_d"]), "title": str(r["title"])[:160]}
+                           "date": str(r["_d"]), "title": str(r["title"])[:160],
+                           "period": str(r["period"] or "").strip(),
+                           "discovered_at": str(r["discovered_at"] or "")[:19],
+                           "processed_at": str(r["processed_at"] or "")[:19]}
     return out
 
 
@@ -580,6 +588,11 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
                     "doc_type": r["doc_type"], "season": season, "resend": resend,
                     "doc_id": doc_id, "doc_date": doc.get("date", ""),
                     "doc_title": doc.get("title", ""),
+                    # ADDITIVE: lets a caller label the document and age it on PIPELINE
+                    # dates rather than announcement_date (wrong for annual reports).
+                    "period": doc.get("period", ""),
+                    "discovered_at": doc.get("discovered_at", ""),
+                    "processed_at": doc.get("processed_at", ""),
                     "reported_on": reporting.get(isin, "")})
     out.sort(key=lambda d: (d["doc_type"], d["symbol"]))
     return out

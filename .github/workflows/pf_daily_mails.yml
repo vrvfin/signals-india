@@ -9,21 +9,35 @@ name: pf_daily_mails
 # run lose that company for good, whereas "not yet mailed" is self-healing — the next
 # run picks it up whenever it runs. So a failed morning costs a delay, never a company.
 #
-# INDEPENDENT OF PHASE 2. Nothing here takes _extract.lock, queues a document, calls
-# Gemini or writes company_page.md. It reads the parquets Phase 2 already produces and
-# writes one thing of its own: its mail ledger. Phase-2 concall keeps absolute priority
-# because this never competes for anything it uses.
+# WHAT USES AN LLM HERE, AND WHAT DOES NOT. The mail steps make NO model calls at all:
+# they read the parquets and the company_page.md sections Phase 2 already wrote, render
+# them, and write one thing of their own - the mail ledger. Every summary a reader sees
+# is Phase 2's own extraction output; no prompt and no summarisation lives in this
+# workflow. The ONLY model calls are Phase 2's OWN extractors invoked below
+# (presentation, rating, annual report), on Phase 2's prompts and the FREE_POOL keys,
+# each capped and deadline-bounded.
 #
-# Runs after t4_nightly has refreshed statements and the extractors have drained, so the
-# numbers a mail quotes are the current ones.
+# PHASE-2 CONCALL KEEPS ABSOLUTE PRIORITY. extract_concall.py is never run here. The
+# sweep only enqueues concall rows (source=pf_sweep) and phase2.yml drains them on its
+# next scheduled pass, so the P0 path is untouched. The extractors that DO run here take
+# _extract.lock with defer_to_phase2=True.
 
 on:
   schedule:
-    # 09:05 IST, EVERY day, after the nightly chain. Mon-Sat until 2026-08-16: a deck
-    # filed on a Saturday evening or a Sunday then waited until Monday, which is exactly
-    # what happened to RISHABH's Q1FY27 deck. Companies file at weekends; the run is
-    # cheap and no-ops when nothing is due, so there is no reason to skip a day.
-    - cron: "35 3 * * *"
+    # EVERY 3 HOURS across the filing day (user, 2026-09-02) - 09:05, 12:05, 15:05,
+    # 18:05 and 21:05 IST. A document filed at noon used to wait until the next morning;
+    # this bounds that to about three hours. Nothing outside the window, because Indian
+    # exchange filings land roughly 09:00-23:00 IST and an overnight run would only
+    # re-scan an unchanged book.
+    #
+    # EVERY day, including weekends. Mon-Sat until 2026-08-16: a deck filed on a Saturday
+    # evening or a Sunday then waited until Monday, which is exactly what happened to
+    # RISHABH's Q1FY27 deck. Companies file at weekends; a run no-ops when nothing is
+    # due, so there is no reason to skip a day.
+    #
+    # The concurrency group below serialises these, and every trigger is idempotent: the
+    # sweep skips documents already queued and the mail skips documents already sent.
+    - cron: "35 3,6,9,12,15 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -32,10 +46,16 @@ on:
         default: false
       types:
         description: "Which mails to consider"
-        default: "results,presentation,rating"
+        default: "results,presentation,rating,concall,annual_report"
+      scope:
+        description: "concall/AR scope: 'current' (this quarter + this FY) or 'all'"
+        default: "current"
       limit:
         description: "Max mails this run (0 = no cap)"
         default: "0"
+      symbols:
+        description: "Restrict to these NSE symbols, comma separated (blank = whole PF)"
+        default: ""
 
 concurrency:
   group: pf-daily-mails
@@ -100,10 +120,21 @@ jobs:
       # Screener has nothing for (and is the ONLY source that reaches the SME holdings,
       # which carry no bse_code). --one-per-quarter keeps this to one document per
       # quarter per type instead of re-ingesting a company's whole history.
-      - name: Daily sweep — find new documents
+      #
+      # annual_report and concall were NOT swept before, and nothing else reliably found
+      # them for a holding: ingest_announcements EXCLUDES both by design ("Phase 2 owns
+      # these"), and the Screener feed Phase 2 does use is a 25-item market-wide page-1
+      # window that a PF filing rolls off during AR season. Concall is safe to sweep now
+      # that the sweep drops recordings — Screener's bare "REC" link is audio, and
+      # queueing audio into a PDF extractor is the largest single class of extract error.
+      # THREE SOURCES, each reaching what the others cannot. Screener is primary and
+      # cleanest; NSE is the only one that reaches the SME holdings (no bse_code); BSE
+      # reaches a mainboard filing at its origin, on the day it is made. NSE and BSE
+      # fill gaps only, so a filing is never enqueued twice.
+      - name: Daily sweep — find new documents (screener + nse + bse)
         run: >
-          python scripts/pf_docs_sweep.py --enqueue --nse --one-per-quarter
-          --days 30 --types presentation,rating,results
+          python scripts/pf_docs_sweep.py --enqueue --nse --bse --one-per-quarter
+          --days 30 --types presentation,rating,results,annual_report,concall
         continue-on-error: true
 
       - name: Fetch what the sweep found
@@ -112,7 +143,7 @@ jobs:
 
       # FREE_POOL, never the Phase-2 GEMINI_API_KEY pool — this must not compete with
       # live concall extraction for quota. Bounded so a heavy day cannot run long.
-      - name: Extract new decks and ratings (FREE_POOL)
+      - name: Extract new decks, ratings and annual reports (FREE_POOL)
         env:
           FREE_POOL:           ${{ secrets.FREE_POOL }}
           BACKFILL_GEMINI_KEY: ${{ secrets.BACKFILL_GEMINI_KEY }}
@@ -131,13 +162,31 @@ jobs:
             --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 25 --deadline-min 20 || true
           python scripts/extract_rating.py \
             --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 25 --deadline-min 20 || true
+          # Annual reports are the slowest documents here (map-reduce over a 10 MB+ PDF),
+          # so the cap is lower than the others. Whatever is not drained now stays pending
+          # and phase2 / backfill_nightly picks it up; the mail is self-healing and
+          # reports it the next morning. CONCALL is deliberately NOT extracted here - that
+          # path is P0 and belongs to Phase 2, whose live step already drains the swept
+          # rows (source=pf_sweep) on its next scheduled pass.
+          python scripts/extract_annual_report.py \
+            --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 10 --deadline-min 20 || true
         continue-on-error: true
 
-      # Per-company presentation and rating mails.
-      - name: Per-company mails (presentation, rating)
+      # Per-company mails: one mail per company per DOCUMENT.
+      # concall and annual_report carry the narrative Phase 2 wrote to company_page.md
+      # (no parquet holds that prose). Each is scoped to its own calendar: a concall to
+      # the SEASON QUARTER, exactly as the presentation mail above; an annual report to
+      # the FINANCIAL YEAR, because the AGM timetable spreads one FY's reports across
+      # Jun-Sep and a narrower window would split the crop arbitrarily.
+      # A holding that entered the portfolio in the last 30 days bypasses both and is
+      # onboarded with its LATEST call and report - the same way a new holding picks up
+      # the current quarter's deck simply by having no ledger row yet.
+      - name: Per-company mails (presentation, rating, concall, annual report)
         run: >
           python scripts/pf_company_mails.py
-          --types "${{ inputs.types || 'presentation,rating' }}"
+          --types "${{ inputs.types || 'presentation,rating,concall,annual_report' }}"
+          --scope "${{ inputs.scope || 'current' }}"
+          --symbols "${{ inputs.symbols }}"
           --limit "${{ inputs.limit || '0' }}"
           ${{ inputs.dry_run == true && '--dry-run' || '' }}
         continue-on-error: true
