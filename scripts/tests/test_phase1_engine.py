@@ -532,6 +532,51 @@ def test_tracker_replay() -> None:
               ag.family_of)) == 0)
 
 
+def test_ipo_base() -> None:
+    section("IPO first-base detection")
+    m = _load("ipo", os.path.join(SCRIPTS, "strategy_ipo_base.py"))
+    dv = _load("dv", os.path.join(SCRIPTS, "strategy_darvas.py"))
+
+    def series(highs, lows, closes, vols=None):
+        n = len(highs)
+        return pd.DataFrame({"date": pd.bdate_range("2026-01-01", periods=n),
+                             "open": closes, "high": highs, "low": lows,
+                             "close": closes,
+                             "volume": vols or [100000.0] * n})
+
+    n = 60
+    hi, lo, cl = [120.0] * n, [84.0] * n, [100.0] * n
+    b = m.find_ipo_base(series(hi, lo, cl))
+    check("finds a 30%-deep base", b is not None and
+          abs(b["base_depth_pct"] - 30.0) < 0.1)
+    check("base excludes today's bar (else a breakout is impossible)",
+          b["base_days"] == n - 1)
+    check("a 2% drift is not a base",
+          m.find_ipo_base(series([101.0] * n, [99.0] * n, [100.0] * n)) is None)
+    check("a 75% collapse is not a base",
+          m.find_ipo_base(series([200.0] * n, [50.0] * n, [100.0] * n)) is None)
+
+    feat = pd.Series({"date": "2026-09-02", "symbol": "NEWCO",
+                      "avg_turnover_20d_cr": 5.0})
+    s_add = m.ipo_signal("NEWCO", series(hi + [126.0], lo + [118.0], cl + [125.0],
+                                         [100000.0] * n + [220000.0]), feat, 180)
+    check("break above the base on 2x volume -> add",
+          s_add and s_add["zone_type"] == "add")
+    check("stop is the base low, not an ATR guess", s_add["stop"] == 84.0)
+    s_buy = m.ipo_signal("NEWCO", series(hi + [110.0], lo + [95.0], cl + [100.0]),
+                         feat, 180)
+    check("sitting inside the base -> buy", s_buy and s_buy["zone_type"] == "buy")
+    check("below the base low -> no signal",
+          m.ipo_signal("NEWCO", series(hi + [85.0], lo + [70.0], cl + [80.0]),
+                       feat, 180) is None)
+
+    # The reason this cannot just be darvas with different numbers.
+    check("a 30%-deep IPO base is rejected by darvas' 10% tolerance",
+          30.0 > dv.BOX_MAX_RANGE_PCT,
+          f"darvas allows {dv.BOX_MAX_RANGE_PCT}%, IPO bases run "
+          f"{m.BASE_MIN_DEPTH_PCT}-{m.BASE_MAX_DEPTH_PCT}%")
+
+
 def main() -> int:
     cf = _load("cf", os.path.join(SCRIPTS, "compute_features.py"))
     psc = _load("psc", os.path.join(SCRIPTS, "pipeline_skip_check.py"))
@@ -553,6 +598,7 @@ def main() -> int:
     test_signal_tracker()
     test_ranking_terms()
     test_tracker_replay()
+    test_ipo_base()
     print()
     if _FAILS:
         print(f"{len(_FAILS)} FAILED:")

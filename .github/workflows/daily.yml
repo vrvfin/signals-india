@@ -197,6 +197,15 @@ jobs:
         run: python scripts/strategy_pullback.py
         continue-on-error: true
 
+      # New listings form SHORTER and DEEPER first bases than the classic
+      # patterns allow, so darvas (10% max range) and minervini (needs a 200-day
+      # average) reject them on technicalities and the most reactive part of the
+      # market is invisible to the engine. Needs listing_dates.parquet.
+      - name: Strategy - IPO base
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/strategy_ipo_base.py
+        continue-on-error: true
+
       # ---- Fundamentals-dependent strategies ----
       # Fundamentals + market cap ingestion moved to its own weekly workflow
       # (fundamentals.yml): the full-universe Screener pull + statement history
