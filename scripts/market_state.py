@@ -293,6 +293,109 @@ def sector_rotation(idx_files, drive):
 
 # ---------- Main ----------
 
+# ---------- Stance: direction, agreement, and what to DO about it ------------
+#
+# health_score blends six components into one number, which destroys direction:
+# 45 could be "trend fine, breadth collapsing" or "trend broken, VIX calm", and
+# nothing recorded how many components AGREED. It also had a cliff — the Nifty
+# component was binary and worth 25 points, so a single day's cross of the 200
+# SMA swung the score 25 points. And it changed nothing: the only consumer was
+# CANSLIM's M >= 40 gate, sitting right beside a score that printed 44.8.
+#
+# health_score and `regime` are left EXACTLY as they were so CANSLIM and the
+# HTML dashboard do not move. Everything below is additive.
+
+STANCE_STRONG = 5      # components agreeing for the emphatic call
+STANCE_CLEAR = 3       # ... for the moderate one
+
+
+def component_directions(nifty_info, breadth_info, hl_info, vix_info,
+                         fii_info, ad_info) -> dict:
+    """+1 bullish / -1 bearish / 0 neutral for each component.
+
+    Thresholds are stated on the component's own natural scale (a VIX level, a
+    breadth percentage) rather than on its 0-100 score, so they can be argued
+    with. The Nifty read is CONTINUOUS here — distance from the 200 SMA — even
+    though health_score still uses the binary version; that removes the 25-point
+    cliff from the stance without touching the published score."""
+    d = {}
+    if nifty_info and nifty_info.get("nifty50_sma200"):
+        gap = (nifty_info["nifty50_close"] / nifty_info["nifty50_sma200"] - 1) * 100
+        d["nifty50_trend"] = 1 if gap > 2 else (-1 if gap < -2 else 0)
+    if breadth_info:
+        pct = breadth_info.get("pct_above_50sma")
+        if pct is not None:
+            d["breadth_50sma"] = 1 if pct > 60 else (-1 if pct < 40 else 0)
+    if hl_info:
+        diff = hl_info.get("highs_minus_lows_pct_univ")
+        if diff is not None:
+            d["highs_lows"] = 1 if diff > 0.25 else (-1 if diff < -0.25 else 0)
+    if vix_info:
+        vix = vix_info.get("india_vix")
+        if vix is not None:
+            d["vix"] = 1 if vix < 15 else (-1 if vix > 20 else 0)
+    if fii_info:
+        net = fii_info.get("fii_5d_net_cr")     # Rs cr, net over 5 sessions
+        if net is not None:
+            d["fii"] = 1 if net > 1000 else (-1 if net < -1000 else 0)
+    if ad_info:
+        # pct_advancing is absent when score_ad_ratio falls back to its proxy
+        # (the early-return branch returns only ad_score_basis/ad_proxy), in
+        # which case this component simply abstains rather than guessing.
+        pct_up = ad_info.get("pct_advancing")
+        if pct_up is not None:
+            d["ad_ratio"] = 1 if pct_up > 55 else (-1 if pct_up < 45 else 0)
+    return d
+
+
+def stance_from(directions: dict) -> tuple[str, int, int, int]:
+    """(stance, n_bullish, n_bearish, agreement).
+
+    Answers the question the blended score could not: am I meant to be
+    aggressive or cautious, and do enough independent things agree to act on it?
+    """
+    n_bull = sum(1 for v in directions.values() if v > 0)
+    n_bear = sum(1 for v in directions.values() if v < 0)
+    agreement = max(n_bull, n_bear)
+    if n_bull > n_bear:
+        stance = ("AGGRESSIVE" if n_bull >= STANCE_STRONG
+                  else "CONSTRUCTIVE" if n_bull >= STANCE_CLEAR else "NEUTRAL")
+    elif n_bear > n_bull:
+        stance = ("DEFENSIVE" if n_bear >= STANCE_STRONG
+                  else "CAUTIOUS" if n_bear >= STANCE_CLEAR else "NEUTRAL")
+    else:
+        stance = "NEUTRAL"          # genuinely mixed — the honest answer
+    return stance, n_bull, n_bear, agreement
+
+
+# What each stance means for position-taking. Consumed by the aggregator's
+# buy rules: regime-conditioned signals measured +31.6pp (COMBO_REGIME) in
+# guru/backtest/family_lift.parquet, and nothing in Phase 1 used the regime for
+# anything beyond a binary CANSLIM gate.
+STANCE_PLAYBOOK = {
+    "AGGRESSIVE":   "full size; SOFT BUY (state-only) acceptable",
+    "CONSTRUCTIVE": "full size; HARD BUY plus the best SOFT BUYs",
+    "NEUTRAL":      "HARD BUY only (needs an event firing today)",
+    "CAUTIOUS":     "half size; HARD BUY only, and >=3 agreeing families",
+    "DEFENSIVE":    "no new buys; manage existing positions only",
+}
+
+
+def stance_history(hist: pd.DataFrame, stance: str, today: str) -> int:
+    """How many consecutive sessions this stance has held, today included.
+    A one-day flip is noise; ten days is a regime."""
+    if hist is None or not len(hist) or "stance" not in hist.columns:
+        return 1
+    prev = hist[hist["date"] != today].sort_values("date")
+    run = 1
+    for v in reversed(prev["stance"].tolist()):
+        if str(v) == stance:
+            run += 1
+        else:
+            break
+    return run
+
+
 def main():
     print("Stage 7 — Market State + Health Score")
     print("-" * 50)
@@ -352,19 +455,48 @@ def main():
     row.update(fii_info or {})
     row.update(ad_info or {})
 
+    # ---- STANCE: direction and agreement, not one blended number ----------
+    dirs = component_directions(nifty_info, breadth_info, hl_info, vix_info,
+                                fii_info, ad_info)
+    stance, n_bull, n_bear, agreement = stance_from(dirs)
+    row["stance"] = stance
+    row["stance_playbook"] = STANCE_PLAYBOOK[stance]
+    row["n_bullish"] = n_bull
+    row["n_bearish"] = n_bear
+    row["n_components"] = len(dirs)
+    row["agreement"] = agreement
+    for k, v in dirs.items():
+        row[f"{k}_dir"] = v
+
+    ms_id = get_or_create_subfolder(drive, data_id, "market_state")
+
+    # History is read BEFORE the snapshot is written, so stance_days and the
+    # score trend can go into the same row. Falling from 70 to 50 is a different
+    # message from rising from 30 to 50, and the blended score alone said neither.
+    hist_id = find_file(drive, ms_id, "history.csv")
+    hist_prev = download_csv(drive, hist_id) if hist_id else pd.DataFrame()
+    row["stance_days"] = stance_history(hist_prev, stance, today_str)
+    if len(hist_prev) and "health_score" in hist_prev.columns:
+        h = (hist_prev[hist_prev["date"] != today_str]
+             .sort_values("date")["health_score"])
+        hs = pd.to_numeric(h, errors="coerce").dropna()
+        row["health_trend_5d"] = (round(float(health - hs.iloc[-5]), 1)
+                                  if len(hs) >= 5 else None)
+        row["health_trend_20d"] = (round(float(health - hs.iloc[-20]), 1)
+                                   if len(hs) >= 20 else None)
+    else:
+        row["health_trend_5d"] = row["health_trend_20d"] = None
+
     snapshot_df = pd.DataFrame([row])
 
     # Save snapshot + sector rotation
-    ms_id = get_or_create_subfolder(drive, data_id, "market_state")
     upload_parquet(drive, ms_id, "latest.parquet", snapshot_df,
                    find_file(drive, ms_id, "latest.parquet"))
     log("Wrote data/market_state/latest.parquet")
 
     # Append to history CSV
-    hist_id = find_file(drive, ms_id, "history.csv")
     if hist_id:
-        hist = download_csv(drive, hist_id)
-        hist = hist[hist["date"] != today_str]   # replace today if rerun
+        hist = hist_prev[hist_prev["date"] != today_str]   # replace today if rerun
         hist = pd.concat([hist, snapshot_df], ignore_index=True)
     else:
         hist = snapshot_df
@@ -382,6 +514,17 @@ def main():
     print()
     print("=" * 50)
     print(f"  MARKET HEALTH SCORE : {row['health_score']:>5} / 100   [{row['regime']}]")
+    print("=" * 50)
+    _arrow = {1: "bullish", -1: "bearish", 0: "neutral"}
+    print(f"  STANCE              : {row['stance']}  "
+          f"({row['n_bullish']} bullish / {row['n_bearish']} bearish of "
+          f"{row['n_components']} components, held {row['stance_days']}d)")
+    print(f"  -> {row['stance_playbook']}")
+    if row.get("health_trend_5d") is not None:
+        print(f"  health 5d / 20d     : {row['health_trend_5d']:+.1f} / "
+              f"{row['health_trend_20d'] if row['health_trend_20d'] is not None else 'n/a'}")
+    for k, v in dirs.items():
+        print(f"     {k:<16} {_arrow[v]}")
     print("=" * 50)
     print(f"  Nifty 50            : {nifty_info.get('nifty50_close')}  "
           f"(200 SMA {nifty_info.get('nifty50_sma200')})  "

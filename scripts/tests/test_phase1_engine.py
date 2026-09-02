@@ -354,6 +354,45 @@ def test_aggregation() -> None:
                              collapse_ma_respect=True).iloc[0]["n_families"] == 1)
 
 
+def test_market_stance() -> None:
+    section("market stance: direction and agreement, not one blended number")
+    ms = _load("ms", os.path.join(SCRIPTS, "market_state.py"))
+
+    def info(gap=5.0, breadth=70, hl=1.0, vix=12, fii=2000, adv=60):
+        return (dict(nifty50_close=100 * (1 + gap / 100), nifty50_sma200=100.0),
+                dict(pct_above_50sma=breadth),
+                dict(highs_minus_lows_pct_univ=hl),
+                dict(india_vix=vix), dict(fii_5d_net_cr=fii),
+                dict(pct_advancing=adv))
+
+    st, nb, nbe, _ = ms.stance_from(ms.component_directions(*info()))
+    check("six bullish -> AGGRESSIVE", st == "AGGRESSIVE", f"{nb} bull / {nbe} bear")
+    st, _, _, _ = ms.stance_from(ms.component_directions(
+        *info(gap=-5, breadth=30, hl=-1.0, vix=25, fii=-2000, adv=40)))
+    check("six bearish -> DEFENSIVE", st == "DEFENSIVE")
+    # The case a single blended number cannot express: half strongly bullish,
+    # half strongly bearish averages to a mid reading that looks like calm.
+    st, nb, nbe, ag = ms.stance_from(ms.component_directions(
+        *info(gap=5, breadth=70, hl=1.0, vix=25, fii=-2000, adv=40)))
+    check("three-all -> NEUTRAL, stated as genuinely mixed", st == "NEUTRAL",
+          f"{nb} bull / {nbe} bear, agreement {ag}")
+    st, _, _, _ = ms.stance_from(ms.component_directions(
+        *info(gap=5, breadth=70, hl=1.0, vix=17, fii=0, adv=50)))
+    check("a moderate lean -> CONSTRUCTIVE", st == "CONSTRUCTIVE")
+    d = ms.component_directions(None, dict(pct_above_50sma=70), {}, None, None,
+                                dict(ad_score_basis="x", ad_proxy="y"))
+    check("unreadable components abstain rather than vote neutral", len(d) == 1)
+
+    h = pd.DataFrame({"date": ["2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"],
+                      "stance": ["CAUTIOUS", "AGGRESSIVE", "AGGRESSIVE", "AGGRESSIVE"]})
+    check("stance run length counted, today included",
+          ms.stance_history(h, "AGGRESSIVE", "2026-09-01") == 4)
+    check("a flip resets the run", ms.stance_history(h, "DEFENSIVE", "2026-09-01") == 1)
+    check("every stance carries a playbook",
+          all(k in ms.STANCE_PLAYBOOK for k in
+              ("AGGRESSIVE", "CONSTRUCTIVE", "NEUTRAL", "CAUTIOUS", "DEFENSIVE")))
+
+
 def main() -> int:
     cf = _load("cf", os.path.join(SCRIPTS, "compute_features.py"))
     psc = _load("psc", os.path.join(SCRIPTS, "pipeline_skip_check.py"))
@@ -371,6 +410,7 @@ def main() -> int:
     test_momentum_index_relative()
     test_pead_anchor()
     test_aggregation()
+    test_market_stance()
     print()
     if _FAILS:
         print(f"{len(_FAILS)} FAILED:")
