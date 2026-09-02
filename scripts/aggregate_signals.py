@@ -413,7 +413,9 @@ def update_open_signals(drive, agg_id, unified: pd.DataFrame, bar_date: str):
     offside". One row per (symbol, family), first_date/entry/stop frozen at first
     appearance; same carry-forward pattern as membership.parquet."""
     prev = pd.DataFrame(columns=["symbol", "family", "first_date", "entry_at_signal",
-                                 "stop_at_signal", "last_seen", "times_seen"])
+                                 "stop_at_signal", "last_seen", "times_seen",
+                                 "zone_at_signal", "conviction_at_signal",
+                                 "n_families_at_signal", "n_events_at_signal"])
     fid = find_file(drive, agg_id, "open_signals.csv")
     if fid:
         try:
@@ -440,6 +442,18 @@ def update_open_signals(drive, agg_id, unified: pd.DataFrame, bar_date: str):
                                    else r.get("stop_median")),
                 "last_seen": bar_date,
                 "times_seen": (int(old["times_seen"]) + 1) if old is not None else 1,
+                # Frozen alongside the price: signal_tracker.py needs the score
+                # AS IT WAS when the call was made to ask whether it predicted
+                # anything. Reading today's score against a months-old outcome
+                # would be measuring the wrong thing.
+                "zone_at_signal": (old["zone_at_signal"] if old is not None
+                                   else r.get("zone_type")),
+                "conviction_at_signal": (old["conviction_at_signal"] if old is not None
+                                         else r.get("conviction_v2")),
+                "n_families_at_signal": (old["n_families_at_signal"] if old is not None
+                                         else r.get("n_families")),
+                "n_events_at_signal": (old["n_events_at_signal"] if old is not None
+                                       else r.get("n_event_families")),
             })
     live = pd.DataFrame(rows)
     live_keys = {(str(r["symbol"]), str(r["family"])) for _, r in live.iterrows()}         if len(live) else set()

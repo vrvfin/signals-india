@@ -393,6 +393,75 @@ def test_market_stance() -> None:
               ("AGGRESSIVE", "CONSTRUCTIVE", "NEUTRAL", "CAUTIOUS", "DEFENSIVE")))
 
 
+def test_signal_tracker() -> None:
+    section("outcome tracker: R-multiples, exit-vs-hold, reliability")
+    st = _load("st", os.path.join(SCRIPTS, "signal_tracker.py"))
+
+    def bars(closes, highs=None, lows=None):
+        n = len(closes)
+        return pd.DataFrame({"date": pd.bdate_range("2026-06-01", periods=n),
+                             "high": highs or [c * 1.01 for c in closes],
+                             "low": lows or [c * 0.99 for c in closes],
+                             "close": closes})
+
+    # entry 100, stop 90 -> 1R = 10, a 2R target sits at 120
+    r = st.evaluate_signal(bars([100, 105, 112, 121, 118]), 100, 90)
+    check("target hit -> +2R", r["status"] == "target_hit" and r["r_multiple"] == 2.0)
+    r = st.evaluate_signal(bars([100, 96, 91, 88, 95]), 100, 90)
+    check("stop hit -> -1R", r["status"] == "stopped" and r["r_multiple"] == -1.0)
+
+    same_bar = pd.DataFrame({"date": pd.bdate_range("2026-06-01", periods=2),
+                             "high": [101, 125], "low": [99, 85],
+                             "close": [100, 120]})
+    check("stop and target on one bar -> the pessimistic read",
+          st.evaluate_signal(same_bar, 100, 90)["status"] == "stopped",
+          "daily bars cannot say which came first; assuming the good one "
+          "would flatter every result")
+
+    r = st.evaluate_signal(bars([100, 102, 104]), 100, 90)
+    check("still running -> open, not counted as closed",
+          r["status"] == "open" and not r["closed"])
+    r = st.evaluate_signal(bars([100] * 70), 100, 90, max_hold_days=63)
+    check("goes stale -> expired at the hold limit",
+          r["status"] == "expired" and r["days_held"] == 63)
+
+    # Stopped out, then the stock ran: the EXIT destroyed the trade, not the pick.
+    r = st.evaluate_signal(bars([100, 95, 89] + [100 + 3 * i for i in range(70)]),
+                           100, 90)
+    check("exit_vs_hold catches an exit that cut a big winner",
+          r["exit_vs_hold_r"] < -5,
+          f"realised {r['r_multiple']}R vs {r['hold_r']}R holding")
+
+    r = st.evaluate_signal(bars([100, 108, 104, 118, 112]), 100, 90, target_r=99)
+    check("MFE/MAE captured (this is what sets the target)",
+          r["mfe_r"] > 1.7 and r["mae_r"] < 0,
+          f"MFE {r['mfe_r']}R, MAE {r['mae_r']}R")
+    check("stop >= entry flagged invalid, not silently dropped",
+          st.evaluate_signal(bars([100, 101]), 100, 105)["status"] == "invalid")
+
+    small = pd.DataFrame({"conviction_at_signal": range(10),
+                          "r_multiple": range(10)})
+    check("reliability declines to report below n=20",
+          pd.isna(st.reliability(small, "conviction_at_signal")["decile_lift"]))
+    perfect = pd.DataFrame({"conviction_at_signal": np.arange(200),
+                            "r_multiple": np.arange(200) * 0.01})
+    o = st.reliability(perfect, "conviction_at_signal")
+    check("a perfectly predictive score -> IC 1.0", abs(o["rank_ic"] - 1.0) < 1e-6)
+    rng = np.random.default_rng(1)
+    noise = pd.DataFrame({"conviction_at_signal": rng.normal(size=400),
+                          "r_multiple": rng.normal(size=400)})
+    o = st.reliability(noise, "conviction_at_signal")
+    check("a meaningless score -> ~zero lift and ~zero IC",
+          abs(o["decile_lift"]) < 1.0 and abs(o["rank_ic"]) < 0.15,
+          f"lift {o['decile_lift']}R, IC {o['rank_ic']}")
+    backwards = pd.DataFrame({"conviction_at_signal": np.arange(200),
+                              "r_multiple": -np.arange(200) * 0.01})
+    check("a BACKWARDS score is caught",
+          st.reliability(backwards, "conviction_at_signal")["decile_lift"] < 0)
+    check("no scipy needed (it is not in requirements.txt)",
+          "scipy" not in sys.modules)
+
+
 def main() -> int:
     cf = _load("cf", os.path.join(SCRIPTS, "compute_features.py"))
     psc = _load("psc", os.path.join(SCRIPTS, "pipeline_skip_check.py"))
@@ -411,6 +480,7 @@ def main() -> int:
     test_pead_anchor()
     test_aggregation()
     test_market_stance()
+    test_signal_tracker()
     print()
     if _FAILS:
         print(f"{len(_FAILS)} FAILED:")

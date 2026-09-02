@@ -225,6 +225,14 @@ jobs:
         run: python scripts/build_signal_membership.py
         continue-on-error: true
 
+      # Score yesterday's calls before anything else consumes today's list.
+      # Reads open_signals.csv (the frozen entry/stop) + OHLCV, and writes the
+      # outcome ledger. Silent until aggregate_signals has run at least once.
+      - name: Signal tracker (did the calls work?)
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/signal_tracker.py
+        continue-on-error: true
+
       # ---- BSE announcements -> LLM summary (independent of Phase 2) ----
       # Runs after Aggregate signals (needs the fresh PF + n_strategies>=2 watchlist
       # with the Rs1cr turnover floor). Pulls the day's market-wide BSE filings,
