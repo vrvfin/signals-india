@@ -89,6 +89,9 @@ MASTER_MIN_FRACTION = 0.90
 
 COLS = ["isin", "symbol", "exchange", "listing_date", "source", "confidence",
         "first_seen", "updated_at",
+        # set when a date is shared by more names than could plausibly list on
+        # one day, WHATEVER the source said (see the global cliff check)
+        "on_date_cliff",
         # --classify pass (additive; blank for rows never classified)
         "listing_type", "type_evidence", "classified_at"]
 
@@ -898,6 +901,31 @@ def main() -> None:
     log(f"  RESOLVED {len([1 for v in resolved.values() if v[2] != UNKNOWN])}"
         f" / {len(todo)}; {len(undated)} recorded as undatable")
 
+    # ---- date cliffs, ACROSS EVERY SOURCE ---------------------------------
+    # The tier-3 cliff rule above only ever guarded dates INFERRED from a first
+    # price bar. An authoritative source can publish a bulk date too: NSE's own
+    # EQUITY_L.csv carries 2026-04-20 for 103 different names, which is not 103
+    # companies listing on one day — India's busiest genuine IPO day is a
+    # handful. Those rows sailed through tier 1 unchallenged and made up a THIRD
+    # of the "listed in the last year" cohort feeding the IPO engine.
+    #
+    # The date is NOT discarded: it may well mean something real (a
+    # re-registration, a series migration, a corporate action). It is flagged, so
+    # consumers that need "when did this actually start trading" can exclude it
+    # while anything wanting the raw exchange field still has it. Additive column,
+    # per the schema-first rule.
+    dated = {s_: d for s_, (d, _, _) in resolved.items() if d is not None}
+    global_cliffs = _find_cliffs(dated)
+    if global_cliffs:
+        from collections import Counter
+        cnt = Counter(dated.values())
+        detail = ", ".join(f"{c} ({cnt[c]} names)" for c in sorted(global_cliffs))
+        log(f"  DATE CLIFFS across all sources (> {CLIFF_MIN} names on one date): "
+            f"{detail}")
+        by_src = Counter(src for s_, (d, src, _) in resolved.items()
+                         if d in global_cliffs)
+        log(f"    by source: {dict(by_src)} — flagged on_date_cliff, date kept")
+
     # ---- assemble ---------------------------------------------------------
     now = datetime.now().isoformat(timespec="seconds")
     isin_by = dict(zip(uni["symbol"], uni.get("isin", pd.Series(dtype=object))))
@@ -906,7 +934,8 @@ def main() -> None:
                        existing.get("first_seen", pd.Series(dtype=object))))
     rows = [{"isin": isin_by.get(s, ""), "symbol": s, "exchange": exch_by.get(s, ""),
              "listing_date": d, "source": src, "confidence": conf,
-             "first_seen": seen_by.get(s) or now, "updated_at": now}
+             "first_seen": seen_by.get(s) or now, "updated_at": now,
+             "on_date_cliff": bool(d is not None and d in global_cliffs)}
             for s, (d, src, conf) in sorted(resolved.items())]
     fresh = pd.DataFrame(rows, columns=COLS)
 
@@ -935,9 +964,12 @@ def main() -> None:
     ld = pd.to_datetime(out["listing_date"], errors="coerce")
     cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=365)
     recent = out[ld >= cut]
+    n_cliff = (int(out["on_date_cliff"].fillna(False).astype(bool).sum())
+               if "on_date_cliff" in out.columns else 0)
     log(f"  TABLE: {len(out)} rows "
         f"({int(out['confidence'].eq(AUTHORITATIVE).sum())} authoritative, "
-        f"{int(out['confidence'].eq(INFERRED).sum())} inferred)")
+        f"{int(out['confidence'].eq(INFERRED).sum())} inferred, "
+        f"{n_cliff} flagged on_date_cliff)")
     log(f"  listed in the last 365d: {len(recent)}")
     if not recent.empty and "exchange" in recent.columns:
         for ex, n in recent["exchange"].value_counts().items():

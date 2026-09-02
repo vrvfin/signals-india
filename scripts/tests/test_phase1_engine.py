@@ -549,8 +549,21 @@ def test_ipo_base() -> None:
     b = m.find_ipo_base(series(hi, lo, cl))
     check("finds a 30%-deep base", b is not None and
           abs(b["base_depth_pct"] - 30.0) < 0.1)
-    check("base excludes today's bar (else a breakout is impossible)",
-          b["base_days"] == n - 1)
+    # The invariant that matters: base_high is resistance built BEFORE today, so
+    # a breakout today is representable. (base_days is now measured from the
+    # PEAK, not the window length, so it is no longer n-1.)
+    today_tops = series(hi + [200.0], lo + [150.0], cl + [190.0])
+    b2 = m.find_ipo_base(today_tops)
+    check("base_high excludes today's bar, so a breakout is possible",
+          b2 is not None and b2["base_high"] < 200.0,
+          f"base_high {b2['base_high']:.0f} < today's high 200")
+    check("base_days measures the structure, not the scan window",
+          b["base_days"] < m.BASE_MAX_DAYS, f"{b['base_days']} < {m.BASE_MAX_DAYS}")
+    # A stock still making new lows is falling, not basing.
+    fall = list(np.linspace(150, 90, 60))
+    check("still making new lows -> not a base",
+          m.find_ipo_base(series([x * 1.01 for x in fall],
+                                 [x * 0.99 for x in fall], fall)) is None)
     check("a 2% drift is not a base",
           m.find_ipo_base(series([101.0] * n, [99.0] * n, [100.0] * n)) is None)
     check("a 75% collapse is not a base",

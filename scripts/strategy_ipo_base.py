@@ -72,7 +72,7 @@ from strategy_common import base_quality_score
 MIN_AGE_DAYS = 90        # below this there has been no time to form a base
 MAX_AGE_DAYS = 365       # beyond a year it is no longer a FIRST base
 BASE_MIN_DAYS = 25       # ~5 weeks. IPO bases are much shorter than classic ones
-BASE_MAX_DAYS = 90
+BASE_MAX_DAYS = 180      # the peak can sit well back in a 12-month-old listing
 BASE_MIN_DEPTH_PCT = 8   # flatter than this is a drift, not a base
 BASE_MAX_DEPTH_PCT = 50  # IPO bases correct far deeper than the usual 12-35%
 BREAKOUT_VOL_MULT = 1.4  # "expanded volume" — 40% above average
@@ -88,7 +88,8 @@ MIN_PRICE = 10.0
 STRATEGY = "ipo_base"
 OUT_COLS = ["symbol", "date", "strategy", "zone_type", "score", "entry", "stop",
             "days_since_listing", "base_days", "base_high", "base_low",
-            "base_depth_pct", "pct_below_pivot", "listing_day_low", "vol_today_ratio",
+            "base_depth_pct", "days_since_trough", "pct_below_pivot",
+            "listing_day_low", "vol_today_ratio",
             "avg_turnover_20d_cr", "reason"]
 
 
@@ -97,27 +98,57 @@ def log(msg: str) -> None:
 
 
 def find_ipo_base(ohlcv: pd.DataFrame) -> dict | None:
-    """Longest recent window that looks like a first base.
+    """The post-listing peak, the correction after it, and the recovery since.
+
+    An IPO base is a STRUCTURE, not a window. The stock runs after listing, sells
+    off, then works its way back toward that first peak; the peak is the pivot.
+
+    The first version scanned for "any recent window whose range is 8-50% deep"
+    and returned the longest one that fit. With a tolerance that wide the longest
+    window ALWAYS fit, so base_days came back as exactly 90 — the maximum — for
+    every single signal in the live run, and the duration third of the score was
+    a constant. It was measuring the last 90 days, not finding a base.
 
     Measured EXCLUDING today's bar, so base_high is resistance built BEFORE
-    today — otherwise `close > base_high` could never be true and the breakout
-    zone would be permanently dead. (Same trap darvas documents as audit #32.)
+    today; otherwise `close > base_high` can never be true and the breakout zone
+    is permanently dead (the trap darvas documents as audit #32).
     """
-    if len(ohlcv) < BASE_MIN_DAYS + 1:
+    if len(ohlcv) < BASE_MIN_DAYS + 2:
         return None
-    high = ohlcv["high"].astype(float).values
-    low = ohlcv["low"].astype(float).values
+    prior = ohlcv.iloc[:-1].reset_index(drop=True)   # today is the candidate
+    if len(prior) < BASE_MIN_DAYS + 1:
+        return None
 
-    for n in range(min(BASE_MAX_DAYS, len(ohlcv) - 1), BASE_MIN_DAYS - 1, -1):
-        h = high[-(n + 1):-1].max()
-        l = low[-(n + 1):-1].min()
-        if h <= 0:
-            continue
-        depth = (h - l) / h * 100          # % off the base high, the classic read
-        if BASE_MIN_DEPTH_PCT <= depth <= BASE_MAX_DEPTH_PCT:
-            return {"base_days": n, "base_high": h, "base_low": l,
-                    "base_depth_pct": depth}
-    return None
+    high = prior["high"].astype(float)
+    low = prior["low"].astype(float)
+
+    # The peak: the highest point since listing. Everything after it is the base.
+    peak_i = int(high.idxmax())
+    base_days = len(prior) - 1 - peak_i
+    if not (BASE_MIN_DAYS <= base_days <= BASE_MAX_DAYS):
+        # Too soon after the peak to have built anything, or so long ago that
+        # this is no longer a FIRST base.
+        return None
+
+    base_high = float(high.iloc[peak_i])
+    trough = low.iloc[peak_i:]
+    base_low = float(trough.min())
+    if base_high <= 0:
+        return None
+    depth = (base_high - base_low) / base_high * 100
+    if not (BASE_MIN_DEPTH_PCT <= depth <= BASE_MAX_DEPTH_PCT):
+        return None
+
+    # The low must be behind us: a stock still making new lows is falling, not
+    # basing. Require the trough in the first two-thirds of the base.
+    trough_i = int(trough.idxmin())
+    if (trough_i - peak_i) > base_days * 0.67:
+        return None
+
+    return {"base_days": int(base_days), "base_high": base_high,
+            "base_low": base_low, "base_depth_pct": depth,
+            "days_since_peak": int(base_days),
+            "days_since_trough": int(len(prior) - 1 - trough_i)}
 
 
 def ipo_signal(symbol: str, ohlcv: pd.DataFrame, feat: pd.Series,
@@ -169,6 +200,7 @@ def ipo_signal(symbol: str, ohlcv: pd.DataFrame, feat: pd.Series,
         "base_days": base["base_days"],
         "base_high": round(hi, 2), "base_low": round(lo, 2),
         "base_depth_pct": round(base["base_depth_pct"], 1),
+        "days_since_trough": base["days_since_trough"],
         "listing_day_low": round(listing_low, 2),
         "pct_below_pivot": round((hi - close) / hi * 100, 2),
         "vol_today_ratio": round(vol_ratio, 2),
