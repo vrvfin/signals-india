@@ -437,7 +437,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None,
                         help="Process only first N symbols (debug)")
-    parser.add_argument("--no-upload", action="store_true",
+    parser.add_argument("--dry-run", "--no-upload", dest="no_upload",
+                        action="store_true",
                         help="compute and summarise but write NOTHING to Drive. "
                              "Required for any --limit run: uploading a limited "
                              "frame would overwrite features/latest.parquet with "

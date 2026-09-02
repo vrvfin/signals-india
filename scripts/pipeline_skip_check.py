@@ -297,6 +297,11 @@ def check_phase1(drive, folder_id: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pipeline", choices=["phase1", "phase2"], required=True)
+    # Accepted and ignored: this script writes nothing to Drive, it only decides
+    # whether the caller should proceed. Declared so that dry-running the whole
+    # pipeline with one flag does not fall over here with exit 2.
+    parser.add_argument("--dry-run", action="store_true",
+                        help="accepted for consistency; this script never writes")
     args = parser.parse_args()
 
     try:

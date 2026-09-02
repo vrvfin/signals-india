@@ -293,6 +293,13 @@ def main():
                          "independent per symbol, results collected in the main "
                          "thread — data-safe; bounded for Drive API limits. Use 1 "
                          "for the serial path.")
+    # Declared on the script's OWN parser too. The shared guard reads it with
+    # parse_known_args, but this parser is strict — so without this line
+    # `--dry-run` was rejected as unrecognised and the script exited 2 before
+    # doing anything. Every other strategy had no parser of its own, which is
+    # why only this one broke.
+    ap.add_argument("--dry-run", action="store_true",
+                    help="compute and report, write nothing to Drive")
     args = ap.parse_args()
 
     print("Stage 11c — PEAD signals")
