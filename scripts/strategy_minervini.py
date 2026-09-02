@@ -29,10 +29,16 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from strategy_common import slack, min_slack_score
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -139,23 +145,63 @@ def evaluate_trend_template(row: pd.Series) -> tuple[int, dict]:
     return passed, checks
 
 
+def template_slacks(row: pd.Series) -> dict:
+    """How much head-room the stock has on each CONTINUOUS template condition.
+
+    Rule 3 (200 SMA rising) is boolean and has no slack, so it stays a pure gate.
+    The `full` values are the point past each threshold where more stops meaning
+    materially safer — judgements, stated here rather than buried in a formula."""
+    close = row["close"]
+    return {
+        # rule 8: RS rank 70 floor, rank 100 is full slack
+        "rs":    slack(row.get("rs_rank_6m"), 70, 30),
+        # rule 7: within 25% of the 52w high; AT the high is full slack
+        "high":  slack(row.get("dist_from_52w_high_pct"), -25, 25),
+        # rule 6: 30% above the 52w low; +60% is full slack
+        "low":   slack(row.get("dist_from_52w_low_pct"), 30, 30),
+        # rule 5: above the 50 SMA; +10% is full slack
+        "ma50":  slack(close / row["sma_50"] - 1 if row.get("sma_50") else None,
+                       0, 0.10),
+        # rule 1: above the 200 SMA; +30% is full slack
+        "ma200": slack(close / row["sma_200"] - 1 if row.get("sma_200") else None,
+                       0, 0.30),
+        # rule 4: 50 SMA above the 100 EMA; +5% is full slack
+        "stack": slack(row["sma_50"] / row["ema_100"] - 1
+                       if row.get("sma_50") and row.get("ema_100") else None,
+                       0, 0.05),
+        # rule 2: 100 EMA above the 200 SMA; +5% is full slack
+        "e100":  slack(row["ema_100"] / row["sma_200"] - 1
+                       if row.get("ema_100") and row.get("sma_200") else None,
+                       0, 0.05),
+    }
+
+
 def minervini_signals(features: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for _, r in features.iterrows():
         passed, checks = evaluate_trend_template(r)
-        if passed < 6:
+        # 8/8 ONLY. The old 6-or-7 "hold" tier was producing most of this
+        # strategy's ~1,185 daily signals, and a 6-of-8 Minervini is not a
+        # Minervini — the template is a conjunction, not a scorecard.
+        if passed < 8:
             continue
-        zone = "buy" if passed == 8 else "hold"
+        zone = "buy"
         rs_rank = r.get("rs_rank_6m", float("nan"))
         atr = r.get("atr_14", 0)
         rules_passed = [k for k, v in checks.items() if v]
         rules_failed = [k for k, v in checks.items() if not v]
+        sl = template_slacks(r)
+        margin, binding = min_slack_score(sl)
         rows.append({
             "symbol": r["symbol"],
             "date": r["date"],
             "strategy": "minervini",
             "zone_type": zone,
-            "score": passed * 10 + (rs_rank / 10 if pd.notna(rs_rank) else 0),
+            # Distance to failing the template, not boxes-ticked-times-ten. Every
+            # signal here is 8/8, so a rule count would now be a constant.
+            "score": margin,
+            "template_margin": margin,
+            "binding_rule": binding,
             "entry": round(r["close"], 2),
             "stop": round(r["close"] - 2 * atr, 2) if atr else None,
             "rules_passed": passed,
@@ -164,8 +210,8 @@ def minervini_signals(features: pd.DataFrame) -> pd.DataFrame:
             "dist_from_52w_high_pct": round(r["dist_from_52w_high_pct"], 1),
             "dist_from_52w_low_pct": round(r["dist_from_52w_low_pct"], 1),
             "return_6m_pct": round(r["return_6m_pct"], 1) if pd.notna(r["return_6m_pct"]) else None,
-            "reason": f"Trend template {passed}/8" +
-                      (f"; missing: {', '.join(rules_failed)}" if rules_failed else ""),
+            "reason": (f"Trend template 8/8; tightest condition '{binding}' "
+                       f"at {margin:.0f}% of full slack"),
         })
     return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
 

@@ -133,17 +133,30 @@ def ma_respect_signals(features: pd.DataFrame, ema_n: int, days_n: int,
 
     df["strategy"] = strategy_name
     df["zone_type"] = "buy"   # current state: holding above the EMA
-    df["score"] = df[days_col]  # longer streak = higher conviction
     df["entry"] = df["close"].round(2)
     # Stop-loss: 1 ATR below the EMA (first-violation guard)
     df["stop"] = (df[ema_col] - df["atr_14"]).round(2)
+
+    # Was `df[days_col]` — longest streak wins. That ranked the MOST EXTENDED
+    # name top: a stock 200 days above its 20 EMA is further into its move and
+    # more likely to revert than one at 35 days, and it is also the one whose
+    # stop sits furthest below the price. Two changes:
+    #   risk      how far the stop is, as a fraction of price. Nearer is better,
+    #             because it is what lets you size the position.
+    #   streak    credit for CLEARING the bar, capped at twice the threshold.
+    #             Meeting it comfortably counts; running on forever does not.
+    _risk = ((df["close"] - df["stop"]) / df["close"]).clip(lower=0)
+    _risk_score = (1.0 - (_risk / 0.15).clip(upper=1.0))     # 15% away = no marks
+    _streak_score = ((df[days_col] - days_n) / max(days_n, 1)).clip(lower=0, upper=1)
+    df["score"] = (100 * (0.6 * _risk_score + 0.4 * _streak_score)).round(2)
+    df["risk_pct"] = (_risk * 100).round(2)
     df["reason"] = df.apply(
         lambda r: f"Held above {ema_n} EMA for {int(r[days_col])} days "
                   f"(>= {days_n}d threshold), ADR {r['adr_pct_20']:.1f}%",
         axis=1)
 
     keep = ["symbol", "date", "strategy", "zone_type", "score",
-            "entry", "stop", days_col, ema_col, "close",
+            "entry", "stop", "risk_pct", days_col, ema_col, "close",
             "adr_pct_20", "dist_from_52w_high_pct", "reason"]
     out = df[keep].copy()
     out = out.rename(columns={days_col: "days_above_ema", ema_col: "ema"})

@@ -23,10 +23,16 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from strategy_common import pct_rank
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -119,18 +125,38 @@ def momentum_signals(features: pd.DataFrame, lookback: str,
     """
     rs_col = f"rs_rank_{lookback}"
     ret_col = f"return_{lookback}_pct"
+    exc_col = f"rs_vs_nifty500_{lookback}_pct"
     if rs_col not in features.columns:
         return pd.DataFrame()
 
     df = features.copy()
     df = df[df["above_200sma"] == True]  # trend filter
-    df = df[df[rs_col].notna()]
+
+    # Gate on strength RELATIVE TO THE INDEX, not raw return percentile.
+    # guru/backtest/family_lift.parquet, 3M: raw momentum (TECH_MOM) is +38.2pp
+    # on a 55.6% win rate with a +3.4% median; index-relative
+    # (TECH_RELSTRENGTH) is +38.0pp on a 72.6% win rate with a +14.8% median.
+    # Nearly the same lift, a far better hit rate and four times the median.
+    # rs_vs_nifty500 is an excess return in pp, not a percentile, so it is
+    # ranked cross-sectionally here to keep the "top decile" semantics the
+    # thresholds below are written in.
+    if exc_col in df.columns and df[exc_col].notna().any():
+        df["rs_basis"] = pct_rank(df[exc_col])
+        rs_basis_name = "index-relative"
+    else:
+        # compute_features has not shipped the excess columns yet, or the index
+        # is unavailable — fall back to the raw percentile rather than emitting
+        # nothing, and say so in the log.
+        df["rs_basis"] = df[rs_col]
+        rs_basis_name = "raw-return (FALLBACK: no index-relative column)"
+    df = df[df["rs_basis"].notna()]
+    log(f"  {lookback}: gating on {rs_basis_name}")
 
     buy_thresh = 100 - top_pct          # 90 by default
     hold_thresh = 100 - hold_pct        # 80 by default
 
-    is_buy = df[rs_col] >= buy_thresh
-    is_hold = (df[rs_col] >= hold_thresh) & (df[rs_col] < buy_thresh)
+    is_buy = df["rs_basis"] >= buy_thresh
+    is_hold = (df["rs_basis"] >= hold_thresh) & (df["rs_basis"] < buy_thresh)
     is_add = is_buy & (df["dist_from_52w_high_pct"] >= -near_high_pct)
 
     df["zone_type"] = None
@@ -143,7 +169,13 @@ def momentum_signals(features: pd.DataFrame, lookback: str,
         return pd.DataFrame()
 
     df["strategy"] = f"momentum_{lookback}"
-    df["score"] = df[rs_col]
+    # The variant is kept as its own column so aggregate_signals can collapse the
+    # five lookbacks into ONE family vote while still knowing which of them
+    # fired — a name in 1m only is a fresh mover, a name in all five is an
+    # established leader, and they are not the same trade.
+    df["variant"] = lookback
+    # Score on the index-relative percentile, not the raw one that also gates.
+    df["score"] = df["rs_basis"].round(2)
     df["entry"] = df["close"].round(2)
     df["stop"] = (df["close"] - 2 * df["atr_14"]).round(2)
     df["reason"] = df.apply(
@@ -152,9 +184,12 @@ def momentum_signals(features: pd.DataFrame, lookback: str,
                   f"{r['dist_from_52w_high_pct']:.1f}% from 52w high",
         axis=1)
 
-    cols = ["symbol", "date", "strategy", "zone_type", "score",
+    cols = ["symbol", "date", "strategy", "variant", "zone_type", "score",
             "entry", "stop", rs_col, ret_col, "dist_from_52w_high_pct",
             "adr_pct_20", "reason"]
+    if exc_col in df.columns:
+        df["rs_excess_pct"] = df[exc_col].round(2)
+        cols.insert(cols.index("adr_pct_20"), "rs_excess_pct")
     out = df[cols].copy()
     out = out.rename(columns={rs_col: "rs_rank", ret_col: "return_pct"})
     return out.sort_values("score", ascending=False).reset_index(drop=True)

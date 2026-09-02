@@ -34,11 +34,17 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from strategy_common import base_quality_score
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -214,12 +220,22 @@ def darvas_signal(symbol: str, ohlcv: pd.DataFrame,
         return None
 
     stop = bot - 0.5 * float(feat["atr_14"])
+    _qual, _parts = base_quality_score(
+        box["range_pct"], BOX_MAX_RANGE_PCT, box["box_days"], BOX_MIN_DAYS,
+        BOX_MAX_DAYS, vol_ratio, breakout=(zone == "add"))
     return {
         "symbol": symbol,
         "date": feat["date"],
         "strategy": "darvas",
         "zone_type": zone,
-        "score": -float(feat["dist_from_52w_high_pct"]),  # closer to high = higher score
+        # Was -dist_from_52w_high_pct alone. Proximity to the high is already a
+        # hard PRE-FILTER (within 5%), so re-ranking on it separated almost
+        # nothing; box tightness, duration and breakout volume — all computed
+        # above and previously discarded — are what actually differ.
+        "score": _qual,
+        "box_tightness": round(_parts["tightness"], 3),
+        "box_duration": round(_parts["duration"], 3),
+        "box_confirmation": round(_parts["confirmation"], 3),
         "entry": round(close, 2),
         "stop": round(stop, 2),
         "box_top": round(top, 2),

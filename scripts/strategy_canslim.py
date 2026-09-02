@@ -26,10 +26,16 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from strategy_common import slack, min_slack_score
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -99,7 +105,24 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
     return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
 
 
+# "M" is one number for the WHOLE market on a given day, so counting it as a
+# seventh per-stock rule added zero cross-sectional information — it just shifted
+# every stock's score by the same 10 points, and on a day it flipped, every
+# CANSLIM name silently dropped a tier at once. It is a gate on the day, not a
+# property of the stock.
+M_MARKET_HEALTH_MIN = 40
+
+# Rules that describe the STOCK. C and A are the CANSLIM thesis (current and
+# annual earnings acceleration); the old 5-of-7 "hold" tier let a stock fail both
+# and still signal, which is not CANSLIM in any meaningful sense.
+STOCK_RULES = ["C_qtr_eps_growth_25pct", "A_ann_eps_growth_25pct",
+               "N_within_25pct_52w_high", "S_promoter_holding_40pct",
+               "L_rs_rank_6m_80", "I_roe_15pct"]
+REQUIRED_RULES = ["C_qtr_eps_growth_25pct", "A_ann_eps_growth_25pct"]
+
+
 def evaluate(row) -> tuple[int, dict]:
+    """Returns (count of STOCK rules passed, all checks incl. M for reporting)."""
     checks = {
         "C_qtr_eps_growth_25pct": (pd.notna(row.get("q_eps_yoy_pct"))
                                     and row["q_eps_yoy_pct"] >= 25),
@@ -114,9 +137,27 @@ def evaluate(row) -> tuple[int, dict]:
         "I_roe_15pct": (pd.notna(row.get("roe_pct"))
                          and row["roe_pct"] >= 15),
         "M_market_health_40": (pd.notna(row.get("market_health_score"))
-                                and row["market_health_score"] >= 40),
+                                and row["market_health_score"] >= M_MARKET_HEALTH_MIN),
     }
-    return sum(1 for v in checks.values() if v), checks
+    return sum(1 for k in STOCK_RULES if checks[k]), checks
+
+
+def canslim_slacks(row) -> dict:
+    """Head-room on each stock rule. `full` = where more stops meaning safer.
+
+    NOTE on S: OWN_PROMHOLD measures -0.7pp at 3M and -7.0pp at 12M in
+    guru/backtest/family_lift.parquet, while PROJECT_STATUS.md section 3 reports
+    high promoter holding as a winner characteristic. Those are different
+    measurements (timing lift vs winner profiling) and they disagree. The rule is
+    left EXACTLY as it was pending that reconciliation — flagged, not changed."""
+    return {
+        "C": slack(row.get("q_eps_yoy_pct"), 25, 50),
+        "A": slack(row.get("ann_eps_yoy_pct"), 25, 50),
+        "N": slack(row.get("dist_from_52w_high_pct"), -25, 25),
+        "S": slack(row.get("promoter_holding_pct"), 40, 35),
+        "L": slack(row.get("rs_rank_6m"), 80, 20),
+        "I": slack(row.get("roe_pct"), 15, 25),
+    }
 
 
 def main():
@@ -153,21 +194,38 @@ def main():
     merged["market_health_score"] = market_health
     log(f"Universe with fundamentals: {len(merged)}")
 
+    # M is a gate on the DAY, not a rule on the stock. Below the threshold
+    # CANSLIM emits nothing at all rather than quietly demoting every name.
+    if market_health is None or market_health < M_MARKET_HEALTH_MIN:
+        log(f"M gate: market health {market_health} < {M_MARKET_HEALTH_MIN} "
+            f"— CANSLIM stands down today (0 signals)")
+        merged = merged.iloc[0:0]
+
     # Evaluate
     rows = []
     for _, r in merged.iterrows():
         passed, checks = evaluate(r)
+        # C and A are the thesis. Without earnings acceleration this is not a
+        # CANSLIM setup, however many of the other rules happen to pass.
+        if not all(checks[k] for k in REQUIRED_RULES):
+            continue
         if passed < 5:
             continue
-        zone = "buy" if passed == 7 else "hold"
+        zone = "buy" if passed == len(STOCK_RULES) else "hold"
+        sl = canslim_slacks(r)
+        margin, binding = min_slack_score(sl)
         failed = [k for k, v in checks.items() if not v]
         rows.append({
             "symbol": r["symbol"],
             "date": r.get("date"),
             "strategy": "canslim",
             "zone_type": zone,
-            "score": passed * 10 + (r.get("rs_rank_6m", 0) / 10
-                                     if pd.notna(r.get("rs_rank_6m")) else 0),
+            # Distance to failing the tightest satisfied rule, not boxes-ticked
+            # times ten (which capped RS's influence at 10 points and made a
+            # 5-of-6 unable to ever outrank a 6-of-6).
+            "score": margin,
+            "canslim_margin": margin,
+            "binding_rule": binding,
             "entry": round(r["close"], 2) if pd.notna(r.get("close")) else None,
             "stop": (round(r["close"] - 2 * r["atr_14"], 2)
                      if pd.notna(r.get("atr_14")) else None),

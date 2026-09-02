@@ -26,11 +26,17 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from strategy_common import base_quality_score
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -213,12 +219,22 @@ def qullamaggie_signal(symbol: str, ohlcv: pd.DataFrame,
         return None  # already extended above pivot or below; not actionable
 
     stop = pivot_l - 0.5 * float(feat["atr_14"])
+    _qual, _parts = base_quality_score(
+        consol["range_pct"], CONSOLIDATION_MAX_RANGE_PCT,
+        consol["consolidation_days"], CONSOLIDATION_MIN_DAYS,
+        CONSOLIDATION_MAX_DAYS, vol_today_ratio, breakout=(zone == "add"))
     return {
         "symbol": symbol,
         "date": feat["date"],
         "strategy": "qullamaggie",
         "zone_type": zone,
-        "score": float(feat["return_3m_pct"]),  # bigger run = higher conviction
+        # Was float(return_3m_pct) — "bigger prior run = higher conviction",
+        # which ranked the MOST EXTENDED name top, i.e. the worst risk/reward in
+        # the list, and ignored the base geometry computed just above.
+        "score": _qual,
+        "base_tightness": round(_parts["tightness"], 3),
+        "base_duration": round(_parts["duration"], 3),
+        "base_confirmation": round(_parts["confirmation"], 3),
         "entry": round(close, 2),
         "stop": round(stop, 2),
         "pivot_high": round(pivot_h, 2),

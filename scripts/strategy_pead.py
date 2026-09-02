@@ -189,7 +189,14 @@ def detect_pead_at(symbol, ohlcv, result_dt, today_dt):
              & (df["vol_mult"] >= MIN_VOL_MULT)]
     if win.empty:
         return None
-    er = win.loc[win["gap_pct"].idxmax()]           # biggest gap near the result
+    # Anchor to the qualifying session CLOSEST TO THE DECLARED DATE, not the
+    # biggest gap in the window. With idxmax, a stock that gapped DOWN on results
+    # and then gapped up two days later on a rebound had the rebound recorded as
+    # its "earnings reaction" — a different event entirely. Ties break toward the
+    # larger gap.
+    _win = win.assign(_dist=(win["date"] - result_dt).abs())
+    _win = _win.sort_values(["_dist", "gap_pct"], ascending=[True, False])
+    er = _win.iloc[0]
     er_date = pd.to_datetime(er["date"])
     days_since = (today_dt - er_date).days
     if days_since < 0 or days_since > MAX_DRIFT_DAYS:

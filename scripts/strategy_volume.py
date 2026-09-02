@@ -132,7 +132,8 @@ REQUIRED_COLS = ["symbol", "date", "close", "atr_14", "vol_today_ratio",
                  "dist_from_52w_high_pct", "adr_pct_20"]
 
 OUT_COLS = ["symbol", "date", "strategy", "zone_type", "score", "entry", "stop",
-            "vol_today_ratio", "dist_from_52w_high_pct", "adr_pct_20", "reason"]
+            "vol_today_ratio", "atr_expansion_ratio", "dist_from_52w_high_pct",
+            "adr_pct_20", "reason"]
 
 
 def _check_columns(features: pd.DataFrame, label: str) -> bool:
@@ -187,8 +188,22 @@ def volume_breakout_signals(features: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df["strategy"] = "volume_breakout"
-    # Score 0-100: scales with the size of the volume spike.
-    df["score"] = (df["vol_today_ratio"] / BREAKOUT_VOL_MULT * 60).clip(upper=100).round(1)
+    # Rank on RANGE expansion, not the size of the volume spike.
+    # guru/backtest/family_lift.parquet: TECH_VOLSURGE is +5.7pp at 3M, while
+    # TECH_ATR (ATR expansion) is +22.1pp. Volume alone cannot tell accumulation
+    # from a news dump; range expanding with it is the confirming tell. Volume
+    # stays the GATE (>= BREAKOUT_VOL_MULT); this only changes the ordering.
+    _atr_exp = pd.to_numeric(df.get("atr_expansion_ratio"), errors="coerce")
+    _vol = (df["vol_today_ratio"] / BREAKOUT_VOL_MULT * 60).clip(upper=100)
+    if _atr_exp.notna().any():
+        # 1.0 = no expansion, 2.0x = full marks.
+        _rng = ((_atr_exp - 1.0) / 1.0 * 100).clip(lower=0, upper=100)
+        df["score"] = (0.7 * _rng.fillna(_vol) + 0.3 * _vol).round(1)
+        df["atr_expansion_ratio"] = _atr_exp.round(3)
+    else:
+        # compute_features has not shipped atr_expansion_ratio yet — fall back to
+        # the old volume-only score rather than emitting nothing.
+        df["score"] = _vol.round(1)
     df["entry"] = df["close"].round(2)
     df["stop"] = (df["close"] - 2 * df["atr_14"]).round(2)
     df["reason"] = df.apply(
