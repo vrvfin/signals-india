@@ -194,8 +194,17 @@ DOC_PATTERNS = [
     ("rating", ("rating update", "credit rating", "rating rationale")),
 ]
 # Filings that are not company results/deck material — never queued.
-IGNORE = ("newspaper publication", "shareholders meeting", "egm", "agm notice",
-          "general updates", "trading window", "share transfer", "all")
+# PHRASES, safe to test as substrings.
+IGNORE = ("newspaper publication", "shareholders meeting", "agm notice",
+          "general updates", "trading window", "share transfer")
+# SHORT TOKENS, which must match as WHOLE WORDS. Tested as substrings they were
+# catastrophic: "all" matched inside "c-all", so classify() rejected EVERY title
+# containing the word call — "Concall transcript", "Earnings Call Transcript",
+# "Conference Call Transcript" all returned "". Only Screener's bare "Transcript"
+# label survived, via the exact-label branch above, which is why concall discovery
+# worked from Screener and could never work from NSE or BSE, whose descriptions are
+# full sentences. "egm" had the same flaw: it matches inside "s-egm-ent".
+_IGNORE_WORD_RE = re.compile(r"\b(?:all|egm)\b", re.I)
 
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun",
@@ -211,13 +220,55 @@ def classify(text: str) -> str:
     if low in ("rec", "ppt", "transcript"):      # Screener's bare link labels
         return {"rec": "concall", "ppt": "presentation",
                 "transcript": "concall"}[low]
-    if any(k in low for k in IGNORE) and not any(
+    if (any(k in low for k in IGNORE) or _IGNORE_WORD_RE.search(low)) and not any(
             k in low for k in ("outcome of board meeting", "financial result")):
         return ""
     for doc_type, keys in DOC_PATTERNS:
         if any(k in low for k in keys):
             return doc_type
     return ""
+
+
+# Screener's bare "REC" link is an AUDIO RECORDING, and classify() maps it to concall
+# (that mapping is correct - it IS the concall's artefact). Queueing it sends an audio
+# URL to a PDF extractor, which is the "document queued as a type it can never satisfy"
+# failure that accounts for the largest share of existing extraction errors. classify()
+# is left alone because other callers depend on it; the drop happens at the gate instead.
+_AUDIO_EXT_RE = re.compile(r"\.(mp3|wav|m4a|aac|ogg|wma)(?:[?#]|$)", re.I)
+_AUDIO_LABELS = {"rec", "recording", "audio", "audio recording", "concall recording"}
+_AUDIO_TEXT_RE = re.compile(r"audio|recording", re.I)
+
+
+def is_audio_link(title: str, url: str = "") -> bool:
+    """True for a link that is a recording rather than a readable document.
+
+    THE ORDER OF THESE FOUR TESTS IS LOAD-BEARING.
+
+    1. The LEADING label, because scrape_company_docs enriches a bare label with its
+       whole parent row: Screener's audio link becomes
+       "REC — Aug 2026 Transcript AI Summary PPT REC". That string contains the word
+       "transcript", so test 3 would wave it straight through if it ran first.
+    2. The url's own extension, for a source that links the media file directly.
+    3. "transcript" ANYWHERE is decisive proof of a readable document. Companies file
+       "Earnings Call Transcript ... - Transcript of Earning Call", and an audio-word
+       test alone would reject the very documents this sweep exists to find.
+    4. Only then, an audio word. This is what catches recordings whose titles are full
+       sentences rather than a label — measured live 2026-09-02:
+         "Audio Recording Of Earning Conference Call Held On 17.08.2026"   (INDSWFTLAB)
+         "Update Of Audio Recording For Earnings Conference Call For Q1"   (RISHABH)
+         "Analyst / Investor Meet - Outcome 3 Aug - Audio recording of..." (YASHO)
+       All three classify() as concall and all three are audio. Sending them to a PDF
+       extractor is the largest single class of extraction error in this repo.
+    """
+    t = str(title or "").lower()
+    label = t.split("—")[0].strip().strip("-").strip()
+    if label in _AUDIO_LABELS:
+        return True
+    if _AUDIO_EXT_RE.search(str(url or "")):
+        return True
+    if "transcript" in t:
+        return False
+    return bool(_AUDIO_TEXT_RE.search(t))
 
 
 def parse_date(text: str, today: datetime | None = None) -> str:
@@ -486,6 +537,83 @@ def _fetch_raw(session, url: str) -> bytes | None:
         return None
 
 
+_BSE_ATTACH = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+
+
+def bse_company_docs(code: str, days: int) -> list[dict]:
+    """That company's filings from BSE's per-scrip announcements API (strScrip=code).
+
+    THE THIRD SOURCE, and each one reaches what the others cannot. Screener is primary
+    and cleanest. NSE is the ONLY source that reaches the SME holdings, which have no
+    bse_code at all. BSE reaches the mainboard filing at its origin, carries a real
+    filing TIMESTAMP where Screener's concall table only dates the row, and covers
+    BSE-listed names on the day they file rather than when Screener gets round to it.
+
+    Reuses ingest_announcements.fetch_company_announcements - the same guaranteed
+    per-company endpoint that pipeline already relies on - rather than a second raw BSE
+    client. Note that pipeline then EXCLUDES annual reports and transcripts by design
+    ("Phase 2 owns these"), which is precisely why the documents this sweep wants never
+    reached the queue through it.
+
+    Returns the same dict shape as scrape_company_docs, so all three sources feed one
+    dedupe path.
+    """
+    code = str(code or "").strip()
+    if not code or code.lower() in ("nan", "none", "0"):
+        return []
+    try:
+        from ingest_announcements import fetch_company_announcements
+        rows = fetch_company_announcements(code, lookback_days=max(1, int(days)))
+    except Exception as e:
+        log(f"    BSE fetch failed for {code} ({str(e)[:60]})")
+        return []
+
+    out = []
+    for x in rows or []:
+        att = str(x.get("ATTACHMENTNAME") or "").strip()
+        if not att:
+            continue
+        # BSE flags the recording itself, so here the audio guard has a first-class
+        # field instead of a label heuristic.
+        if str(x.get("AUDIO_VIDEO_FILE") or "").strip():
+            continue
+        head = str(x.get("NEWSSUB") or x.get("HEADLINE") or "").strip()
+        sub = str(x.get("SUBCATNAME") or "").strip()
+        doc_type = classify(f"{head} {sub}")
+        if not doc_type:
+            continue
+        when = str(x.get("NEWS_DT") or "")[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", when):
+            continue
+        out.append({"doc_type": doc_type, "title": (head or sub)[:200],
+                    "pdf_url": _BSE_ATTACH + att,
+                    "announcement_date": when, "source": "bse"})
+    return out
+
+
+def _bse_map(drive, index_id) -> dict:
+    """{isin: bse_code} from company_universe.csv - which scrip to ask BSE about."""
+    import io
+    from _extractor_base import find_file, download_bytes
+    try:
+        fid = find_file(drive, index_id, "company_universe.csv")
+        if not fid:
+            return {}
+        u = pd.read_csv(io.BytesIO(download_bytes(drive, fid))).fillna("")
+        if "bse_code" not in u.columns:
+            log("  company_universe.csv has no bse_code column - BSE source disabled")
+            return {}
+        out = {}
+        for _, r in u.iterrows():
+            i, c = str(r.get("isin", "")).strip(), str(r.get("bse_code", "")).strip()
+            if i and c and c.lower() not in ("nan", "none", "0"):
+                out[i] = c.split(".")[0]        # read back from csv as 539730.0
+        return out
+    except Exception as e:
+        log(f"  bse_code map unavailable ({str(e)[:60]}) - BSE source disabled")
+        return {}
+
+
 def _board_map(drive, index_id) -> dict:
     """{isin: board} from company_universe.csv — decides the NSE index to query."""
     import io
@@ -576,6 +704,11 @@ def main() -> None:
                          "NSE only fills quarters Screener has nothing for.")
     ap.add_argument("--quarters", type=int, default=6,
                     help="How many recent quarters --one-per-quarter/--nse consider.")
+    ap.add_argument("--bse", action="store_true",
+                    help="Also query BSE's per-scrip announcements as a THIRD source, "
+                         "after Screener and NSE, filling only the quarters neither "
+                         "covered. Reaches a mainboard filing on the day it is made; "
+                         "skipped for holdings with no bse_code (the SME names).")
     ap.add_argument("--nse", action="store_true",
                     help="Also query NSE's per-symbol announcements as a SECOND source "
                          "(index=sme for NSE Emerge names, equities otherwise). The only "
@@ -610,6 +743,7 @@ def main() -> None:
     queue = load_queue(drive, idx)
     client = ScreenerClient()
     boards = _board_map(drive, idx) if args.nse else {}
+    bse_codes = _bse_map(drive, idx) if args.bse else {}
     nse = nse_session() if args.nse else None
     found, per_company = [], {}
     for n, (isin, sym, name) in enumerate(pf, 1):
@@ -643,6 +777,26 @@ def main() -> None:
                 except Exception as e:
                     log(f"  ! {sym:<14} nse fetch failed ({str(e)[:60]})")
 
+        if args.bse:
+            # BSE FILLS WHAT SCREENER AND NSE BOTH MISSED, on the same gap-only rule -
+            # merging a third source wholesale would enqueue every filing a third time,
+            # since none of the three share a title or an exact date.
+            code = bse_codes.get(isin, "")
+            types = want_types or {"presentation", "rating", "results"}
+            gaps = missing_quarters(docs, types, recent_quarters(args.quarters))
+            if code and gaps:
+                try:
+                    bdocs = bse_company_docs(code, args.days)
+                    fill = [d for d in bdocs
+                            if (d.get("doc_type"),
+                                quarter_of(d.get("announcement_date", ""))) in gaps]
+                    if fill:
+                        log(f"    {sym}: BSE fills {len(fill)} gap(s) "
+                            f"{sorted({q for _t, q in gaps})[:4]}")
+                    docs += fill
+                except Exception as e:
+                    log(f"  ! {sym:<14} bse fetch failed ({str(e)[:60]})")
+
         if not docs:
             continue
         for _d in docs:
@@ -653,6 +807,12 @@ def main() -> None:
         miss = missing_vs_queue(docs, queue, isin, since)
         if want_types:
             miss = [d for d in miss if d["doc_type"] in want_types]
+        # One gate for BOTH sources (Screener and NSE): never let a recording through.
+        _audio = [d for d in miss if is_audio_link(d.get("title"), d.get("pdf_url"))]
+        if _audio:
+            miss = [d for d in miss if d not in _audio]
+            log(f"  - {sym:<14} dropped {len(_audio)} audio link(s) "
+                f"(recordings are not extractable documents)")
         if miss:
             per_company[sym] = miss
             for d in miss:
@@ -751,6 +911,104 @@ def _self_test() -> int:
     # ---- classification of the bare labels the concall table uses
     check("bare PPT is a presentation", classify("PPT") == "presentation")
     check("bare Transcript is a concall", classify("Transcript") == "concall")
+
+    # ---- the audio guard: REC classifies as concall but must never be queued
+    check("bare REC still classifies as concall", classify("REC") == "concall")
+
+    # ---- "all" and "egm" are WORDS. As substrings they ate the whole concall feed.
+    check("'Concall transcript' is a concall",
+          classify("Concall transcript") == "concall")
+    check("'Earnings Call Transcript' is a concall",
+          classify("Earnings Call Transcript Q1 FY27") == "concall")
+    check("the full NSE description is a concall",
+          classify("Announcement under Regulation 30 (LODR)-Earnings Call Transcript")
+          == "concall")
+    check("'Conference Call Transcript' is a concall",
+          classify("Conference Call Transcript") == "concall")
+    # ...and the words they were meant to exclude still are
+    check("a bare 'All' label is still ignored", classify("All") == "")
+    check("an EGM notice is still ignored", classify("EGM Notice to shareholders") == "")
+    check("a trading-window filing is still ignored",
+          classify("Trading window closure") == "")
+    check("a newspaper publication is still ignored",
+          classify("Newspaper Publication of results") == "")
+    # ...and the words that merely CONTAIN them are not swept in by the fix
+    check("'Postal Ballot' is still not a document type",
+          classify("Postal Ballot-Scrutinizer's Report") == "")
+    check("'Allotment' is still not a document type",
+          classify("Allotment of equity shares") == "")
+    check("'Segment' does not trip the egm rule",
+          classify("Segment wise Financial Results") == "results")
+    check("bare REC is an audio link", is_audio_link("REC", "http://x/rec"))
+    check("REC enriched with its parent row is still audio",
+          is_audio_link("REC — Aug 2026 Transcript PPT REC", "http://x/r"))
+    check("an .mp3 url is audio", is_audio_link("Transcript", "http://x/call.mp3"))
+    check("an .mp3 url with a query is audio",
+          is_audio_link("Transcript", "http://x/call.mp3?sig=1"))
+    check("a real transcript is NOT audio",
+          not is_audio_link("Transcript — Aug 2026", "http://x/t.pdf"))
+    check("a real deck is NOT audio", not is_audio_link("PPT", "http://x/p.pdf"))
+    check("an annual report is NOT audio",
+          not is_audio_link("Financial Year 2025 from bse", "http://x/ar.pdf"))
+    check("a title containing 'record' is NOT audio",
+          not is_audio_link("Record Date for Dividend", "http://x/d.pdf"))
+
+    # ---- audio titles that are SENTENCES, not the bare REC label (live 2026-09-02)
+    check("'Audio Recording Of Earning Conference Call' is audio",
+          is_audio_link("Audio Recording Of Earning Conference Call Held On 17.08.2026. "
+                        "17 Aug - Audio recording of Q1", "http://x/a.pdf"))
+    check("'Update Of Audio Recording For Earnings Conference Call' is audio",
+          is_audio_link("Update Of Audio Recording For Earnings Conference Call For Q1 "
+                        "- FY 2026-27 17 Aug", "http://x/a.pdf"))
+    check("an Investor Meet whose payload is an audio recording is audio",
+          is_audio_link("Announcement under Regulation 30 (LODR)-Analyst / Investor "
+                        "Meet - Outcome 3 Aug - Audio recording of", "http://x/a.pdf"))
+    # ...while the real transcripts these sit beside are kept
+    check("'Earnings Call Transcript' is NOT audio",
+          not is_audio_link("Announcement under Regulation 30 (LODR)-Earnings Call "
+                            "Transcript 11 Aug - Please find enclosed", "http://x/t.pdf"))
+    check("a transcript that MENTIONS the audio is still a transcript",
+          not is_audio_link("Earnings Call Transcript 20 Aug - Transcript of Earning "
+                            "Call, audio available on the website", "http://x/t.pdf"))
+    # ...and the enriched REC label, which CONTAINS "transcript", is still audio
+    check("the enriched REC label is still audio despite containing 'transcript'",
+          is_audio_link("REC \u2014 Aug 2026 Transcript AI Summary PPT REC",
+                        "http://x/r"))
+
+    # ---- BSE, the third source
+    import ingest_announcements as _IA
+    _bse_rows = [
+        {"ATTACHMENTNAME": "a1.pdf", "NEWSSUB": "Transcript of the earnings call",
+         "SUBCATNAME": "", "NEWS_DT": "2026-09-02 15:04:00"},
+        {"ATTACHMENTNAME": "a2.pdf", "NEWSSUB": "Reg. 34 (1) Annual Report",
+         "SUBCATNAME": "", "NEWS_DT": "2026-09-01 11:00:00"},
+        {"ATTACHMENTNAME": "a3.pdf", "NEWSSUB": "Audio recording of the earnings call",
+         "SUBCATNAME": "", "NEWS_DT": "2026-09-02 16:00:00",
+         "AUDIO_VIDEO_FILE": "call.mp3"},
+        {"ATTACHMENTNAME": "", "NEWSSUB": "Transcript with no attachment",
+         "SUBCATNAME": "", "NEWS_DT": "2026-09-02 16:00:00"},
+        {"ATTACHMENTNAME": "a5.pdf", "NEWSSUB": "Trading window closure",
+         "SUBCATNAME": "", "NEWS_DT": "2026-09-02 16:00:00"},
+    ]
+    _orig = _IA.fetch_company_announcements
+    try:
+        _IA.fetch_company_announcements = lambda code, lookback_days=30, **k: _bse_rows
+        got = bse_company_docs("539730", 30)
+    finally:
+        _IA.fetch_company_announcements = _orig
+    _types = sorted(d["doc_type"] for d in got)
+    check("BSE yields the transcript and the annual report",
+          _types == ["annual_report", "concall"])
+    check("BSE drops the AUDIO_VIDEO_FILE row",
+          not any("Audio recording" in d["title"] for d in got))
+    check("BSE drops a row with no attachment", len(got) == 2)
+    check("BSE builds the AttachLive url",
+          all(d["pdf_url"].startswith(_BSE_ATTACH) for d in got))
+    check("BSE keeps the real filing date",
+          any(d["announcement_date"] == "2026-09-02" for d in got))
+    check("BSE tags its source", all(d["source"] == "bse" for d in got))
+    check("no bse_code yields nothing", bse_company_docs("", 30) == []
+          and bse_company_docs("nan", 30) == [])
 
     # ---- the parent-row fallback, against real Screener markup
     from bs4 import BeautifulSoup

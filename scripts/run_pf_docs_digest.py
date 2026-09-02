@@ -61,16 +61,51 @@ PER_STOCK_CAP = 8              # hard ceiling per stock block (rest -> "+N more"
 # (today.year - AR_FY_LOOKBACK), i.e. this + last AR season. cap=1 -> latest per co.
 AR_FY_LOOKBACK = 1
 MAILED_NAME = "pf_docs_mailed.parquet"
-MAILED_COLS = ["item_id", "isin", "symbol", "doc_type", "arrival_date", "mailed_at"]
+MAILED_COLS = ["item_id", "isin", "symbol", "doc_type", "arrival_date", "mailed_at",
+               "summary_state"]
+# A document whose narrative could not be lifted was still burned into the ledger, and
+# item_id mails ONCE EVER - so the "(summary pending - the nightly backfill will extract
+# this in a later pass)" line printed in the mail promised a retry the ledger made
+# impossible. Pending rows now retry until the narrative appears, or until the FIRST
+# sighting is this many days old, whichever comes first.
+LEDGER_BURN_DAYS = 14
 
 DOC_ICON = {"concall": "🎙", "annual_report": "📗", "presentation": "📊",
             "results": "📈", "rating": "🏷", "announcement": "📢"}
 DOC_LABEL = {"concall": "Concall", "annual_report": "Annual Report",
              "presentation": "Presentation", "results": "Results",
              "rating": "Rating", "announcement": "Announcement"}
-# doc_type -> keywords that appear in the company_page.md section header
-_SECTION_KW = {"concall": ("concall",), "annual_report": ("annual", "ar"),
+# doc_type -> keywords that appear in the company_page.md section header.
+# "ar" WAS in the annual_report list and matched inside ordinary words, because _norm()
+# strips spaces before the test: "summARy" contains it, so APLAPOLLO's
+# "## FY26 Presentation - PPT - May 2026 Transcript AI Summary PPT REC" was served as
+# that company's Annual Report, slide references and all. Every real AR heading is
+# written as "<FY> Annual Report - <title>" by _extractor_base.append_company_page and
+# extract_annual_report._replace_ar_section, so "annual" alone is sufficient AND safe.
+_SECTION_KW = {"concall": ("concall",), "annual_report": ("annual",),
                "presentation": ("ppt", "presentation"), "results": ("result",)}
+# Which keywords positively identify a section as belonging to a given document type.
+# Used to keep one document's section from being served as another's.
+_TYPE_KW = {"concall": ("concall", "transcript"),
+            "annual_report": ("annualreport",),
+            "presentation": ("ppt", "presentation"),
+            "results": ("results",)}
+
+
+def _other_type_heading(hn: str, doc_type: str) -> bool:
+    """True when this normalised heading plainly belongs to a DIFFERENT document type.
+
+    The period-only fallback below matches on the period alone, and a company page
+    carries several documents per period - so without this guard an annual report with
+    no section of its own silently borrows the quarter's presentation. Reporting nothing
+    is correct there; reporting a deck as the annual report is not.
+    """
+    for t, kws in _TYPE_KW.items():
+        if t == doc_type:
+            continue
+        if any(k in hn for k in kws):
+            return True
+    return False
 # priority order of narrative subsections to lift from a company_page section.
 # Covers concall headers (A-1 Executive Summary…) AND AR headers (numbered
 # "2. FINANCIAL PERFORMANCE…", "7. INVESTMENT THESIS…").
@@ -89,6 +124,31 @@ RATINGS_COLS = ["isin", "symbol", "company_name", "agency", "rating", "outlook",
                 "processed_at", "source_doc_id"]
 ANN_COLS = ["newsid", "isin", "symbol", "ann_date", "category", "headline",
             "summary", "status", "processed_at", "materiality", "direction"]
+
+
+def _settled_ids(mailed: pd.DataFrame) -> set:
+    """item_ids that must never be reported again.
+
+    SETTLED = the item was reported carrying a real narrative ("full"), or it predates
+    summary_state entirely (legacy rows read back as None - treated as full, so the
+    historical ledger keeps suppressing exactly what it suppressed before).
+
+    A "pending" row is NOT settled: it was mailed with no liftable summary, so it is
+    retried every run until the extractor produces the narrative - or until
+    LEDGER_BURN_DAYS have passed since the FIRST sighting, so a permanently
+    unextractable document cannot retry forever.
+    """
+    if mailed is None or mailed.empty:
+        return set()
+    ids = mailed["item_id"].astype(str)
+    state = mailed["summary_state"].astype(str).str.strip().str.lower()
+    settled = set(ids[state != "pending"])
+    pend = mailed[state == "pending"]
+    if not pend.empty:
+        cutoff = (date.today() - timedelta(days=LEDGER_BURN_DAYS)).isoformat()
+        first = pend.groupby(pend["item_id"].astype(str))["mailed_at"].min()
+        settled |= {i for i, t in first.items() if str(t)[:10] <= cutoff}
+    return settled
 
 
 # ------------------------------------------------------------------ #
@@ -147,9 +207,24 @@ def _find_region(sections, period: str, doc_type: str) -> str | None:
             break
     if start is None:                                # fallback: period-only match
         for i, (h, _b) in enumerate(sections):
-            if pn and pn in _norm(h):
+            hn = _norm(h)
+            if pn and pn in hn and not _other_type_heading(hn, doc_type):
                 start = i
                 break
+    if start is None and not pn:
+        # PERIOD UNKNOWN. Concall sections carry no <!-- doc:... --> marker
+        # (extract_concall.py writes the header without one), and `period` on the queue
+        # row is frequently blank - which renders the heading as "##  Concall - Title"
+        # and made both matches above impossible, so every such document reported no
+        # summary at all. Fall back to the doc_type keyword alone and take the LAST
+        # match, i.e. the most recent document of that type on the page.
+        for i, (h, _b) in enumerate(sections):
+            hn = _norm(h)
+            if not any(_norm(k) in hn for k in kws):
+                continue
+            if _other_type_heading(hn, doc_type):          # not another doc's section
+                continue
+            start = i
     if start is None:
         return None
     region = [sections[start]]
@@ -167,6 +242,10 @@ _META_RE = re.compile(
 
 def _prose(text: str) -> str:
     """Human prose only: drop tables, code fences, headers, [TAG] lines, metadata."""
+    # append_company_page embeds "<!-- doc:<id> -->" for idempotency. It sits on its own
+    # line inside the section body, starts with "<" so no rule below caught it, and was
+    # reaching the reader verbatim mid-sentence in the Morepen annual-report mail.
+    text = re.sub(r"<!--.*?-->", " ", str(text or ""), flags=re.S)
     out = []
     for l in text.splitlines():
         raw = l.strip()
@@ -324,12 +403,17 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
     # --- narrative docs from the global queue (concall/AR/presentation/results) ---
     q = load_parquet(drive, index_id, "processing_queue.parquet", QUEUE_COLS)
     if not q.empty:
+        # ARRIVAL = recently DISCOVERED in our pipeline (not the filing's own date,
+        # which for an AR is the FY-end months earlier) OR recently EXTRACTED. Eligibility
+        # requires status=done, but discovery and extraction are different days: a doc
+        # found Monday and extracted Thursday became `done` outside its own discovery
+        # window, and keyed on discovered_at alone it was dropped silently and forever.
+        _arrived = ((q["discovered_at"].astype(str) >= since_date)
+                    | (q["processed_at"].astype(str) >= since_date))
         q = q[(q["status"].astype(str) == "done")
               & (q["isin"].astype(str).isin(pf))
               & (q["doc_type"].astype(str).isin(TYPED))
-              # arrival = recently DISCOVERED in our pipeline (not the filing's own date,
-              # which for an AR is the FY-end months earlier)
-              & (q["discovered_at"].astype(str) >= since_date)]
+              & _arrived]
         q = q[~q["doc_id"].astype(str).isin(mailed_ids)]
         # ARs: keep only recent fiscal years (by FY-end YEAR, not a day-window — the
         # FY-end lags the declaration, so a day-cutoff wrongly dropped recent FY2025 ARs).
@@ -453,7 +537,7 @@ def main() -> None:
         return
 
     mailed = load_parquet(drive, index_id, MAILED_NAME, MAILED_COLS)
-    mailed_ids = set(mailed["item_id"].astype(str)) if not mailed.empty else set()
+    mailed_ids = _settled_ids(mailed)
     since_date = (date.today() - timedelta(days=int(args.days))).isoformat()
     log(f"PF ISINs: {len(pf)} · window since {since_date} · already-mailed: {len(mailed_ids)}")
 
@@ -484,9 +568,10 @@ def main() -> None:
         return
 
     # record every reported item so it never mails again
+    _now = datetime.now().isoformat(timespec="seconds")
     new_rows = [{"item_id": _id, "isin": isin, "symbol": v["symbol"],
-                 "doc_type": dt, "arrival_date": arr,
-                 "mailed_at": datetime.now().isoformat(timespec="seconds")}
+                 "doc_type": dt, "arrival_date": arr, "mailed_at": _now,
+                 "summary_state": "full" if str(_s).strip() else "pending"}
                 for isin, v in blocks.items()
                 for (dt, _h, _s, _id, arr) in v["items"]]
     if new_rows:
@@ -494,7 +579,10 @@ def main() -> None:
                              ignore_index=True) if not mailed.empty \
             else pd.DataFrame(new_rows, columns=MAILED_COLS)
         save_parquet(drive, index_id, MAILED_NAME, combined)
-        log(f"ledger updated: +{len(new_rows)} -> {len(combined)} rows")
+        _pend = sum(1 for r in new_rows if r["summary_state"] == "pending")
+        log(f"ledger updated: +{len(new_rows)} -> {len(combined)} rows"
+            + (f" ({_pend} pending - will retry until extracted or "
+               f"{LEDGER_BURN_DAYS}d old)" if _pend else ""))
 
     if not load_mail_settings(drive, index_id).get("pf_docs_digest", True):
         log("pf_docs_digest mail toggled OFF — skipped.")
