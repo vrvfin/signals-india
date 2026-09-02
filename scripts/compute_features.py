@@ -104,6 +104,27 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def _retry(fn, *a, what: str = "drive call", tries: int = 4, **kw):
+    """Retry a Drive read on a transient failure.
+
+    A single dropped connection (WinError 10053) silently cost the entire
+    price_highs join on a live run: the join is wrapped in try/except so it
+    warned and continued, and the published feature set was missing every
+    long-horizon-high column. "Continue on failure" is right for an optional
+    join; giving up after ONE attempt is not."""
+    import time as _t
+    for i in range(tries):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            wait = 2 ** i
+            log(f"  {what} failed ({type(e).__name__}: {str(e)[:60]}) — "
+                f"retry {i + 1}/{tries - 1} in {wait}s")
+            _t.sleep(wait)
+
+
 def get_or_create_subfolder(drive, parent_id: str, name: str) -> str:
     q = (f"name='{name}' and '{parent_id}' in parents "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
@@ -574,7 +595,8 @@ def main() -> None:
         idx_id = get_or_create_subfolder(drive, repo_id, "_index")
         hfid = find_file(drive, idx_id, "price_highs.parquet")
         if hfid:
-            hi = download_parquet(drive, hfid)
+            hi = _retry(download_parquet, drive, hfid,
+                        what="price_highs download")
             hcols = [c for c in hi.columns if c.startswith("high_")]
             hi = hi[["symbol", "history_years"] + hcols].drop_duplicates("symbol")
             hi["symbol"] = hi["symbol"].astype(str)
@@ -615,7 +637,13 @@ def main() -> None:
             log("company_repo/_index/price_highs.parquet not found — "
                 "long-horizon highs fall back to our own shallow bars")
     except Exception as e:
-        log(f"WARNING: price_highs join failed ({str(e)[:80]}) — continuing")
+        log("=" * 62)
+        log(f"WARNING: price_highs join FAILED after retries "
+            f"({type(e).__name__}: {str(e)[:70]})")
+        log("Long-horizon-high columns will be ABSENT or fall back to this "
+            "store's shallow window (median 2.2 years). Any strategy gated on "
+            "history_years >= 5 will under-fire. Re-run before trusting them.")
+        log("=" * 62)
 
     # ---- market cap (MCAPVAR, +31.8pp) -------------------------------------
     # Already computed weekly by universe_refresh.yml; features never carried it,
@@ -623,7 +651,8 @@ def main() -> None:
     try:
         mc_fid = uni_files.get("market_cap.csv")
         if mc_fid:
-            mc = download_csv(drive, mc_fid)
+            mc = _retry(download_csv, drive, mc_fid,
+                        what="market_cap download")
             cap_col = next((c for c in mc.columns if "cap" in c.lower()), None)
             if cap_col and "symbol" in mc.columns:
                 cap = (mc[["symbol", cap_col]]
