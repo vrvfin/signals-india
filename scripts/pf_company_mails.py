@@ -1581,6 +1581,12 @@ def main() -> None:
                          "ONBOARDED: its latest concall and latest annual report are "
                          "mailed whatever month they were filed, once. 0 disables it, "
                          "leaving every holding on the --month rule.")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-send the named holdings even though the ledger says they "
+                         "were already mailed. REQUIRES --symbols, so it can never "
+                         "re-send the whole book by accident. For when a fix changed "
+                         "what a mail SAYS without changing its content_key - the key is "
+                         "deliberately coarse and cannot see prose improving.")
     ap.add_argument("--seed-ledger", action="store_true",
                     help="Write ledger rows for everything currently due WITHOUT "
                          "sending, so only genuinely-new documents mail from then on. "
@@ -1682,15 +1688,19 @@ def main() -> None:
                 kept.append(d)
                 onboarded += 1
                 continue
+            # NOT `want`: that name already holds the set of doc types this run was
+            # asked for, and rebinding it here silently emptied every later test
+            # against it - --force found nothing, because "annual_report" is not a
+            # substring of "Q1FY27".
             if d["doc_type"] == "concall":
-                got, want = concall_quarter(d.get("doc_date")), season_q
+                got, expect = concall_quarter(d.get("doc_date")), season_q
             else:
-                got, want = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
+                got, expect = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
             if not got:
                 # Undatable. Skipped rather than assumed current, and COUNTED so that it
                 # is visible rather than silent.
                 undated += 1
-            elif got == want:
+            elif got == expect:
                 kept.append(d)
             else:
                 out_of_scope += 1
@@ -1707,6 +1717,33 @@ def main() -> None:
     if not due:
         log("nothing due — no mail.")
         return
+
+    if args.force:
+        # Rebuild the due list straight from the newest document per type, bypassing both
+        # the ledger and the scope. mail_due exists to answer "what is new"; force
+        # answers a different question - "send me these again, they are better now".
+        if not args.symbols:
+            log("--force requires --symbols — refusing to re-send the whole portfolio.")
+            return
+        _wsym = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        _by_isin = {str(i): (s, n) for i, s, n in pf}
+        due = []
+        for (_i, _dt), _d in sorted(_latest.items()):
+            _sym, _name = _by_isin.get(str(_i), ("", ""))
+            if _dt not in want or _sym.upper() not in _wsym:
+                continue
+            due.append({"isin": _i, "symbol": _sym, "name": _name, "doc_type": _dt,
+                        "season": season, "resend": True,
+                        "doc_id": _d.get("doc_id", ""), "doc_date": _d.get("date", ""),
+                        "doc_title": _d.get("title", ""), "period": _d.get("period", ""),
+                        "discovered_at": _d.get("discovered_at", ""),
+                        "processed_at": _d.get("processed_at", ""), "reported_on": ""})
+        due.sort(key=lambda d: (d["doc_type"], d["symbol"]))
+        log(f"--force: {len(due)} document(s) for {sorted(_wsym)} — ledger and scope "
+            f"bypassed")
+        if not due:
+            log("nothing to force — no document of those types for those symbols.")
+            return
 
     if args.seed_ledger:
         # Mark the current back catalogue as already handled WITHOUT sending, so the
@@ -2228,6 +2265,16 @@ def _self_test() -> int:
     check("--symbols keeps both docs of the chosen holding", len(_sel) == 2)
     check("--symbols excludes every other holding",
           all(d["symbol"] == "APLAPOLLO" for d in _sel))
+    # --force must never be usable without --symbols: that is the guard stopping an
+    # accidental re-send of the whole book.
+    import inspect as _insp
+    _src = _insp.getsource(main)
+    check("--force refuses to run without --symbols",
+          "--force requires --symbols" in _src)
+    check("--force marks its rows as a resend", '"resend": True' in _src)
+    # The scope loop must not rebind `want`, which holds the requested doc types.
+    check("the scope loop does not shadow the doc-type set",
+          "got, want =" not in _src and "got, expect =" in _src)
 
     # ---- concall: the SEASON QUARTER, same rule the deck mail uses ---------
     check("a call filed Aug 2026 is Q1 FY27",

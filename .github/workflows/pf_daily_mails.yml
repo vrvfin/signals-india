@@ -56,6 +56,10 @@ on:
       symbols:
         description: "Restrict to these NSE symbols, comma separated (blank = whole PF)"
         default: ""
+      force:
+        description: "Re-send those symbols even if already mailed (needs symbols)"
+        type: boolean
+        default: false
 
 concurrency:
   group: pf-daily-mails
@@ -187,6 +191,7 @@ jobs:
           --types "${{ inputs.types || 'presentation,rating,concall,annual_report' }}"
           --scope "${{ inputs.scope || 'current' }}"
           --symbols "${{ inputs.symbols }}"
+          ${{ inputs.force == true && '--force' || '' }}
           --limit "${{ inputs.limit || '0' }}"
           ${{ inputs.dry_run == true && '--dry-run' || '' }}
         continue-on-error: true
