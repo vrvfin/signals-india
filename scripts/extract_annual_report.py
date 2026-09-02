@@ -365,33 +365,69 @@ def _upsert_ar(drive, index_id: str, filename: str, cols: list[str],
 #  Map-reduce chunked processing                                       #
 # ------------------------------------------------------------------ #
 
-def _split_pdf_chunks(pdf_bytes: bytes, chunk_mb: float = 4.0) -> list[bytes]:
-    """Split a PDF into ~chunk_mb sized byte slices.
+def _pages_per_chunk(pdf_bytes: bytes, n_pages: int, chunk_mb: float) -> int:
+    return max(1, int((chunk_mb * 1024 * 1024) /
+                      (len(pdf_bytes) / max(n_pages, 1))))
 
-    Uses pypdf if available; falls back to naive byte-chunking otherwise.
+
+def _split_pdf_chunks(pdf_bytes: bytes, chunk_mb: float = 4.0) -> list[bytes]:
+    """Split a PDF into ~chunk_mb slices, ALWAYS as valid PDFs.
+
+    NEVER SPLIT THE RAW BYTES. That was the old fallback and it is not a PDF split at
+    all: cutting a PDF mid-object yields files with no trailer and no xref, which the
+    model cannot open. Every chunk of a large annual report would come back empty or
+    near-empty, the synthesis would then have nothing to work from, and the result was
+    stored and marked done - indistinguishable from a genuine short report. Handing over
+    ONE valid oversized PDF is strictly better than N invalid ones, so that is what
+    happens when no page-level splitter is available.
+
+    Two splitters, because both are already declared in scripts/requirements.txt and
+    either alone can be missing from an environment: pypdf first, then PyMuPDF (fitz).
+    Measured 2026-09-02 on the dev box: pypdf absent, fitz present - so a local run took
+    the byte-splitting path and produced garbage, silently.
     """
     try:
         from pypdf import PdfReader, PdfWriter  # type: ignore
-
         reader = PdfReader(io.BytesIO(pdf_bytes))
         n = len(reader.pages)
-        pages_per_chunk = max(1, int((chunk_mb * 1024 * 1024) /
-                                     (len(pdf_bytes) / max(n, 1))))
+        step = _pages_per_chunk(pdf_bytes, n, chunk_mb)
         chunks = []
-        for start in range(0, n, pages_per_chunk):
+        for start in range(0, n, step):
             writer = PdfWriter()
-            for p in reader.pages[start: start + pages_per_chunk]:
+            for p in reader.pages[start: start + step]:
                 writer.add_page(p)
             buf = io.BytesIO()
             writer.write(buf)
             chunks.append(buf.getvalue())
+        log(f"  split with pypdf: {n} pages -> {len(chunks)} chunk(s)")
         return chunks
     except ImportError:
-        # Naive fallback: split bytes evenly (Gemini may reject malformed PDFs)
-        size = len(pdf_bytes)
-        chunk_size = int(chunk_mb * 1024 * 1024)
-        return [pdf_bytes[i: i + chunk_size]
-                for i in range(0, size, chunk_size)]
+        pass
+    except Exception as e:
+        log(f"  pypdf split failed ({str(e)[:70]}) — trying PyMuPDF")
+
+    try:
+        import fitz  # type: ignore
+        src = fitz.open(stream=pdf_bytes, filetype="pdf")
+        n = src.page_count
+        step = _pages_per_chunk(pdf_bytes, n, chunk_mb)
+        chunks = []
+        for start in range(0, n, step):
+            out = fitz.open()
+            out.insert_pdf(src, from_page=start, to_page=min(start + step, n) - 1)
+            chunks.append(out.tobytes())
+            out.close()
+        src.close()
+        log(f"  split with PyMuPDF: {n} pages -> {len(chunks)} chunk(s)")
+        return chunks
+    except ImportError:
+        pass
+    except Exception as e:
+        log(f"  PyMuPDF split failed ({str(e)[:70]})")
+
+    log("  WARNING: no PDF splitter available (pypdf and PyMuPDF both unusable) — "
+        "sending the whole document as ONE chunk rather than invalid byte slices")
+    return [pdf_bytes]
 
 
 def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
