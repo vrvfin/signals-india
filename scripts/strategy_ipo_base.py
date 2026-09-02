@@ -30,7 +30,10 @@ MEASURED CANDIDATE POOL (2026-09-02)
 
 Zones:
   add   close breaks above the base high on volume >= BREAKOUT_VOL_MULT x avg
-  buy   close sits inside the base and above the listing-day low
+  buy   close is coiling within BUY_MAX_BELOW_HIGH_PCT of the base high, and
+        above the listing-day low. NOT "anywhere inside the base": that fired on
+        68% of the cohort in testing, which describes the cohort rather than
+        selecting from it.
   stop  base low (structural), reported alongside the listing-day low
 
 Output:
@@ -73,13 +76,19 @@ BASE_MAX_DAYS = 90
 BASE_MIN_DEPTH_PCT = 8   # flatter than this is a drift, not a base
 BASE_MAX_DEPTH_PCT = 50  # IPO bases correct far deeper than the usual 12-35%
 BREAKOUT_VOL_MULT = 1.4  # "expanded volume" — 40% above average
+# A stock "in a base" is only interesting NEAR THE PIVOT. Accepting anything
+# inside a 50%-deep range made `buy` near-vacuous: a live dry-run fired on 34 of
+# the first 50 candidates (68%), which is a description of the cohort, not a
+# signal. Requiring the close within this % of the base high means "coiling
+# under resistance", which is the setup people actually mean.
+BUY_MAX_BELOW_HIGH_PCT = 15.0
 MIN_TURNOVER_CR = 1.0    # tradeable; the engine has no liquidity floor otherwise
 MIN_PRICE = 10.0
 
 STRATEGY = "ipo_base"
 OUT_COLS = ["symbol", "date", "strategy", "zone_type", "score", "entry", "stop",
             "days_since_listing", "base_days", "base_high", "base_low",
-            "base_depth_pct", "listing_day_low", "vol_today_ratio",
+            "base_depth_pct", "pct_below_pivot", "listing_day_low", "vol_today_ratio",
             "avg_turnover_20d_cr", "reason"]
 
 
@@ -132,12 +141,13 @@ def ipo_signal(symbol: str, ohlcv: pd.DataFrame, feat: pd.Series,
         reason = (f"Breaks first base at Rs {hi:.2f} on {vol_ratio:.1f}x volume; "
                   f"{base['base_days']}d base, {base['base_depth_pct']:.0f}% deep, "
                   f"listed {days_since_listing}d ago")
-    elif lo <= close <= hi and close > listing_low:
+    elif (lo <= close <= hi and close > listing_low
+          and (hi - close) / hi * 100 <= BUY_MAX_BELOW_HIGH_PCT):
         zone = "buy"
-        reason = (f"Inside a {base['base_days']}d first base "
-                  f"Rs {lo:.2f}-{hi:.2f} ({base['base_depth_pct']:.0f}% deep), "
-                  f"above the listing-day low Rs {listing_low:.2f}; "
-                  f"listed {days_since_listing}d ago")
+        reason = (f"Coiling {(hi-close)/hi*100:.1f}% under the pivot Rs {hi:.2f} "
+                  f"in a {base['base_days']}d first base "
+                  f"({base['base_depth_pct']:.0f}% deep), above the listing-day "
+                  f"low Rs {listing_low:.2f}; listed {days_since_listing}d ago")
     else:
         # Below the base low, or already extended past the breakout — neither is
         # an entry.
@@ -160,6 +170,7 @@ def ipo_signal(symbol: str, ohlcv: pd.DataFrame, feat: pd.Series,
         "base_high": round(hi, 2), "base_low": round(lo, 2),
         "base_depth_pct": round(base["base_depth_pct"], 1),
         "listing_day_low": round(listing_low, 2),
+        "pct_below_pivot": round((hi - close) / hi * 100, 2),
         "vol_today_ratio": round(vol_ratio, 2),
         "avg_turnover_20d_cr": round(float(feat.get("avg_turnover_20d_cr", np.nan)), 2),
         "base_tightness": round(parts["tightness"], 3),

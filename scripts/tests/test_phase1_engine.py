@@ -563,9 +563,16 @@ def test_ipo_base() -> None:
     check("break above the base on 2x volume -> add",
           s_add and s_add["zone_type"] == "add")
     check("stop is the base low, not an ATR guess", s_add["stop"] == 84.0)
-    s_buy = m.ipo_signal("NEWCO", series(hi + [110.0], lo + [95.0], cl + [100.0]),
+    s_buy = m.ipo_signal("NEWCO", series(hi + [112.0], lo + [105.0], cl + [110.0]),
                          feat, 180)
-    check("sitting inside the base -> buy", s_buy and s_buy["zone_type"] == "buy")
+    check("coiling just under the pivot -> buy",
+          s_buy and s_buy["zone_type"] == "buy")
+    # "Anywhere inside the base" fired on 68% of the live cohort — a description
+    # of the cohort, not a selection from it.
+    mid = m.ipo_signal("NEWCO", series(hi + [95.0], lo + [86.0], cl + [90.0]),
+                       feat, 180)
+    check("meandering 25% under the pivot -> no signal", mid is None,
+          f"buy requires within {m.BUY_MAX_BELOW_HIGH_PCT:g}% of the pivot")
     check("below the base low -> no signal",
           m.ipo_signal("NEWCO", series(hi + [85.0], lo + [70.0], cl + [80.0]),
                        feat, 180) is None)
