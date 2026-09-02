@@ -239,6 +239,25 @@ def is_event(family: str, zone: str) -> bool:
     return False
 
 
+def _variants(g: pd.DataFrame) -> set:
+    """Which momentum lookbacks fired, for this (symbol, zone).
+
+    Derived from the STRATEGY NAME (`momentum_6m` -> `6m`) rather than from a
+    `variant` column. The column only exists once the new momentum strategy is
+    deployed, so relying on it left momentum_profile blank on every row when run
+    against the currently-deployed output — a headline feature silently dead.
+    The name is always there, so this works before and after."""
+    if "family" not in g.columns:
+        return set()
+    m = g.loc[g["family"] == "momentum", "strategy"].astype(str)
+    out = {s_.split("momentum_", 1)[1] for s_ in m if s_.startswith("momentum_")}
+    if "variant" in g.columns:                # prefer an explicit column if set
+        out |= {str(v) for v in
+                g.loc[g["family"] == "momentum", "variant"].dropna()
+                if str(v) not in ("", "nan")}
+    return out
+
+
 def momentum_profile(variants: set) -> str:
     """Which momentum lookbacks fired — a name unique to 1m is a fresh mover, a
     name in all five is an established leader, and they are not the same trade.
@@ -400,12 +419,8 @@ def compute_unified(signals: pd.DataFrame,
             "strategies": ", ".join(sorted(g["strategy"].unique())),
             "n_event_families": len(ev),
             "event_families": ", ".join(ev),
-            "momentum_profile": momentum_profile(
-                set(g.loc[g["family"] == "momentum", "variant"].dropna())
-                if "variant" in g.columns else set()),
-            "momentum_variants": int(
-                g.loc[g["family"] == "momentum", "variant"].nunique()
-                if "variant" in g.columns else 0),
+            "momentum_profile": momentum_profile(_variants(g)),
+            "momentum_variants": len(_variants(g)),
             "conviction_v2": conv_v2,
             "composite_score": float(g["score_norm"].mean()),
             "max_score": float(g["score_norm"].max()),

@@ -306,6 +306,17 @@ def test_aggregation() -> None:
           f"n_strategies={m['n_strategies']} -> n_families=1")
     check("which lookbacks fired is still recorded",
           m["momentum_profile"] == "persistent")
+    # Derived from the STRATEGY NAME, not a `variant` column. The column only
+    # exists once the new momentum strategy is deployed; relying on it left
+    # momentum_profile blank on every row against the currently-deployed output.
+    no_col = pd.DataFrame([{"symbol": "A", "strategy": f"momentum_{lb}",
+                            "zone_type": "buy", "score": 90.0, "entry": 100.0,
+                            "stop": 90.0, "reason": "r"}
+                           for lb in ("1m", "2m", "3m", "6m", "12m")])
+    u2 = ag.compute_unified(no_col).iloc[0]
+    check("profile works with NO variant column present",
+          u2["momentum_profile"] == "persistent" and u2["momentum_variants"] == 5,
+          f"{u2['momentum_profile']!r}, {u2['momentum_variants']} variants")
     check("a state-only name marks no event", m["n_event_families"] == 0)
     check("3 different ideas count as 3", d["n_families"] == 3)
     check("the diverse name now sorts first", list(u["symbol"])[0] == "DIVERSE",
