@@ -413,13 +413,146 @@ def _tile_row(pairs) -> str:
             f"<tr>{cells}</tr></table>" if cells else "")
 
 
-def _narrative_html(narrative: str, title: str, sub: str) -> str:
-    if not str(narrative or "").strip():
+# The sections of Phase 2's own reports worth putting in front of a reader, in the order
+# a reader wants them. Matched as substrings against the sub-headings the prompts emit -
+# annual_report_prompt.txt numbers its sections ("### 2. FINANCIAL PERFORMANCE & GROWTH
+# TRAJECTORY"), concall_prompt.txt letters its own ("### A-1 Executive Summary").
+_NARRATIVE_WANTS = (
+    "executive summary", "investment thesis", "thesis matrix",
+    "financial performance", "growth trajectory", "management outlook",
+    "management commentary", "forward guidance", "capital efficiency",
+    "governance", "q&a summary", "growth drivers", "business overview",
+)
+# Never lift these as "the summary": methodology, the scorecard the mail renders as its
+# own table, and the question list.
+_NARRATIVE_SKIP = ("source coverage", "data integrity", "probing questions",
+                   "risk scorecard", "credibility", "mgmt said", "disclaimer")
+# THE MODEL SOMETIMES ECHOES THE PROMPT BACK. CGPOWER's stored annual-report analysis
+# opens with annual_report_prompt.txt itself - "Generate the final report immediately...
+# The ENTIRE report must stay under ~1,200 lines" - and that text is long and prose-like,
+# so every length-based heuristic ranks it first. It is instructions, never analysis, and
+# it must never reach a reader. Filtered at RENDER time; the stored text is untouched.
+_PROMPT_ECHO = ("generate the final report", "visible report structure",
+                "no individual paragraph", "must stay under", "output must be",
+                "formatting style", "make absolutely zero", "do not continue or loop",
+                "report structure", "you are a lead forensic", "your task is",
+                "never repeat a sentence")
+
+
+def _is_prompt_echo(text: str) -> bool:
+    """True when a block is the prompt talking, not the analysis."""
+    t = str(text or "").lower()
+    return sum(1 for k in _PROMPT_ECHO if k in t) >= 2
+
+
+def _digest_prose(text: str) -> str:
+    """The digest's prose filter (drops tables, fences, tags, metadata), reused rather
+    than re-implemented so both mails strip the same things."""
+    from run_pf_docs_digest import _prose
+    return _prose(text)
+
+
+# A report section header, in the three shapes these prompts actually emit:
+#   "### 2. FINANCIAL PERFORMANCE"   hashed (APL Apollo, most concalls)
+#   "2. FINANCIAL PERFORMANCE"       plain numbered (Deep Industries) - without this the
+#                                    whole report stayed ONE block and the section
+#                                    priority below had nothing to choose between
+#   "**2. FINANCIAL PERFORMANCE**"   bolded
+_SECTION_HEAD_RE = re.compile(
+    r"^\s*(?:#{1,4}\s+|\*{0,2}\s*)(?:[0-9]{1,2}[A-Za-z]?[.)]\s+|[A-Z]-[0-9]\s+)?"
+    r"\*{0,2}[A-Z][A-Za-z0-9 &/,'\-()]{6,80}\*{0,2}\s*:?\s*$")
+
+
+def _subsections(region) -> list:
+    """[(heading, body)] for a document region, split on its own section headings.
+
+    The region's own top-level section comes first with an empty heading, so a report
+    that uses no sub-headings at all still yields its text.
+    """
+    out = []
+    for h, body in region or []:
+        cur_h, cur_b = "", []
+        for ln in str(body).splitlines():
+            if _SECTION_HEAD_RE.match(ln):
+                if cur_h or cur_b:
+                    out.append((cur_h, "\n".join(cur_b)))
+                cur_h, cur_b = ln, []
+            else:
+                cur_b.append(ln)
+        if cur_h or cur_b:
+            out.append((cur_h, "\n".join(cur_b)))
+    return out
+
+
+def lift_report(region, limit: int = None) -> list:
+    """The most useful parts of Phase 2's report, as [(heading, prose)].
+
+    WHY NOT THE DIGEST'S _lift_summary. That returns the single best FRAGMENT, which is
+    the right shape for a one-line digest row and the wrong shape for a mail whose whole
+    job is the document. Measured across 25 PF annual reports on 2026-09-02 it returned
+    74 characters from CGPOWER's 88,819-character report and 0 from NAVINFLUOR's 10,639,
+    because these reports are mostly TABLES and the prose filter drops table rows - so
+    whichever single section it landed on had almost no qualifying text left.
+
+    This walks the report's own sections in reader order and takes several, so a mail
+    carries the analysis rather than a sentence of it. Numbers are not lost by dropping
+    tables: the mail renders ar_guidance and ar_red_flags as its own tables alongside.
+    """
+    limit = NARRATIVE_LIMIT if limit is None else limit
+    subs = _subsections(region)
+    if not subs:
+        return []
+    picked, seen, used = [], set(), 0
+    for want in _NARRATIVE_WANTS:
+        for i, (h, body) in enumerate(subs):
+            hl = str(h).lower()
+            if i in seen or want not in hl or any(s in hl for s in _NARRATIVE_SKIP):
+                continue
+            prose = _digest_prose(body)
+            if len(prose) < 80 or _is_prompt_echo(prose) or _is_prompt_echo(h):
+                continue
+            room = limit - used
+            if room < 200:
+                break
+            seen.add(i)
+            picked.append((re.sub(r"^#+\s*", "", str(h)).strip(),
+                           prose[:room].rstrip() + ("…" if len(prose) > room else "")))
+            used += min(len(prose), room)
+        if used >= limit - 200:
+            break
+    if picked:
+        return picked
+    # Nothing matched a wanted heading - fall back to the longest qualifying block, so a
+    # report that numbers its sections differently still says something.
+    best = ""
+    for h, body in subs:
+        if any(s in str(h).lower() for s in _NARRATIVE_SKIP):
+            continue
+        pr = _digest_prose(body)
+        if _is_prompt_echo(pr) or _is_prompt_echo(h):
+            continue
+        if len(pr) > len(best):
+            best = pr
+    return [("", best[:limit].rstrip() + ("…" if len(best) > limit else ""))] if best else []
+
+
+def _narrative_html(narrative, title: str, sub: str) -> str:
+    """Accepts either a plain string or [(heading, prose)] from lift_report()."""
+    if isinstance(narrative, str):
+        parts = [("", narrative)] if narrative.strip() else []
+    else:
+        parts = [(h, t) for h, t in (narrative or []) if str(t).strip()]
+    if not parts:
         return ""
-    return (_h(title, sub)
-            + f"<div style='font-size:12.5px;color:#333;line-height:1.55;"
-              f"border-left:3px solid #ccc;padding-left:10px;margin:0 0 12px'>"
-              f"{_esc(narrative, NARRATIVE_LIMIT)}</div>")
+    out = [_h(title, sub)]
+    for head, text in parts:
+        if head:
+            out.append(f"<div style='font-size:12px;font-weight:700;color:{BLUE};"
+                       f"margin:8px 0 2px'>{_esc(head, 80)}</div>")
+        out.append(f"<div style='font-size:12.5px;color:#333;line-height:1.55;"
+                   f"border-left:3px solid #ccc;padding-left:10px;margin:0 0 10px'>"
+                   f"{_esc(text, NARRATIVE_LIMIT)}</div>")
+    return "".join(out)
 
 
 def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
@@ -438,7 +571,9 @@ def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
     """
     n = (tables.get("_narr") or {}).get((str(isin).strip(), doc_type)) or {}
     per = str(n.get("period") or "").strip().upper()
-    has = "1" if str(n.get("text") or "").strip() else "0"
+    _t = n.get("text")
+    has = "1" if (_t if isinstance(_t, str) else "".join(x for _h, x in (_t or []))
+                  ).strip() else "0"
     if not per and has == "0":
         return ""                    # nothing known; no key means no change check
     return f"{doc_type}|{per}|{has}"
@@ -1147,7 +1282,9 @@ def concall_body(isin, symbol, name, period, doc_id, narrative, tables) -> str:
     gf4 = _doc_rows(tables, "gf4_quality_flags", isin, doc_id, limit=6)
     cred = _doc_rows(tables, "mgmt_credibility", isin, doc_id, limit=8)
 
-    if not str(narrative or "").strip() and guid.empty and gf1.empty and facts.empty:
+    _has_narr = bool(narrative if isinstance(narrative, str)
+                     else "".join(t for _h, t in (narrative or [])))
+    if not _has_narr and guid.empty and gf1.empty and facts.empty:
         # Nothing readable yet. Returning "" leaves the document UNMAILED and therefore
         # still due, so the next run picks it up once extraction lands - rather than
         # sending an empty mail and burning the only chance to report it.
@@ -1294,7 +1431,9 @@ def annual_report_body(isin, symbol, name, fy_label, doc_id, narrative, tables) 
     guid = _doc_rows(tables, "ar_guidance", isin, doc_id, limit=12)
     flags = _doc_rows(tables, "ar_red_flags", isin, doc_id, limit=14)
 
-    if not str(narrative or "").strip() and guid.empty and flags.empty:
+    _has_narr = bool(narrative if isinstance(narrative, str)
+                     else "".join(t for _h, t in (narrative or [])))
+    if not _has_narr and guid.empty and flags.empty:
         return ""                     # see concall_body: stays due, retried next run
 
     out = [f"<div style='{_WRAP}'>",
@@ -1381,10 +1520,12 @@ def _narratives(drive, repo_id, latest: dict, cache: dict) -> dict:
         if dt not in SCOPED_TYPES:
             continue
         period = str(d.get("period") or "").strip()
+        doc_id = str(d.get("doc_id") or "").strip()
         txt = ""
         try:
-            reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt)
-            txt = _lift_summary(reg or [], limit=NARRATIVE_LIMIT) if reg else ""
+            reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
+                               doc_id)
+            txt = lift_report(reg, NARRATIVE_LIMIT) if reg else []
         except Exception as e:
             _log(f"  WARN: narrative lift failed for {isin} {dt} ({str(e)[:60]})")
         out[(isin, dt)] = {"period": period, "text": txt}
@@ -1626,7 +1767,7 @@ def main() -> None:
             _n = (tables.get("_narr") or {}).get((isin, "concall")) or {}
             _per = _n.get("period") or d.get("period") or QT.qtr_label(season)
             body = concall_body(isin, sym, name, _per, d.get("doc_id", ""),
-                                _n.get("text", ""), tables)
+                                _n.get("text") or [], tables)
             # A new holding's mail is its LATEST call, not this month's news, and
             # saying so stops it reading as a filing that just happened.
             _new = " (new holding \u2014 latest call)" if d.get("onboarding") else ""
@@ -1645,7 +1786,7 @@ def main() -> None:
             # so the label is derived from it rather than printed as a bare FY.
             _fy = _ar_display(d.get("doc_date", "")) or str(d.get("period") or "")
             body = annual_report_body(isin, sym, name, _fy, d.get("doc_id", ""),
-                                      _n.get("text", ""), tables)
+                                      _n.get("text") or [], tables)
             _new = " (new holding \u2014 latest report)" if d.get("onboarding") else ""
             subject = (f"\U0001F4D7 {sym} \u2014 Annual Report {_esc(_fy, 40)} UPDATED"
                        if d.get("resend")
@@ -2200,6 +2341,81 @@ Management guided to twenty percent growth and flagged an export order win.
               _D._find_region(_secs, "Q1 FY26", "concall") or []))
     check("a blank-period concall finds the concall, not the deck",
           "Concall" in (_D._find_region(_secs, "", "concall") or [("", "")])[0][0])
+
+    # ---- the doc-id marker beats a wrong heading label --------------------
+    # Real shape, live 2026-09-02: APL Apollo's FY2026 annual report sits under a
+    # heading saying FY22, because _extract_fy_year takes the first year of the
+    # report's own "Fiscal Coverage Horizon: FY22 - FY26" line.
+    _mis = """# X
+
+---
+## FY22 Annual Report - Annual Report 2026 from bse
+*Processed: 2026-08-30*
+<!-- doc:abc-123 -->
+
+### 2. FINANCIAL PERFORMANCE AND TRAJECTORY
+Revenue grew twenty two percent with margin expansion from operating leverage.
+
+---
+## Q1 FY27 Concall - Transcript
+*Processed: 2026-08-11*
+
+### A-1 Executive Summary
+Management guided to twenty percent growth.
+"""
+    _ms = _D._split_sections(_mis)
+    check("the FY26 label finds nothing, as the heading says FY22",
+          _D._find_region(_ms, "FY26", "annual_report") is None)
+    check("the doc-id marker finds it anyway",
+          _D._find_region(_ms, "FY26", "annual_report", "abc-123") is not None)
+    check("and it lifts the real prose",
+          "Revenue grew twenty two" in _D._lift_summary(
+              _D._find_region(_ms, "FY26", "annual_report", "abc-123") or []))
+    check("an unknown doc-id falls back to the label logic",
+          _D._find_region(_ms, "FY26", "annual_report", "no-such-id") is None)
+    check("the doc-id region stops at the next document",
+          "Management guided" not in _D._lift_summary(
+              _D._find_region(_ms, "FY26", "annual_report", "abc-123") or []))
+
+    # A rating section carries no period at all, so the old header-only boundary test
+    # let 124,637 chars of rating prose flow into APL Apollo's annual-report region.
+    _rating_head = "## CRISIL AA+ Credit Rating - Rating update 30 Sep 2025 from crisil"
+    check("a rating section IS a document boundary",
+          _D._is_boundary(_rating_head, "*Processed: 2026-08-30*\n<!-- doc:xyz -->"))
+    check("a dated rating heading is a boundary even with no marker",
+          _D._is_boundary(_rating_head))
+    check("an intra-document header is NOT a boundary",
+          not _D._is_boundary("## Section GF1 - Raw Guidance Extraction"))
+    check("a numbered AR sub-section is NOT a boundary",
+          not _D._is_boundary("## 6. FORENSIC FINANCIAL RISK SCORECARD"))
+    check("a marker anywhere in the first lines makes it a boundary",
+          _D._is_boundary("## Anything At All", "*Processed: x*\n<!-- doc:abc -->"))
+
+    # ---- the model sometimes echoes the prompt back into the stored report -------
+    _echo = ("Generate the final report immediately without displaying preliminary "
+             "steps. No individual paragraph may be longer than 3 lines. The ENTIRE "
+             "report must stay under ~1,200 lines. Output must be completely clean.")
+    check("prompt text is recognised as an echo", _is_prompt_echo(_echo))
+    check("real analysis is NOT an echo",
+          not _is_prompt_echo("Revenue grew 22% with margin expansion of 140bps driven "
+                              "by operating leverage and a better export mix."))
+    check("a single incidental phrase is not enough to flag an echo",
+          not _is_prompt_echo("The output must be read alongside the cash flow note."))
+
+    # ---- plain-numbered sections must split, or the whole report is one block ----
+    _plain = [("", "1. SOURCE COVERAGE & DATA INTEGRITY\nParsed FY2025-26.\n"
+                   "2. FINANCIAL PERFORMANCE & GROWTH TRAJECTORY\n"
+                   + "The shift to charter hire altered the return profile. " * 6
+                   + "\n3. CAPITAL EFFICIENCY & ASSET ALLOCATION\n"
+                   + "Capex was prioritised over dividends. " * 6)]
+    _subs = _subsections(_plain)
+    check("plain-numbered sections split into blocks", len(_subs) >= 3)
+    _got = lift_report(_plain, 2000)
+    check("lift_report picks the wanted section", bool(_got))
+    check("and it skips source coverage",
+          all("SOURCE COVERAGE" not in h.upper() for h, _t in _got))
+    check("and it carries the real analysis",
+          any("charter hire" in t for _h, t in _got))
 
     print(f"\npf_company_mails self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

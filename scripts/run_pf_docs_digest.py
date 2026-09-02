@@ -175,23 +175,62 @@ def _split_sections(md: str) -> list[tuple[str, str]]:
 
 
 _BOUNDARY_KW = ("concall", "ppt", "presentation", "annualreport", "annual report",
-                "rating", "results")
+                "rating", "results", "announcement")
+_DOC_MARKER_RE = re.compile(r"<!--\s*doc:")
+# A period OR a plain date. The period-only test missed rating sections outright:
+# "## CRISIL AA+ Credit Rating - Rating update 30 Sep 2025 from crisil" carries no
+# FY or quarter, so it was not read as a document boundary and 124,637 characters of
+# RATING prose were absorbed into APL Apollo's annual-report region.
+_PERIOD_RE = re.compile(r"q[1-4]\s*fy\s*\d{2}|\bfy\s*\d{2,4}"
+                        r"|\d{1,2}\s+[a-z]{3}[a-z]*\.?\s+\d{4}|\d{4}-\d{2}-\d{2}", re.I)
 
 
-def _is_boundary(header: str) -> bool:
-    """A top-level header that STARTS a new document (period + a doc keyword),
-    as opposed to an intra-document header (Section 1), GF1, Mgmt Credibility…)."""
+def _is_boundary(header: str, body: str = "") -> bool:
+    """A top-level header that STARTS a new document, as opposed to an intra-document
+    header (Section 1), GF1, Mgmt Credibility…).
+
+    THE DOC MARKER IS PROOF. append_company_page stamps "<!-- doc:<id> -->" directly
+    under the heading of every section it writes, so a marker within the first few lines
+    of a body means this heading begins a new document - whatever its label says. That
+    matters because the labels are not dependable: extract_annual_report derives the FY
+    from the report's own text and gets it wrong, and rating sections carry no period at
+    all. The header heuristic stays as the fallback for older sections written before
+    markers existed.
+    """
+    if body and _DOC_MARKER_RE.search(body[:400]):
+        return True
     hn = header.lower()
-    has_period = re.search(r"q[1-4]\s*fy\s*\d{2}|\bfy\s*\d{2,4}", hn)
-    return bool(has_period and any(k in hn.replace(" ", "") or k in hn
-                                   for k in _BOUNDARY_KW))
+    return bool(_PERIOD_RE.search(hn) and any(k in hn.replace(" ", "") or k in hn
+                                              for k in _BOUNDARY_KW))
 
 
-def _find_region(sections, period: str, doc_type: str) -> str | None:
+def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str | None:
     """Concatenated body of a document's FULL block: its boundary section plus the
-    following intra-doc sections, up to the next document boundary."""
+    following intra-doc sections, up to the next document boundary.
+
+    doc_id, WHEN PRESENT, IS THE ONLY EXACT KEY. append_company_page embeds
+    "<!-- doc:<id> -->" under the heading of every AR / rating / presentation section, and
+    matching on it sidesteps the heading label entirely - which matters because the label
+    is not reliable. extract_annual_report._extract_fy_year takes the FIRST year out of
+    the report's own "Fiscal Coverage Horizon: FY22 - FY26" line, so APL Apollo's FY2026
+    annual report sits on the page under "## FY22 Annual Report - Annual Report 2026 from
+    bse". A period test for FY26 finds nothing there and the reader gets a mail with no
+    summary, even though Phase 2 wrote a full forensic report. Concall sections carry no
+    marker, so they still fall through to the period logic below.
+    """
     pn = _norm(period)
     kws = _SECTION_KW.get(doc_type, (doc_type,))
+
+    if doc_id:
+        marker = f"<!-- doc:{str(doc_id).strip()} -->"
+        for i, (h, b) in enumerate(sections):
+            if marker in b or marker in h:
+                region = [sections[i]]
+                for h2, body2 in sections[i + 1:]:
+                    if _is_boundary(h2, body2):
+                        break
+                    region.append((h2, body2))
+                return region
 
     def _starts_here(hn: str) -> bool:
         if not (pn and pn in hn and any(_norm(k) in hn for k in kws)):
@@ -229,7 +268,7 @@ def _find_region(sections, period: str, doc_type: str) -> str | None:
         return None
     region = [sections[start]]
     for h, body in sections[start + 1:]:
-        if _is_boundary(h):
+        if _is_boundary(h, body):
             break
         region.append((h, body))
     return region
@@ -425,7 +464,7 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
                 period = str(r.get("period") or "").strip()
                 doc_id = str(r["doc_id"])
                 summary = _lift_summary(_find_region(
-                    _company_page(drive, repo_id, isin, cache), period, dt) or "")
+                    _company_page(drive, repo_id, isin, cache), period, dt, doc_id) or "")
                 if not summary:   # narrative missing -> structured guidance rows
                     summary = _structured_fallback(dt, doc_id, isin, tables)
                 # unambiguous doc name: ARs get FY2024-25-style labels
