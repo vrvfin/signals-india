@@ -141,6 +141,15 @@ jobs:
         run: python scripts/compute_features.py
         continue-on-error: true
 
+      # Raise any long-horizon high that today's bar exceeded. Exact for the
+      # all-time high; the N-year windows can only move UP between re-seeds,
+      # which errs toward "further from its high" and so under-fires rather
+      # than over-fires. Re-seed periodically with --seed to clear the drift.
+      - name: Update price highs
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/build_price_highs.py --update
+        continue-on-error: true
+
       # Market state runs BEFORE the strategies: it depends only on features +
       # indices + macro (all ready above), and CANSLIM's "M" rule reads
       # data/market_state/latest.parquet. Running it after the strategies (the

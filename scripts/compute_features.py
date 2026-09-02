@@ -549,6 +549,62 @@ def main() -> None:
     if too_short:
         log(f"  first 10 too-short symbols: {too_short[:10]}")
 
+    # ---- long-horizon highs from the dedicated table -----------------------
+    # Phase 1's own bar store is shallow (median 2.2y; every BSE name capped at
+    # 2.22y by fetch_bse_only_ohlcv.py), so the window-based columns computed in
+    # compute_features_one are NaN for most stocks. company_repo/_index/
+    # price_highs.parquet holds the numbers extracted once from the 25-year
+    # research store: 5-year highs for 62% of the universe against 26% from our
+    # own bars. Storing the ANSWER costs 233 KB; storing the bars to derive it
+    # would cost ~239 MB.
+    try:
+        repo_id = get_or_create_subfolder(drive, folder_id, "company_repo")
+        idx_id = get_or_create_subfolder(drive, repo_id, "_index")
+        hfid = find_file(drive, idx_id, "price_highs.parquet")
+        if hfid:
+            hi = download_parquet(drive, hfid)
+            hcols = [c for c in hi.columns if c.startswith("high_")]
+            hi = hi[["symbol", "history_years"] + hcols].drop_duplicates("symbol")
+            hi["symbol"] = hi["symbol"].astype(str)
+            hi = hi.rename(columns={"history_years": "history_years_deep"})
+            feat_df["symbol"] = feat_df["symbol"].astype(str)
+            feat_df = feat_df.merge(hi, on="symbol", how="left")
+            close = pd.to_numeric(feat_df["close"], errors="coerce")
+            n_from_table = 0
+            for c in hcols:
+                if c == "high_all_time":
+                    col = "pct_from_all_time_high"
+                else:
+                    col = f"pct_from_{c}"          # high_5y -> pct_from_high_5y
+                v = pd.to_numeric(feat_df[c], errors="coerce")
+                pct = (close / v - 1) * 100
+                if col in feat_df.columns:
+                    # table wins where it has a figure; the shallow window-based
+                    # value survives only where the table has none
+                    feat_df[col] = pct.where(pct.notna(), feat_df[col])
+                else:
+                    feat_df[col] = pct
+                n_from_table = max(n_from_table, int(pct.notna().sum()))
+            # history_years must reflect the DEEP history, since the >=5y gate
+            # is what decides whether a long-horizon signal may fire at all.
+            if "history_years_deep" in feat_df.columns:
+                feat_df["history_years"] = (
+                    pd.to_numeric(feat_df["history_years_deep"], errors="coerce")
+                    .fillna(feat_df.get("history_years")))
+            feat_df = feat_df.drop(columns=[c for c in hcols
+                                            if c in feat_df.columns]
+                                   + ["history_years_deep"], errors="ignore")
+            ge5 = int((pd.to_numeric(feat_df["history_years"],
+                                     errors="coerce") >= ATH_MIN_YEARS).sum())
+            log(f"price_highs joined: {n_from_table:,} rows with a long-horizon "
+                f"high | {ge5:,}/{len(feat_df):,} clear the "
+                f"{ATH_MIN_YEARS}y floor")
+        else:
+            log("company_repo/_index/price_highs.parquet not found — "
+                "long-horizon highs fall back to our own shallow bars")
+    except Exception as e:
+        log(f"WARNING: price_highs join failed ({str(e)[:80]}) — continuing")
+
     # ---- market cap (MCAPVAR, +31.8pp) -------------------------------------
     # Already computed weekly by universe_refresh.yml; features never carried it,
     # so no strategy could size- or band-condition anything.
