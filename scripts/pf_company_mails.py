@@ -1527,6 +1527,16 @@ def _narratives(drive, repo_id, latest: dict, cache: dict) -> dict:
             continue
         period = str(d.get("period") or "").strip()
         doc_id = str(d.get("doc_id") or "").strip()
+        if not period and dt == "annual_report":
+            # MOST AR QUEUE ROWS CARRY NO PERIOD - measured on APL Apollo, the field is
+            # empty. Without one, the only way left to find the section is the doc
+            # marker, and after a re-extraction the marker sits on the STALE section
+            # while the good re-read is appended under a correct heading with none. So
+            # the fresh report was invisible and the mail lost its summary again.
+            # announcement_date always answers this (FY-end stamp or filing date).
+            _fy = ar_fy_year(d.get("date"), "")
+            if _fy:
+                period = f"FY{str(_fy)[-2:]}"
         txt = ""
         try:
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
@@ -2275,6 +2285,13 @@ def _self_test() -> int:
     # The scope loop must not rebind `want`, which holds the requested doc types.
     check("the scope loop does not shadow the doc-type set",
           "got, want =" not in _src and "got, expect =" in _src)
+    # An AR row with no period must still resolve to a period, or its section can only
+    # be found by a doc marker that a re-extraction leaves on the STALE section.
+    _nsrc = _insp.getsource(_narratives)
+    check("_narratives derives a period for an AR that has none",
+          'dt == "annual_report"' in _nsrc and "ar_fy_year" in _nsrc)
+    check("the derived period is FY-shaped",
+          f"FY{str(ar_fy_year('2026-03-31', ''))[-2:]}" == "FY26")
 
     # ---- concall: the SEASON QUARTER, same rule the deck mail uses ---------
     check("a call filed Aug 2026 is Q1 FY27",
