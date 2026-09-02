@@ -487,6 +487,21 @@ def compute_diff(today: pd.DataFrame, yday: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- Main ----------
 
+def _safe_print(text: str) -> None:
+    """Print without dying on a non-UTF-8 console.
+
+    The strategies build their `reason` strings with the rupee sign, and a
+    Windows console is cp1252, so printing the preview raised
+    UnicodeEncodeError and took the whole run down with it — after all the work
+    was done, and only in --dry-run, which is the mode the house rules require
+    before every live run."""
+    enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+
 def apply_liquidity_gate(signals: pd.DataFrame, feat: pd.DataFrame,
                          min_turnover_cr: float) -> pd.DataFrame:
     """Drop signals in names that cannot actually be traded.
@@ -689,7 +704,8 @@ def main():
             f"wall clock {today_str}")
     if args.dry_run:
         log("DRY RUN — nothing written to Drive")
-        print(conviction.head(15).to_string(index=False) if len(conviction) else "(none)")
+        _safe_print(conviction.head(15).to_string(index=False)
+                    if len(conviction) else "(none)")
         return
 
     upload_csv(drive, agg_id, "latest.csv", unified,
@@ -723,7 +739,7 @@ def main():
     if not conviction.empty:
         print(f"Top 10 Multi-Strategy Conviction names:")
         show = ["symbol", "zone_type", "n_strategies", "composite_score", "strategies"]
-        print(conviction.head(10)[show].to_string(index=False))
+        _safe_print(conviction.head(10)[show].to_string(index=False))
 
 
 if __name__ == "__main__":
