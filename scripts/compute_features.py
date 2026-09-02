@@ -38,8 +38,21 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # Indicator config
 EMAS = [10, 20, 50, 100, 200]
-SMAS = [50, 200]
+SMAS = [20, 50, 200]
 RETURN_LOOKBACKS = {"1m": 21, "2m": 42, "3m": 63, "6m": 126, "12m": 252}
+
+# Long-horizon high windows, in YEARS. Deliberately explicit rather than a single
+# "all-time high": Phase 1's price depth is 10y for NSE (ingest_ohlcv
+# BACKFILL_PERIOD) but only 2y for BSE-only names, and a cohort of ~7.5% starts
+# 2025-12-19 (an ingest cliff, not a listing). A naive expanding().max() would
+# mean a 10-year high for one stock and an 8-month high for another, and the bias
+# is systematic — LESS history makes "near its high" trivially easy to satisfy.
+# Each column is NaN when the stock lacks that much history: never a silent
+# fallback to a shorter window.
+HIGH_WINDOWS_Y = [3, 5, 10]
+# Below this, long-horizon-high signals do not apply at all (user decision,
+# 2026-09-01). Strategies must gate on history_years >= ATH_MIN_YEARS.
+ATH_MIN_YEARS = 5
 
 
 def log(msg: str) -> None:
@@ -164,6 +177,43 @@ def days_above_ma(close: pd.Series, ma: pd.Series) -> int:
     return count
 
 
+def slope_pct_last(close: pd.Series, n: int) -> float:
+    """Linear-regression slope of the last n closes, as %/day of the current
+    level. guru/compute_technical_metrics.py computes this as a rolling series;
+    only the latest value is needed here, so it is a single fit."""
+    if len(close) < n:
+        return np.nan
+    y = close.tail(n).to_numpy(dtype=float)
+    x = np.arange(n, dtype=float)
+    xm = x.mean()
+    denom = float(((x - xm) ** 2).sum())
+    if denom == 0:
+        return np.nan
+    slope = float(((x - xm) * (y - y.mean())).sum() / denom)
+    last = float(y[-1])
+    return slope / last * 100.0 if last else np.nan
+
+
+def consecutive_up_weeks(df: pd.DataFrame) -> int:
+    """Run of consecutive up weeks (W-FRI close vs the prior week's).
+
+    Deliberately a line-for-line copy of guru/compute_technical_metrics.py's
+    version, reduced to its latest value. The subtlety is the ffill: resample
+    labels each week by its Friday, so when the last bar is mid-week its label
+    lies in the FUTURE and the ffill falls back to the last COMPLETED week. A
+    naive trailing count would instead include the in-progress week, which makes
+    the value flip around mid-week and — more importantly — would no longer be
+    the quantity TECH_UPWEEKS (+32.5pp) was measured on."""
+    wk = df.set_index("date")["close"].resample("W-FRI").last().dropna()
+    if len(wk) < 2:
+        return 0
+    up = (wk.diff() > 0)
+    run = up * (up.groupby((~up).cumsum()).cumcount() + 1)
+    daily = run.reindex(df["date"], method="ffill")
+    v = daily.iloc[-1]
+    return int(v) if pd.notna(v) else 0
+
+
 def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
     """Compute a single-row feature dict for a symbol. Returns None if too short."""
     if df is None or len(df) < 60:
@@ -245,6 +295,62 @@ def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
     for n in [10, 20, 50]:
         feat[f"days_above_ema_{n}"] = days_above_ma(close, emas[n])
 
+    # ---- how much history this stock actually has -------------------------
+    # First-class column, not an assumption: every long-window feature below is
+    # gated on it, and so are the strategies that consume them.
+    span_days = (df["date"].iloc[-1] - df["date"].iloc[0]).days
+    feat["history_years"] = span_days / 365.25
+    feat["n_bars"] = len(df)
+
+    # ---- long-horizon highs (see HIGH_WINDOWS_Y) ---------------------------
+    # Intraday high, consistent with this file's existing dist_from_52w_high_pct
+    # (guru/compute_technical_metrics.py uses closes; Phase 1's convention wins
+    # here so the 1y and Ny columns mean the same thing).
+    last_date = df["date"].iloc[-1]
+    first_date = df["date"].iloc[0]
+    for yrs in HIGH_WINDOWS_Y:
+        col = f"pct_from_high_{yrs}y"
+        cutoff = last_date - pd.DateOffset(years=yrs)
+        if first_date > cutoff:
+            feat[col] = np.nan          # not enough history — no silent fallback
+            continue
+        win = df[df["date"] >= cutoff]
+        hi = win["high"].max()
+        feat[col] = (close.iloc[-1] / hi - 1) * 100 if hi and hi > 0 else np.nan
+
+    # ---- MA extension (TECH_EXTENSION) -------------------------------------
+    # % ABOVE the moving average, not just the above/below booleans below. The
+    # highest-median-return family in guru/backtest/family_lift.parquet.
+    for n in (20, 50, 200):
+        ma = smas[n].iloc[-1]
+        feat[f"price_vs_ma_{n}"] = ((close.iloc[-1] / ma - 1) * 100
+                                    if pd.notna(ma) and ma > 0 else np.nan)
+
+    # ---- Bollinger upper break (TECH_BB) -----------------------------------
+    std20 = close.rolling(20).std().iloc[-1]
+    ma20 = smas[20].iloc[-1]
+    for sd in (1.0, 2.0):
+        lbl = f"bb_upper_break_{sd:g}sd"
+        if pd.notna(std20) and pd.notna(ma20):
+            feat[lbl] = bool(close.iloc[-1] > ma20 + sd * std20)
+        else:
+            feat[lbl] = False
+
+    # ---- ATR expansion (TECH_ATR, +22.1pp vs volume surge's +5.7pp) --------
+    atr_series = tr.rolling(14).mean()
+    feat["atr_expansion_ratio"] = (
+        float(atr_series.iloc[-1] / atr_series.iloc[-64])
+        if len(atr_series) > 64 and pd.notna(atr_series.iloc[-64])
+        and atr_series.iloc[-64] > 0 else np.nan)
+
+    # ---- trend shape -------------------------------------------------------
+    for n in (20, 50):
+        feat[f"price_slope_{n}d_pct"] = slope_pct_last(close, n)
+    feat["consecutive_up_weeks"] = consecutive_up_weeks(df)
+    rng52 = high_52w - low_52w
+    feat["pct_position_in_52w_range"] = (
+        (close.iloc[-1] - low_52w) / rng52 * 100 if rng52 and rng52 > 0 else np.nan)
+
     # Gap + 1-day move
     if len(df) >= 2:
         prior_close = close.iloc[-2]
@@ -282,14 +388,45 @@ def add_relative_strength(feat_df: pd.DataFrame, nifty500_df: pd.DataFrame | Non
         feat_df[f"rs_rank_{label}"] = (
             feat_df.loc[eligible, col].rank(pct=True) * 100)
 
-    # Excess return vs Nifty 500
+    # Excess return vs Nifty 500, DATE-ALIGNED.
+    # Previously one scalar index return (measured off the index's own last bar)
+    # was subtracted from every stock regardless of when that stock last traded.
+    # BSE-only names run 3-5 days behind, so their "excess" compared a stale
+    # stock window against a fresh index window. Now each stock's return is
+    # differenced against the index return over the window ending on ITS bar date
+    # (asof-backward, so a stock trading on a day the index has no row falls back
+    # to the previous index session).
     if nifty500_df is not None and len(nifty500_df) > 252:
-        n500 = nifty500_df.sort_values("date").reset_index(drop=True)
+        n500 = nifty500_df.copy()
+        n500["date"] = pd.to_datetime(n500["date"], errors="coerce")
+        n500 = (n500.dropna(subset=["date"]).sort_values("date")
+                    .reset_index(drop=True))
         n500_close = n500["close"].astype(float)
+        idx = pd.DataFrame({"date": n500["date"]})
+        labels = []
         for label, n in RETURN_LOOKBACKS.items():
             if len(n500_close) > n:
-                n500_ret = (n500_close.iloc[-1] / n500_close.iloc[-1 - n] - 1) * 100
-                feat_df[f"rs_vs_nifty500_{label}_pct"] = feat_df[f"return_{label}_pct"] - n500_ret
+                idx[f"_idx_{label}"] = n500_close.pct_change(n).to_numpy() * 100
+                labels.append(label)
+
+        sdates = pd.to_datetime(feat_df["date"], errors="coerce")
+        ok = sdates.notna()
+        left = (pd.DataFrame({"_row": np.arange(len(feat_df))[ok.to_numpy()],
+                              "date": sdates[ok].to_numpy()})
+                  .sort_values("date"))
+        merged = pd.merge_asof(left, idx, on="date", direction="backward")
+
+        n_missing = int(merged[[f"_idx_{l}" for l in labels]].isna().all(axis=1).sum()) if labels else 0
+        for label in labels:
+            col = f"rs_vs_nifty500_{label}_pct"
+            aligned = pd.Series(np.nan, index=feat_df.index, dtype="float64")
+            aligned.iloc[merged["_row"].to_numpy()] = merged[f"_idx_{label}"].to_numpy()
+            feat_df[col] = feat_df[f"return_{label}_pct"] - aligned
+        if labels:
+            span = f"{n500['date'].min().date()}..{n500['date'].max().date()}"
+            log(f"RS vs Nifty500: date-aligned over {span} "
+                f"({int(ok.sum())} rows matched, {int((~ok).sum())} with no bar "
+                f"date, {n_missing} before the index history starts)")
 
     return feat_df
 
@@ -411,6 +548,33 @@ def main() -> None:
         log(f"  first 10 failing symbols: {[sym for sym, _ in errors[:10]]}")
     if too_short:
         log(f"  first 10 too-short symbols: {too_short[:10]}")
+
+    # ---- market cap (MCAPVAR, +31.8pp) -------------------------------------
+    # Already computed weekly by universe_refresh.yml; features never carried it,
+    # so no strategy could size- or band-condition anything.
+    try:
+        mc_fid = uni_files.get("market_cap.csv")
+        if mc_fid:
+            mc = download_csv(drive, mc_fid)
+            cap_col = next((c for c in mc.columns if "cap" in c.lower()), None)
+            if cap_col and "symbol" in mc.columns:
+                cap = (mc[["symbol", cap_col]]
+                       .assign(**{cap_col: pd.to_numeric(mc[cap_col], errors="coerce")})
+                       .dropna(subset=["symbol"])
+                       .drop_duplicates(subset=["symbol"], keep="first")
+                       .rename(columns={cap_col: "market_cap_cr"}))
+                cap["symbol"] = cap["symbol"].astype(str)
+                feat_df["symbol"] = feat_df["symbol"].astype(str)
+                feat_df = feat_df.merge(cap, on="symbol", how="left")
+                n_cap = int(feat_df["market_cap_cr"].notna().sum())
+                log(f"market cap joined: {n_cap}/{len(feat_df)} rows "
+                    f"({len(feat_df)-n_cap} without a cap)")
+            else:
+                log("WARNING: market_cap.csv lacks symbol/cap columns — skipped")
+        else:
+            log("WARNING: universe/market_cap.csv not found — market_cap_cr skipped")
+    except Exception as e:
+        log(f"WARNING: market-cap join failed ({str(e)[:80]}) — continuing without it")
 
     # Penny-stock filter FIRST — sub-₹10 names must not shape the RS
     # percentiles they are about to be dropped from.
