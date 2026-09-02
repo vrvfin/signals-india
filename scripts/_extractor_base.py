@@ -144,6 +144,26 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "attempts", "last_error", "last_attempt_at"]
 
 
+# A model sometimes returns the PROMPT instead of an answer. Measured 2026-09-02:
+# CG Power's stored annual-report analysis opens with annual_report_prompt.txt itself
+# ("Generate the final report immediately... The ENTIRE report must stay under ~1,200
+# lines"). That text is long and prose-like, so every length-based quality test rates it
+# highly and every "best passage" heuristic picks it first. Two or more of these phrases
+# together is the signal; one alone can appear in genuine prose.
+_PROMPT_ECHO_MARKERS = (
+    "generate the final report", "visible report structure", "no individual paragraph",
+    "must stay under", "output must be", "formatting style", "make absolutely zero",
+    "do not continue or loop", "report structure", "you are a lead forensic",
+    "your task is", "never repeat a sentence",
+)
+
+
+def is_prompt_echo(text: str) -> bool:
+    """True when a model response is the prompt talking back, not an answer."""
+    t = str(text or "").lower()
+    return sum(1 for k in _PROMPT_ECHO_MARKERS if k in t) >= 2
+
+
 def mark_queue_error(queue, idx, reason: str, status: str = "error") -> None:
     """Record a failure ON the queue row: status, reason, attempt count, timestamp.
 

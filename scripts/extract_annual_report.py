@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
-    load_queue, save_queue,
+    load_queue, save_queue, mark_queue_error, is_prompt_echo,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -67,6 +67,14 @@ AR_MAX_OUTPUT_TOKENS = 4096                       # model-level cap on the REPOR
                                                   # what bounds the bloat. ~67k chars
                                                   # still covers the forensic/guidance
                                                   # sections the structured pass reads.
+MIN_REPORT_CHARS = 2000     # below this the report call FAILED, however cleanly it
+                            # returned. Measured over 51 PF FY2026 annual reports on
+                            # 2026-09-02 the distribution is bimodal and the band
+                            # 1,000-2,500 chars is EMPTY: 8 failures sit under 1,000
+                            # (UNIVASTU 0, INDOMIM 108, APLAPOLLO 764, ending mid-word)
+                            # and the smallest genuine report is 3,004. 2,000 therefore
+                            # sits in open space, ~1,200 clear of the worst failure and
+                            # ~1,000 clear of the smallest real report.
 DOC_TYPE_LABEL  = "Annual Report"
 
 OUTPUT_COMPANY_MD   = True
@@ -414,10 +422,35 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
 # ------------------------------------------------------------------ #
 
 def _extract_fy_year(text: str, row: pd.Series) -> str:
-    """Try to identify the fiscal year from title or text."""
-    # Check title first
-    title = str(row.get("title", ""))
-    for src in (title, text[:2000]):
+    """The financial year an annual report COVERS, as "FY26".
+
+    THE QUEUE ROW IS AUTHORITATIVE; THE REPORT TEXT IS NOT. This used to take the first
+    "FY<digits>" out of the title and then out of the report body - but the body opens
+    with the report's own coverage SPAN, "Annual Report Fiscal Coverage Horizon:
+    FY22 - FY26", so the first match is the START of the span, not the year covered.
+    Measured 2026-09-02: APL Apollo's FY2026 report was labelled FY22 and CG Power's
+    FY2024 report FY20, and that label reached the company_page.md heading AND the
+    fy_year column of ar_guidance and ar_red_flags.
+
+    announcement_date answers it unambiguously in either shape it arrives in:
+      2026-03-31  the FY-END stamp the backfill writes -> names its own year -> FY26
+      2026-09-02  a real filing date from the sweep -> the report is for the year that
+                  last ended -> FY26
+    """
+    period = str(row.get("period") or "").strip()
+    m = re.search(r"FY\s*(\d{4}|\d{2})", period, re.IGNORECASE)
+    if m:
+        return f"FY{m.group(1)[-2:]}"
+
+    d = str(row.get("announcement_date") or "")[:10]
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+        y, mth, day = int(d[:4]), int(d[5:7]), int(d[8:10])
+        fy = y if (mth, day) == (3, 31) or mth >= 4 else y - 1
+        return f"FY{str(fy)[-2:]}"
+
+    # Last resort only: a row with no period and no parseable date still gets a label
+    # rather than none, and a title is far likelier to name the year than the body is.
+    for src in (str(row.get("title", "")), text[:2000]):
         m = re.search(r"FY\s*(\d{2,4})", src, re.IGNORECASE)
         if m:
             yr = m.group(1)
@@ -710,6 +743,47 @@ def main() -> None:
                       f"-- structured pass: guidance={len(g_rows)} "
                       f"red_flags={len(rf_rows)} --\n{'='*60}\n")
                 counts["processed"] += 1
+                continue
+
+            # ── QUALITY GATE ──────────────────────────────────────────────────
+            # A response can come back cleanly and still be a failed generation. Marking
+            # it "done" is what made that permanent: done is terminal, nothing revisits
+            # it, and 8 of 51 PF annual reports were holding a failed generation for good
+            # (UNIVASTU 0 chars, INDOMIM 108, APL Apollo 764 ending mid-word, CG Power the
+            # prompt echoed back). "error" is cycled by requeue_error_docs, so a bad draw
+            # is retried instead of frozen.
+            def _bad(txt: str) -> str:
+                if is_prompt_echo(txt):
+                    return "prompt echoed back instead of a report"
+                n = len(str(txt or "").strip())
+                if n < MIN_REPORT_CHARS:
+                    return f"thin report: {n:,} chars (min {MIN_REPORT_CHARS:,})"
+                return ""
+
+            _why = _bad(markdown_text)
+            if _why:
+                # ONE retry in-run. The pool rotates key and model per call, so the second
+                # attempt is a genuinely different generation rather than the same one
+                # repeated. Rate-limit exhaustion propagates untouched.
+                log(f"  {_why} — retrying once")
+                try:
+                    markdown_text = (
+                        _process_with_map_reduce(gemini, pdf_bytes, prompt, display_name)
+                        if size_mb > MAP_REDUCE_THRESHOLD_MB
+                        else gemini.call(pdf_bytes, prompt, display_name,
+                                         max_output_tokens=AR_MAX_OUTPUT_TOKENS))
+                    log(f"  retry response: {len(markdown_text):,} chars")
+                except RateLimitExhausted:
+                    raise
+                except Exception as e:
+                    log(f"  retry call failed ({str(e)[:80]})")
+                _why = _bad(markdown_text)
+            if _why:
+                mark_queue_error(queue, queue_idx, _why)
+                _save_queue_batched()
+                counts["error"] += 1
+                log(f"  {row.get('symbol')}: {_why} after retry — left pending retry, "
+                    f"NOT marked done")
                 continue
 
             facts = parse_gemini_response(markdown_text, row)

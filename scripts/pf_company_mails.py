@@ -432,17 +432,15 @@ _NARRATIVE_SKIP = ("source coverage", "data integrity", "probing questions",
 # The ENTIRE report must stay under ~1,200 lines" - and that text is long and prose-like,
 # so every length-based heuristic ranks it first. It is instructions, never analysis, and
 # it must never reach a reader. Filtered at RENDER time; the stored text is untouched.
-_PROMPT_ECHO = ("generate the final report", "visible report structure",
-                "no individual paragraph", "must stay under", "output must be",
-                "formatting style", "make absolutely zero", "do not continue or loop",
-                "report structure", "you are a lead forensic", "your task is",
-                "never repeat a sentence")
-
-
 def _is_prompt_echo(text: str) -> bool:
-    """True when a block is the prompt talking, not the analysis."""
-    t = str(text or "").lower()
-    return sum(1 for k in _PROMPT_ECHO if k in t) >= 2
+    """True when a block is the prompt talking, not the analysis.
+
+    Delegates to _extractor_base so the extractor's quality gate and this renderer
+    agree on what an echo is - the extractor now refuses to store one, and this stays
+    as the guard for the rows stored before it did.
+    """
+    from _extractor_base import is_prompt_echo
+    return is_prompt_echo(text)
 
 
 def _digest_prose(text: str) -> str:
