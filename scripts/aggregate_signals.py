@@ -28,10 +28,17 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from strategy_common import pct_rank
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -246,6 +253,108 @@ def momentum_profile(variants: set) -> str:
     if v <= {"12m"}:
         return "stale"
     return "broad"
+
+
+def add_ranking_terms(signals: pd.DataFrame, feat: pd.DataFrame | None,
+                      opens: pd.DataFrame | None) -> pd.DataFrame:
+    """Four orthogonal ranking measures, percentile-ranked WITHIN each strategy.
+
+    Computed here rather than inside each of the nine strategies: one
+    implementation instead of nine, identical normalisation by construction, and
+    the strategy files stay untouched. Every strategy already emits entry, stop
+    and symbol, which is all three of the price-based terms need.
+
+    The point of all four is to rank on what the GATE DID NOT ALREADY MEASURE.
+    momentum gated on rs_rank and then ranked on rs_rank; minervini and canslim
+    ranked on how many boxes were ticked. Neither ordering carried information.
+
+      term_risk     (entry - stop) / entry, ranked ASCENDING. The dimension
+                    missing everywhere except pullback. Two identical-looking
+                    stocks with stops 4% and 14% away are not the same trade:
+                    you can size the first three times larger for the same rupee
+                    risk. Free to compute — the numbers are already there.
+      term_rs       index-relative strength. +38.0pp lift at a 72.6% win rate in
+                    guru/backtest/family_lift.parquet, computed daily and, until
+                    now, read by nothing.
+      term_stage    freshness. Ranked so a name that qualified TODAY beats one
+                    that has been on the list for two months — inverting the
+                    bias that had ma_respect and qullamaggie ranking the most
+                    extended stock top.
+      term_confirm  range expansion. TECH_ATR is +22.1pp; TECH_VOLSURGE, which
+                    volume_breakout used to rank on, is +5.7pp.
+
+    NOTE: these are written as OBSERVABLE COLUMNS only. Nothing consumes them
+    yet — the blend weights are deliberately not chosen here. signal_tracker.py
+    measures whether each term separates outcomes, and that is what should pick
+    the weights (user sign-off pending, 2026-09-01).
+    """
+    df = signals.copy()
+    df["symbol"] = df["symbol"].astype(str)
+
+    # --- risk: from entry/stop, which every strategy already emits ----------
+    e = pd.to_numeric(df.get("entry"), errors="coerce")
+    st = pd.to_numeric(df.get("stop"), errors="coerce")
+    risk_pct = ((e - st) / e * 100).where((e > 0) & (st < e))
+    df["risk_pct"] = risk_pct.round(2)
+
+    # --- rs + confirmation: joined from features ----------------------------
+    for col, src in (("_rs", "rs_vs_nifty500_6m_pct"),
+                     ("_confirm", "atr_expansion_ratio")):
+        if feat is not None and src in getattr(feat, "columns", []):
+            m = (feat[["symbol", src]].dropna(subset=["symbol"])
+                 .drop_duplicates("symbol"))
+            m["symbol"] = m["symbol"].astype(str)
+            df = df.merge(m.rename(columns={src: col}), on="symbol", how="left")
+        else:
+            df[col] = np.nan
+
+    # --- stage: how long this name has already been on the list -------------
+    if opens is not None and len(opens) and "first_date" in opens.columns:
+        o = opens.copy()
+        o["symbol"] = o["symbol"].astype(str)
+        age = (o.groupby("symbol")["first_date"]
+                .min().rename("_first_seen").reset_index())
+        df = df.merge(age, on="symbol", how="left")
+        first = pd.to_datetime(df["_first_seen"], errors="coerce")
+        today = pd.to_datetime(df.get("date"), errors="coerce")
+        df["_stage_days"] = (today - first).dt.days
+        # A name with no history is brand new today, which is the freshest case.
+        df["_stage_days"] = df["_stage_days"].fillna(0)
+        df = df.drop(columns=["_first_seen"])
+    else:
+        df["_stage_days"] = np.nan
+
+    # Percentile WITHIN each strategy, so 90 means "top decile of that
+    # strategy's signals today" for every strategy alike.
+    g = df.groupby("strategy")
+    df["term_risk"] = g["risk_pct"].transform(
+        lambda s: pct_rank(s, ascending=False))       # tighter stop ranks higher
+    df["term_rs"] = g["_rs"].transform(pct_rank)
+    df["term_stage"] = g["_stage_days"].transform(
+        lambda s: pct_rank(s, ascending=False))       # fresher ranks higher
+    df["term_confirm"] = g["_confirm"].transform(pct_rank)
+    return df.drop(columns=["_rs", "_confirm", "_stage_days"])
+
+
+def terms_report(signals: pd.DataFrame, n: int = 20) -> pd.DataFrame:
+    """Per strategy: the current top N by `score` beside the top N by each term.
+
+    This is the sheet the blend weights should be chosen against — real names,
+    not a formula argued in the abstract."""
+    terms = ["score", "term_risk", "term_rs", "term_stage", "term_confirm"]
+    rows = []
+    for strat, g in signals.groupby("strategy"):
+        for t in terms:
+            if t not in g.columns or g[t].isna().all():
+                continue
+            top = g.nlargest(n, t)["symbol"].tolist()
+            rows.append({"strategy": strat, "ranked_by": t, "n_signals": len(g),
+                         "top_n": ", ".join(top[:n]),
+                         "overlap_with_score_pct": (
+                             round(100.0 * len(set(top) & set(
+                                 g.nlargest(n, "score")["symbol"])) / max(len(top), 1), 1)
+                             if "score" in g.columns else np.nan)})
+    return pd.DataFrame(rows)
 
 
 def compute_unified(signals: pd.DataFrame,
@@ -480,6 +589,11 @@ def main():
                          "is. NOT the default: the collapse is not signed off.")
     ap.add_argument("--dry-run", action="store_true",
                     help="compute and report, write nothing to Drive")
+    ap.add_argument("--terms-report", action="store_true",
+                    help="also write signals/aggregated/ranking_terms_report.csv "
+                         "— per strategy, the current top 20 by score beside the "
+                         "top 20 by each ranking term. This is the sheet the "
+                         "blend weights should be chosen against.")
     args = ap.parse_args()
 
     print("Stage 9 — Aggregator + Multi-Strategy Conviction")
@@ -517,6 +631,21 @@ def main():
     if signals.empty:
         print("No signals survived the liquidity gate.")
         return
+
+    # 1c. Four orthogonal ranking measures, as OBSERVABLE COLUMNS. Nothing
+    # consumes them yet — the blend is deliberately not chosen here.
+    agg_id_early = get_or_create_subfolder(
+        drive, get_or_create_subfolder(drive, folder_id, "signals"), "aggregated")
+    opens_prev = None
+    try:
+        _f = find_file(drive, agg_id_early, "open_signals.csv")
+        opens_prev = download_csv(drive, _f) if _f else None
+    except Exception:
+        pass
+    signals = add_ranking_terms(signals, feat_df, opens_prev)
+    _have = [c for c in ("term_risk", "term_rs", "term_stage", "term_confirm")
+             if c in signals.columns and signals[c].notna().any()]
+    log(f"ranking terms populated: {_have}")
 
     # 2. Unified view
     unified = compute_unified(signals, collapse_ma_respect=args.collapse_ma_respect)
@@ -572,6 +701,13 @@ def main():
     upload_csv(drive, agg_id, "diff_vs_yesterday.csv", diff,
                find_file(drive, agg_id, "diff_vs_yesterday.csv"))
     log("Wrote: latest.csv, dated snapshot, conviction.csv, diff_vs_yesterday.csv")
+
+    if args.terms_report:
+        rep = terms_report(signals)
+        upload_csv(drive, agg_id, "ranking_terms_report.csv", rep,
+                   find_file(drive, agg_id, "ranking_terms_report.csv"))
+        log(f"Wrote ranking_terms_report.csv ({len(rep)} rows) — inspect this "
+            f"before choosing any blend weights")
 
     # 5b. Remember the entry/stop that were live when each signal first fired.
     try:

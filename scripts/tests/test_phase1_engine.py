@@ -462,6 +462,41 @@ def test_signal_tracker() -> None:
           "scipy" not in sys.modules)
 
 
+def test_ranking_terms() -> None:
+    section("four ranking terms: computed, not yet blended")
+    ag = _load("ag2", os.path.join(SCRIPTS, "aggregate_signals.py"))
+    sig = pd.DataFrame({
+        "symbol": ["TIGHT", "WIDE", "MID"], "strategy": "darvas",
+        "zone_type": "buy", "score": [50.0, 50.0, 50.0],
+        "date": pd.Timestamp("2026-09-01"),
+        "entry": [100.0, 100.0, 100.0], "stop": [96.0, 86.0, 92.0],
+        "reason": "r"})
+    feat = pd.DataFrame({"symbol": ["TIGHT", "WIDE", "MID"],
+                         "rs_vs_nifty500_6m_pct": [30.0, -5.0, 10.0],
+                         "atr_expansion_ratio": [2.0, 1.0, 1.5]})
+    opens = pd.DataFrame({"symbol": ["TIGHT", "WIDE", "MID"],
+                          "first_date": ["2026-09-01", "2026-06-01", "2026-08-15"]})
+    out = ag.add_ranking_terms(sig, feat, opens).set_index("symbol")
+    check("risk_pct from entry/stop", abs(out.loc["TIGHT", "risk_pct"] - 4.0) < 1e-6)
+    check("a tighter stop ranks higher",
+          out.loc["TIGHT", "term_risk"] > out.loc["WIDE", "term_risk"],
+          "4% stop vs 14% — the first can be sized 3x larger for the same risk")
+    check("stronger vs the index ranks higher",
+          out.loc["TIGHT", "term_rs"] > out.loc["WIDE", "term_rs"])
+    check("fresher ranks higher (inverts the extension bias)",
+          out.loc["TIGHT", "term_stage"] > out.loc["WIDE", "term_stage"])
+    check("more range expansion ranks higher",
+          out.loc["TIGHT", "term_confirm"] > out.loc["WIDE", "term_confirm"])
+    check("all terms are 0-100",
+          all(out[c].between(0, 100).all()
+              for c in ("term_risk", "term_rs", "term_stage", "term_confirm")))
+    bare = ag.add_ranking_terms(sig, None, None)
+    check("no features -> terms NaN but risk still computed, no crash",
+          bare["term_rs"].isna().all() and bare["term_risk"].notna().all())
+    check("comparison sheet produced",
+          len(ag.terms_report(out.reset_index(), n=2)) >= 4)
+
+
 def main() -> int:
     cf = _load("cf", os.path.join(SCRIPTS, "compute_features.py"))
     psc = _load("psc", os.path.join(SCRIPTS, "pipeline_skip_check.py"))
@@ -481,6 +516,7 @@ def main() -> int:
     test_aggregation()
     test_market_stance()
     test_signal_tracker()
+    test_ranking_terms()
     print()
     if _FAILS:
         print(f"{len(_FAILS)} FAILED:")
