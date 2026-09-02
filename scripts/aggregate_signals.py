@@ -548,17 +548,22 @@ def apply_liquidity_gate(signals: pd.DataFrame, feat: pd.DataFrame,
     if feat is None or "avg_turnover_20d_cr" not in getattr(feat, "columns", []):
         log("liquidity gate SKIPPED — features lack avg_turnover_20d_cr")
         return signals
-    t = (feat[["symbol", "avg_turnover_20d_cr"]]
-         .dropna(subset=["symbol"]).drop_duplicates("symbol"))
+    COL = "avg_turnover_20d_cr"
+    t = (feat[["symbol", COL]].dropna(subset=["symbol"])
+         .drop_duplicates("symbol").rename(columns={COL: "_turnover"}))
     t["symbol"] = t["symbol"].astype(str)
     before = len(signals)
     out = signals.copy()
     out["symbol"] = out["symbol"].astype(str)
+    # Merge under a PRIVATE name. strategy_ipo_base emits avg_turnover_20d_cr in
+    # its own output, so merging on the public name collided into _x/_y suffixes
+    # and the next line raised KeyError on a column that no longer existed. Only
+    # the new IPO strategy meeting this gate produces that — neither component
+    # showed it alone.
     out = out.merge(t, on="symbol", how="left")
-    keep = pd.to_numeric(out["avg_turnover_20d_cr"],
-                         errors="coerce") >= min_turnover_cr
-    n_nocap = int(out["avg_turnover_20d_cr"].isna().sum())
-    out = out[keep].drop(columns=["avg_turnover_20d_cr"])
+    keep = pd.to_numeric(out["_turnover"], errors="coerce") >= min_turnover_cr
+    n_nocap = int(out["_turnover"].isna().sum())
+    out = out[keep].drop(columns=["_turnover"])
     log(f"liquidity gate >= Rs {min_turnover_cr}cr/day: {before:,} -> {len(out):,} "
         f"signals ({n_nocap:,} had no turnover figure and were dropped)")
     return out

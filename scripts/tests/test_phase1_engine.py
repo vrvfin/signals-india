@@ -355,6 +355,20 @@ def test_aggregation() -> None:
     check("illiquid names dropped", "ILLIQ" not in set(out["symbol"]))
     check("unknown turnover dropped, not silently passed",
           "NOCAP" not in set(out["symbol"]))
+    # strategy_ipo_base emits avg_turnover_20d_cr itself. Merging the gate's copy
+    # under the same name collided into _x/_y and raised KeyError on the very
+    # next line — a crash only visible once the new IPO strategy met the new
+    # aggregator, which is to say only in a real integration run.
+    own = pd.DataFrame([{**{"strategy": "ipo_base", "zone_type": "buy",
+                            "score": 50.0, "entry": 100.0, "stop": 90.0,
+                            "reason": "r"},
+                         "symbol": s_, "avg_turnover_20d_cr": v}
+                        for s_, v in (("LIQ", 5.0), ("ILLIQ", 0.2))])
+    g = ag.apply_liquidity_gate(own, feat, 1.0)
+    check("a strategy carrying the turnover column does not collide",
+          set(g["symbol"]) == {"LIQ"} and "avg_turnover_20d_cr" in g.columns)
+    check("no merge suffixes leak into the frame",
+          not any(c.endswith(("_x", "_y")) for c in g.columns))
 
     mr = [sig("X", f"ma_respect_{v}")
           for v in ("20ema_30d", "20ema_60d", "50ema_60d")]
