@@ -293,7 +293,7 @@ def main() -> int:
             "build_listing_dates.py --classify.")
 
     if "on_date_cliff" in ld.columns:
-        cliff = ld["on_date_cliff"].fillna(False).astype(bool)
+        cliff = ld["on_date_cliff"].astype("boolean").fillna(False).astype(bool)
         if int(cliff.sum()):
             log(f"date-cliff gate: dropping {int(cliff.sum()):,} names whose "
                 f"listing date is shared by implausibly many others")

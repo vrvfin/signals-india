@@ -964,7 +964,7 @@ def main() -> None:
     ld = pd.to_datetime(out["listing_date"], errors="coerce")
     cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=365)
     recent = out[ld >= cut]
-    n_cliff = (int(out["on_date_cliff"].fillna(False).astype(bool).sum())
+    n_cliff = (int(out["on_date_cliff"].astype("boolean").fillna(False).sum())
                if "on_date_cliff" in out.columns else 0)
     log(f"  TABLE: {len(out)} rows "
         f"({int(out['confidence'].eq(AUTHORITATIVE).sum())} authoritative, "
