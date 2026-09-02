@@ -82,12 +82,25 @@ BREAKOUT_VOL_MULT = 1.4  # "expanded volume" — 40% above average
 # signal. Requiring the close within this % of the base high means "coiling
 # under resistance", which is the setup people actually mean.
 BUY_MAX_BELOW_HIGH_PCT = 15.0
+# listing_type, set by build_listing_dates.py --classify, is PROOF-based and is
+# the real gate — listing_date alone is not enough.
+#   migration  the stock has price bars from BEFORE its listing date. You cannot
+#              trade a share that has not listed, so prior trading proves the
+#              date marks a re-listing (typically SME -> main board), not a
+#              debut. 165 of 577 names dated inside a year are this.
+#   etf        a fund, not a company. 12 of 577.
+#   ipo        a SEBI public-issue prospectus is on file. 66 of 577.
+#   unclassified  not provable either way. Demergers land here and, per
+#              build_listing_dates, cannot be separated from genuine IPOs with
+#              anything we hold — so they are INCLUDED but tagged, not guessed at.
+EXCLUDE_LISTING_TYPES = {"migration", "etf"}
 MIN_TURNOVER_CR = 1.0    # tradeable; the engine has no liquidity floor otherwise
 MIN_PRICE = 10.0
 
 STRATEGY = "ipo_base"
 OUT_COLS = ["symbol", "date", "strategy", "zone_type", "score", "entry", "stop",
-            "days_since_listing", "base_days", "base_high", "base_low",
+            "days_since_listing", "listing_type", "base_days", "base_high",
+            "base_low",
             "base_depth_pct", "days_since_trough", "pct_below_pivot",
             "listing_day_low", "vol_today_ratio",
             "avg_turnover_20d_cr", "reason"]
@@ -197,6 +210,7 @@ def ipo_signal(symbol: str, ohlcv: pd.DataFrame, feat: pd.Series,
         # on, not used as the stop.
         "stop": round(lo, 2),
         "days_since_listing": int(days_since_listing),
+        "listing_type": feat.get("listing_type", ""),
         "base_days": base["base_days"],
         "base_high": round(hi, 2), "base_low": round(lo, 2),
         "base_depth_pct": round(base["base_depth_pct"], 1),
@@ -255,14 +269,45 @@ def main() -> int:
     ld = ld.dropna(subset=["listing_date"]).drop_duplicates(sym_col)
     log(f"listing dates: {len(ld):,} names carry one")
 
+    # A recent listing_date is NOT proof of a recent listing. 103 names share
+    # 2026-04-20 in NSE's own EQUITY_L.csv, and 165 of the 577 dated inside a
+    # year are provably re-listings. Filtering on the date alone put roughly a
+    # third of this strategy's universe outside its own premise.
+    if "listing_type" in ld.columns:
+        lt = ld["listing_type"].fillna("").str.lower()
+        n_before = len(ld)
+        dropped = ld[lt.isin(EXCLUDE_LISTING_TYPES)]
+        ld = ld[~lt.isin(EXCLUDE_LISTING_TYPES)]
+        if len(dropped):
+            log(f"listing_type gate: {n_before:,} -> {len(ld):,} "
+                f"({len(dropped):,} dropped: "
+                f"{dropped['listing_type'].value_counts().to_dict()})")
+        n_blank = int((ld["listing_type"].fillna("") == "").sum())
+        if n_blank:
+            log(f"  WARNING: {n_blank:,} rows have no listing_type — run "
+                f"build_listing_dates.py --classify. Until then a re-listing "
+                f"can still reach this strategy.")
+    else:
+        log("  WARNING: listing_dates has no listing_type column — every "
+            "re-listing and ETF will be treated as a new listing. Run "
+            "build_listing_dates.py --classify.")
+
+    if "on_date_cliff" in ld.columns:
+        cliff = ld["on_date_cliff"].fillna(False).astype(bool)
+        if int(cliff.sum()):
+            log(f"date-cliff gate: dropping {int(cliff.sum()):,} names whose "
+                f"listing date is shared by implausibly many others")
+            ld = ld[~cliff]
+
     asof = pd.to_datetime(feats["date"], errors="coerce").max()
     ld["days_since_listing"] = (asof - ld["listing_date"]).dt.days
     recent = ld[(ld["days_since_listing"] >= MIN_AGE_DAYS)
                 & (ld["days_since_listing"] <= MAX_AGE_DAYS)]
     log(f"listed {MIN_AGE_DAYS}-{MAX_AGE_DAYS}d ago: {len(recent):,}")
 
-    cand = feats.merge(recent[[sym_col, "days_since_listing"]],
-                       left_on="symbol", right_on=sym_col, how="inner")
+    keep = [sym_col, "days_since_listing"] +         [c for c in ("listing_type",) if c in recent.columns]
+    cand = feats.merge(recent[keep], left_on="symbol", right_on=sym_col,
+                       how="inner")
     cand = cand[(cand["close"] >= MIN_PRICE)
                 & (pd.to_numeric(cand.get("avg_turnover_20d_cr"),
                                  errors="coerce") >= MIN_TURNOVER_CR)]
