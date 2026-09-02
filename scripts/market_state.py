@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,15 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+# The summary prints a delta sign and a rupee sign; a Windows console is cp1252,
+# so the run died AFTER completing all its work — and only while printing, which
+# no unit test exercises. Degrade the characters instead of the run.
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:          # pragma: no cover - not all streams support it
+    pass
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -154,6 +164,37 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
         return existing_id
     meta = {"name": filename, "parents": [folder_id]}
     return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
+
+
+# ── --dry-run guard ──────────────────────────────────────────────────────────
+# market_state writes the snapshot, the history and the sector table. The stance
+# columns are new, so house rule 6 applies: confirm a dry-run first.
+DRY_RUN = False
+_live_upload_csv = upload_csv
+_live_upload_parquet = upload_parquet
+
+
+def upload_csv(drive, folder_id, filename, df, existing_id=None):     # noqa: F811
+    if DRY_RUN:
+        log(f"[DRY RUN] would write {filename} ({len(df)} rows)")
+        return existing_id
+    return _live_upload_csv(drive, folder_id, filename, df, existing_id)
+
+
+def upload_parquet(drive, folder_id, filename, df, existing_id=None):  # noqa: F811
+    if DRY_RUN:
+        log(f"[DRY RUN] would write {filename} ({len(df)} rows)")
+        return existing_id
+    return _live_upload_parquet(drive, folder_id, filename, df, existing_id)
+
+
+def _parse_dry_run() -> bool:
+    import argparse as _ap
+    p = _ap.ArgumentParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true",
+                   help="compute and report, write nothing to Drive")
+    known, _ = p.parse_known_args()
+    return known.dry_run
 
 
 # ---------- Component scorers (each returns 0-100) ----------
@@ -397,7 +438,11 @@ def stance_history(hist: pd.DataFrame, stance: str, today: str) -> int:
 
 
 def main():
+    global DRY_RUN
+    DRY_RUN = _parse_dry_run()
     print("Stage 7 — Market State + Health Score")
+    if DRY_RUN:
+        log("DRY RUN — no Drive writes will be made")
     print("-" * 50)
 
     drive = get_drive()

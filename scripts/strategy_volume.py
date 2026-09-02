@@ -33,6 +33,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -125,6 +126,32 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
     return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
 
 
+# ── --dry-run guard ──────────────────────────────────────────────────────────
+# This script writes signal files straight to Drive. Its scoring logic changed,
+# and house rule 6 says a dry-run must be confirmed before any live run — so the
+# upload is wrapped rather than the call sites edited. Set by _parse_dry_run().
+DRY_RUN = False
+_live_upload_csv = upload_csv
+
+
+def upload_csv(drive, folder_id, filename, df, existing_id=None):   # noqa: F811
+    if DRY_RUN:
+        log(f"[DRY RUN] would write {filename} ({len(df)} rows)")
+        return existing_id
+    return _live_upload_csv(drive, folder_id, filename, df, existing_id)
+
+
+def _parse_dry_run() -> bool:
+    """--dry-run only; kept deliberately separate from any argparse the script
+    already has, so adding it cannot disturb existing flags."""
+    import argparse as _ap
+    p = _ap.ArgumentParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true",
+                   help="compute and report, write nothing to Drive")
+    known, _ = p.parse_known_args()
+    return known.dry_run
+
+
 # ---------- Shared helpers ----------
 
 REQUIRED_COLS = ["symbol", "date", "close", "atr_14", "vol_today_ratio",
@@ -193,7 +220,13 @@ def volume_breakout_signals(features: pd.DataFrame) -> pd.DataFrame:
     # TECH_ATR (ATR expansion) is +22.1pp. Volume alone cannot tell accumulation
     # from a news dump; range expanding with it is the confirming tell. Volume
     # stays the GATE (>= BREAKOUT_VOL_MULT); this only changes the ordering.
-    _atr_exp = pd.to_numeric(df.get("atr_expansion_ratio"), errors="coerce")
+    # df.get() returns None when the column is absent, and pd.to_numeric(None)
+    # yields a SCALAR nan — which has no .notna(). Build an explicit Series so the
+    # "features have not shipped atr_expansion_ratio yet" path stays a fallback
+    # rather than an AttributeError.
+    _atr_exp = (pd.to_numeric(df["atr_expansion_ratio"], errors="coerce")
+                if "atr_expansion_ratio" in df.columns
+                else pd.Series(np.nan, index=df.index, dtype="float64"))
     _vol = (df["vol_today_ratio"] / BREAKOUT_VOL_MULT * 60).clip(upper=100)
     if _atr_exp.notna().any():
         # 1.0 = no expansion, 2.0x = full marks.
@@ -211,7 +244,12 @@ def volume_breakout_signals(features: pd.DataFrame) -> pd.DataFrame:
                   f"{r['dist_from_52w_high_pct']:.1f}% from 52w high, "
                   f"ADR {r['adr_pct_20']:.1f}%",
         axis=1)
-    return df[OUT_COLS].sort_values("score", ascending=False).reset_index(drop=True)
+    # Select only what exists. atr_expansion_ratio arrives with the new
+    # compute_features; until that ships, asking for it raises KeyError and
+    # takes the strategy down rather than degrading to the volume-only score
+    # the fallback above was written to provide.
+    return (df[[c for c in OUT_COLS if c in df.columns]]
+            .sort_values("score", ascending=False).reset_index(drop=True))
 
 
 # ---------- Strategy 2: volume_vcp ----------
@@ -253,7 +291,12 @@ def volume_vcp_signals(features: pd.DataFrame) -> pd.DataFrame:
                   f"{r['dist_from_52w_high_pct']:.1f}% from 52w high — "
                   f"buy on the breakout",
         axis=1)
-    return df[OUT_COLS].sort_values("score", ascending=False).reset_index(drop=True)
+    # Select only what exists. atr_expansion_ratio arrives with the new
+    # compute_features; until that ships, asking for it raises KeyError and
+    # takes the strategy down rather than degrading to the volume-only score
+    # the fallback above was written to provide.
+    return (df[[c for c in OUT_COLS if c in df.columns]]
+            .sort_values("score", ascending=False).reset_index(drop=True))
 
 
 # Each entry: (per_strategy folder name, signal function)
@@ -271,6 +314,10 @@ _EMPTY_SIG_COLS = ["symbol", "date", "strategy", "zone_type", "score",
 # ---------- Main ----------
 
 def main() -> None:
+    global DRY_RUN
+    DRY_RUN = _parse_dry_run()
+    if DRY_RUN:
+        log("DRY RUN — no Drive writes will be made")
     print("Stage 12 — Volume signals")
     print("-" * 50)
 

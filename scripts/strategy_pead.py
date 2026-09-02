@@ -151,6 +151,32 @@ def upload_csv(drive, folder_id, filename, df, existing_id=None):
     return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
 
 
+# ── --dry-run guard ──────────────────────────────────────────────────────────
+# This script writes signal files straight to Drive. Its scoring logic changed,
+# and house rule 6 says a dry-run must be confirmed before any live run — so the
+# upload is wrapped rather than the call sites edited. Set by _parse_dry_run().
+DRY_RUN = False
+_live_upload_csv = upload_csv
+
+
+def upload_csv(drive, folder_id, filename, df, existing_id=None):   # noqa: F811
+    if DRY_RUN:
+        log(f"[DRY RUN] would write {filename} ({len(df)} rows)")
+        return existing_id
+    return _live_upload_csv(drive, folder_id, filename, df, existing_id)
+
+
+def _parse_dry_run() -> bool:
+    """--dry-run only; kept deliberately separate from any argparse the script
+    already has, so adding it cannot disturb existing flags."""
+    import argparse as _ap
+    p = _ap.ArgumentParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true",
+                   help="compute and report, write nothing to Drive")
+    known, _ = p.parse_known_args()
+    return known.dry_run
+
+
 _MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
            "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
 
@@ -257,6 +283,10 @@ def detect_pead(symbol, ohlcv, qtr_end_dt, today_dt):
 
 
 def main():
+    global DRY_RUN
+    DRY_RUN = _parse_dry_run()
+    if DRY_RUN:
+        log("DRY RUN — no Drive writes will be made")
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=8,
                     help="Parallel OHLCV-download workers (default 8). Reads are "

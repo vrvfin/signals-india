@@ -433,6 +433,16 @@ def compute_unified(signals: pd.DataFrame,
             )[:1000],
         })
     out = pd.DataFrame(rows)
+    if out.empty:
+        # No signals at all is a legitimate state (a holiday, or every strategy
+        # filtered to nothing). Return the SHAPE callers expect rather than an
+        # empty frame that blows up on the first column access.
+        return pd.DataFrame(columns=[
+            "symbol", "zone_type", "n_strategies", "n_families", "families",
+            "strategies", "n_event_families", "event_families",
+            "momentum_profile", "momentum_variants", "conviction_v2",
+            "composite_score", "max_score", "composite_score_raw",
+            "entry_median", "stop_median", "reasons"])
     # Rank on independent ideas, then on the breadth-rewarding score. The old
     # keys (n_strategies, composite_score) are retained as columns so nothing
     # downstream breaks.

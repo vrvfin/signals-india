@@ -233,7 +233,15 @@ def update_from_features(table: pd.DataFrame, feat: pd.DataFrame) -> tuple[pd.Da
     if table is None or table.empty or feat is None or feat.empty:
         return table, 0
     t = table.copy()
+    if "symbol" not in t.columns:
+        return table, 0
     t["symbol"] = t["symbol"].astype(str)
+    if "symbol" not in feat.columns or "high" not in feat.columns:
+        # compute_features failed, or its schema moved. Leaving the stored highs
+        # untouched is right: a high can only ever be raised, so skipping a day
+        # loses nothing, whereas guessing would corrupt the table permanently.
+        log("update skipped — features lack symbol/high; highs left as they are")
+        return table, 0
     f = feat[["symbol", "high"]].dropna(subset=["symbol"]).drop_duplicates("symbol")
     f["symbol"] = f["symbol"].astype(str)
     m = t.merge(f.rename(columns={"high": "_today_high"}), on="symbol", how="left")

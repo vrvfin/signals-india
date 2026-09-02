@@ -134,6 +134,10 @@ def find_ipo_base(ohlcv: pd.DataFrame) -> dict | None:
 
     high = prior["high"].astype(float)
     low = prior["low"].astype(float)
+    if high.isna().all() or low.isna().all():
+        # A dead feed gives an all-NaN column; idxmax on all-NA is deprecated and
+        # will raise in a future pandas. No prices means no base, not a crash.
+        return None
 
     # The peak: the highest point since listing. Everything after it is the base.
     peak_i = int(high.idxmax())
