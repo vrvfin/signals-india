@@ -286,6 +286,74 @@ def test_pead_anchor() -> None:
               f"old code anchored the +6% rebound and would have bought")
 
 
+def test_aggregation() -> None:
+    section("aggregation: independent ideas, not repeated ones")
+    ag = _load("ag", os.path.join(SCRIPTS, "aggregate_signals.py"))
+
+    def sig(sym, strat, score=50.0, zone="buy", variant=None):
+        return {"symbol": sym, "strategy": strat, "zone_type": zone,
+                "score": score, "entry": 100.0, "stop": 90.0, "reason": "r",
+                "variant": variant}
+
+    rows = [sig("MOMO", f"momentum_{lb}", 95, variant=lb)
+            for lb in ("1m", "2m", "3m", "6m", "12m")]
+    rows += [sig("DIVERSE", s, 95, "add")
+             for s in ("darvas", "pead", "volume_breakout")]
+    u = ag.compute_unified(pd.DataFrame(rows))
+    m = u[u["symbol"] == "MOMO"].iloc[0]
+    d = u[u["symbol"] == "DIVERSE"].iloc[0]
+    check("momentum's 5 lookbacks are 1 family", m["n_families"] == 1,
+          f"n_strategies={m['n_strategies']} -> n_families=1")
+    check("which lookbacks fired is still recorded",
+          m["momentum_profile"] == "persistent")
+    check("a state-only name marks no event", m["n_event_families"] == 0)
+    check("3 different ideas count as 3", d["n_families"] == 3)
+    check("the diverse name now sorts first", list(u["symbol"])[0] == "DIVERSE",
+          "old rule sorted MOMO first on n_strategies=5")
+
+    for variants, want in [({"1m"}, "fresh"), ({"12m"}, "stale"),
+                           ({"3m", "6m", "12m"}, "broad"),
+                           ({"1m", "2m", "3m", "6m", "12m"}, "persistent")]:
+        check(f"momentum profile {sorted(variants)} -> {want}",
+              ag.momentum_profile(variants) == want)
+
+    # Breadth must not lower the score. Filler signals give each strategy a real
+    # percentile spread, without which every score_norm is 100 and the old
+    # mean's defect is invisible.
+    rows = [sig(f"F{s}{i}", s, float(i))
+            for s in ("darvas", "pead", "minervini", "pullback")
+            for i in range(20)]
+    rows += [sig("SOLO", "darvas", 100.0)]
+    rows += [sig("BROAD", s, 99.0)
+             for s in ("darvas", "pead", "minervini", "pullback")]
+    u = ag.compute_unified(pd.DataFrame(rows))
+    solo = u[u["symbol"] == "SOLO"].iloc[0]
+    broad = u[u["symbol"] == "BROAD"].iloc[0]
+    check("the OLD mean penalised breadth",
+          broad["composite_score"] < solo["composite_score"],
+          f"{broad['composite_score']:.1f} < {solo['composite_score']:.1f}")
+    check("conviction_v2 rewards it",
+          broad["conviction_v2"] > solo["conviction_v2"],
+          f"{broad['conviction_v2']:.1f} > {solo['conviction_v2']:.1f}")
+
+    sg = pd.DataFrame([sig("LIQ", "darvas"), sig("ILLIQ", "darvas"),
+                       sig("NOCAP", "darvas")])
+    feat = pd.DataFrame({"symbol": ["LIQ", "ILLIQ"],
+                         "avg_turnover_20d_cr": [5.0, 0.2]})
+    out = ag.apply_liquidity_gate(sg, feat, 1.0)
+    check("illiquid names dropped", "ILLIQ" not in set(out["symbol"]))
+    check("unknown turnover dropped, not silently passed",
+          "NOCAP" not in set(out["symbol"]))
+
+    mr = [sig("X", f"ma_respect_{v}")
+          for v in ("20ema_30d", "20ema_60d", "50ema_60d")]
+    check("ma_respect collapse OFF by default (not signed off)",
+          ag.compute_unified(pd.DataFrame(mr)).iloc[0]["n_families"] == 3)
+    check("--collapse-ma-respect makes it one vote",
+          ag.compute_unified(pd.DataFrame(mr),
+                             collapse_ma_respect=True).iloc[0]["n_families"] == 1)
+
+
 def main() -> int:
     cf = _load("cf", os.path.join(SCRIPTS, "compute_features.py"))
     psc = _load("psc", os.path.join(SCRIPTS, "pipeline_skip_check.py"))
@@ -302,6 +370,7 @@ def main() -> int:
     test_strategy_scoring()
     test_momentum_index_relative()
     test_pead_anchor()
+    test_aggregation()
     print()
     if _FAILS:
         print(f"{len(_FAILS)} FAILED:")
