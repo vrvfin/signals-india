@@ -497,6 +497,41 @@ def test_ranking_terms() -> None:
           len(ag.terms_report(out.reset_index(), n=2)) >= 4)
 
 
+def test_tracker_replay() -> None:
+    section("tracker replay: rebuild history from the dated snapshots")
+    st = _load("st2", os.path.join(SCRIPTS, "signal_tracker.py"))
+    ag = _load("ag3", os.path.join(SCRIPTS, "aggregate_signals.py"))
+
+    def snap(rows):
+        return pd.DataFrame(rows, columns=["symbol", "zone_type", "strategies",
+                                           "entry_median", "stop_median",
+                                           "composite_score"])
+
+    snaps = [
+        ("2026-06-01", snap([
+            ["AAA", "buy", "momentum_1m, momentum_3m, momentum_6m", 100.0, 90.0, 80.0],
+            ["BBB", "hold", "darvas", 50.0, 45.0, 70.0]])),
+        ("2026-06-02", snap([
+            ["AAA", "buy", "momentum_1m, darvas", 110.0, 99.0, 85.0],
+            ["CCC", "add", "pead", 200.0, 190.0, 90.0]])),
+    ]
+    out = st.replay_open_signals(snaps, ag.family_of)
+    momo = out[(out["symbol"] == "AAA") & (out["family"] == "momentum")]
+    check("momentum's lookbacks collapse to one family in history too",
+          len(momo) == 1, "otherwise replayed history would disagree with today")
+    check("first sighting is the call — entry frozen at 100, not 110",
+          float(momo["entry_at_signal"].iloc[0]) == 100.0)
+    check("a second family on the same name dates from ITS first appearance",
+          out[(out["symbol"] == "AAA") &
+              (out["family"] == "darvas")]["first_date"].iloc[0] == "2026-06-02")
+    check("'hold' zones are not replayed as calls", "BBB" not in set(out["symbol"]))
+    check("new names on later days are captured", "CCC" in set(out["symbol"]))
+    check("rows with no entry/stop are skipped, not defaulted",
+          len(st.replay_open_signals(
+              [("2026-06-01", snap([["X", "buy", "darvas", None, None, 1.0]]))],
+              ag.family_of)) == 0)
+
+
 def main() -> int:
     cf = _load("cf", os.path.join(SCRIPTS, "compute_features.py"))
     psc = _load("psc", os.path.join(SCRIPTS, "pipeline_skip_check.py"))
@@ -517,6 +552,7 @@ def main() -> int:
     test_market_stance()
     test_signal_tracker()
     test_ranking_terms()
+    test_tracker_replay()
     print()
     if _FAILS:
         print(f"{len(_FAILS)} FAILED:")

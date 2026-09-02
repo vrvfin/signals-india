@@ -43,12 +43,12 @@ Usage:
     python scripts/signal_tracker.py --dry-run      # compute + report, no writes
     python scripts/signal_tracker.py                # update the ledger
 
-NOT YET BUILT: seeding from the ~70 dated snapshots in signals/aggregated/.
-Those snapshots predate open_signals.csv and so carry no frozen entry/stop; a
-replay would have to reconstruct both from the price history on each snapshot
-date. Until that exists the ledger starts empty and fills as calls close, so the
-reliability section stays silent (it refuses to report below n=20) rather than
-publishing a number drawn from a handful of trades.
+--replay seeds the ledger from the dated snapshots already in
+signals/aggregated/ (79 of them, back to 2026-05-19). Those snapshots predate
+open_signals.csv but they DO carry entry_median and stop_median, so the entry and
+stop as of each call are recoverable without reconstructing anything. Without
+this the ledger starts empty and the reliability section stays silent for weeks,
+since it refuses to report below n=20.
 """
 from __future__ import annotations
 
@@ -245,6 +245,56 @@ def _write_csv(drive, folder_id, name, df):
                  df.to_csv(index=False).encode(), "text/csv")
 
 
+def replay_open_signals(snapshots: list[tuple[str, pd.DataFrame]],
+                        family_of) -> pd.DataFrame:
+    """Rebuild the entry/stop memory from the historical daily snapshots.
+
+    Each dated snapshot is one row per (symbol, zone_type) and carries
+    entry_median / stop_median — the prices as of THAT day. Walking them oldest
+    first and keeping the first sighting of each (symbol, family) reproduces
+    exactly what open_signals.csv would have recorded had it existed.
+
+    Families are derived from the snapshot's `strategies` column, so momentum's
+    five lookbacks collapse to one the same way they do today; otherwise the
+    replayed history would count them five times and disagree with everything
+    recorded from here on.
+
+    Only buy/add zones are replayed. `hold` is a running commentary on a position
+    you would already be in, not a call to open one.
+    """
+    seen: dict[tuple, dict] = {}
+    for date, snap in sorted(snapshots, key=lambda x: x[0]):
+        if snap is None or snap.empty or "symbol" not in snap.columns:
+            continue
+        if "zone_type" in snap.columns:
+            snap = snap[snap["zone_type"].isin(["buy", "add"])]
+        for _, r in snap.iterrows():
+            entry, stop = r.get("entry_median"), r.get("stop_median")
+            if pd.isna(entry) or pd.isna(stop):
+                continue
+            strategies = str(r.get("strategies", "") or "")
+            fams = {family_of(x.strip()) for x in strategies.split(",") if x.strip()}
+            for fam in (fams or {"unknown"}):
+                key = (str(r["symbol"]), fam)
+                if key in seen:
+                    continue          # first sighting is the call; later ones
+                    # are the same position still being reported
+                seen[key] = {
+                    "symbol": str(r["symbol"]), "family": fam,
+                    "first_date": date,
+                    "entry_at_signal": float(entry),
+                    "stop_at_signal": float(stop),
+                    "zone_at_signal": r.get("zone_type"),
+                    # the old snapshots predate conviction_v2; n_strategies is
+                    # what was actually recorded, and is kept as-is rather than
+                    # back-filling a number that did not exist at the time
+                    "conviction_at_signal": r.get("composite_score"),
+                    "n_families_at_signal": len(fams),
+                    "n_events_at_signal": np.nan,
+                }
+    return pd.DataFrame(list(seen.values()))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -255,6 +305,9 @@ def main() -> int:
     ap.add_argument("--max-hold-days", type=int, default=MAX_HOLD_DAYS)
     ap.add_argument("--limit", type=int, default=0,
                     help="cap symbols processed (testing)")
+    ap.add_argument("--replay", action="store_true",
+                    help="seed the ledger from the historical dated snapshots "
+                         "in signals/aggregated/ instead of open_signals.csv")
     args = ap.parse_args()
 
     print("Signal tracker — did the calls work?")
@@ -262,7 +315,39 @@ def main() -> int:
     drive = _drive()
     agg_id = _folder(drive, "signals", "aggregated")
 
-    opens = _read_csv(drive, agg_id, "open_signals.csv")
+    if args.replay:
+        import re as _re
+        from _extractor_base import find_file as _ff
+        DATE_RE = _re.compile(r"^(\d{4}-\d{2}-\d{2})\.csv$")
+        listed, tok = [], None
+        while True:
+            rr = drive.files().list(
+                q=f"'{agg_id}' in parents and trashed=false",
+                fields="nextPageToken, files(id,name)",
+                pageSize=1000, pageToken=tok).execute()
+            listed += rr.get("files", [])
+            tok = rr.get("nextPageToken")
+            if not tok:
+                break
+        dated = [(DATE_RE.match(f["name"]).group(1), f["id"])
+                 for f in listed if DATE_RE.match(f["name"])]
+        log(f"replay: {len(dated)} dated snapshots found")
+        from _extractor_base import download_bytes as _db
+        snaps = []
+        for dt, fid in sorted(dated):
+            try:
+                snaps.append((dt, pd.read_csv(io.BytesIO(_db(drive, fid)))))
+            except Exception as e:
+                log(f"  {dt}: unreadable ({str(e)[:50]})")
+        sys.path.insert(0, _SCRIPTS_DIR)
+        from aggregate_signals import family_of
+        opens = replay_open_signals(snaps, family_of)
+        log(f"replay: reconstructed {len(opens):,} first-sightings across "
+            f"{opens['symbol'].nunique():,} symbols"
+            + (f", {opens['first_date'].min()} .. {opens['first_date'].max()}"
+               if len(opens) else ""))
+    else:
+        opens = _read_csv(drive, agg_id, "open_signals.csv")
     if opens is None or opens.empty:
         print("signals/aggregated/open_signals.csv not found or empty.")
         print("Run aggregate_signals.py at least once first — it writes the "
