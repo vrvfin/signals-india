@@ -106,6 +106,16 @@ OUT_COLS = ["symbol", "date", "strategy", "zone_type", "score", "entry", "stop",
             "avg_turnover_20d_cr", "reason"]
 
 
+# Console encoding. Several scripts here log the rupee sign, a delta or an em
+# dash, and a Windows console is cp1252 — so a run could complete all its work
+# and then die in a log line. It cost three separate crashes before being fixed
+# in one place. Degrade the characters, never the run.
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:          # pragma: no cover - not every stream supports it
+    pass
+
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 

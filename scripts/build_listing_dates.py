@@ -70,7 +70,15 @@ LEDGER = "listing_seen_ledger.parquet"      # every security ever observed
 INDEX_PATH = "company_repo/_index"
 LOCK_NAME = "_listing_dates.lock"
 
-LEDGER_COLS = ["isin", "symbol", "name_norm", "name", "exchange", "scrip_code",
+LEDGER_# Console encoding: this file logs the rupee sign and an em dash, and a Windows
+# console is cp1252. Degrade the characters, never the run.
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:          # pragma: no cover
+    pass
+
+COLS = ["isin", "symbol", "name_norm", "name", "exchange", "scrip_code",
                "first_seen", "last_seen"]
 
 # BSE's active-equity master. A security absent yesterday and present today has
