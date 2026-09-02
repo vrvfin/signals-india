@@ -53,6 +53,9 @@ on:
       limit:
         description: "Max mails this run (0 = no cap)"
         default: "0"
+      symbols:
+        description: "Restrict to these NSE symbols, comma separated (blank = whole PF)"
+        default: ""
 
 concurrency:
   group: pf-daily-mails
@@ -183,6 +186,7 @@ jobs:
           python scripts/pf_company_mails.py
           --types "${{ inputs.types || 'presentation,rating,concall,annual_report' }}"
           --scope "${{ inputs.scope || 'current' }}"
+          --symbols "${{ inputs.symbols }}"
           --limit "${{ inputs.limit || '0' }}"
           ${{ inputs.dry_run == true && '--dry-run' || '' }}
         continue-on-error: true

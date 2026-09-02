@@ -1414,6 +1414,10 @@ def main() -> None:
     ap.add_argument("--types", default="results,presentation,rating",
                     help="Which mails to consider.")
     ap.add_argument("--limit", type=int, default=0, help="Max mails this run.")
+    ap.add_argument("--symbols", default="",
+                    help="Restrict to these NSE symbols (comma separated). --limit caps "
+                         "a count but cannot choose WHICH holding, so this is what lets "
+                         "one real mail be sent and read before the whole book goes out.")
     ap.add_argument("--window-days", type=int, default=2,
                     help="How far back a calendar date still counts (backwards only).")
     ap.add_argument("--require-calendar", action="store_true",
@@ -1595,6 +1599,14 @@ def main() -> None:
     if "_narr" in _pre:
         tables["_narr"] = _pre["_narr"]
 
+    if args.symbols:
+        want_sym = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        before = len(due)
+        due = [d for d in due if str(d.get("symbol", "")).upper() in want_sym]
+        log(f"--symbols {sorted(want_sym)}: {len(due)} of {before} due")
+        if not due:
+            log("nothing due for those symbols — no mail.")
+            return
     if args.limit:
         due = due[: args.limit]
 
@@ -2059,6 +2071,16 @@ def _self_test() -> int:
           == k_has)
     check("scoped types are exactly concall and AR",
           set(SCOPED_TYPES) == {"concall", "annual_report"})
+
+    # --symbols must select the HOLDING, where --limit can only cap a count
+    _due = [{"symbol": "APLAPOLLO", "doc_type": "concall"},
+            {"symbol": "APLAPOLLO", "doc_type": "annual_report"},
+            {"symbol": "SYRMA", "doc_type": "concall"}]
+    _want = {s.strip().upper() for s in "aplapollo".split(",") if s.strip()}
+    _sel = [d for d in _due if str(d.get("symbol", "")).upper() in _want]
+    check("--symbols keeps both docs of the chosen holding", len(_sel) == 2)
+    check("--symbols excludes every other holding",
+          all(d["symbol"] == "APLAPOLLO" for d in _sel))
 
     # ---- concall: the SEASON QUARTER, same rule the deck mail uses ---------
     check("a call filed Aug 2026 is Q1 FY27",
