@@ -48,38 +48,98 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, log, load_portfolio_isins,
                              find_latest_portfolio_file, isin_symbol_map)
+from drive_io import drive_call, ParquetCache
 import gradation as G
+
+# Tolerance for "how far behind the market may a series be". Mirrors
+# OHLCV_MAX_STALE_DAYS in pipeline_healthcheck.py:52 — 4 calendar days is too
+# tight for India's long holiday weekends. Kept as a local constant rather than
+# an import so this renderer pulls in no pipeline/Drive side effects.
+OHLCV_MAX_STALE_DAYS = 6
 
 _EMPTY = pd.DataFrame()
 
 
 # ─────────────────────────── Drive loaders (plain) ──────────────────────────
+# Every Drive entry point here goes through drive_io.drive_call. On 2026-08-25 a
+# momentary DNS failure (getaddrinfo -> ServerNotFoundError) killed a build one
+# statement AFTER 45 minutes of downloads had finished, and gallery.html silently
+# stayed a day stale. A transient blip now costs a short pause, not the run.
+_DRIVE = None
+_FOLDER_IDS: dict = {}          # path -> folder id, resolved once per process
+
+
+def _drive(existing=None):
+    """The Drive service these helpers actually call.
+
+    `existing` lets an outside caller's service be adopted on first use —
+    pf_results_digest.py and pf_season_status.py import _folder/_bulk_parquet and
+    pass their own — so behaviour for them is unchanged while reconnects still
+    work through the same global.
+    """
+    global _DRIVE
+    if _DRIVE is None:
+        _DRIVE = existing if existing is not None else get_drive()
+    return _DRIVE
+
+
+def _reconnect():
+    """Drop a poisoned httplib2 connection and build a fresh Drive service."""
+    global _DRIVE
+    _DRIVE = get_drive()
+
+
+def _dc(fn, label=""):
+    return drive_call(fn, on_reconnect=_reconnect, label=label)
+
+
 def _folder(drive, parts):
+    """Resolve 'a/b/c' to a folder id. Memoised: main() asks for the same handful
+    of paths up to 11 times and every hop was a live round-trip — so ~25 needless
+    calls, each one its own crash site."""
+    if parts in _FOLDER_IDS:
+        return _FOLDER_IDS[parts]
     fid = os.environ["GDRIVE_FOLDER_ID"]
     for p in parts.split("/"):
-        fid = get_or_create_subfolder(drive, fid, p)
+        fid = _dc(lambda p=p, fid=fid: get_or_create_subfolder(_drive(drive), fid, p),
+                  label=parts)
+    _FOLDER_IDS[parts] = fid
     return fid
 
 
 def _read_parquet(drive, folder, name):
-    fid = find_file(drive, folder, name)
-    return pd.read_parquet(io.BytesIO(download_bytes(drive, fid))) if fid else _EMPTY
+    fid = _dc(lambda: find_file(_drive(drive), folder, name), label=name)
+    if not fid:
+        return _EMPTY
+    raw = _dc(lambda: download_bytes(_drive(drive), fid), label=name)
+    return pd.read_parquet(io.BytesIO(raw))
 
 
 def _read_csv(drive, folder, name):
-    fid = find_file(drive, folder, name)
-    return pd.read_csv(io.BytesIO(download_bytes(drive, fid))) if fid else _EMPTY
+    fid = _dc(lambda: find_file(_drive(drive), folder, name), label=name)
+    if not fid:
+        return _EMPTY
+    raw = _dc(lambda: download_bytes(_drive(drive), fid), label=name)
+    return pd.read_csv(io.BytesIO(raw))
 
 
 def _list_folder(drive, folder_id):
+    """-> {name: {"id", "mtime", "size"}}.
+
+    modifiedTime/size ride along in the SAME request (no extra round-trip) and
+    are what the parquet cache keys on, so a cached copy can never outlive the
+    file it came from. NOTE the value is a dict, not a bare id — the callers in
+    this file (_bulk_parquet, _load_signals) read ["id"].
+    """
     out, tok = {}, None
     while True:
-        resp = drive.files().list(
+        resp = _dc(lambda tok=tok: _drive(drive).files().list(
             q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id,name)", pageSize=1000,
-            pageToken=tok).execute()
+            fields="nextPageToken, files(id,name,modifiedTime,size)",
+            pageSize=1000, pageToken=tok).execute(), label="list")
         for f in resp.get("files", []):
-            out[f["name"]] = f["id"]
+            out[f["name"]] = {"id": f["id"], "mtime": f.get("modifiedTime", ""),
+                              "size": f.get("size")}
         tok = resp.get("nextPageToken")
         if not tok:
             break
@@ -88,16 +148,19 @@ def _list_folder(drive, folder_id):
 
 def _load_signals(drive):
     sig_id = _folder(drive, "signals/per_strategy")
-    subs = drive.files().list(
+    subs = _dc(lambda: _drive(drive).files().list(
         q=f"'{sig_id}' in parents and mimeType='application/vnd.google-apps.folder' "
-          "and trashed=false", fields="files(id,name)").execute().get("files", [])
+          "and trashed=false", fields="files(id,name)").execute().get("files", []),
+        label="signals")
     frames = []
     for s in subs:
         files = _list_folder(drive, s["id"])
-        fid = files.get("latest.csv")
-        if fid:
+        ent = files.get("latest.csv")
+        if ent:
             try:
-                df = pd.read_csv(io.BytesIO(download_bytes(drive, fid)))
+                raw = _dc(lambda e=ent: download_bytes(_drive(drive), e["id"]),
+                          label=s["name"])
+                df = pd.read_csv(io.BytesIO(raw))
             except pd.errors.EmptyDataError:
                 continue  # zero-signal / empty latest.csv — skip, don't crash the gallery
             df["strategy_group"] = s["name"]
@@ -110,10 +173,12 @@ def _load_pf_holdings(drive):
     pf_tracking/ + portfolio/, same source as load_portfolio_isins). Scans every
     cell for an ISIN pattern so it is format-agnostic (Screener / broker exports)."""
     import re as _re
-    tgt = find_latest_portfolio_file(drive, os.environ["GDRIVE_FOLDER_ID"])
+    tgt = _dc(lambda: find_latest_portfolio_file(_drive(drive),
+                                                 os.environ["GDRIVE_FOLDER_ID"]),
+              label="pf-holdings")
     if not tgt:
         return _EMPTY
-    raw = download_bytes(drive, tgt["id"])
+    raw = _dc(lambda: download_bytes(_drive(drive), tgt["id"]), label="pf-holdings")
     try:
         if tgt["name"].lower().endswith(".csv"):
             df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
@@ -138,20 +203,83 @@ def _load_pf_holdings(drive):
     return pd.DataFrame(rows).drop_duplicates("isin")
 
 
-def _bulk_parquet(drive, folder_id, symbols):
-    """{symbol: DataFrame} — list folder once, download only needed files."""
+def _bulk_parquet(drive, folder_id, symbols, cache=None, what="files",
+                  max_missing_pct=None, failed_out=None):
+    """-> {symbol: DataFrame}   (return contract deliberately UNCHANGED)
+
+    pf_results_digest.py and pf_season_status.py both import this, so the new
+    behaviour is strictly opt-in: they keep the plain dict, get retry and better
+    logging for free, and — with max_missing_pct=None — never gain an abort that
+    could silence a live daily mail. build_gallery passes both extras.
+
+    cache            ParquetCache, or None to always download.
+    max_missing_pct  None = never abort (legacy). A number = raise past that
+                     share of failures.
+    failed_out       optional set, populated with symbols that FAILED to download.
+
+    List the folder once, then fetch only what is needed. Two outcomes that used
+    to be indistinguishable are now separated:
+
+      absent  no file for that symbol here at all. Normal and expected — plenty
+              of names legitimately have no statements. Counted, not warned.
+      failed  the file EXISTS on Drive but could not be downloaded. THIS is the
+              real signal, and it used to be swallowed into an empty frame: a
+              network blip mid-loop produced blank charts on a build that still
+              reported success. Now it retries, names the offenders, and refuses
+              to write the page past a floor.
+    """
     all_files = _list_folder(drive, folder_id)
-    out = {}
+    out, absent, failed = {}, [], []
     for sym in symbols:
-        fid = all_files.get(f"{sym}.parquet")
-        if not fid:
+        ent = all_files.get(f"{sym}.parquet")
+        if not ent:
             out[sym] = _EMPTY
+            absent.append(sym)
+            continue
+        df = cache.get(ent["id"], ent["mtime"]) if cache else None
+        if df is not None:
+            out[sym] = df
             continue
         try:
-            out[sym] = pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
-        except Exception:
+            raw = _dc(lambda e=ent: download_bytes(_drive(drive), e["id"]), label=sym)
+            out[sym] = pd.read_parquet(io.BytesIO(raw))
+            if cache:
+                cache.put(ent["id"], ent["mtime"], raw)
+        except Exception as e:
             out[sym] = _EMPTY
+            failed.append((sym, type(e).__name__))
+    present = len(symbols) - len(absent)
+    if failed_out is not None:
+        failed_out.update(s for s, _ in failed)
+    log(f"  {what}: {present - len(failed)}/{len(symbols)} loaded"
+        + (f", {len(absent)} not on Drive" if absent else "")
+        + (f", {len(failed)} FAILED" if failed else "")
+        + (f" [{cache.summary()}]" if cache else ""))
+    if failed:
+        shown = ", ".join(f"{s} ({e})" for s, e in failed[:25])
+        more = f" +{len(failed) - 25} more" if len(failed) > 25 else ""
+        log(f"  !! {what} download failures: {shown}{more}")
+        pct = 100.0 * len(failed) / max(present, 1)
+        if max_missing_pct is not None and pct > max_missing_pct:
+            raise RuntimeError(
+                f"{what}: {len(failed)}/{present} downloads failed ({pct:.1f}% > "
+                f"{max_missing_pct}%). Refusing to write a gallery with silently "
+                f"blank charts. Re-run (the cache makes it quick), or pass "
+                f"--max-missing-pct if this level of loss is expected.")
     return out
+
+
+def _last_bar_date(odf):
+    """Newest date in the RAW frame.
+
+    Must be read BEFORE any resampling: a 'W-FRI' bar is stamped with that week's
+    Friday — a FUTURE date midweek — and 'ME' with month-end, so a resampled
+    label would report a chart as fresher than it actually is.
+    """
+    if odf is None or getattr(odf, "empty", True) or "date" not in odf.columns:
+        return None
+    d = pd.to_datetime(odf["date"], errors="coerce").max()
+    return None if pd.isna(d) else d.date()
 
 
 # ─────────────────────────── card helpers (ported) ──────────────────────────
@@ -865,8 +993,16 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
  .row{margin:2px 0}
  .chart{height:440px;margin-top:6px}
  table{border-collapse:collapse;width:100%}
+ .fresh{font-size:12px;margin:-2px 8px 8px;padding:5px 9px;border-radius:5px;display:inline-block}
+ .fresh-ok{background:#e8f5e9;color:#1b5e20;border:1px solid #c3e6c8}
+ .fresh-warn{background:#fff4e0;color:#8a5300;border:1px solid #f2d9a8}
+ .fresh-bad{background:#fdecea;color:#96231a;border:1px solid #f5c6c0}
+ .stale{font-size:10.5px;font-weight:600;color:#8a5300;background:#fff4e0;border:1px solid #f2d9a8;border-radius:4px;padding:1px 5px;margin-left:6px;white-space:nowrap}
+ .stale-bad{font-size:10.5px;font-weight:600;color:#96231a;background:#fdecea;border:1px solid #f5c6c0;border-radius:4px;padding:1px 5px;margin-left:6px;white-space:nowrap}
+ .dlfail{font-size:11px;color:#96231a;background:#fdecea;border:1px solid #f5c6c0;border-radius:4px;padding:5px 7px;margin:4px 0}
 </style></head><body>
 <h1>__TITLE__ — __N__ charts — __DATE__ (rendered in your browser)</h1>
+__FRESH__
 <div style="font-size:11px;color:#888;margin:-2px 8px 10px">Candlesticks + volume · <b style="color:#2962FF">EMA20</b> · <b style="color:#FF6D00">EMA50</b></div>
 __PRELUDE__<div class="grid">__CARDS__</div>
 <script>
@@ -889,14 +1025,82 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
 </script></body></html>"""
 
 
+def _stale_chip(d, mkt_date):
+    """Per-card marker, rendered ONLY when this series is behind the market. Fresh
+    cards get nothing — 700 identical badges would just become wallpaper, so mark
+    the exception, not the rule."""
+    if not d or not mkt_date or d >= mkt_date:
+        return ""
+    n = (mkt_date - d).days
+    cls = "stale-bad" if n > OHLCV_MAX_STALE_DAYS else "stale"
+    return (f'<span class="{cls}">&#9888; data to {d.strftime("%d %b %Y")} '
+            f'({n}d behind)</span>')
+
+
+def _freshness_banner(mkt_date, gen_date, n_behind, n_charts):
+    """Page-level statement of what the page was built from, so a stale gallery
+    announces itself instead of being noticed days later by accident.
+
+    Both dates carry their weekday, because that is what makes the gap readable
+    at a glance: Sat-generated/Fri-data is nothing, Wed-generated/Fri-data is a
+    stalled feed, and the day names say which is which without any arithmetic.
+    """
+    if not mkt_date:
+        return ('<div class="fresh fresh-bad">&#9888; No price data on this page '
+                '&mdash; latest data point unknown.</div>')
+    lag = (gen_date - mkt_date).days
+    when = mkt_date.strftime("%a %d %b %Y")
+    gen = gen_date.strftime("%a %d %b %Y")
+    plural = "day" if lag == 1 else "days"
+    if lag <= 0:
+        cls = "fresh-ok"
+        msg = (f"&#10003; Generated {gen} &middot; latest data point {when} "
+               f"&mdash; up to date.")
+    elif lag > OHLCV_MAX_STALE_DAYS:
+        cls = "fresh-bad"
+        msg = (f"&#9888; Generated {gen} &middot; latest data point {when} "
+               f"&mdash; {lag} {plural} behind. The price feed looks stalled.")
+    else:
+        # Name the ordinary explanations so a normal gap doesn't read as a fault.
+        why = (" (today's close may not be ingested yet)" if lag == 1
+               else " (weekend / holiday gap is normal)" if lag <= 4 else "")
+        cls = "fresh-warn"
+        msg = (f"&#9888; Generated {gen} &middot; latest data point {when} "
+               f"&mdash; {lag} {plural} behind{why}.")
+    tail = (f" &middot; {n_behind} of {n_charts} charts are behind {when}"
+            if n_behind else f" &middot; all {n_charts} charts current to {when}")
+    return f'<div class="fresh {cls}">{msg}{tail}</div>'
+
+
 def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
-               annot=None, resample=None, prelude=""):
+               annot=None, resample=None, prelude="", failed_syms=None):
     """`prelude` is optional page furniture rendered ABOVE the card grid (the
     watchlist summary table uses it). It defaults to "" and the placeholder sits
     flush against <div class="grid">, so every existing caller emits a
-    byte-identical page."""
+    byte-identical page.
+
+    `failed_syms` are names whose OHLCV download FAILED this run (as opposed to
+    not existing on Drive) — they render a red note instead of the benign
+    "no feed" one, so a network problem can never masquerade as missing data."""
     annot = annot or {}
+    failed_syms = failed_syms or set()
     card_html, data = [], {}
+
+    # Freshness reference = the MODE of every symbol's last raw bar, i.e. what the
+    # market as a whole last traded. Self-calibrating, so there is no NSE holiday
+    # calendar to maintain and a long holiday weekend simply looks normal.
+    bar_dates = {}
+    for _s in ranked.get("symbol", pd.Series(dtype=object)).tolist():
+        _s = str(_s or "")
+        if _s:
+            _d = _last_bar_date(omap.get(_s))
+            if _d:
+                bar_dates[_s] = _d
+    mkt_date = None
+    if bar_dates:
+        _modes = pd.Series(list(bar_dates.values())).mode()
+        if not _modes.empty:
+            mkt_date = _modes.iloc[0]
     for j, (_, rr) in enumerate(ranked.iterrows()):
         s = str(rr.get("symbol", "") or "")
         pfname = str(rr.get("_pfname", "") or "")          # PF holding name (raw list)
@@ -921,6 +1125,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             f'<div class="hd">{j + 1}. <b>{s}</b>'
             + (f' <span class="nm">{nmj}</span>' if nmj else "")
             + _decision_chip(rr.get("decision"), rr.get("n_buy"), rr.get("n_vote"))
+            + _stale_chip(bar_dates.get(s), mkt_date)
             + "</div>",
             annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
@@ -930,11 +1135,16 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         ] if x)
         if not c:
             # Fundamentals present but no price series — panels + a small note,
-            # no chart div.
-            card_html.append(
-                f'<div class="card">{meta}'
-                f'<div style="font-size:11px;color:#999;padding:6px 2px">'
-                f'No chart/price data for this name (no OHLCV feed).</div></div>')
+            # no chart div. A DOWNLOAD FAILURE is called out separately: it used
+            # to render as the benign "no feed" note, so a network problem was
+            # indistinguishable from a name that genuinely has no price history.
+            note = (f'<div class="dlfail">&#9888; Price data FAILED to download '
+                    f'this run — this is a fetch problem, not a missing feed. '
+                    f'Re-run to restore this chart.</div>'
+                    if s.upper() in failed_syms or s in failed_syms else
+                    f'<div style="font-size:11px;color:#999;padding:6px 2px">'
+                    f'No chart/price data for this name (no OHLCV feed).</div>')
+            card_html.append(f'<div class="card">{meta}{note}</div>')
             continue
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
         # Per-chart legend — the page-level note scrolls away on a long gallery,
@@ -945,11 +1155,18 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
                   '(medium-term trend)</div>')
         card_html.append(f'<div class="card">{meta}{legend}'
                          f'<div class="chart" id="ch{j}"></div></div>')
+    now = datetime.now()
+    n_behind = sum(1 for d in bar_dates.values() if mkt_date and d < mkt_date)
+    banner = _freshness_banner(mkt_date, now.date(), n_behind, len(bar_dates))
+    if mkt_date:
+        log(f"  data as of {mkt_date} (generated {now.date()}); "
+            f"{n_behind}/{len(bar_dates)} charts behind that date")
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
                 .replace("__CARDS__", "".join(card_html))
                 .replace("__N__", str(len(card_html)))
                 .replace("__TITLE__", title)
-                .replace("__DATE__", datetime.now().strftime("%d %b %Y %H:%M"))
+                .replace("__DATE__", now.strftime("%d %b %Y %H:%M"))
+                .replace("__FRESH__", banner)
                 .replace("__PRELUDE__", prelude or ""))
 
 
@@ -1126,8 +1343,6 @@ def _select_ipos(drive, args, exch):
 
     out = pd.DataFrame({"symbol": rec["symbol"].astype(str),
                         "_listed": rec["_ld"]})
-    # carried onto the card so the reader sees WHY a name qualifies
-    out["listing_type"] = out["symbol"].map(lambda x: ltype.get(x, "") or "unclassified")
     # attach returns + liquidity from features; a listing with no features yet
     # (too new to compute) is dropped rather than shown blank
     feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
@@ -1656,9 +1871,24 @@ def main():
                     help="skip the Google-News headline pass (network-bound)")
     ap.add_argument("--news-days", type=int, default=30,
                     help="news lookback window in days (default 30)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="bypass the local parquet cache (always download)")
+    ap.add_argument("--purge-cache", action="store_true",
+                    help="wipe the local parquet cache first, then build "
+                         "normally. gallery_all.bat passes this on its FIRST "
+                         "gallery step so one batch shares one warm cache.")
+    ap.add_argument("--max-missing-pct", type=float, default=5.0,
+                    help="abort if more than this %% of the files that DO exist "
+                         "on Drive fail to download (default 5). Guards against "
+                         "writing a gallery full of silently blank charts.")
     args = ap.parse_args()
 
-    drive = get_drive()
+    cache = ParquetCache(enabled=not args.no_cache)
+    if args.purge_cache:
+        cache.purge()
+        log(f"parquet cache purged ({cache.root})")
+
+    drive = _drive()
     idx = _folder(drive, "company_repo/_index")
     fund = _folder(drive, "fundamentals")
     uni = _read_csv(drive, _folder(drive, "universe"), "master_list.csv")
@@ -1691,9 +1921,9 @@ def main():
     # Meta-line inputs (52wH, returns+ranks, tenure) — used by signals AND pf modes
     mem = _read_parquet(drive, _folder(drive, "signals/aggregated"),
                         "membership.parquet")
-    # The entry/stop memory. Loaded once here so every view and both modes get
-    # the same frame; absent until the new aggregator has run, and every
-    # consumer degrades to the pre-existing card when it is.
+    # The entry/stop memory. Loaded once so every view and both modes see the
+    # same frame; absent until the new aggregator has run, and every consumer
+    # degrades to the pre-existing card when it is.
     opens_df = _load_open_signals(drive)
     feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
 
@@ -1733,7 +1963,7 @@ def main():
                     [z.strip() for z in args.zones.split(",")])]
             nmap = sig_pf.groupby("symbol")["strategy_group"].nunique()
             ranked["n_strategies"] = ranked["symbol"].map(nmap)
-        annot = _build_meta_annot(ranked, feats_g, mem)
+        annot = _build_meta_annot(ranked, feats_g, mem, opens_df)
         log(f"  PF holdings: {len(ranked)} total "
             f"({len(resolved)} chartable, {len(unresolved)} name-only/not-in-universe)")
 
@@ -1866,9 +2096,14 @@ def main():
     ann = _read_parquet(drive, idx, "announcement_ledger.parquet")
     res_idx = _read_parquet(drive, idx, "research_index.parquet")
     log(f"downloading OHLCV for {len(syms)} names…")
-    omap = _bulk_parquet(drive, _folder(drive, "data/ohlcv"), syms)
+    ohlcv_failed = set()
+    omap = _bulk_parquet(
+        drive, _folder(drive, "data/ohlcv"), syms, cache=cache, what="OHLCV",
+        max_missing_pct=args.max_missing_pct, failed_out=ohlcv_failed)
     log("downloading statements…")
-    stmts = _bulk_parquet(drive, _folder(drive, "fundamentals/statements"), syms)
+    stmts = _bulk_parquet(
+        drive, _folder(drive, "fundamentals/statements"), syms, cache=cache,
+        what="statements", max_missing_pct=args.max_missing_pct)
 
     _name_by = {}
     if not grades.empty and {"symbol", "company_name"} <= set(grades.columns):
@@ -1881,7 +2116,7 @@ def main():
     log("assembling HTML…")
     html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
                       title=title, annot=annot, resample=resample,
-                      prelude=prelude)
+                      prelude=prelude, failed_syms=ohlcv_failed)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     log(f"wrote {out_path}  ({len(html) / 1e6:.1f} MB, {len(syms)} charts)")
