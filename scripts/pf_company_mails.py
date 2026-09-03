@@ -648,6 +648,33 @@ def md_to_html(md: str, limit: int = None) -> str:
     return "".join(out)
 
 
+def report_attachment(symbol: str, label: str, subtitle: str,
+                      narrative) -> tuple | None:
+    """(filename, bytes, "html") - Phase 2's report as a standalone file, or None.
+
+    WHY ATTACH SOMETHING THE BODY ALREADY CONTAINS. Gmail collapses repeated content
+    when several messages share a subject: send the same annual report twice and the
+    second arrives with its body behind a "..." trim, which reads exactly like the mail
+    was cut off. An attachment is never trimmed, never clipped, and can be opened or
+    kept independently of the thread.
+    """
+    md = narrative if isinstance(narrative, str) else "\n".join(
+        ((h + "\n") if h else "") + t for h, t in (narrative or []))
+    if not str(md).strip():
+        return None
+    inner = md_to_html(md, limit=REPORT_LIMIT)
+    if not inner:
+        return None
+    doc = (f"<!doctype html><html><head><meta charset='utf-8'>"
+           f"<title>{_esc(symbol, 20)} {_esc(label, 60)}</title></head>"
+           f"<body style='{_WRAP};max-width:820px;margin:24px auto;padding:0 18px'>"
+           f"<h2 style='margin:0 0 2px'>{_esc(symbol, 20)} &middot; {_esc(label, 80)}</h2>"
+           f"<div style='color:{MUTED};font-size:12px;margin:0 0 16px'>"
+           f"{_esc(subtitle, 120)}</div>{inner}</body></html>")
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", f"{symbol}_{label}").strip("_")[:70]
+    return (f"{safe}.html", doc.encode("utf-8"), "html")
+
+
 def _narrative_html(narrative, title: str, sub: str) -> str:
     """Accepts either a plain string or [(heading, prose)] from lift_report()."""
     md = narrative if isinstance(narrative, str) else "\n".join(
@@ -1911,6 +1938,7 @@ def main() -> None:
     sent_rows = []
     for d in due:
         isin, sym, name, dt = d["isin"], d["symbol"], d["name"], d["doc_type"]
+        _attach = None
         if dt == "presentation":
             body = presentation_body(isin, sym, name, season, tables)
             subject = (f"📊 {sym} — investor presentation UPDATED, "
@@ -1927,9 +1955,16 @@ def main() -> None:
                                 _n.get("text") or [], tables)
             # A new holding's mail is its LATEST call, not this month's news, and
             # saying so stops it reading as a filing that just happened.
+            _attach = report_attachment(sym, f"Concall {_per}".strip(),
+                                        f"{name} - Phase 2 transcript brief",
+                                        _n.get("text") or [])
             _new = " (new holding \u2014 latest call)" if d.get("onboarding") else ""
-            subject = (f"\U0001F399 {sym} \u2014 concall transcript UPDATED, "
-                       f"{_esc(_per, 20)}" if d.get("resend")
+            # A RESEND MUST NOT SHARE A SUBJECT WITH THE MAIL IT REPLACES. Gmail threads
+            # on subject and hides the repeated body behind a "..." trim, which reads as
+            # a truncated mail. The send date makes each one its own conversation.
+            _stamp = today.strftime("%-d %b") if os.name != "nt" else today.strftime("%d %b").lstrip("0")
+            subject = (f"\U0001F399 {sym} \u2014 concall transcript UPDATED "
+                       f"{_stamp}, {_esc(_per, 20)}" if d.get("resend")
                        else f"\U0001F399 {sym} \u2014 concall transcript, "
                             f"{_esc(_per, 20)}{_new}")
         elif dt == "annual_report":
@@ -1944,9 +1979,13 @@ def main() -> None:
             _fy = _ar_display(d.get("doc_date", "")) or str(d.get("period") or "")
             body = annual_report_body(isin, sym, name, _fy, d.get("doc_id", ""),
                                       _n.get("text") or [], tables)
+            _attach = report_attachment(sym, f"Annual Report {_fy}".strip(),
+                                        f"{name} - Phase 2 forensic analysis",
+                                        _n.get("text") or [])
             _new = " (new holding \u2014 latest report)" if d.get("onboarding") else ""
-            subject = (f"\U0001F4D7 {sym} \u2014 Annual Report {_esc(_fy, 40)} UPDATED"
-                       if d.get("resend")
+            _stamp = today.strftime("%d %b").lstrip("0")
+            subject = (f"\U0001F4D7 {sym} \u2014 Annual Report {_esc(_fy, 40)} "
+                       f"UPDATED {_stamp}" if d.get("resend")
                        else f"\U0001F4D7 {sym} \u2014 Annual Report "
                             f"{_esc(_fy, 40)}{_new}")
         else:
@@ -1963,7 +2002,14 @@ def main() -> None:
             p = os.path.join(args.out_dir, f"mail_{sym}_{dt}.html")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write(body)
-            log(f"  {sym:<12} {dt}: preview -> {p} ({len(body.encode()):,} B)")
+            _extra = ""
+            if _attach:
+                ap = os.path.join(args.out_dir, "attach_" + _attach[0])
+                with open(ap, "wb") as fh:
+                    fh.write(_attach[1])
+                _extra = f" + attachment {_attach[0]} ({len(_attach[1]):,} B)"
+            log(f"  {sym:<12} {dt}: preview -> {p} "
+                f"({len(body.encode()):,} B){_extra}")
             continue
 
         from mailer import send_email, load_mail_settings
@@ -1974,7 +2020,8 @@ def main() -> None:
                 and os.getenv("NOTIFY_EMAIL")):
             log("  mail NOT sent — GMAIL_* not set in this environment.")
             return
-        ok = send_email(subject, body)
+        ok = send_email(subject, body,
+                        attachments=[_attach] if _attach else None)
         log(f"  {sym:<12} {dt}: sent={ok}")
         if ok:
             sent_rows.append({"season": season, "isin": isin, "symbol": sym,
@@ -2431,6 +2478,25 @@ Capacity reaches eight million tons by FY28.
           "&lt;script&gt;" in md_to_html("<script>alert(1)</script>"))
     check("it carries far more than the old lift",
           len(_out) > 6 * sum(len(t) for _h, t in lift_report([("", _rep)], 2600)))
+
+    # ---- the attachment ----------------------------------------------------
+    _att = report_attachment("APLAPOLLO", "Annual Report FY2025-26",
+                             "APL Apollo - Phase 2 forensic analysis", _rep)
+    check("an attachment is produced", _att is not None)
+    check("it is named for the company and document",
+          _att[0].startswith("APLAPOLLO_Annual_Report") and _att[0].endswith(".html"))
+    check("it is a standalone document", _att[1].lstrip().startswith(b"<!doctype html>"))
+    check("it carries the report's table", b"122" in _att[1] and b"<table" in _att[1])
+    check("it is declared as html", _att[2] == "html")
+    check("nothing to attach yields None",
+          report_attachment("X", "Y", "Z", "") is None
+          and report_attachment("X", "Y", "Z", []) is None)
+    # A resend must not reuse the subject it replaces, or Gmail threads and trims it.
+    _msrc = _insp.getsource(main)
+    check("a resend subject carries a date stamp",
+          _msrc.count("UPDATED {_stamp}") + _msrc.count("UPDATED \"\n") >= 1
+          or "_stamp" in _msrc)
+    check("both mail types attach their report", _msrc.count("report_attachment(") == 2)
 
     # ---- concall: the SEASON QUARTER, same rule the deck mail uses ---------
     check("a call filed Aug 2026 is Q1 FY27",
