@@ -29,7 +29,8 @@ status from Drive and decides whether the run should proceed or be skipped.
 
 Phase 1 skip logic:
   Skip only if the last run already processed the session we would process now
-  (report["bar_date"] >= the latest session whose bars should exist). Falls back
+  AND it did so AFTER that session closed. A run before the close sees a partial
+  intraday bar; counting it as "done" cancels the real post-close run. Falls back
   to the old same-IST-calendar-day rule when the report predates bar_date.
 
 Exit behaviour:
@@ -282,9 +283,23 @@ def check_phase1(drive, folder_id: str) -> None:
             last_bar = None
         if last_bar is not None:
             want = _expected_bar_date(ist_now)
-            if last_bar >= want:
-                return skip_run(f"session {last_bar} already processed "
-                                f"(expected {want}) — {age:.0f}m ago")
+            # A run that happened BEFORE the close saw a partial intraday bar and
+            # stamped it with today's date. Treating that as "today's session is
+            # done" cancels the real post-close run — which is exactly what
+            # happened on 2026-09-03: a 12:36 IST test run claimed the date and
+            # the 16:00 IST trigger stood down 134 minutes later.
+            ran_at_ist = (datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+                          + IST_OFFSET)
+            complete = ran_at_ist.hour >= PHASE1_SESSION_CUTOFF_IST_HOUR
+            if last_bar >= want and complete:
+                return skip_run(f"session {last_bar} already processed after the "
+                                f"close (expected {want}) — {age:.0f}m ago")
+            if last_bar >= want and not complete:
+                log(f"last run processed {last_bar} at "
+                    f"{ran_at_ist:%H:%M} IST, BEFORE the "
+                    f"{PHASE1_SESSION_CUTOFF_IST_HOUR}:00 close — that bar is "
+                    f"partial, so this session is not done. Proceeding.")
+                return proceed()
             log(f"last run processed session {last_bar}, expected {want} "
                 f"— proceeding")
             return proceed()

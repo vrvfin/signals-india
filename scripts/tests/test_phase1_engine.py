@@ -85,6 +85,14 @@ def test_session_date(psc) -> None:
     want = f(datetime(2026, 8, 28, 16, 0))
     check("Aug-28 regression: the 4pm run is NOT skipped",
           date(2026, 8, 27) < want, f"last_bar 2026-08-27 < expected {want}")
+    # 2026-09-03: a 12:36 IST test run picked up a PARTIAL intraday bar, stamped
+    # it 2026-09-03, and the real 16:00 IST trigger then stood down 134 minutes
+    # later. Same session is not the same as session FINISHED.
+    cutoff = psc.PHASE1_SESSION_CUTOFF_IST_HOUR
+    check("a pre-close run's bar is treated as partial", 12 < cutoff,
+          f"12:36 IST < {cutoff}:00 cutoff, so it must not block the 4pm run")
+    check("a post-close run's bar is treated as complete", 17 >= cutoff,
+          f"17:30 IST >= {cutoff}:00 cutoff, so it still blocks a duplicate")
 
 
 def test_bar_date_naming() -> None:
