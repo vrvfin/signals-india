@@ -125,6 +125,20 @@ jobs:
       # which carry no bse_code). --one-per-quarter keeps this to one document per
       # quarter per type instead of re-ingesting a company's whole history.
       #
+      # CONCALL IS DELIBERATELY NOT SWEPT HERE (reverted 2026-09-03).
+      # Sweeping it worked, and that was the problem. Swept rows carry source="pf_sweep",
+      # and extract_concall.py:1662 splits the queue with a BINARY test -
+      # `origin_mask = is_backfill_row if args.backfill else (~is_backfill_row)` - so any
+      # source that is not literally "backfill" counts as live. The live extractor then
+      # drained them and append_day_page wrote them to concall_*.md, the Daily Concall
+      # Digest, with no date guard: 30 days of backdated filings landed in a file that is
+      # meant to hold today's calls only.
+      # Re-enable by appending ",concall" once the digest routing names the live origin
+      # explicitly instead of inferring it by exclusion. extract_concall.py is P0 and is
+      # not touched from here.
+      #
+      # annual_report is unaffected: its digest has no live/backfill split.
+      #
       # annual_report and concall were NOT swept before, and nothing else reliably found
       # them for a holding: ingest_announcements EXCLUDES both by design ("Phase 2 owns
       # these"), and the Screener feed Phase 2 does use is a 25-item market-wide page-1
@@ -138,7 +152,7 @@ jobs:
       - name: Daily sweep — find new documents (screener + nse + bse)
         run: >
           python scripts/pf_docs_sweep.py --enqueue --nse --bse --one-per-quarter
-          --days 30 --types presentation,rating,results,annual_report,concall
+          --days 30 --types presentation,rating,results,annual_report
         continue-on-error: true
 
       - name: Fetch what the sweep found
