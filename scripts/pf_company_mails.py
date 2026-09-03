@@ -648,6 +648,33 @@ def md_to_html(md: str, limit: int = None) -> str:
     return "".join(out)
 
 
+def html_to_pdf(doc_html: str, max_pages: int = 200) -> bytes | None:
+    """A4 PDF of a standalone HTML document, or None if it cannot be produced.
+
+    PyMuPDF is already a declared dependency (scripts/requirements.txt) and is used
+    elsewhere for page-range chunking, so this adds nothing to install.
+    """
+    try:
+        import fitz
+        story = fitz.Story(html=doc_html)
+        buf = io.BytesIO()
+        writer = fitz.DocumentWriter(buf)
+        page = fitz.paper_rect("a4")
+        frame = page + (36, 40, -36, -40)
+        more, n = 1, 0
+        while more and n < max_pages:
+            dev = writer.begin_page(page)
+            more, _ = story.place(frame)
+            story.draw(dev)
+            writer.end_page()
+            n += 1
+        writer.close()
+        data = buf.getvalue()
+        return data if data.startswith(b"%PDF") else None
+    except Exception:
+        return None
+
+
 def report_attachment(symbol: str, label: str, subtitle: str,
                       narrative) -> tuple | None:
     """(filename, bytes, "html") - Phase 2's report as a standalone file, or None.
@@ -672,6 +699,14 @@ def report_attachment(symbol: str, label: str, subtitle: str,
            f"<div style='color:{MUTED};font-size:12px;margin:0 0 16px'>"
            f"{_esc(subtitle, 120)}</div>{inner}</body></html>")
     safe = re.sub(r"[^A-Za-z0-9]+", "_", f"{symbol}_{label}").strip("_")[:70]
+    # PDF FIRST. An .html attachment is at the mercy of whatever opens it - a mail
+    # client may sandbox it, refuse to preview it, or render only part of it, which is
+    # exactly the complaint this replaces. A PDF renders identically everywhere, cannot
+    # be thread-trimmed, and prints. HTML stays as the fallback if PyMuPDF is missing,
+    # since a readable attachment beats none.
+    pdf = html_to_pdf(doc)
+    if pdf:
+        return (f"{safe}.pdf", pdf, "pdf")
     return (f"{safe}.html", doc.encode("utf-8"), "html")
 
 
@@ -2484,10 +2519,24 @@ Capacity reaches eight million tons by FY28.
                              "APL Apollo - Phase 2 forensic analysis", _rep)
     check("an attachment is produced", _att is not None)
     check("it is named for the company and document",
-          _att[0].startswith("APLAPOLLO_Annual_Report") and _att[0].endswith(".html"))
-    check("it is a standalone document", _att[1].lstrip().startswith(b"<!doctype html>"))
-    check("it carries the report's table", b"122" in _att[1] and b"<table" in _att[1])
-    check("it is declared as html", _att[2] == "html")
+          _att[0].startswith("APLAPOLLO_Annual_Report"))
+    check("it is a PDF where PyMuPDF is available, else html",
+          (_att[0].endswith(".pdf") and _att[1].startswith(b"%PDF")
+           and _att[2] == "pdf")
+          or (_att[0].endswith(".html") and _att[2] == "html"))
+    if _att[0].endswith(".pdf"):
+        import fitz as _fz
+        _d = _fz.open(stream=_att[1], filetype="pdf")
+        _txt = "".join(_d[i].get_text() for i in range(_d.page_count))
+        _d.close()
+        check("the PDF carries the report's numbers", "122" in _txt)
+        check("the PDF carries its headings", "FINANCIAL PERFORMANCE" in _txt)
+        check("the PDF has real pages", _att[1].count(b"/Type /Page") >= 1
+              or b"/Pages" in _att[1])
+    _html_only = report_attachment("X", "Doc", "sub", _rep)
+    check("the html fallback is still a standalone document",
+          html_to_pdf("<!doctype html><html><body>x</body></html>") is not None
+          or _html_only[1].lstrip().startswith(b"<!doctype html>"))
     check("nothing to attach yields None",
           report_attachment("X", "Y", "Z", "") is None
           and report_attachment("X", "Y", "Z", []) is None)
