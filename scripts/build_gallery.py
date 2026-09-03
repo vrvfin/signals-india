@@ -1066,7 +1066,16 @@ def _select_ipos(drive, args, exch):
     the card so a name that IS being flagged stands out.
 
     NOTE: listing_date only exists for NSE rows; BSE-only names carry no date and
-    are therefore absent from this view."""
+    are therefore absent from this view.
+
+    A RECENT DATE IS NOT PROOF OF A RECENT LISTING. Measured 2026-09-02: of the
+    577 names dated inside a year, 165 are provable re-listings (the stock has
+    price bars from BEFORE its listing date — you cannot trade a share that has
+    not listed, so prior trading proves the date marks an SME-to-main-board
+    migration, not a debut) and 12 are ETFs. That is 31% of this view that was
+    never an IPO. company_repo/_index/listing_dates.parquet carries the proof in
+    `listing_type`, so it is preferred over master_list when present; the
+    classification travels onto the card rather than being silently applied."""
     uni = _read_csv(drive, _folder(drive, "universe"), "master_list.csv")
     if uni.empty or "listing_date" not in uni.columns:
         log("  master_list has no listing_date — IPO view unavailable")
@@ -1074,12 +1083,51 @@ def _select_ipos(drive, args, exch):
     ld = pd.to_datetime(uni["listing_date"], format="%d-%b-%Y", errors="coerce")
     cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=args.ipo_days)
     rec = uni.assign(_ld=ld)[ld >= cut].copy()
-    log(f"  {len(rec)} names listed in the last {args.ipo_days}d")
+    log(f"  {len(rec)} names listed in the last {args.ipo_days}d (master_list)")
+
+    # ---- prefer the PROVEN classification where it exists --------------------
+    ltype = {}
+    try:
+        lt = _read_parquet(drive, _folder(drive, "company_repo/_index"),
+                           "listing_dates.parquet")
+    except Exception as e:
+        log(f"  listing_dates.parquet unavailable ({type(e).__name__}) — "
+            f"falling back to master_list dates only")
+        lt = pd.DataFrame()
+    if not lt.empty and "listing_type" in lt.columns and "symbol" in lt.columns:
+        lt = lt.copy()
+        lt["symbol"] = lt["symbol"].astype(str)
+        lt["_ld2"] = pd.to_datetime(lt.get("listing_date"), errors="coerce")
+        lt = lt.dropna(subset=["_ld2"])
+        # this table covers BSE and NSE SME too, which master_list does not
+        wider = lt[lt["_ld2"] >= cut]
+        if len(wider) > len(rec):
+            log(f"  listing_dates.parquet covers {len(wider)} in the same window "
+                f"(master_list has {len(rec)}) — using it")
+            rec = pd.DataFrame({"symbol": wider["symbol"], "_ld": wider["_ld2"]})
+        ltype = dict(zip(lt["symbol"], lt["listing_type"].fillna("")))
+        before = len(rec)
+        bad = rec["symbol"].astype(str).map(
+            lambda x: str(ltype.get(x, "")).lower() in ("migration", "etf"))
+        dropped = rec[bad]
+        rec = rec[~bad]
+        if len(dropped):
+            kinds = (dropped["symbol"].astype(str).map(lambda x: ltype.get(x, ""))
+                     .value_counts().to_dict())
+            log(f"  listing_type gate: {before} -> {len(rec)} "
+                f"({len(dropped)} dropped: {kinds}) — re-listings and funds are "
+                f"not IPOs")
+    else:
+        log("  listing_dates.parquet has no listing_type — showing every recent "
+            "DATE, which includes re-listings and ETFs. Run "
+            "build_listing_dates.py --classify to fix.")
     if rec.empty:
         return pd.DataFrame()
 
     out = pd.DataFrame({"symbol": rec["symbol"].astype(str),
                         "_listed": rec["_ld"]})
+    # carried onto the card so the reader sees WHY a name qualifies
+    out["listing_type"] = out["symbol"].map(lambda x: ltype.get(x, "") or "unclassified")
     # attach returns + liquidity from features; a listing with no features yet
     # (too new to compute) is dropped rather than shown blank
     feats = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")

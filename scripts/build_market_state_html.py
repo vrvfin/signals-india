@@ -98,6 +98,74 @@ def _ret_cell(v):
             f'{v:+.1f}%</td>')
 
 
+# Stance colours run bullish -> bearish. Deliberately a different scale from the
+# 0-100 tiles below: a stance is a DIRECTION plus how many components agree,
+# which is exactly what a single blended score cannot express.
+_STANCE_COL = {"AGGRESSIVE": "#0d7a35", "CONSTRUCTIVE": "#1a7a3a",
+               "NEUTRAL": "#a66300", "CAUTIOUS": "#c86a00",
+               "DEFENSIVE": "#c0392b"}
+_DIR_WORD = {1: ("bullish", "#1a7a3a"), 0: ("neutral", "#888"),
+             -1: ("bearish", "#c0392b")}
+
+
+def _stance_block(row: dict) -> str:
+    """Direction, agreement and what to DO — none of which the health score says.
+
+    Returns "" when market_state.py has not yet published the stance columns, so
+    an older snapshot renders exactly as it did before."""
+    stance = row.get("stance")
+    if not stance or (isinstance(stance, float) and pd.isna(stance)):
+        return ""
+    col = _STANCE_COL.get(str(stance), "#555")
+    nb, nbe = row.get("n_bullish"), row.get("n_bearish")
+    ncomp, days = row.get("n_components"), row.get("stance_days")
+    play = row.get("stance_playbook", "")
+
+    def _fmt(v, suffix=""):
+        return "—" if v is None or pd.isna(v) else f"{float(v):+.1f}{suffix}"
+
+    t5, t20 = _fmt(row.get("health_trend_5d")), _fmt(row.get("health_trend_20d"))
+
+    # per-component direction, by name — the part a blended number destroys
+    rows_html = ""
+    for key, label in (("nifty50_trend", "Nifty vs 200SMA"),
+                       ("breadth_50sma", "Breadth >50SMA"),
+                       ("highs_lows", "New highs − lows"),
+                       ("vix", "India VIX"),
+                       ("fii", "FII 5-day flow"),
+                       ("ad_ratio", "Advance/decline")):
+        d = row.get(f"{key}_dir")
+        if d is None or pd.isna(d):
+            word, c = "not read", "#bbb"
+        else:
+            word, c = _DIR_WORD.get(int(d), ("neutral", "#888"))
+        rows_html += (f'<tr><td>{label}</td>'
+                      f'<td style="text-align:right;color:{c};font-weight:600">'
+                      f'{word}</td></tr>')
+
+    return (
+        f'<div class="card" style="margin:8px 6px;border-left:5px solid {col}">'
+        f'<div style="display:flex;flex-wrap:wrap;gap:18px;align-items:baseline">'
+        f'<div><span style="font-size:11px;color:#666">STANCE</span><br>'
+        f'<b style="font-size:24px;color:{col}">{stance}</b></div>'
+        f'<div><span style="font-size:11px;color:#666">agreement</span><br>'
+        f'<b style="font-size:16px">{nb} bullish / {nbe} bearish</b>'
+        f'<span style="font-size:11px;color:#888"> of {ncomp}</span></div>'
+        f'<div><span style="font-size:11px;color:#666">held</span><br>'
+        f'<b style="font-size:16px">{days}d</b></div>'
+        f'<div><span style="font-size:11px;color:#666">health 5d / 20d</span><br>'
+        f'<b style="font-size:16px">{t5} / {t20}</b></div>'
+        f'</div>'
+        f'<div style="margin-top:8px;padding:6px 10px;background:#f7f9fc;'
+        f'border-radius:6px;font-size:13px"><b>What this means:</b> {play}</div>'
+        f'<table style="margin-top:8px;max-width:420px">{rows_html}</table>'
+        f'<div style="font-size:10px;color:#999;margin-top:4px">'
+        f'A stance is a direction plus how many independent components agree. '
+        f'The 0-100 score below blends them into one number, which cannot say '
+        f'whether 50 means "calm" or "three strongly opposed readings".</div>'
+        f'</div>')
+
+
 def _tile(label, score, extra=""):
     v = None if score is None or pd.isna(score) else float(score)
     col = "#c0392b" if (v is None or v < 40) else ("#a66300" if v < 60 else "#1a7a3a")
@@ -130,6 +198,7 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 </style></head><body><div class="wrap">
 <h1>__HEADLINE__</h1>
 <div style="font-size:11px;color:#888;margin:-2px 6px 8px">__SUB__</div>
+__STANCE__
 <div class="tiles">__TILES__</div>
 <h2>Trends (daily)</h2>
 <div class="charts">__CHARTS__</div>
@@ -181,6 +250,7 @@ def main():
         return
     row = latest.iloc[0].to_dict()
     log(f"health={row.get('health_score')} regime={row.get('regime')} "
+        f"stance={row.get('stance', 'ABSENT')} "
         f"| history rows={len(hist)} | sectors={len(sect)}")
 
     # ---- headline + component tiles ----
@@ -332,6 +402,7 @@ def main():
         return
 
     html = (_TPL.replace("__DATE__", str(row.get("date", "")))
+                .replace("__STANCE__", _stance_block(row))
                 .replace("__HEADLINE__", headline).replace("__SUB__", sub)
                 .replace("__TILES__", tiles).replace("__CHARTS__", charts_html)
                 .replace("__IDXTABLE__", idxtable).replace("__SECTABLE__", sectable)
