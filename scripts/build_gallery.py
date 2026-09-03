@@ -1247,7 +1247,57 @@ def _dh_chip(dh):
             f'border-radius:6px;font-weight:700">▼ {abs(v):.0f}% off high</span>')
 
 
-def _build_meta_annot(ranked, feats, mem) -> dict:
+def _load_open_signals(drive) -> pd.DataFrame:
+    """signals/aggregated/open_signals.csv — the entry and stop FROZEN on the day
+    each (symbol, family) first fired, written by aggregate_signals.
+
+    This is what lets a card say what you would have RISKED and what the idea has
+    done since, rather than only what it looks like today. Absent until the new
+    aggregator has run once; every consumer below degrades to the old card."""
+    try:
+        df = _read_csv(drive, _folder(drive, "signals/aggregated"),
+                       "open_signals.csv")
+    except Exception as e:
+        log(f"  open_signals.csv unavailable ({type(e).__name__}) — cards will "
+            f"omit the risk and engine lines")
+        return pd.DataFrame()
+    if df.empty or "symbol" not in df.columns:
+        return pd.DataFrame()
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    log(f"  open_signals: {len(df):,} rows, {df['symbol'].nunique():,} symbols")
+    return df
+
+
+def _open_map(opens: pd.DataFrame) -> dict:
+    """symbol -> {families, first_date, entry, stop, times_seen, events}.
+
+    One symbol can hold several families; the OLDEST first_date is the one that
+    matters ("when did this idea first appear"), and the entry/stop come from
+    that same first sighting so the risk shown is the risk that was real."""
+    if opens is None or opens.empty:
+        return {}
+    out = {}
+    for sym, g in opens.groupby("symbol"):
+        g = g.copy()
+        g["_fd"] = pd.to_datetime(g.get("first_date"), errors="coerce")
+        g = g.sort_values("_fd")
+        first = g.iloc[0]
+        out[str(sym)] = {
+            "families": sorted({str(x) for x in g.get("family", []) if str(x)}),
+            "first_date": first.get("first_date"),
+            "entry": pd.to_numeric(pd.Series([first.get("entry_at_signal")]),
+                                   errors="coerce").iloc[0],
+            "stop": pd.to_numeric(pd.Series([first.get("stop_at_signal")]),
+                                  errors="coerce").iloc[0],
+            "times_seen": int(pd.to_numeric(g.get("times_seen"),
+                                            errors="coerce").max() or 0),
+            "events": int(pd.to_numeric(g.get("n_events_at_signal"),
+                                        errors="coerce").fillna(0).max() or 0),
+        }
+    return out
+
+
+def _build_meta_annot(ranked, feats, mem, opens=None) -> dict:
     """symbol.upper() -> meta HTML: strategies · price · 1/3/6/12M returns ·
     tenure (came Nx since <date>) + FRESH/NEW/RECENT/DROPPED badge."""
     fcols = ["close", "dist_from_52w_high_pct",
@@ -1258,6 +1308,7 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
         keep = [c for c in fcols if c in feats.columns]
         for _, r in feats[["symbol"] + keep].iterrows():
             fmap[str(r["symbol"]).upper()] = r
+    omap = _open_map(opens)
     mmap = {}
     if mem is not None and not mem.empty and "symbol" in mem.columns:
         mk = [c for c in ["days_present", "window_snapshots", "first_seen",
@@ -1315,6 +1366,42 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
                 if b:
                     bits.append(f'<span style="background:{b[1]};color:#fff;'
                                 f'padding:0 6px;border-radius:6px">{b[0]}</span>')
+        # ---- signal memory: which engines, is it new, and what is at risk ----
+        # Appended AFTER everything that was already on the card; nothing above
+        # is removed or reordered.
+        o = omap.get(u)
+        if o:
+            if o["families"]:
+                bits.append('<span style="color:#555">🔧 '
+                            + ", ".join(o["families"]) + '</span>')
+            if o["times_seen"] == 1:
+                bits.append('<span style="background:#0d7a35;color:#fff;'
+                            'padding:0 6px;border-radius:6px">🆕 NEW TODAY</span>')
+            elif o["times_seen"] > 1:
+                bits.append(f'<span style="color:#666">held {o["times_seen"]}d'
+                            f'</span>')
+            if o["events"] > 0:
+                bits.append('<span style="background:#b8860b;color:#fff;'
+                            'padding:0 6px;border-radius:6px">⚡ EVENT TODAY'
+                            '</span>')
+            e, st = o["entry"], o["stop"]
+            if pd.notna(e) and pd.notna(st) and float(e) > 0 and float(st) < float(e):
+                risk = (float(e) - float(st)) / float(e) * 100
+                # A list of names becomes a list of TRADES: what you risk, and a
+                # 2R target measured off that risk rather than off a round number.
+                tgt = float(e) + 2 * (float(e) - float(st))
+                bits.append(f'<span style="color:#333">🎯 entry ₹{float(e):,.0f} '
+                            f'· stop ₹{float(st):,.0f} '
+                            f'<b>({risk:.1f}% risk)</b> · 2R ₹{tgt:,.0f}</span>')
+                # "have I missed it?" — answerable only because entry is frozen
+                f2 = fmap.get(u)
+                px_now = f2.get("close") if f2 is not None else None
+                if px_now is not None and pd.notna(px_now) and float(e) > 0:
+                    move = (float(px_now) / float(e) - 1) * 100
+                    c = "#1a7a3a" if move >= 0 else "#c0392b"
+                    since = f' since {o["first_date"]}' if o.get("first_date") else ""
+                    bits.append(f'<span style="color:{c}">{move:+.1f}%{since}</span>')
+
         annot[u] = (f'<div style="font-size:12px;color:#333;margin:2px 0;'
                     f'line-height:1.6">{" · ".join(bits)}</div>')
     return annot
@@ -1538,7 +1625,7 @@ def main():
     ap.add_argument("--min-cagr", type=float, default=0.0,
                     help="watchlist mode: extra CAGR floor on top of whatever "
                          "the table was built with (0 = show everything in it)")
-    ap.add_argument("--view", choices=["full", "additions", "drops", "ipo"],
+    ap.add_argument("--view", choices=["full", "additions", "drops", "ipo", "new"],
                     default="full",
                     help="signals mode: full=all ranked (existing limits); "
                          "additions=first seen last 14d (fresh/new/recent); "
@@ -1604,6 +1691,10 @@ def main():
     # Meta-line inputs (52wH, returns+ranks, tenure) — used by signals AND pf modes
     mem = _read_parquet(drive, _folder(drive, "signals/aggregated"),
                         "membership.parquet")
+    # The entry/stop memory. Loaded once here so every view and both modes get
+    # the same frame; absent until the new aggregator has run, and every
+    # consumer degrades to the pre-existing card when it is.
+    opens_df = _load_open_signals(drive)
     feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
 
     if args.mode == "pf":
@@ -1730,7 +1821,23 @@ def main():
                     ranked = ranked[ranked["symbol"].astype(str).str.upper()
                                     .isin(add)].reset_index(drop=True)
                 log(f"  {len(ranked)} recent additions (fresh/new/recent)")
-        annot = _build_meta_annot(ranked, feats_g, mem)
+            elif args.view == "new":
+                # STRICTLY today's first-timers, from the signal memory rather
+                # than a 14-day window. `additions` answers "what is recent";
+                # this answers "what is new TODAY, and which engine found it".
+                title = "🆕 New ideas today — by engine"
+                out_default = "gallery_new_today.html"
+                om = _open_map(opens_df)
+                fresh = {k for k, v in om.items() if v["times_seen"] == 1}
+                if not fresh:
+                    log("  no first-time signals today — open_signals has no "
+                        "times_seen == 1 rows (the memory may be one run old)")
+                ranked = ranked[ranked["symbol"].astype(str).str.upper()
+                                .isin(fresh)].reset_index(drop=True)
+                ev = sum(1 for k in fresh if om[k]["events"] > 0)
+                log(f"  {len(ranked)} NEW today ({ev} of them with an event "
+                    f"firing, the rest are states that just qualified)")
+        annot = _build_meta_annot(ranked, feats_g, mem, opens_df)
         if args.max > 0:
             ranked = ranked.head(args.max)
 
