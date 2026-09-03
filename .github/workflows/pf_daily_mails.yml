@@ -224,5 +224,6 @@ jobs:
           name: pf-daily-mail-previews
           path: |
             mail_*.html
+            attach_*
             quarter_teardown_preview.html
           if-no-files-found: ignore
