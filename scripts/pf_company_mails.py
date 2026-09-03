@@ -542,23 +542,124 @@ def lift_report(region, limit: int = None) -> list:
     return [("", best[:limit].rstrip() + ("…" if len(best) > limit else ""))] if best else []
 
 
+REPORT_LIMIT = 60000        # Gmail clips a message around 102 KB; the structured
+                            # tables and chrome take the rest. Phase 2's reports run
+                            # ~5-10k chars, so this only bites on an outlier.
+
+_MD_SKIP = re.compile(r"^\s*(?:<!--.*?-->\s*)?$")
+_MD_DOCHEAD = re.compile(r"^##\s+\S.*\s(?:Annual Report|Concall|Presentation|"
+                         r"Credit Rating|Results)\s+[-\u2013\u2014]", re.I)
+
+
+def _md_inline(s: str) -> str:
+    """Bold and code inside a line. Escapes first, so no markup can leak through."""
+    out = _esc(s, 4000)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"`([^`]+)`", r"<code style='font-size:11.5px'>\1</code>", out)
+    return out
+
+
+def md_to_html(md: str, limit: int = None) -> str:
+    """Phase 2's own report, rendered as HTML - headings, bullets, TABLES and all.
+
+    NOT a summary of a summary. The report IS the summary; this mail's job is to carry
+    it, not to distil it a second time. Measured 2026-09-02, the previous approach
+    lifted 522 of APL Apollo's 4,881-char annual-report analysis (11%) and 1,486 of its
+    9,975-char concall brief (15%), and dropped every one of their 21 and 40 table rows,
+    because the prose filter it reused was built for one-line digest rows.
+
+    The document's own top heading is skipped - the mail renders its own header - and so
+    is the "*Processed:*" stamp and the doc marker.
+    """
+    limit = REPORT_LIMIT if limit is None else limit
+    text = re.sub(r"<!--.*?-->", " ", str(md or ""), flags=re.S)
+    lines = text.splitlines()
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        raw = lines[i]
+        s = raw.strip()
+        i += 1
+        if not s or s in ("---", "***", "___") or _MD_SKIP.match(s):
+            continue
+        if s.startswith("*Processed:") or _MD_DOCHEAD.match(s):
+            continue
+        # ---- table: a run of pipe rows -------------------------------------
+        if s.startswith("|"):
+            rows = []
+            j = i - 1
+            while j < n and lines[j].strip().startswith("|"):
+                cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{2,}:?", c or "-") for c in cells):
+                    rows.append(cells)
+                j += 1
+            i = j
+            if rows:
+                head, body = rows[0], rows[1:]
+                th = "".join(f"<th style='text-align:left;padding:4px 9px 4px 0;"
+                             f"border-bottom:1px solid #ccc;color:{MUTED};"
+                             f"font-weight:600'>{_md_inline(c)}</th>" for c in head)
+                tb = "".join("<tr>" + "".join(
+                    f"<td style='padding:4px 9px 4px 0;border-bottom:1px solid #eee;"
+                    f"vertical-align:top'>{_md_inline(c)}</td>" for c in r) + "</tr>"
+                    for r in body)
+                out.append(f"<div style='overflow-x:auto'><table cellpadding='0' "
+                           f"cellspacing='0' style='{_TBL}'><tr>{th}</tr>{tb}</table>"
+                           f"</div>")
+            continue
+        # ---- headings ------------------------------------------------------
+        m = re.match(r"^(#{1,6})\s+(.*)$", s)
+        if m:
+            lvl = len(m.group(1))
+            size, col = (14, "#34495e") if lvl <= 2 else (13, BLUE)
+            out.append(f"<div style='font-size:{size}px;font-weight:700;color:{col};"
+                       f"margin:14px 0 5px'>{_md_inline(m.group(2))}</div>")
+            continue
+        # a fully bolded line is a heading in these reports ("**A-2) Q&A Summary**")
+        if s.startswith("**") and s.endswith("**") and len(s) < 110:
+            out.append(f"<div style='font-size:13px;font-weight:700;color:{BLUE};"
+                       f"margin:12px 0 4px'>{_md_inline(s.strip('*'))}</div>")
+            continue
+        # ---- bullets -------------------------------------------------------
+        if re.match(r"^[-*\u2022]\s+", s):
+            items = []
+            j = i - 1
+            while j < n:
+                t = lines[j].strip()
+                if re.match(r"^[-*\u2022]\s+", t):
+                    items.append(re.sub(r"^[-*\u2022]\s+", "", t))
+                elif t and items and lines[j].startswith(("   ", "\t")):
+                    items[-1] += " " + t          # continuation of the same bullet
+                else:
+                    break
+                j += 1
+            i = j
+            lis = "".join(f"<li style='margin:3px 0'>{_md_inline(x)}</li>"
+                          for x in items)
+            out.append(f"<ul style='margin:4px 0 8px;padding-left:20px;"
+                       f"font-size:12.5px;color:#333;line-height:1.5'>{lis}</ul>")
+            continue
+        # ---- paragraph -----------------------------------------------------
+        out.append(f"<p style='margin:5px 0;font-size:12.5px;color:#333;"
+                   f"line-height:1.55'>{_md_inline(s)}</p>")
+        if sum(len(x) for x in out) > limit:
+            out.append(f"<p style='color:{MUTED};font-size:11.5px'>"
+                       f"[report truncated for email length]</p>")
+            break
+    return "".join(out)
+
+
 def _narrative_html(narrative, title: str, sub: str) -> str:
     """Accepts either a plain string or [(heading, prose)] from lift_report()."""
-    if isinstance(narrative, str):
-        parts = [("", narrative)] if narrative.strip() else []
-    else:
-        parts = [(h, t) for h, t in (narrative or []) if str(t).strip()]
-    if not parts:
+    md = narrative if isinstance(narrative, str) else "\n".join(
+        ((h + "\n") if h else "") + t for h, t in (narrative or []))
+    if not str(md).strip():
         return ""
-    out = [_h(title, sub)]
-    for head, text in parts:
-        if head:
-            out.append(f"<div style='font-size:12px;font-weight:700;color:{BLUE};"
-                       f"margin:8px 0 2px'>{_esc(head, 80)}</div>")
-        out.append(f"<div style='font-size:12.5px;color:#333;line-height:1.55;"
-                   f"border-left:3px solid #ccc;padding-left:10px;margin:0 0 10px'>"
-                   f"{_esc(text, NARRATIVE_LIMIT)}</div>")
-    return "".join(out)
+    inner = md_to_html(md)
+    if not inner:
+        return ""
+    return (_h(title, sub)
+            + f"<div style='border-left:3px solid #ccc;padding-left:12px;"
+              f"margin:0 0 14px'>{inner}</div>")
 
 
 def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
@@ -1314,8 +1415,8 @@ def concall_body(isin, symbol, name, period, doc_id, narrative, tables) -> str:
         ]))
 
     out.append(_narrative_html(
-        narrative, "What management said",
-        "Lifted from the transcript summary Phase 2 wrote to this company's page."))
+        narrative, "The call, as Phase 2 read it",
+        "Phase 2's full transcript brief for this document, tables and all."))
 
     if not guid.empty:
         rows = []
@@ -1465,8 +1566,8 @@ def annual_report_body(isin, symbol, name, fy_label, doc_id, narrative, tables) 
         out.append(_tile_row(pairs))
 
     out.append(_narrative_html(
-        narrative, "The report in brief",
-        "Lifted from the forensic analysis Phase 2 wrote to this company's page."))
+        narrative, "The report, as Phase 2 read it",
+        "Phase 2's full forensic analysis of this annual report, tables and all."))
 
     if not guid.empty:
         rows = []
@@ -1541,7 +1642,10 @@ def _narratives(drive, repo_id, latest: dict, cache: dict) -> dict:
         try:
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
                                doc_id)
-            txt = lift_report(reg, NARRATIVE_LIMIT) if reg else []
+            # The whole region, headings and tables intact. lift_report stays for
+            # anything that wants a short extract; the mail wants the report.
+            txt = "\n".join(((h + "\n") if h else "") + b
+                            for h, b in (reg or [])) if reg else ""
         except Exception as e:
             _log(f"  WARN: narrative lift failed for {isin} {dt} ({str(e)[:60]})")
         out[(isin, dt)] = {"period": period, "text": txt}
@@ -2292,6 +2396,41 @@ def _self_test() -> int:
           'dt == "annual_report"' in _nsrc and "ar_fy_year" in _nsrc)
     check("the derived period is FY-shaped",
           f"FY{str(ar_fy_year('2026-03-31', ''))[-2:]}" == "FY26")
+
+    # ---- the report is CARRIED, not distilled -----------------------------
+    _rep = """## FY26 Annual Report - Annual Report 2026 from bse
+*Processed: 2026-09-02*
+<!-- doc:zz -->
+
+# CONSOLIDATED ANNUAL REPORT SYNTHESIS
+
+## 2. FINANCIAL PERFORMANCE & GROWTH TRAJECTORY
+| Metric | FY25 | FY26 |
+| :--- | :--- | :--- |
+| Revenue | 100 | 122 |
+| PAT | 8 | 12 |
+
+*   Revenue grew twenty two percent on volume.
+*   Margin expanded one hundred forty basis points.
+
+**Weighted Overall Risk Score: 2.65 (Label: Monitor)**
+
+## 5B. MANAGEMENT OUTLOOK & EXPANSION
+Capacity reaches eight million tons by FY28.
+"""
+    _out = md_to_html(_rep)
+    check("the report's table survives", "<table" in _out and "122" in _out)
+    check("its header row survives", "<th" in _out and "FY26" in _out)
+    check("bullets survive", "<li" in _out and "twenty two percent" in _out)
+    check("section headings survive", "FINANCIAL PERFORMANCE" in _out)
+    check("a bolded line becomes a heading", "Risk Score: 2.65" in _out)
+    check("the document heading is dropped", "Annual Report 2026 from bse" not in _out)
+    check("the Processed stamp is dropped", "Processed:" not in _out)
+    check("the doc marker is dropped", "doc:zz" not in _out and "<!--" not in _out)
+    check("markup in the source cannot leak",
+          "&lt;script&gt;" in md_to_html("<script>alert(1)</script>"))
+    check("it carries far more than the old lift",
+          len(_out) > 6 * sum(len(t) for _h, t in lift_report([("", _rep)], 2600)))
 
     # ---- concall: the SEASON QUARTER, same rule the deck mail uses ---------
     check("a call filed Aug 2026 is Q1 FY27",
