@@ -1709,8 +1709,14 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
         except Exception:
             exact = ""
         if exact.strip():
-            out[(isin, dt)] = {"period": period, "text": exact}
-            continue
+            # The echo guard must sit on BOTH paths. It was added to the page walk only,
+            # so a doc_reports row holding a prompt echo went straight to the reader -
+            # the exact-record lookup runs first and returned before the check.
+            if is_prompt_echo(exact):
+                _log(f"  {dt} for {isin}: doc_reports row is a prompt echo — ignored")
+            else:
+                out[(isin, dt)] = {"period": period, "text": exact}
+                continue
         try:
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
                                doc_id)
@@ -2499,6 +2505,8 @@ def _self_test() -> int:
     # Compare the CALLS, not the imports - the import line names _find_region first.
     check("_narratives refuses to render a prompt echo as the report",
           "is_prompt_echo(txt)" in _nsrc)
+    check("the echo guard covers the doc_reports path too",
+          "is_prompt_echo(exact)" in _nsrc)
     check("_narratives prefers the exact doc-keyed record",
           "load_doc_report(" in _nsrc
           and _nsrc.index("load_doc_report(") < _nsrc.index("_find_region("))

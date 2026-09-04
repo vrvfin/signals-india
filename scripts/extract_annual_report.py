@@ -431,7 +431,8 @@ def _split_pdf_chunks(pdf_bytes: bytes, chunk_mb: float = 4.0) -> list[bytes]:
 
 
 def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
-                              prompt: str, display_name: str) -> str:
+                              prompt: str, display_name: str,
+                              max_tokens: int = AR_MAX_OUTPUT_TOKENS) -> str:
     """Chunk large PDF, summarise each chunk, then synthesise."""
     log(f"  PDF > {MAP_REDUCE_THRESHOLD_MB}MB — using map-reduce chunking")
     chunks = _split_pdf_chunks(pdf_bytes)
@@ -441,7 +442,7 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
     for i, chunk in enumerate(chunks, 1):
         log(f"  Chunk {i}/{len(chunks)}: {len(chunk):,} bytes")
         summary = gemini.call(chunk, prompt, f"{display_name}_chunk{i}",
-                              max_output_tokens=AR_MAX_OUTPUT_TOKENS)
+                              max_output_tokens=max_tokens)
         chunk_summaries.append(f"=== CHUNK {i} ===\n{summary}")
 
     if len(chunk_summaries) == 1:
@@ -450,7 +451,7 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
     synthesis_prompt = SYNTHESIS_PROMPT_PREFIX + "\n\n".join(chunk_summaries)
     # Text-only call: all content is already in the prompt, no PDF needed
     return gemini.call_text(synthesis_prompt, f"{display_name}_synthesis",
-                            max_output_tokens=AR_MAX_OUTPUT_TOKENS)
+                            max_output_tokens=max_tokens)
 
 
 # ------------------------------------------------------------------ #
@@ -584,6 +585,19 @@ def main() -> None:
     parser.add_argument("--key-prefix", type=str, default=None,
                         help="T8: load keys from this env prefix (e.g. "
                              "BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
+    parser.add_argument("--prompt-file", default=PROMPT_FILE,
+                        help=f"Report prompt to use (default {PROMPT_FILE}). "
+                             f"annual_report_prompt_v2.txt reorders the report to "
+                             f"management letter / business / industry / financial / "
+                             f"risk and gives each section a hard LINE budget, so a "
+                             f"verbose early section cannot starve a later one.")
+    parser.add_argument("--max-output-tokens", type=int, default=AR_MAX_OUTPUT_TOKENS,
+                        help=f"Model-level cap on the REPORT call (default "
+                             f"{AR_MAX_OUTPUT_TOKENS}). The prompt asks for ~45k chars; "
+                             f"too low truncates the LATE sections (management letter, "
+                             f"scorecard, thesis) because the model emits in document "
+                             f"order. Raise only with measurement - a lite model rambles "
+                             f"non-linearly as the cap grows.")
     parser.add_argument("--symbols", default="",
                         help="Restrict to these NSE symbols (comma separated). --limit "
                              "caps a count but cannot choose WHICH company, so this is "
@@ -643,11 +657,13 @@ def main() -> None:
     # --all-companies AND alt keys exist.
     gemini = make_extraction_pool(api_keys, _models, enable_fallback=args.all_companies)
 
-    prompt_path = Path(__file__).resolve().parent / PROMPT_FILE
+    prompt_path = Path(__file__).resolve().parent / args.prompt_file
     if not prompt_path.exists():
         print(f"ERROR: prompt file not found: {prompt_path}")
         sys.exit(1)
     prompt = prompt_path.read_text(encoding="utf-8")
+    if args.prompt_file != PROMPT_FILE:
+        log(f"  prompt: {args.prompt_file} ({len(prompt):,} chars)")
 
     # Structured-extraction prompt (separate, bounded JSON-only pass). Optional — if
     # absent, tabulation is silently skipped and the markdown report still works.
@@ -781,11 +797,11 @@ def main() -> None:
             size_mb = len(pdf_bytes) / (1024 * 1024)
             if size_mb > MAP_REDUCE_THRESHOLD_MB:
                 markdown_text = _process_with_map_reduce(
-                    gemini, pdf_bytes, prompt, display_name
+                    gemini, pdf_bytes, prompt, display_name, args.max_output_tokens
                 )
             else:
                 markdown_text = gemini.call(pdf_bytes, prompt, display_name,
-                                            max_output_tokens=AR_MAX_OUTPUT_TOKENS)
+                                            max_output_tokens=args.max_output_tokens)
 
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
@@ -827,10 +843,11 @@ def main() -> None:
                 log(f"  {_why} — retrying once")
                 try:
                     markdown_text = (
-                        _process_with_map_reduce(gemini, pdf_bytes, prompt, display_name)
+                        _process_with_map_reduce(gemini, pdf_bytes, prompt, display_name,
+                                                 args.max_output_tokens)
                         if size_mb > MAP_REDUCE_THRESHOLD_MB
                         else gemini.call(pdf_bytes, prompt, display_name,
-                                         max_output_tokens=AR_MAX_OUTPUT_TOKENS))
+                                         max_output_tokens=args.max_output_tokens))
                     log(f"  retry response: {len(markdown_text):,} chars")
                 except RateLimitExhausted:
                     raise
