@@ -164,6 +164,34 @@ def is_prompt_echo(text: str) -> bool:
     return sum(1 for k in _PROMPT_ECHO_MARKERS if k in t) >= 2
 
 
+# A run this long is never typesetting. MEASURED on the eight stored annual-report
+# narratives, 2026-09-04 - the longest space run in each:
+#     SHADOWFAX 0 · SENORES 5 · RISHABH 18 || RATEGAIN 4,712 · INDOBORAX 9,393 ·
+#     GOLDIAM 64,883 · WELSPUNLIV 67,934 · RATEGAIN 76,272
+# The gap between 18 and 4,712 is empty, so 40 separates real markdown-table alignment
+# from a degenerate generation with a wide margin on both sides.
+PAD_RUN_MIN = 40
+
+
+def squeeze_padding(text: str) -> str:
+    """Collapse the runaway space runs these models emit, leaving tables intact.
+
+    THE BUG THIS FIXES. A model that loses its stop condition mid-report emits tens of
+    thousands of consecutive spaces and then stops. Nothing noticed, because every check
+    downstream measured len(): the MIN_REPORT_CHARS gate scored RATEGAIN's report as
+    80,039 chars and passed it, when it held 3,528 chars of report followed by 76,272
+    spaces. Worse, DOC_REPORT_MAX_CHARS then truncated INSIDE the padding, so whatever
+    the model wrote after the run was thrown away.
+
+    Runs shorter than PAD_RUN_MIN are left exactly as they are, so markdown table
+    alignment survives. Four or more blank lines collapse to two, which markdown treats
+    identically.
+    """
+    s = str(text or "")
+    s = re.sub(r"[ \t]{%d,}" % PAD_RUN_MIN, " ", s)
+    return re.sub(r"\n{4,}", "\n\n", s)
+
+
 # ADDITIVE (2026-09-03). A narrative keyed by the DOCUMENT that produced it.
 #
 # WHY THIS EXISTS. Until now the only durable copy of an extraction's prose was the
@@ -196,7 +224,8 @@ def save_doc_report(drive, index_id: str, row: dict, report_md: str) -> None:
     """
     try:
         did = str(row.get("doc_id") or "").strip()
-        md = str(report_md or "")
+        # Squeeze BEFORE the cap: truncating inside a padding run discards real report.
+        md = squeeze_padding(report_md)
         if not did or not md.strip():
             return
         if len(md) > DOC_REPORT_MAX_CHARS:

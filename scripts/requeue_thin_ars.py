@@ -55,7 +55,7 @@ load_dotenv(os.path.join(os.path.dirname(_D), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, load_parquet,
                              save_parquet, QUEUE_COLS, acquire_lock, release_lock,
-                             is_prompt_echo, log)
+                             is_prompt_echo, squeeze_padding, log)
 
 MIN_CHARS = 2000        # matches extract_annual_report.MIN_REPORT_CHARS
 
@@ -73,7 +73,11 @@ def section_chars(sections, period: str, doc_id: str) -> tuple[int, str]:
     if not reg:
         return 0, ""
     text = "\n".join(b for _h, b in reg)
-    return len(text), text
+    # Measure the REPORT, not the padding, or this tool cannot see the very failures it
+    # exists to repair: a generation that emitted 3,528 chars of report followed by
+    # 76,272 spaces scored 80,039 here and was never flagged (measured 2026-09-04,
+    # RATEGAIN). Same normalisation the extractor's quality gate applies.
+    return len(squeeze_padding(text)), text
 
 
 def is_thin(n_chars: int, text: str, min_chars: int = MIN_CHARS) -> bool:
@@ -220,6 +224,13 @@ def _self_test() -> int:
              "steps. The ENTIRE report must stay under ~1,200 lines. Output must be "
              "completely clean." + "x" * 9000)
     check("a long PROMPT ECHO is still a failed generation", is_thin(len(_echo), _echo))
+    # The padding defect: 3,000 chars of report + 70,000 spaces is a FAILED generation,
+    # and every length check must agree on that.
+    _padded = ("x" * 3000) + (" " * 70000)
+    check("runaway padding does not count as report",
+          len(squeeze_padding(_padded)) < 3100)
+    check("markdown table alignment survives the squeeze",
+          squeeze_padding("| a" + " " * 12 + "| b |") == "| a" + " " * 12 + "| b |")
 
     # ---- selection ----------------------------------------------------------
     q = pd.DataFrame([

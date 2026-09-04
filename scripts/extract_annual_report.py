@@ -39,6 +39,7 @@ from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
+    squeeze_padding,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -830,7 +831,9 @@ def main() -> None:
             def _bad(txt: str) -> str:
                 if is_prompt_echo(txt):
                     return "prompt echoed back instead of a report"
-                n = len(str(txt or "").strip())
+                # Measure the REPORT, not the padding. A degenerate generation that
+                # emits 76k spaces after 3.5k of prose used to score 80k and pass.
+                n = len(squeeze_padding(txt).strip())
                 if n < MIN_REPORT_CHARS:
                     return f"thin report: {n:,} chars (min {MIN_REPORT_CHARS:,})"
                 return ""
@@ -865,6 +868,10 @@ def main() -> None:
             # ADDITIVE: keep an exact, doc-keyed copy of the narrative alongside the
             # company_page.md section. Nothing downstream changes; this only adds a way
             # to ask for "the report for THIS document" without parsing an append log.
+            # Normalise once, here, so the page, the doc_reports store, the parse and
+            # the supersede size comparison all see the same text. Doing it only at the
+            # store would leave company_page.md holding the padding.
+            markdown_text = squeeze_padding(markdown_text)
             save_doc_report(drive, index_id, row, markdown_text)
 
             facts = parse_gemini_response(markdown_text, row)
