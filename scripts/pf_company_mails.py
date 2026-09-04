@@ -1683,7 +1683,7 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
     headings, and a divergent copy here would drift away from it.
     """
     from run_pf_docs_digest import _company_page, _find_region, _lift_summary
-    from _extractor_base import log as _log, load_doc_report
+    from _extractor_base import log as _log, load_doc_report, is_prompt_echo
     out = {}
     for (isin, dt), d in latest.items():
         if dt not in SCOPED_TYPES:
@@ -1720,6 +1720,16 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
                             for h, b in (reg or [])) if reg else ""
         except Exception as e:
             _log(f"  WARN: narrative lift failed for {isin} {dt} ({str(e)[:60]})")
+        # A PROMPT ECHO IS NOT A REPORT. Switching from lift_report() to carrying the
+        # whole report removed the echo filter that lift_report applied per section, so
+        # a response that is annual_report_prompt.txt talking back would be rendered in
+        # full - measured 2026-09-04, that is 5k / 89k / 120k characters of instructions
+        # for DEEPINDS, CGPOWER and MOREPENLAB. Treat it as NO narrative: the mail then
+        # carries its structured tables, or does not send at all and stays due, and the
+        # coarse content_key flips to "0" so a good re-extraction re-notifies.
+        if txt and is_prompt_echo(txt):
+            _log(f"  {dt} for {isin}: stored report is a prompt echo — treated as empty")
+            txt = ""
         out[(isin, dt)] = {"period": period, "text": txt}
     return out
 
@@ -2487,6 +2497,8 @@ def _self_test() -> int:
     check("_narratives derives a period for an AR that has none",
           'dt == "annual_report"' in _nsrc and "ar_fy_year" in _nsrc)
     # Compare the CALLS, not the imports - the import line names _find_region first.
+    check("_narratives refuses to render a prompt echo as the report",
+          "is_prompt_echo(txt)" in _nsrc)
     check("_narratives prefers the exact doc-keyed record",
           "load_doc_report(" in _nsrc
           and _nsrc.index("load_doc_report(") < _nsrc.index("_find_region("))
