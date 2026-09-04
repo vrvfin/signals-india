@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
-    load_queue, save_queue, mark_queue_error, is_prompt_echo,
+    load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -832,6 +832,11 @@ def main() -> None:
                 log(f"  {row.get('symbol')}: {_why} after retry — left pending retry, "
                     f"NOT marked done")
                 continue
+
+            # ADDITIVE: keep an exact, doc-keyed copy of the narrative alongside the
+            # company_page.md section. Nothing downstream changes; this only adds a way
+            # to ask for "the report for THIS document" without parsing an append log.
+            save_doc_report(drive, index_id, row, markdown_text)
 
             facts = parse_gemini_response(markdown_text, row)
             log(f"  Parsed: fy={facts['fy_year'] or 'unknown'}, "

@@ -164,6 +164,73 @@ def is_prompt_echo(text: str) -> bool:
     return sum(1 for k in _PROMPT_ECHO_MARKERS if k in t) >= 2
 
 
+# ADDITIVE (2026-09-03). A narrative keyed by the DOCUMENT that produced it.
+#
+# WHY THIS EXISTS. Until now the only durable copy of an extraction's prose was the
+# section it appended to company_repo/<isin>/company_page.md, and that page is an
+# APPEND LOG: a re-extraction adds a second section for the same document rather than
+# replacing the first, and the supersede path drops the <!-- doc:... --> marker, so the
+# STALE copy keeps the only exact key. Measured on APL Apollo 2026-09-03: 21 annual
+# report sections, two of them for the same FY2026 document - one 764 chars holding the
+# marker, one 4,474 chars without it. Any reader then has to GUESS which is current, and
+# two readers guessing differently is exactly what produced a mail with the wrong report.
+#
+# Rather than change how that page is written - 25+ scripts parse it, including
+# ar_scorecard, daily_ar_summary, company_deep_report, ask_company and the Obsidian
+# fetchers - this INTRODUCES a second, exact record. company_page.md is untouched and
+# every existing reader keeps working. Readers that want "the report for document X"
+# can now ask for it by id instead of parsing a page.
+DOC_REPORT_COLS = ["source_doc_id", "isin", "symbol", "company_name", "doc_type",
+                   "period", "report_md", "chars", "processed_at"]
+DOC_REPORT_FILE = "doc_reports.parquet"
+DOC_REPORT_MAX_CHARS = 80000       # a runaway lite-model response must not bloat the table
+
+
+def save_doc_report(drive, index_id: str, row: dict, report_md: str) -> None:
+    """Record one extraction's narrative against its doc_id. Never raises.
+
+    upsert_structured deletes any existing rows for this source_doc_id before appending,
+    so a re-extraction REPLACES its own record - one row per document, always current.
+    Failure here must never fail an extraction that has already succeeded, so everything
+    is caught: the page write remains the system of record.
+    """
+    try:
+        did = str(row.get("doc_id") or "").strip()
+        md = str(report_md or "")
+        if not did or not md.strip():
+            return
+        if len(md) > DOC_REPORT_MAX_CHARS:
+            md = md[:DOC_REPORT_MAX_CHARS] + "\n\n_[truncated at DOC_REPORT_MAX_CHARS]_"
+        upsert_structured(drive, index_id, DOC_REPORT_FILE, DOC_REPORT_COLS, [{
+            "source_doc_id": did,
+            "isin": str(row.get("isin") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "company_name": str(row.get("company_name") or ""),
+            "doc_type": str(row.get("doc_type") or ""),
+            "period": str(row.get("period") or ""),
+            "report_md": md,
+            "chars": len(md),
+            "processed_at": datetime.now().isoformat(timespec="seconds"),
+        }])
+    except Exception as e:
+        log(f"  NOTE: doc_reports write skipped ({str(e)[:70]})")
+
+
+def load_doc_report(drive, index_id: str, doc_id: str) -> str:
+    """The stored narrative for one document, or "" when there is none."""
+    try:
+        did = str(doc_id or "").strip()
+        if not did:
+            return ""
+        df = load_parquet(drive, index_id, DOC_REPORT_FILE, DOC_REPORT_COLS)
+        if df is None or df.empty:
+            return ""
+        hit = df[df["source_doc_id"].astype(str).str.strip() == did]
+        return str(hit.iloc[-1]["report_md"]) if not hit.empty else ""
+    except Exception:
+        return ""
+
+
 def mark_queue_error(queue, idx, reason: str, status: str = "error") -> None:
     """Record a failure ON the queue row: status, reason, attempt count, timestamp.
 

@@ -1675,7 +1675,7 @@ def annual_report_body(isin, symbol, name, fy_label, doc_id, narrative, tables) 
     return "".join(out)
 
 
-def _narratives(drive, repo_id, latest: dict, cache: dict) -> dict:
+def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -> dict:
     """{(isin, doc_type): {'period':.., 'text':..}} for the newest concall / AR per holding.
 
     Reuses the digest's parser rather than carrying a second copy: run_pf_docs_digest
@@ -1683,7 +1683,7 @@ def _narratives(drive, repo_id, latest: dict, cache: dict) -> dict:
     headings, and a divergent copy here would drift away from it.
     """
     from run_pf_docs_digest import _company_page, _find_region, _lift_summary
-    from _extractor_base import log as _log
+    from _extractor_base import log as _log, load_doc_report
     out = {}
     for (isin, dt), d in latest.items():
         if dt not in SCOPED_TYPES:
@@ -1701,6 +1701,16 @@ def _narratives(drive, repo_id, latest: dict, cache: dict) -> dict:
             if _fy:
                 period = f"FY{str(_fy)[-2:]}"
         txt = ""
+        # EXACT FIRST. doc_reports is keyed on the document, so there is nothing to
+        # guess; the page walk below stays as the fallback for every document extracted
+        # before this store existed.
+        try:
+            exact = load_doc_report(drive, index_id, doc_id) if doc_id else ""
+        except Exception:
+            exact = ""
+        if exact.strip():
+            out[(isin, dt)] = {"period": period, "text": exact}
+            continue
         try:
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
                                doc_id)
@@ -1810,7 +1820,7 @@ def main() -> None:
                   ("quarterly_facts", "guidance_tracker", "gf1_guidance_statements",
                    "gf3_operational_visibility", "ar_guidance", "ar_red_flags")}
         _pre.update(_extra)
-        _pre["_narr"] = _narratives(drive, repo, _latest, {})
+        _pre["_narr"] = _narratives(drive, repo, _latest, {}, idx)
         _n_ok = sum(1 for v in _pre["_narr"].values() if v["text"])
         log(f"narratives lifted from company_page.md: {_n_ok}/{len(_pre['_narr'])}")
     _keys = {}
@@ -2476,6 +2486,10 @@ def _self_test() -> int:
     _nsrc = _insp.getsource(_narratives)
     check("_narratives derives a period for an AR that has none",
           'dt == "annual_report"' in _nsrc and "ar_fy_year" in _nsrc)
+    # Compare the CALLS, not the imports - the import line names _find_region first.
+    check("_narratives prefers the exact doc-keyed record",
+          "load_doc_report(" in _nsrc
+          and _nsrc.index("load_doc_report(") < _nsrc.index("_find_region("))
     check("the derived period is FY-shaped",
           f"FY{str(ar_fy_year('2026-03-31', ''))[-2:]}" == "FY26")
 
