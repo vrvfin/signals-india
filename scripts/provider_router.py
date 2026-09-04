@@ -34,9 +34,14 @@ _SMALL_CHARS = 24_000   # ≈ 6k tokens
 # bigger requests 429 on the free tier. Gemini (primary) still sees the full doc; only the
 # fallback trims the doc TAIL (instruction stays at the front of the prompt).
 _ALT_MAX_CHARS = 80_000
-_ALT_SMALL = [("groq", "openai/gpt-oss-120b"),
-              ("groq", "llama-3.3-70b-versatile"),
-              ("cerebras", "gpt-oss-120b")]
+# GROQ IS REMOVED, ON EVIDENCE. gemini_usage.parquet over 2026-08-05..09-04:
+#     groq:openai/gpt-oss-120b        0 ok / 151 fail = 100%
+#     groq:llama-3.3-70b-versatile    0 ok / 151 fail = 100%
+#     cerebras:gpt-oss-120b         558 ok / 182 fail =  24.6%
+# 302 calls, not one success - the same signature as the retired gemini-2.0-flash, which
+# burned 282. A fallback that has never worked is not a fallback; it is latency and
+# wasted quota in front of the one that does. Cerebras stays.
+_ALT_SMALL = [("cerebras", "gpt-oss-120b")]
 _ALT_LARGE = [("cerebras", "gpt-oss-120b")]
 
 

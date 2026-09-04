@@ -41,8 +41,9 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -67,6 +68,104 @@ LEDGER_COLS = ["season", "isin", "symbol", "doc_type", "period", "doc_id",
                "mailed_at", "subject", "content_key"]
 MAIL_KEY = "pf_company_mails"
 MAX_HTML_BYTES = 90_000
+# Concall and AR extractions store their PROSE ONLY in company_repo/<isin>/company_page.md
+# - no parquet column holds it (extract_concall.py keeps len(markdown_text) as
+# `response_chars` and nothing more). So the narrative is lifted back off the page, with
+# the digest's parser rather than a second copy of it here.
+NARRATIVE_LIMIT = 2600
+# Types --scope applies to, each on its own calendar: a concall to the season QUARTER,
+# an annual report to the FINANCIAL YEAR. Applies to these two and to nothing else, so
+# the established presentation/rating/results mails keep their behaviour exactly.
+SCOPED_TYPES = ("concall", "annual_report")
+
+
+def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None) -> set:
+    """ISINs that ENTERED the portfolio within the last `days`.
+
+    THE POINT. The month scope answers "what did the exchanges send this month", which is
+    right for a holding already covered and wrong for one just bought: a company added
+    today whose latest concall was filed in July would be suppressed forever, and its
+    concall is the single thing a new holding most needs. So a new holding is onboarded
+    with its LATEST concall and LATEST annual report whatever month they were filed.
+
+    This mirrors what the presentation mail already does implicitly - it is season-scoped
+    with no date window, so a new holding picks up the current quarter's deck on the very
+    next run simply because the ledger has no row for it.
+
+    THE HISTORY-START GUARD IS NOT OPTIONAL. first_seen for every holding present on the
+    first snapshot is that snapshot's own date, which says nothing about when the holding
+    was actually bought. Once `days` exceeds the history's age, every holding reads as new
+    - measured 2026-09-02 against history starting 2026-07-23: at 30 days 7 holdings are
+    new, at 45 days it jumps to 51, i.e. the entire portfolio. Requiring first_seen to be
+    strictly AFTER the first snapshot keeps that at the true 11.
+    """
+    if snaps is None or getattr(snaps, "empty", True) or days <= 0:
+        return set()
+    if not {"isin", "snapshot_date"} <= set(snaps.columns):
+        return set()
+    d = snaps["snapshot_date"].astype(str).str.slice(0, 10)
+    hist_start = d.min()
+    first = snaps.assign(_d=d).groupby(snaps["isin"].astype(str))["_d"].min()
+    cutoff = ((today or date.today()) - timedelta(days=days)).isoformat()
+    return {i for i, f in first.items() if str(f) >= cutoff and str(f) > hist_start}
+
+
+def concall_quarter(doc_date) -> str:
+    """The season quarter a concall belongs to, from its FILING date.
+
+    The same rule the presentation mail already lives by, and for the same reason
+    pf_coverage.doc_quarter_map spells out: a document's own label cannot be trusted,
+    but the date it was filed is not open to interpretation. A call filed in Aug 2026
+    belongs to Q1 FY27 whatever it calls itself.
+    """
+    d = str(doc_date or "")[:10]
+    if len(d) < 10:
+        return ""
+    try:
+        return QT.norm_q(QT.season_quarter(pd.to_datetime(d)))
+    except Exception:
+        return ""
+
+
+_FY_RE = re.compile(r"FY\s*(\d{4}|\d{2})", re.I)
+
+
+def ar_fy_year(doc_date, period="") -> int | None:
+    """The financial YEAR an annual report covers - the year that FY ENDED.
+
+    Annual reports are not month news. A company must lay its report before an AGM
+    within six months of the year end, so the FY2026 reports all arrive between roughly
+    June and September 2026: the meaningful question is which FINANCIAL YEAR a report
+    covers, not which month it happened to be filed in.
+
+    Two date shapes reach us and they mean opposite things (measured 2026-09-02: 233 of
+    235 PF annual_report rows are FY-end shaped, 2 are filing dates):
+      2026-03-31  an FY-END stamp from the backfill ("Annual Report 2026 from bse").
+                  It names its OWN year - this is FY2026.
+      2026-09-02  a real filing date from the per-company sweep. The report being filed
+                  is for the year that last ended, so this is also FY2026.
+    `period` ("FY26") wins when present, being the extractor's own judgement.
+    """
+    m = _FY_RE.search(str(period or ""))
+    if m:
+        y = int(m.group(1))
+        return y if y > 1900 else 2000 + y
+    d = str(doc_date or "")[:10]
+    if len(d) < 10:
+        return None
+    try:
+        dt = date.fromisoformat(d)
+    except ValueError:
+        return None
+    if (dt.month, dt.day) == (3, 31):        # an FY-END stamp names its own year
+        return dt.year
+    return dt.year if dt.month >= 4 else dt.year - 1
+
+
+def current_ar_fy(today: date | None = None) -> int:
+    """The financial year whose annual reports are being filed now."""
+    t = today or date.today()
+    return t.year if t.month >= 4 else t.year - 1
 
 UP, DOWN, MUTED, AMBER = "#1a7a3a", "#c0392b", "#8a97a0", "#b8860b"
 # Theme colours, defined here with the rest of the palette because both the deck
@@ -266,6 +365,389 @@ def _deck_key(isin: str, tables: dict) -> str:
     return "deck|" + "".join(parts)
 
 
+def _doc_rows(tables, name, isin, doc_id, limit=0):
+    """The rows THIS document produced, newest first.
+
+    Falls back to the company's most recent rows when nothing carries this doc_id: rows
+    written before source_doc_id was stamped, and AR guidance tabulated by a second pass
+    that keys on the report rather than on the queue row.
+    """
+    d = _slice(tables.get(name), isin)
+    if d.empty:
+        return d
+    if doc_id and "source_doc_id" in d.columns:
+        hit = d[d["source_doc_id"].astype(str).str.strip() == str(doc_id).strip()]
+        if not hit.empty:
+            d = hit
+    if "processed_at" in d.columns:
+        d = d.sort_values("processed_at", ascending=False)
+    return d.head(limit) if limit else d
+
+
+def _num(v, suffix="") -> str:
+    """Parquet number -> display string. NaN/None/blank all render as nothing."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if f != f:                                   # NaN
+        return ""
+    return f"{f:g}{suffix}"
+
+
+def _tile_row(pairs) -> str:
+    """Key numbers as tiles; blank values are dropped rather than rendered empty."""
+    cells = ""
+    for lab, val, good in pairs:
+        v = str(val or "").strip()
+        if not v or v.lower() in ("nan", "none"):
+            continue
+        cells += (f"<td style='vertical-align:top;padding:0 8px 0 0'>"
+                  f"<div style='border:1px solid #e0e6ea;background:#f6f8f9;"
+                  f"padding:7px 10px'>"
+                  f"<div style='font-size:10.5px;color:{MUTED};text-transform:uppercase;"
+                  f"letter-spacing:.3px'>{_esc(lab, 26)}</div>"
+                  f"<div style='font-size:16px;margin-top:2px'>"
+                  f"{colour_num(v, good_up=good)}</div></div></td>")
+    return (f"<table cellpadding='0' cellspacing='0' style='{_TBL}'>"
+            f"<tr>{cells}</tr></table>" if cells else "")
+
+
+# The sections of Phase 2's own reports worth putting in front of a reader, in the order
+# a reader wants them. Matched as substrings against the sub-headings the prompts emit -
+# annual_report_prompt.txt numbers its sections ("### 2. FINANCIAL PERFORMANCE & GROWTH
+# TRAJECTORY"), concall_prompt.txt letters its own ("### A-1 Executive Summary").
+_NARRATIVE_WANTS = (
+    "executive summary", "investment thesis", "thesis matrix",
+    "financial performance", "growth trajectory", "management outlook",
+    "management commentary", "forward guidance", "capital efficiency",
+    "governance", "q&a summary", "growth drivers", "business overview",
+)
+# Never lift these as "the summary": methodology, the scorecard the mail renders as its
+# own table, and the question list.
+_NARRATIVE_SKIP = ("source coverage", "data integrity", "probing questions",
+                   "risk scorecard", "credibility", "mgmt said", "disclaimer")
+# THE MODEL SOMETIMES ECHOES THE PROMPT BACK. CGPOWER's stored annual-report analysis
+# opens with annual_report_prompt.txt itself - "Generate the final report immediately...
+# The ENTIRE report must stay under ~1,200 lines" - and that text is long and prose-like,
+# so every length-based heuristic ranks it first. It is instructions, never analysis, and
+# it must never reach a reader. Filtered at RENDER time; the stored text is untouched.
+def _is_prompt_echo(text: str) -> bool:
+    """True when a block is the prompt talking, not the analysis.
+
+    Delegates to _extractor_base so the extractor's quality gate and this renderer
+    agree on what an echo is - the extractor now refuses to store one, and this stays
+    as the guard for the rows stored before it did.
+    """
+    from _extractor_base import is_prompt_echo
+    return is_prompt_echo(text)
+
+
+def _digest_prose(text: str) -> str:
+    """The digest's prose filter (drops tables, fences, tags, metadata), reused rather
+    than re-implemented so both mails strip the same things."""
+    from run_pf_docs_digest import _prose
+    return _prose(text)
+
+
+# A report section header, in the three shapes these prompts actually emit:
+#   "### 2. FINANCIAL PERFORMANCE"   hashed (APL Apollo, most concalls)
+#   "2. FINANCIAL PERFORMANCE"       plain numbered (Deep Industries) - without this the
+#                                    whole report stayed ONE block and the section
+#                                    priority below had nothing to choose between
+#   "**2. FINANCIAL PERFORMANCE**"   bolded
+# STRICT. The first version allowed the leading marker to be EMPTY, so any capitalised
+# prose line of the right length was treated as a heading; the report shattered into
+# fragments and the mail carried a sentence like 'Specific details on the nature of
+# "Other financial assets" (non-'. A heading must now be explicitly marked as one:
+_SECTION_HEAD_RE = re.compile(
+    r"^\s*(?:"
+    r"#{1,4}\s+\S"                                     # ### 2. FINANCIAL PERFORMANCE
+    r"|\*\*[^*]{4,90}\*\*\s*:?\s*$"                    # **A-3) Forward Guidance**
+    r"|(?:[0-9]{1,2}[A-Z]?[.)]|[A-Z]-[0-9][.)]?)\s+"     # 2. / 5B. / A-1
+    r"[A-Z][A-Za-z0-9 &/,'\-()]{4,80}\s*:?\s*$"
+    r")")
+
+
+def _subsections(region) -> list:
+    """[(heading, body)] for a document region, split on its own section headings.
+
+    The region's own top-level section comes first with an empty heading, so a report
+    that uses no sub-headings at all still yields its text.
+    """
+    out = []
+    for h, body in region or []:
+        cur_h, cur_b = "", []
+        for ln in str(body).splitlines():
+            if _SECTION_HEAD_RE.match(ln):
+                if cur_h or cur_b:
+                    out.append((cur_h, "\n".join(cur_b)))
+                cur_h, cur_b = ln, []
+            else:
+                cur_b.append(ln)
+        if cur_h or cur_b:
+            out.append((cur_h, "\n".join(cur_b)))
+    return out
+
+
+def lift_report(region, limit: int = None) -> list:
+    """The most useful parts of Phase 2's report, as [(heading, prose)].
+
+    WHY NOT THE DIGEST'S _lift_summary. That returns the single best FRAGMENT, which is
+    the right shape for a one-line digest row and the wrong shape for a mail whose whole
+    job is the document. Measured across 25 PF annual reports on 2026-09-02 it returned
+    74 characters from CGPOWER's 88,819-character report and 0 from NAVINFLUOR's 10,639,
+    because these reports are mostly TABLES and the prose filter drops table rows - so
+    whichever single section it landed on had almost no qualifying text left.
+
+    This walks the report's own sections in reader order and takes several, so a mail
+    carries the analysis rather than a sentence of it. Numbers are not lost by dropping
+    tables: the mail renders ar_guidance and ar_red_flags as its own tables alongside.
+    """
+    limit = NARRATIVE_LIMIT if limit is None else limit
+    subs = _subsections(region)
+    if not subs:
+        return []
+    picked, seen, used = [], set(), 0
+    for want in _NARRATIVE_WANTS:
+        for i, (h, body) in enumerate(subs):
+            hl = str(h).lower()
+            if i in seen or want not in hl or any(s in hl for s in _NARRATIVE_SKIP):
+                continue
+            prose = _digest_prose(body)
+            if len(prose) < 80 or _is_prompt_echo(prose) or _is_prompt_echo(h):
+                continue
+            room = limit - used
+            if room < 200:
+                break
+            seen.add(i)
+            picked.append((re.sub(r"^#+\s*", "", str(h)).strip(),
+                           prose[:room].rstrip() + ("…" if len(prose) > room else "")))
+            used += min(len(prose), room)
+        if used >= limit - 200:
+            break
+    if picked:
+        return picked
+    # Nothing matched a wanted heading - fall back to the longest qualifying block, so a
+    # report that numbers its sections differently still says something.
+    best = ""
+    for h, body in subs:
+        if any(s in str(h).lower() for s in _NARRATIVE_SKIP):
+            continue
+        pr = _digest_prose(body)
+        if _is_prompt_echo(pr) or _is_prompt_echo(h):
+            continue
+        if len(pr) > len(best):
+            best = pr
+    return [("", best[:limit].rstrip() + ("…" if len(best) > limit else ""))] if best else []
+
+
+REPORT_LIMIT = 60000        # Gmail clips a message around 102 KB; the structured
+                            # tables and chrome take the rest. Phase 2's reports run
+                            # ~5-10k chars, so this only bites on an outlier.
+
+_MD_SKIP = re.compile(r"^\s*(?:<!--.*?-->\s*)?$")
+_MD_DOCHEAD = re.compile(r"^##\s+\S.*\s(?:Annual Report|Concall|Presentation|"
+                         r"Credit Rating|Results)\s+[-\u2013\u2014]", re.I)
+
+
+def _md_inline(s: str) -> str:
+    """Bold and code inside a line. Escapes first, so no markup can leak through."""
+    out = _esc(s, 4000)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"`([^`]+)`", r"<code style='font-size:11.5px'>\1</code>", out)
+    return out
+
+
+def md_to_html(md: str, limit: int = None) -> str:
+    """Phase 2's own report, rendered as HTML - headings, bullets, TABLES and all.
+
+    NOT a summary of a summary. The report IS the summary; this mail's job is to carry
+    it, not to distil it a second time. Measured 2026-09-02, the previous approach
+    lifted 522 of APL Apollo's 4,881-char annual-report analysis (11%) and 1,486 of its
+    9,975-char concall brief (15%), and dropped every one of their 21 and 40 table rows,
+    because the prose filter it reused was built for one-line digest rows.
+
+    The document's own top heading is skipped - the mail renders its own header - and so
+    is the "*Processed:*" stamp and the doc marker.
+    """
+    limit = REPORT_LIMIT if limit is None else limit
+    text = re.sub(r"<!--.*?-->", " ", str(md or ""), flags=re.S)
+    lines = text.splitlines()
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        raw = lines[i]
+        s = raw.strip()
+        i += 1
+        if not s or s in ("---", "***", "___") or _MD_SKIP.match(s):
+            continue
+        if s.startswith("*Processed:") or _MD_DOCHEAD.match(s):
+            continue
+        # ---- table: a run of pipe rows -------------------------------------
+        if s.startswith("|"):
+            rows = []
+            j = i - 1
+            while j < n and lines[j].strip().startswith("|"):
+                cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{2,}:?", c or "-") for c in cells):
+                    rows.append(cells)
+                j += 1
+            i = j
+            if rows:
+                head, body = rows[0], rows[1:]
+                th = "".join(f"<th style='text-align:left;padding:4px 9px 4px 0;"
+                             f"border-bottom:1px solid #ccc;color:{MUTED};"
+                             f"font-weight:600'>{_md_inline(c)}</th>" for c in head)
+                tb = "".join("<tr>" + "".join(
+                    f"<td style='padding:4px 9px 4px 0;border-bottom:1px solid #eee;"
+                    f"vertical-align:top'>{_md_inline(c)}</td>" for c in r) + "</tr>"
+                    for r in body)
+                out.append(f"<div style='overflow-x:auto'><table cellpadding='0' "
+                           f"cellspacing='0' style='{_TBL}'><tr>{th}</tr>{tb}</table>"
+                           f"</div>")
+            continue
+        # ---- headings ------------------------------------------------------
+        m = re.match(r"^(#{1,6})\s+(.*)$", s)
+        if m:
+            lvl = len(m.group(1))
+            size, col = (14, "#34495e") if lvl <= 2 else (13, BLUE)
+            out.append(f"<div style='font-size:{size}px;font-weight:700;color:{col};"
+                       f"margin:14px 0 5px'>{_md_inline(m.group(2))}</div>")
+            continue
+        # a fully bolded line is a heading in these reports ("**A-2) Q&A Summary**")
+        if s.startswith("**") and s.endswith("**") and len(s) < 110:
+            out.append(f"<div style='font-size:13px;font-weight:700;color:{BLUE};"
+                       f"margin:12px 0 4px'>{_md_inline(s.strip('*'))}</div>")
+            continue
+        # ---- bullets -------------------------------------------------------
+        if re.match(r"^[-*\u2022]\s+", s):
+            items = []
+            j = i - 1
+            while j < n:
+                t = lines[j].strip()
+                if re.match(r"^[-*\u2022]\s+", t):
+                    items.append(re.sub(r"^[-*\u2022]\s+", "", t))
+                elif t and items and lines[j].startswith(("   ", "\t")):
+                    items[-1] += " " + t          # continuation of the same bullet
+                else:
+                    break
+                j += 1
+            i = j
+            lis = "".join(f"<li style='margin:3px 0'>{_md_inline(x)}</li>"
+                          for x in items)
+            out.append(f"<ul style='margin:4px 0 8px;padding-left:20px;"
+                       f"font-size:12.5px;color:#333;line-height:1.5'>{lis}</ul>")
+            continue
+        # ---- paragraph -----------------------------------------------------
+        out.append(f"<p style='margin:5px 0;font-size:12.5px;color:#333;"
+                   f"line-height:1.55'>{_md_inline(s)}</p>")
+        if sum(len(x) for x in out) > limit:
+            out.append(f"<p style='color:{MUTED};font-size:11.5px'>"
+                       f"[report truncated for email length]</p>")
+            break
+    return "".join(out)
+
+
+def html_to_pdf(doc_html: str, max_pages: int = 200) -> bytes | None:
+    """A4 PDF of a standalone HTML document, or None if it cannot be produced.
+
+    PyMuPDF is already a declared dependency (scripts/requirements.txt) and is used
+    elsewhere for page-range chunking, so this adds nothing to install.
+    """
+    try:
+        import fitz
+        story = fitz.Story(html=doc_html)
+        buf = io.BytesIO()
+        writer = fitz.DocumentWriter(buf)
+        page = fitz.paper_rect("a4")
+        frame = page + (36, 40, -36, -40)
+        more, n = 1, 0
+        while more and n < max_pages:
+            dev = writer.begin_page(page)
+            more, _ = story.place(frame)
+            story.draw(dev)
+            writer.end_page()
+            n += 1
+        writer.close()
+        data = buf.getvalue()
+        return data if data.startswith(b"%PDF") else None
+    except Exception:
+        return None
+
+
+def report_attachment(symbol: str, label: str, subtitle: str,
+                      narrative) -> tuple | None:
+    """(filename, bytes, "html") - Phase 2's report as a standalone file, or None.
+
+    WHY ATTACH SOMETHING THE BODY ALREADY CONTAINS. Gmail collapses repeated content
+    when several messages share a subject: send the same annual report twice and the
+    second arrives with its body behind a "..." trim, which reads exactly like the mail
+    was cut off. An attachment is never trimmed, never clipped, and can be opened or
+    kept independently of the thread.
+    """
+    md = narrative if isinstance(narrative, str) else "\n".join(
+        ((h + "\n") if h else "") + t for h, t in (narrative or []))
+    if not str(md).strip():
+        return None
+    inner = md_to_html(md, limit=REPORT_LIMIT)
+    if not inner:
+        return None
+    doc = (f"<!doctype html><html><head><meta charset='utf-8'>"
+           f"<title>{_esc(symbol, 20)} {_esc(label, 60)}</title></head>"
+           f"<body style='{_WRAP};max-width:820px;margin:24px auto;padding:0 18px'>"
+           f"<h2 style='margin:0 0 2px'>{_esc(symbol, 20)} &middot; {_esc(label, 80)}</h2>"
+           f"<div style='color:{MUTED};font-size:12px;margin:0 0 16px'>"
+           f"{_esc(subtitle, 120)}</div>{inner}</body></html>")
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", f"{symbol}_{label}").strip("_")[:70]
+    # PDF FIRST. An .html attachment is at the mercy of whatever opens it - a mail
+    # client may sandbox it, refuse to preview it, or render only part of it, which is
+    # exactly the complaint this replaces. A PDF renders identically everywhere, cannot
+    # be thread-trimmed, and prints. HTML stays as the fallback if PyMuPDF is missing,
+    # since a readable attachment beats none.
+    pdf = html_to_pdf(doc)
+    if pdf:
+        return (f"{safe}.pdf", pdf, "pdf")
+    return (f"{safe}.html", doc.encode("utf-8"), "html")
+
+
+def _narrative_html(narrative, title: str, sub: str) -> str:
+    """Accepts either a plain string or [(heading, prose)] from lift_report()."""
+    md = narrative if isinstance(narrative, str) else "\n".join(
+        ((h + "\n") if h else "") + t for h, t in (narrative or []))
+    if not str(md).strip():
+        return ""
+    inner = md_to_html(md)
+    if not inner:
+        return ""
+    return (_h(title, sub)
+            + f"<div style='border-left:3px solid #ccc;padding-left:12px;"
+              f"margin:0 0 14px'>{inner}</div>")
+
+
+def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
+    """Coarse fingerprint for a narrative document: its period, and whether a narrative
+    could be lifted at all.
+
+    Coarse for exactly the reason _deck_key is coarse - the body is an LLM pass over a
+    long PDF and its wording drifts between extractions, so fingerprinting the prose would
+    mark almost every re-extract as "changed" and re-send the portfolio. What it DOES
+    catch is the case worth catching: a document that yielded no readable summary later
+    yielding one.
+
+    A genuine supersede needs no key at all. The richer document arrives with a NEW
+    doc_id and the old queue row goes status='superseded', so mail_due already sees a
+    document it has never mailed.
+    """
+    n = (tables.get("_narr") or {}).get((str(isin).strip(), doc_type)) or {}
+    per = str(n.get("period") or "").strip().upper()
+    _t = n.get("text")
+    has = "1" if (_t if isinstance(_t, str) else "".join(x for _h, x in (_t or []))
+                  ).strip() else "0"
+    if not per and has == "0":
+        return ""                    # nothing known; no key means no change check
+    return f"{doc_type}|{per}|{has}"
+
+
 def content_key(doc_type: str, isin: str, tables: dict) -> str:
     """A fingerprint of WHAT THE MAIL ASSERTS, so a correction can be detected.
 
@@ -301,6 +783,8 @@ def content_key(doc_type: str, isin: str, tables: dict) -> str:
     """
     if doc_type == "presentation":
         return _deck_key(isin, tables)
+    if doc_type in ("concall", "annual_report"):
+        return _narrative_key(doc_type, isin, tables)
     if doc_type != "rating":
         return ""
     rt = _slice(tables.get("ratings"), isin)
@@ -949,6 +1433,314 @@ def rating_body(isin, symbol, name, tables) -> str:
 
 
 # ------------------------------------------------------------------ #
+#  Concall: what was said, what was promised, what was delivered      #
+# ------------------------------------------------------------------ #
+
+def concall_body(isin, symbol, name, period, doc_id, narrative, tables) -> str:
+    """The call in the management's own words, then the promises it can be held to.
+
+    Same two-part shape as the other mails: the document first, then what it changes.
+    For a concall "what changed" is the credibility record - what was guided in an
+    earlier quarter set against what was actually delivered, which extract_concall
+    already tabulates into mgmt_credibility whenever it has the historical context.
+    """
+    facts = _doc_rows(tables, "quarterly_facts", isin, doc_id, limit=1)
+    guid = _doc_rows(tables, "guidance_tracker", isin, doc_id, limit=12)
+    gf1 = _doc_rows(tables, "gf1_guidance_statements", isin, doc_id, limit=8)
+    gf3 = _doc_rows(tables, "gf3_operational_visibility", isin, doc_id, limit=6)
+    gf4 = _doc_rows(tables, "gf4_quality_flags", isin, doc_id, limit=6)
+    cred = _doc_rows(tables, "mgmt_credibility", isin, doc_id, limit=8)
+
+    _has_narr = bool(narrative if isinstance(narrative, str)
+                     else "".join(t for _h, t in (narrative or [])))
+    if not _has_narr and guid.empty and gf1.empty and facts.empty:
+        # Nothing readable yet. Returning "" leaves the document UNMAILED and therefore
+        # still due, so the next run picks it up once extraction lands - rather than
+        # sending an empty mail and burning the only chance to report it.
+        return ""
+
+    out = [f"<div style='{_WRAP}'>",
+           f"<h2 style='margin:0 0 2px'>&#127897; {_esc(name, 70)} "
+           f"<span style='color:#888;font-weight:400'>&middot; "
+           f"{_esc(symbol, 20)}</span></h2>",
+           f"<div style='color:#888;font-size:12px;margin:0 0 10px'>Concall transcript"
+           + (f" &middot; {_esc(period, 20)}" if str(period or "").strip() else "")
+           + "</div>"]
+
+    if not facts.empty:
+        f0 = facts.iloc[0]
+        out.append(_tile_row([
+            ("Revenue", _num(f0.get("revenue_q")), True),
+            ("EBITDA", _num(f0.get("ebitda_q")), True),
+            ("PAT", _num(f0.get("pat_q")), True),
+            ("Margin", _num(f0.get("margin_pct"), "%"), True),
+        ]))
+
+    out.append(_narrative_html(
+        narrative, "The call, as Phase 2 read it",
+        "Phase 2's full transcript brief for this document, tables and all."))
+
+    if not guid.empty:
+        rows = []
+        for _, r in guid.iterrows():
+            if _is_esg(r.get("metric"), r.get("notes")):
+                continue
+            val = _esc(r.get("value"), 40)
+            if not val:
+                continue
+            rows.append([_esc(r.get("metric"), 40), f"<b>{val}</b>",
+                         _esc(r.get("horizon_fy"), 14), _esc(r.get("notes"), 150)])
+        if rows:
+            out.append(_h("Forward guidance",
+                          "What the company committed to on this call.")
+                       + _rows_html(rows, ["Metric", "Guided", "By", "Note"]))
+
+    if not gf1.empty:
+        rows = []
+        for _, r in gf1.iterrows():
+            stmt = _esc(r.get("exact_statement"), 300)
+            if not stmt:
+                continue
+            rows.append([stmt, _esc(r.get("timeframe"), 18),
+                         _esc(r.get("explicitness_type"), 18)])
+        if rows:
+            out.append(_h("In their own words",
+                          "Verbatim forward-looking statements, quoted at extraction "
+                          "so nothing is paraphrased into a promise.")
+                       + _rows_html(rows, ["Statement", "Timeframe", "Type"]))
+
+    if not gf3.empty:
+        rows = []
+        for _, r in gf3.iterrows():
+            drv = _esc(r.get("visibility_driver"), 70)
+            if not drv:
+                continue
+            rows.append([drv, _esc(r.get("timeframe"), 16),
+                         _esc(r.get("commentary"), 190)])
+        if rows:
+            out.append(_h("Operational visibility",
+                          "The concrete things behind the guidance - orders, capacity, "
+                          "contracted volume.")
+                       + _rows_html(rows, ["Driver", "Horizon", "Detail"]))
+
+    if not cred.empty:
+        rows = []
+        for _, r in cred.iterrows():
+            metric = _esc(r.get("metric"), 34)
+            if not metric:
+                continue
+            verdict = str(r.get("verdict") or "").strip()
+            vcol = (UP if "met" in verdict.lower() or "beat" in verdict.lower()
+                    else DOWN if "miss" in verdict.lower() else MUTED)
+            rows.append([_esc(r.get("qtr_guided"), 12), metric,
+                         _esc(r.get("guidance_given"), 40),
+                         _esc(r.get("actual_delivered"), 40),
+                         f"<span style='color:{vcol};font-weight:700'>"
+                         f"{_esc(verdict, 18) or '&mdash;'}</span>"])
+        if rows:
+            sub = "Earlier guidance set against what was actually delivered."
+            score = _num((cred.iloc[0]).get("cred_score"))
+            if score:
+                sub += f" Credibility score: <b>{_esc(score, 10)}</b>."
+            out.append(_h("Said versus delivered", sub)
+                       + _rows_html(rows, ["Guided in", "Metric", "Said",
+                                           "Delivered", "Verdict"]))
+
+    if not gf4.empty:
+        rows = []
+        for _, r in gf4.iterrows():
+            ev = _esc(r.get("evidence"), 240)
+            if not ev:
+                continue
+            rows.append([f"<span style='color:{DOWN};font-weight:700'>"
+                         f"{_esc(r.get('flag_type'), 34)}</span>", ev])
+        if rows:
+            out.append(_h("Quality flags",
+                          "Things the extraction marked as worth a second look - "
+                          "evasion, an unexplained change, a claim without a number.")
+                       + _rows_html(rows, ["Flag", "Evidence"]))
+
+    out.append("</div>")
+    return "".join(out)
+
+
+# ------------------------------------------------------------------ #
+#  Annual report: the year, its promises and its red flags            #
+# ------------------------------------------------------------------ #
+
+_SEVERITY_COLOUR = {"high": DOWN, "medium": AMBER, "low": MUTED}
+
+# Filings that reach the queue as doc_type="annual_report" but are NOT the annual report.
+# Bluspring's "Shareholder Meeting / Postal Ballot-Scrutinizer's Report" was extracted and
+# would have been mailed under an "Annual Report FY2025-26" heading, summarising which
+# resolutions passed. The row comes from Phase-2's own Screener feed (source="live"), so
+# this is filtered at RENDER time only - exactly as _is_esg filters ESG rows out of the
+# guidance tables. Nothing upstream changes and the rows stay in the queue.
+_NOT_AN_AR = ("postal ballot", "scrutinizer", "scrutiniser", "e-voting", "evoting",
+              "voting result", "newspaper publication", "business responsibility",
+              "brsr")
+
+
+def is_annual_report(title: str) -> bool:
+    """False when the title plainly identifies a filing that is not the annual report.
+
+    "annual report" in the title is the strongest positive signal there is and always
+    wins - "Weblink / Exact Path Of Integrated Annual Report 2025-26" is how several
+    companies file the real thing, and must not be excluded for saying "weblink".
+    """
+    t = str(title or "").lower()
+    if "annual report" in t:
+        return True
+    return not any(k in t for k in _NOT_AN_AR)
+
+
+def annual_report_body(isin, symbol, name, fy_label, doc_id, narrative, tables) -> str:
+    """The forensic read of the annual report Phase 2 already produced."""
+    facts = _doc_rows(tables, "quarterly_facts", isin, doc_id, limit=1)
+    guid = _doc_rows(tables, "ar_guidance", isin, doc_id, limit=12)
+    flags = _doc_rows(tables, "ar_red_flags", isin, doc_id, limit=14)
+
+    _has_narr = bool(narrative if isinstance(narrative, str)
+                     else "".join(t for _h, t in (narrative or [])))
+    if not _has_narr and guid.empty and flags.empty:
+        return ""                     # see concall_body: stays due, retried next run
+
+    out = [f"<div style='{_WRAP}'>",
+           f"<h2 style='margin:0 0 2px'>&#128215; {_esc(name, 70)} "
+           f"<span style='color:#888;font-weight:400'>&middot; "
+           f"{_esc(symbol, 20)}</span></h2>",
+           f"<div style='color:#888;font-size:12px;margin:0 0 10px'>Annual Report"
+           + (f" &middot; {_esc(fy_label, 40)}" if str(fy_label or "").strip() else "")
+           + "</div>"]
+
+    _sev = (flags["severity"].astype(str).str.lower() if not flags.empty
+            and "severity" in flags.columns else None)
+    if not facts.empty or _sev is not None:
+        pairs = []
+        if not facts.empty:
+            f0 = facts.iloc[0]
+            pairs += [("Revenue (12m)", _num(f0.get("revenue_12m")), True),
+                      ("PAT (12m)", _num(f0.get("pat_12m")), True)]
+        if _sev is not None:
+            pairs += [("High-severity flags", str(int((_sev == "high").sum())) or "",
+                       False),
+                      ("Flags in total", str(len(flags)), False)]
+        out.append(_tile_row(pairs))
+
+    out.append(_narrative_html(
+        narrative, "The report, as Phase 2 read it",
+        "Phase 2's full forensic analysis of this annual report, tables and all."))
+
+    if not guid.empty:
+        rows = []
+        for _, r in guid.iterrows():
+            if _is_esg(r.get("metric"), r.get("notes")):
+                continue
+            val = _esc(r.get("value"), 40)
+            if not val:
+                continue
+            rows.append([_esc(r.get("metric"), 40), f"<b>{val}</b>",
+                         _esc(r.get("horizon_fy"), 14), _esc(r.get("notes"), 150)])
+        if rows:
+            out.append(_h("What the report commits to",
+                          "Management's own forward statements, from the report itself.")
+                       + _rows_html(rows, ["Metric", "Stated", "By", "Note"]))
+
+    if not flags.empty:
+        order = {"high": 0, "medium": 1, "low": 2}
+        fl = flags.copy()
+        fl["_o"] = (fl["severity"].astype(str).str.lower().map(order).fillna(3)
+                    if "severity" in fl.columns else 3)
+        rows = []
+        for _, r in fl.sort_values("_o").iterrows():
+            ev = _esc(r.get("evidence"), 260)
+            if not ev:
+                continue
+            sev = str(r.get("severity") or "").strip().lower()
+            col = _SEVERITY_COLOUR.get(sev, MUTED)
+            rows.append([f"<span style='color:{col};font-weight:700'>"
+                         f"{_esc(sev or 'flag', 10).upper()}</span>",
+                         _esc(r.get("category"), 26),
+                         _esc(r.get("flag_type"), 34), ev,
+                         _esc(r.get("page_ref"), 12)])
+        if rows:
+            out.append(_h("Red flags",
+                          "Raised by the forensic pass over the report - each one "
+                          "carries the evidence it was raised from, so it can be "
+                          "checked rather than taken on trust.")
+                       + _rows_html(rows, ["Severity", "Area", "Flag",
+                                           "Evidence", "Page"]))
+
+    out.append("</div>")
+    return "".join(out)
+
+
+def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -> dict:
+    """{(isin, doc_type): {'period':.., 'text':..}} for the newest concall / AR per holding.
+
+    Reuses the digest's parser rather than carrying a second copy: run_pf_docs_digest
+    already solves boundary detection on a page whose LLM bodies contain their own '## '
+    headings, and a divergent copy here would drift away from it.
+    """
+    from run_pf_docs_digest import _company_page, _find_region, _lift_summary
+    from _extractor_base import log as _log, load_doc_report, is_prompt_echo
+    out = {}
+    for (isin, dt), d in latest.items():
+        if dt not in SCOPED_TYPES:
+            continue
+        period = str(d.get("period") or "").strip()
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not period and dt == "annual_report":
+            # MOST AR QUEUE ROWS CARRY NO PERIOD - measured on APL Apollo, the field is
+            # empty. Without one, the only way left to find the section is the doc
+            # marker, and after a re-extraction the marker sits on the STALE section
+            # while the good re-read is appended under a correct heading with none. So
+            # the fresh report was invisible and the mail lost its summary again.
+            # announcement_date always answers this (FY-end stamp or filing date).
+            _fy = ar_fy_year(d.get("date"), "")
+            if _fy:
+                period = f"FY{str(_fy)[-2:]}"
+        txt = ""
+        # EXACT FIRST. doc_reports is keyed on the document, so there is nothing to
+        # guess; the page walk below stays as the fallback for every document extracted
+        # before this store existed.
+        try:
+            exact = load_doc_report(drive, index_id, doc_id) if doc_id else ""
+        except Exception:
+            exact = ""
+        if exact.strip():
+            # The echo guard must sit on BOTH paths. It was added to the page walk only,
+            # so a doc_reports row holding a prompt echo went straight to the reader -
+            # the exact-record lookup runs first and returned before the check.
+            if is_prompt_echo(exact):
+                _log(f"  {dt} for {isin}: doc_reports row is a prompt echo — ignored")
+            else:
+                out[(isin, dt)] = {"period": period, "text": exact}
+                continue
+        try:
+            reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
+                               doc_id)
+            # The whole region, headings and tables intact. lift_report stays for
+            # anything that wants a short extract; the mail wants the report.
+            txt = "\n".join(((h + "\n") if h else "") + b
+                            for h, b in (reg or [])) if reg else ""
+        except Exception as e:
+            _log(f"  WARN: narrative lift failed for {isin} {dt} ({str(e)[:60]})")
+        # A PROMPT ECHO IS NOT A REPORT. Switching from lift_report() to carrying the
+        # whole report removed the echo filter that lift_report applied per section, so
+        # a response that is annual_report_prompt.txt talking back would be rendered in
+        # full - measured 2026-09-04, that is 5k / 89k / 120k characters of instructions
+        # for DEEPINDS, CGPOWER and MOREPENLAB. Treat it as NO narrative: the mail then
+        # carries its structured tables, or does not send at all and stays due, and the
+        # coarse content_key flips to "0" so a good re-extraction re-notifies.
+        if txt and is_prompt_echo(txt):
+            _log(f"  {dt} for {isin}: stored report is a prompt echo — treated as empty")
+            txt = ""
+        out[(isin, dt)] = {"period": period, "text": txt}
+    return out
+
+
+# ------------------------------------------------------------------ #
 #  Main                                                               #
 # ------------------------------------------------------------------ #
 
@@ -971,12 +1763,36 @@ def main() -> None:
     ap.add_argument("--types", default="results,presentation,rating",
                     help="Which mails to consider.")
     ap.add_argument("--limit", type=int, default=0, help="Max mails this run.")
+    ap.add_argument("--symbols", default="",
+                    help="Restrict to these NSE symbols (comma separated). --limit caps "
+                         "a count but cannot choose WHICH holding, so this is what lets "
+                         "one real mail be sent and read before the whole book goes out.")
     ap.add_argument("--window-days", type=int, default=2,
                     help="How far back a calendar date still counts (backwards only).")
     ap.add_argument("--require-calendar", action="store_true",
                     help="Results mails additionally require a board-meeting date "
                          "on/near today. Presentations and ratings never do — they "
                          "arrive on no calendar.")
+    ap.add_argument("--scope", default="current",
+                    help="Concall/AR ONLY. 'current' (default) mails this season's "
+                         "concalls (the quarter the presentation mail already uses) and "
+                         "this financial year's annual reports. 'all' disables both "
+                         "scopes and mails the latest of each, whenever it was filed.")
+    ap.add_argument("--new-holding-days", type=int, default=30,
+                    help="A holding that entered the portfolio within this many days is "
+                         "ONBOARDED: its latest concall and latest annual report are "
+                         "mailed whatever month they were filed, once. 0 disables it, "
+                         "leaving every holding on the --month rule.")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-send the named holdings even though the ledger says they "
+                         "were already mailed. REQUIRES --symbols, so it can never "
+                         "re-send the whole book by accident. For when a fix changed "
+                         "what a mail SAYS without changing its content_key - the key is "
+                         "deliberately coarse and cannot see prose improving.")
+    ap.add_argument("--seed-ledger", action="store_true",
+                    help="Write ledger rows for everything currently due WITHOUT "
+                         "sending, so only genuinely-new documents mail from then on. "
+                         "One-off, run once when enabling a new doc_type.")
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -1011,6 +1827,18 @@ def main() -> None:
     # What the mail WOULD assert right now, per document — compared against what it
     # asserted when it was last sent, so a corrected re-extract is re-notified.
     _latest = COV.latest_doc_per_type(pf, queue, tuple(want))
+    # Concall/AR prose exists ONLY on company_page.md, so it is lifted once per holding
+    # (cached) and shared by content_key and the renderers. Read only when those types
+    # are actually wanted - otherwise this is six needless Drive round-trips.
+    _extra = {}
+    if set(want) & set(SCOPED_TYPES):
+        _extra = {n: _read(drive, idx, f"{n}.parquet") for n in
+                  ("quarterly_facts", "guidance_tracker", "gf1_guidance_statements",
+                   "gf3_operational_visibility", "ar_guidance", "ar_red_flags")}
+        _pre.update(_extra)
+        _pre["_narr"] = _narratives(drive, repo, _latest, {}, idx)
+        _n_ok = sum(1 for v in _pre["_narr"].values() if v["text"])
+        log(f"narratives lifted from company_page.md: {_n_ok}/{len(_pre['_narr'])}")
     _keys = {}
     for (_i, _dt), _d in _latest.items():
         _did = str(_d.get("doc_id") or "").strip()
@@ -1022,10 +1850,126 @@ def main() -> None:
                        window_days=args.window_days, doc_types=tuple(want),
                        require_calendar=args.require_calendar, tables=_pre,
                        content_keys=_keys)
+    # MONTH SCOPE. "The latest concall and AR" is what the exchanges received THIS
+    # calendar month. This is also what stops a first run mailing the back catalogue:
+    # coverage() calls a holding PRESENT when ANY document of that type ever reached
+    # done, so without a scope every holding's whole history is due at once.
+    # TRACK 2 - holdings that just entered the portfolio. Read before the scope is
+    # applied, because these bypass it.
+    fresh = set()
+    if args.new_holding_days > 0:
+        try:
+            _tid = get_or_create_subfolder(drive, idx, "pf_tracker")
+            _snaps = load_parquet(drive, _tid, "pf_snapshots.parquet",
+                                  ["snapshot_date", "isin", "symbol", "name",
+                                   "weight_pct", "source_file"])
+            fresh = new_pf_holdings(_snaps, args.new_holding_days, today)
+            log(f"new to the portfolio in {args.new_holding_days}d: {len(fresh)} holding(s)"
+                + (" - onboarded with their latest concall/AR" if fresh else ""))
+        except Exception as e:
+            # No holdings history is not a failure: everything simply stays on the
+            # month rule, which is the stricter of the two.
+            log(f"pf_snapshots unavailable ({str(e)[:60]}) - month rule only")
+
+    # EACH TYPE ON ITS OWN CALENDAR. A concall belongs to a QUARTER - so it is scoped
+    # exactly as the presentation mail is, to the current season. An annual report
+    # belongs to a FINANCIAL YEAR and is filed on a statutory timetable (AGM within six
+    # months of the year end), so the whole FY2026 crop arrives across Jun-Sep 2026 and a
+    # month window would arbitrarily split it.
+    season_q, ar_fy = QT.norm_q(season), current_ar_fy(today)
+    if (args.scope or "").strip().lower() != "all":
+        kept, out_of_scope, undated, onboarded = [], 0, 0, 0
+        for d in due:
+            if d["doc_type"] not in SCOPED_TYPES:
+                kept.append(d)
+                continue
+            # TRACK 2 wins over both scopes: a holding just bought needs its LATEST call
+            # and report whenever they were filed, and mail_due hands us exactly those.
+            if str(d.get("isin", "")).strip() in fresh:
+                d["onboarding"] = True
+                kept.append(d)
+                onboarded += 1
+                continue
+            # NOT `want`: that name already holds the set of doc types this run was
+            # asked for, and rebinding it here silently emptied every later test
+            # against it - --force found nothing, because "annual_report" is not a
+            # substring of "Q1FY27".
+            if d["doc_type"] == "concall":
+                got, expect = concall_quarter(d.get("doc_date")), season_q
+            else:
+                got, expect = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
+            if not got:
+                # Undatable. Skipped rather than assumed current, and COUNTED so that it
+                # is visible rather than silent.
+                undated += 1
+            elif got == expect:
+                kept.append(d)
+            else:
+                out_of_scope += 1
+        n_scoped = sum(1 for k in kept
+                       if k["doc_type"] in SCOPED_TYPES and not k.get("onboarding"))
+        log(f"scope: concall={season_q} AR=FY{ar_fy} -> {n_scoped} in scope"
+            + (f", {onboarded} onboarding a new holding" if onboarded else "")
+            + (f", {out_of_scope} from an earlier quarter/FY" if out_of_scope else "")
+            + (f", {undated} undatable" if undated else ""))
+        due = kept
+
     log(f"season={season} pf={len(pf)} due={len(due)} "
         f"({', '.join(sorted({d['doc_type'] for d in due})) or 'nothing'})")
     if not due:
         log("nothing due — no mail.")
+        return
+
+    if args.force:
+        # Rebuild the due list straight from the newest document per type, bypassing both
+        # the ledger and the scope. mail_due exists to answer "what is new"; force
+        # answers a different question - "send me these again, they are better now".
+        if not args.symbols:
+            log("--force requires --symbols — refusing to re-send the whole portfolio.")
+            return
+        _wsym = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        _by_isin = {str(i): (s, n) for i, s, n in pf}
+        due = []
+        for (_i, _dt), _d in sorted(_latest.items()):
+            _sym, _name = _by_isin.get(str(_i), ("", ""))
+            if _dt not in want or _sym.upper() not in _wsym:
+                continue
+            due.append({"isin": _i, "symbol": _sym, "name": _name, "doc_type": _dt,
+                        "season": season, "resend": True,
+                        "doc_id": _d.get("doc_id", ""), "doc_date": _d.get("date", ""),
+                        "doc_title": _d.get("title", ""), "period": _d.get("period", ""),
+                        "discovered_at": _d.get("discovered_at", ""),
+                        "processed_at": _d.get("processed_at", ""), "reported_on": ""})
+        due.sort(key=lambda d: (d["doc_type"], d["symbol"]))
+        log(f"--force: {len(due)} document(s) for {sorted(_wsym)} — ledger and scope "
+            f"bypassed")
+        if not due:
+            log("nothing to force — no document of those types for those symbols.")
+            return
+
+    if args.seed_ledger:
+        # Mark the current back catalogue as already handled WITHOUT sending, so the
+        # first real run reports only genuinely-new documents.
+        for d in due[:40]:
+            log(f"  seed {d['symbol']:<12} {d['doc_type']}")
+        if args.dry_run:
+            log(f"DRY RUN - would seed {len(due)} ledger row(s); nothing written.")
+            return
+        _now = datetime.now().isoformat(timespec="seconds")
+        seed_rows = [{"season": season, "isin": d["isin"], "symbol": d["symbol"],
+                      "doc_type": d["doc_type"], "period": season,
+                      "doc_id": d.get("doc_id", ""), "mailed_at": _now,
+                      "subject": "(seeded - back catalogue, never sent)",
+                      "content_key": _keys.get(str(d.get("doc_id") or ""), "")}
+                     for d in due]
+        out = pd.concat([ledger, pd.DataFrame(seed_rows, columns=LEDGER_COLS)],
+                        ignore_index=True) if ledger is not None and not ledger.empty \
+            else pd.DataFrame(seed_rows, columns=LEDGER_COLS)
+        out = out.drop_duplicates(subset=["season", "isin", "doc_type", "doc_id"],
+                                  keep="last")
+        save_parquet(drive, idx, LEDGER_NAME, out)
+        log(f"SEEDED {len(seed_rows)} row(s) -> _index/{LEDGER_NAME} ({len(out)} rows). "
+            f"Nothing mailed; only new documents will mail from now on.")
         return
 
     tables = {n: _read(drive, idx, f"{n}.parquet") for n in
@@ -1036,13 +1980,26 @@ def main() -> None:
                "gf2_historical_guidance",
                # risks + management changes: the deck does not carry these
                "deck_flags", "gf4_quality_flags", "announcement_ledger")}
+    # Already read above for content_key - carried over rather than re-fetched.
+    tables.update(_extra)
+    if "_narr" in _pre:
+        tables["_narr"] = _pre["_narr"]
 
+    if args.symbols:
+        want_sym = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        before = len(due)
+        due = [d for d in due if str(d.get("symbol", "")).upper() in want_sym]
+        log(f"--symbols {sorted(want_sym)}: {len(due)} of {before} due")
+        if not due:
+            log("nothing due for those symbols — no mail.")
+            return
     if args.limit:
         due = due[: args.limit]
 
     sent_rows = []
     for d in due:
         isin, sym, name, dt = d["isin"], d["symbol"], d["name"], d["doc_type"]
+        _attach = None
         if dt == "presentation":
             body = presentation_body(isin, sym, name, season, tables)
             subject = (f"📊 {sym} — investor presentation UPDATED, "
@@ -1052,6 +2009,46 @@ def main() -> None:
             body = rating_body(isin, sym, name, tables)
             subject = (f"🏷 {sym} — credit rating CORRECTED"
                        if d.get("resend") else f"🏷 {sym} — credit rating update")
+        elif dt == "concall":
+            _n = (tables.get("_narr") or {}).get((isin, "concall")) or {}
+            _per = _n.get("period") or d.get("period") or QT.qtr_label(season)
+            body = concall_body(isin, sym, name, _per, d.get("doc_id", ""),
+                                _n.get("text") or [], tables)
+            # A new holding's mail is its LATEST call, not this month's news, and
+            # saying so stops it reading as a filing that just happened.
+            _attach = report_attachment(sym, f"Concall {_per}".strip(),
+                                        f"{name} - Phase 2 transcript brief",
+                                        _n.get("text") or [])
+            _new = " (new holding \u2014 latest call)" if d.get("onboarding") else ""
+            # A RESEND MUST NOT SHARE A SUBJECT WITH THE MAIL IT REPLACES. Gmail threads
+            # on subject and hides the repeated body behind a "..." trim, which reads as
+            # a truncated mail. The send date makes each one its own conversation.
+            _stamp = today.strftime("%-d %b") if os.name != "nt" else today.strftime("%d %b").lstrip("0")
+            subject = (f"\U0001F399 {sym} \u2014 concall transcript UPDATED "
+                       f"{_stamp}, {_esc(_per, 20)}" if d.get("resend")
+                       else f"\U0001F399 {sym} \u2014 concall transcript, "
+                            f"{_esc(_per, 20)}{_new}")
+        elif dt == "annual_report":
+            if not is_annual_report(d.get("doc_title")):
+                log(f"  {sym:<12} {dt}: not an annual report "
+                    f"({_esc(d.get('doc_title'), 60)}) - skipped")
+                continue
+            from run_pf_docs_digest import _ar_display
+            _n = (tables.get("_narr") or {}).get((isin, "annual_report")) or {}
+            # An AR's announcement_date is the FY-END (2026-03-31 = the 2025-26 report),
+            # so the label is derived from it rather than printed as a bare FY.
+            _fy = _ar_display(d.get("doc_date", "")) or str(d.get("period") or "")
+            body = annual_report_body(isin, sym, name, _fy, d.get("doc_id", ""),
+                                      _n.get("text") or [], tables)
+            _attach = report_attachment(sym, f"Annual Report {_fy}".strip(),
+                                        f"{name} - Phase 2 forensic analysis",
+                                        _n.get("text") or [])
+            _new = " (new holding \u2014 latest report)" if d.get("onboarding") else ""
+            _stamp = today.strftime("%d %b").lstrip("0")
+            subject = (f"\U0001F4D7 {sym} \u2014 Annual Report {_esc(_fy, 40)} "
+                       f"UPDATED {_stamp}" if d.get("resend")
+                       else f"\U0001F4D7 {sym} \u2014 Annual Report "
+                            f"{_esc(_fy, 40)}{_new}")
         else:
             body = ""       # results teardown is rendered by quarter_teardown itself
             subject = ""
@@ -1066,7 +2063,14 @@ def main() -> None:
             p = os.path.join(args.out_dir, f"mail_{sym}_{dt}.html")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write(body)
-            log(f"  {sym:<12} {dt}: preview -> {p} ({len(body.encode()):,} B)")
+            _extra = ""
+            if _attach:
+                ap = os.path.join(args.out_dir, "attach_" + _attach[0])
+                with open(ap, "wb") as fh:
+                    fh.write(_attach[1])
+                _extra = f" + attachment {_attach[0]} ({len(_attach[1]):,} B)"
+            log(f"  {sym:<12} {dt}: preview -> {p} "
+                f"({len(body.encode()):,} B){_extra}")
             continue
 
         from mailer import send_email, load_mail_settings
@@ -1077,7 +2081,8 @@ def main() -> None:
                 and os.getenv("NOTIFY_EMAIL")):
             log("  mail NOT sent — GMAIL_* not set in this environment.")
             return
-        ok = send_email(subject, body)
+        ok = send_email(subject, body,
+                        attachments=[_attach] if _attach else None)
         log(f"  {sym:<12} {dt}: sent={ok}")
         if ok:
             sent_rows.append({"season": season, "isin": isin, "symbol": sym,
@@ -1389,6 +2394,386 @@ def _self_test() -> int:
           not in ("", k_hi, k_deck))
     check("results have no key yet", content_key("results", "INE1", T) == "")
     check("content_key is in the ledger schema", "content_key" in LEDGER_COLS)
+
+    # ---- concall + annual report -------------------------------------------
+    _D = "doc-1"
+    NT = {
+        "quarterly_facts": pd.DataFrame([
+            {"isin": "INE1", "revenue_q": 1284.5, "ebitda_q": 214.0, "pat_q": 131.2,
+             "margin_pct": 16.7, "revenue_12m": 4820.0, "pat_12m": 498.3,
+             "processed_at": "2026-08-30", "source_doc_id": _D},
+            {"isin": "INE1", "revenue_q": 900.0, "ebitda_q": 100.0, "pat_q": 70.0,
+             "margin_pct": 11.1, "revenue_12m": 4000.0, "pat_12m": 400.0,
+             "processed_at": "2026-05-30", "source_doc_id": "old"}]),
+        "guidance_tracker": pd.DataFrame([
+            {"isin": "INE1", "metric": "Revenue growth", "value": "18-20%",
+             "horizon_fy": "FY27", "notes": "export book",
+             "processed_at": "2026-08-30", "source_doc_id": _D},
+            {"isin": "INE1", "metric": "Scope 1 emissions", "value": "-30%",
+             "horizon_fy": "FY30", "notes": "net zero pathway",
+             "processed_at": "2026-08-30", "source_doc_id": _D}]),
+        "gf1_guidance_statements": pd.DataFrame([
+            {"isin": "INE1", "exact_statement": "We expect to close FY27 with revenue "
+             "growth of eighteen to twenty percent.", "timeframe": "FY27",
+             "explicitness_type": "explicit", "processed_at": "2026-08-30",
+             "source_doc_id": _D}]),
+        "ar_red_flags": pd.DataFrame([
+            {"isin": "INE1", "category": "Cash flow", "flag_type": "CFO below PAT",
+             "severity": "low", "evidence": "third year of divergence",
+             "page_ref": "p.9", "processed_at": "2026-08-30", "source_doc_id": _D},
+            {"isin": "INE1", "category": "RPT", "flag_type": "RPT growth",
+             "severity": "high", "evidence": "RPT sales rose faster than sales",
+             "page_ref": "p.20", "processed_at": "2026-08-30", "source_doc_id": _D}]),
+        "_narr": {("INE1", "concall"): {"period": "Q1 FY27", "text": "Record quarter."},
+                  ("INE1", "annual_report"): {"period": "FY26", "text": "Year closed."}},
+    }
+
+    # _doc_rows must prefer THIS document over the company's older rows
+    check("_doc_rows prefers the document's own rows",
+          float(_doc_rows(NT, "quarterly_facts", "INE1", _D).iloc[0]["revenue_q"]) == 1284.5)
+    check("_doc_rows falls back when doc_id is unknown",
+          len(_doc_rows(NT, "quarterly_facts", "INE1", "no-such-doc")) == 2)
+    check("_doc_rows fallback is newest-first",
+          float(_doc_rows(NT, "quarterly_facts", "INE1", "no-such-doc")
+                .iloc[0]["revenue_q"]) == 1284.5)
+    check("_num drops NaN", _num(float("nan")) == "" and _num(None) == "")
+    check("_num keeps a real number", _num(16.7, "%") == "16.7%")
+
+    cb = concall_body("INE1", "ACME", "Acme Ltd", "Q1 FY27", _D, "Record quarter.", NT)
+    check("concall body renders", len(cb) > 400)
+    check("concall carries the narrative", "Record quarter." in cb)
+    check("concall carries this quarter's revenue", "1284.5" in cb)
+    check("concall carries the guidance", "18-20%" in cb)
+    check("concall quotes the verbatim statement", "eighteen to twenty" in cb)
+    check("concall filters ESG out of guidance", "Scope 1" not in cb)
+
+    ab = annual_report_body("INE1", "ACME", "Acme Ltd", "FY2025-26", _D, "Year closed.", NT)
+    check("AR body renders", len(ab) > 300)
+    check("AR carries the narrative", "Year closed." in ab)
+    check("AR carries the FY label", "FY2025-26" in ab)
+    check("AR red flags are severity-ordered, high first",
+          "HIGH" in ab and "LOW" in ab and ab.index("HIGH") < ab.index("LOW"))
+
+    # An unextracted document must render NOTHING, so it stays due and is retried
+    # rather than being burned on an empty mail.
+    check("concall with no content renders nothing",
+          concall_body("INE9", "X", "X", "", "", "", {}) == "")
+    check("AR with no content renders nothing",
+          annual_report_body("INE9", "X", "X", "", "", "", {}) == "")
+
+    # content_key: coarse, and it moves only when the narrative appears
+    k_has = content_key("concall", "INE1", NT)
+    k_not = content_key("concall", "INE1",
+                        {"_narr": {("INE1", "concall"): {"period": "Q1 FY27", "text": ""}}})
+    check("concall key routes through _narrative_key", k_has.startswith("concall|"))
+    check("empty narrative gives a DIFFERENT key", k_has != k_not)
+    check("nothing known gives no key at all", content_key("concall", "INE9", {}) == "")
+    check("AR key routes through _narrative_key",
+          content_key("annual_report", "INE1", NT).startswith("annual_report|"))
+    check("the coarse key ignores prose drift",
+          content_key("concall", "INE1",
+                      {"_narr": {("INE1", "concall"): {"period": "Q1 FY27",
+                                                       "text": "Totally different."}}})
+          == k_has)
+    check("scoped types are exactly concall and AR",
+          set(SCOPED_TYPES) == {"concall", "annual_report"})
+
+    # --symbols must select the HOLDING, where --limit can only cap a count
+    _due = [{"symbol": "APLAPOLLO", "doc_type": "concall"},
+            {"symbol": "APLAPOLLO", "doc_type": "annual_report"},
+            {"symbol": "SYRMA", "doc_type": "concall"}]
+    _want = {s.strip().upper() for s in "aplapollo".split(",") if s.strip()}
+    _sel = [d for d in _due if str(d.get("symbol", "")).upper() in _want]
+    check("--symbols keeps both docs of the chosen holding", len(_sel) == 2)
+    check("--symbols excludes every other holding",
+          all(d["symbol"] == "APLAPOLLO" for d in _sel))
+    # --force must never be usable without --symbols: that is the guard stopping an
+    # accidental re-send of the whole book.
+    import inspect as _insp
+    _src = _insp.getsource(main)
+    check("--force refuses to run without --symbols",
+          "--force requires --symbols" in _src)
+    check("--force marks its rows as a resend", '"resend": True' in _src)
+    # The scope loop must not rebind `want`, which holds the requested doc types.
+    check("the scope loop does not shadow the doc-type set",
+          "got, want =" not in _src and "got, expect =" in _src)
+    # An AR row with no period must still resolve to a period, or its section can only
+    # be found by a doc marker that a re-extraction leaves on the STALE section.
+    _nsrc = _insp.getsource(_narratives)
+    check("_narratives derives a period for an AR that has none",
+          'dt == "annual_report"' in _nsrc and "ar_fy_year" in _nsrc)
+    # Compare the CALLS, not the imports - the import line names _find_region first.
+    check("_narratives refuses to render a prompt echo as the report",
+          "is_prompt_echo(txt)" in _nsrc)
+    check("the echo guard covers the doc_reports path too",
+          "is_prompt_echo(exact)" in _nsrc)
+    check("_narratives prefers the exact doc-keyed record",
+          "load_doc_report(" in _nsrc
+          and _nsrc.index("load_doc_report(") < _nsrc.index("_find_region("))
+    check("the derived period is FY-shaped",
+          f"FY{str(ar_fy_year('2026-03-31', ''))[-2:]}" == "FY26")
+
+    # ---- the report is CARRIED, not distilled -----------------------------
+    _rep = """## FY26 Annual Report - Annual Report 2026 from bse
+*Processed: 2026-09-02*
+<!-- doc:zz -->
+
+# CONSOLIDATED ANNUAL REPORT SYNTHESIS
+
+## 2. FINANCIAL PERFORMANCE & GROWTH TRAJECTORY
+| Metric | FY25 | FY26 |
+| :--- | :--- | :--- |
+| Revenue | 100 | 122 |
+| PAT | 8 | 12 |
+
+*   Revenue grew twenty two percent on volume.
+*   Margin expanded one hundred forty basis points.
+
+**Weighted Overall Risk Score: 2.65 (Label: Monitor)**
+
+## 5B. MANAGEMENT OUTLOOK & EXPANSION
+Capacity reaches eight million tons by FY28.
+"""
+    _out = md_to_html(_rep)
+    check("the report's table survives", "<table" in _out and "122" in _out)
+    check("its header row survives", "<th" in _out and "FY26" in _out)
+    check("bullets survive", "<li" in _out and "twenty two percent" in _out)
+    check("section headings survive", "FINANCIAL PERFORMANCE" in _out)
+    check("a bolded line becomes a heading", "Risk Score: 2.65" in _out)
+    check("the document heading is dropped", "Annual Report 2026 from bse" not in _out)
+    check("the Processed stamp is dropped", "Processed:" not in _out)
+    check("the doc marker is dropped", "doc:zz" not in _out and "<!--" not in _out)
+    check("markup in the source cannot leak",
+          "&lt;script&gt;" in md_to_html("<script>alert(1)</script>"))
+    check("it carries far more than the old lift",
+          len(_out) > 6 * sum(len(t) for _h, t in lift_report([("", _rep)], 2600)))
+
+    # ---- the attachment ----------------------------------------------------
+    _att = report_attachment("APLAPOLLO", "Annual Report FY2025-26",
+                             "APL Apollo - Phase 2 forensic analysis", _rep)
+    check("an attachment is produced", _att is not None)
+    check("it is named for the company and document",
+          _att[0].startswith("APLAPOLLO_Annual_Report"))
+    check("it is a PDF where PyMuPDF is available, else html",
+          (_att[0].endswith(".pdf") and _att[1].startswith(b"%PDF")
+           and _att[2] == "pdf")
+          or (_att[0].endswith(".html") and _att[2] == "html"))
+    if _att[0].endswith(".pdf"):
+        import fitz as _fz
+        _d = _fz.open(stream=_att[1], filetype="pdf")
+        _txt = "".join(_d[i].get_text() for i in range(_d.page_count))
+        _d.close()
+        check("the PDF carries the report's numbers", "122" in _txt)
+        check("the PDF carries its headings", "FINANCIAL PERFORMANCE" in _txt)
+        check("the PDF has real pages", _att[1].count(b"/Type /Page") >= 1
+              or b"/Pages" in _att[1])
+    _html_only = report_attachment("X", "Doc", "sub", _rep)
+    check("the html fallback is still a standalone document",
+          html_to_pdf("<!doctype html><html><body>x</body></html>") is not None
+          or _html_only[1].lstrip().startswith(b"<!doctype html>"))
+    check("nothing to attach yields None",
+          report_attachment("X", "Y", "Z", "") is None
+          and report_attachment("X", "Y", "Z", []) is None)
+    # A resend must not reuse the subject it replaces, or Gmail threads and trims it.
+    _msrc = _insp.getsource(main)
+    check("a resend subject carries a date stamp",
+          _msrc.count("UPDATED {_stamp}") + _msrc.count("UPDATED \"\n") >= 1
+          or "_stamp" in _msrc)
+    check("both mail types attach their report", _msrc.count("report_attachment(") == 2)
+
+    # ---- concall: the SEASON QUARTER, same rule the deck mail uses ---------
+    check("a call filed Aug 2026 is Q1 FY27",
+          concall_quarter("2026-08-11") == QT.norm_q("Q1FY27"))
+    check("a call filed Sep 2026 is still Q1 FY27",
+          concall_quarter("2026-09-01") == QT.norm_q("Q1FY27"))
+    check("a call filed May 2026 is Q4 FY26",
+          concall_quarter("2026-05-20") == QT.norm_q("Q4FY26"))
+    check("an undatable call yields nothing", concall_quarter("") == ""
+          and concall_quarter(None) == "" and concall_quarter("Aug 2026") == "")
+
+    # ---- annual report: the FINANCIAL YEAR, on the statutory timetable -----
+    # The two date shapes that reach us mean the same FY by opposite routes.
+    check("the FY-END stamp names its own year", ar_fy_year("2026-03-31") == 2026)
+    check("a report FILED Sep 2026 is also FY2026", ar_fy_year("2026-09-02") == 2026)
+    check("a report filed Jun 2026 is FY2026", ar_fy_year("2026-06-15") == 2026)
+    check("last year's FY-end stamp is FY2025", ar_fy_year("2025-03-31") == 2025)
+    check("a report filed Feb 2026 covers FY2025", ar_fy_year("2026-02-10") == 2025)
+    check("period wins when present", ar_fy_year("2026-03-31", "FY25") == 2025)
+    check("a 4-digit period also parses", ar_fy_year("", "FY2024") == 2024)
+    check("an undatable AR yields None", ar_fy_year("") is None
+          and ar_fy_year(None) is None and ar_fy_year("Sept") is None)
+    check("the AR filing year in Sep 2026 is FY2026",
+          current_ar_fy(date(2026, 9, 2)) == 2026)
+    check("the AR filing year in Feb 2026 is still FY2025",
+          current_ar_fy(date(2026, 2, 10)) == 2025)
+    check("April flips the AR filing year",
+          current_ar_fy(date(2026, 4, 1)) == 2026)
+
+    # ---- track 2: holdings that just entered the portfolio -----------------
+    _T = date(2026, 9, 2)
+    _snaps = pd.DataFrame([
+        # history starts 2026-07-23; OLD was there from the first snapshot
+        {"snapshot_date": "2026-07-23", "isin": "OLD"},
+        {"snapshot_date": "2026-08-31", "isin": "OLD"},
+        {"snapshot_date": "2026-08-27", "isin": "NEW"},      # bought 6 days ago
+        {"snapshot_date": "2026-08-31", "isin": "NEW"},
+        {"snapshot_date": "2026-08-06", "isin": "MID"},      # bought 27 days ago
+    ])
+    _n30 = new_pf_holdings(_snaps, 30, _T)
+    check("a holding bought 6 days ago is new", "NEW" in _n30)
+    check("a holding bought 27 days ago is new at 30d", "MID" in _n30)
+    check("a holding held since before the history is NOT new", "OLD" not in _n30)
+    check("a 7-day window excludes the 27-day-old buy",
+          new_pf_holdings(_snaps, 7, _T) == {"NEW"})
+    # The guard that matters: once the window outruns the history, everything present on
+    # the first snapshot would otherwise read as newly bought.
+    check("a 60-day window does NOT declare the whole book new",
+          "OLD" not in new_pf_holdings(_snaps, 60, _T))
+    check("days=0 disables onboarding", new_pf_holdings(_snaps, 0, _T) == set())
+    check("no history means no onboarding, not a crash",
+          new_pf_holdings(pd.DataFrame(), 30, _T) == set()
+          and new_pf_holdings(None, 30, _T) == set())
+
+    # ---- doc_type=annual_report is not proof of an annual report -----------
+    check("a postal-ballot scrutinizer report is not an AR",
+          not is_annual_report("Shareholder Meeting / Postal Ballot-Scrutinizer's Report"))
+    check("a BRSR filing is not an AR",
+          not is_annual_report("Business Responsibility and Sustainability Reporting (BRSR)"))
+    check("a newspaper publication is not an AR",
+          not is_annual_report("Announcement under Regulation 30 - Newspaper Publication"))
+    check("the real filing IS an AR", is_annual_report("Reg. 34 (1) Annual Report. 2 Sep"))
+    check("a weblink to the report IS an AR",
+          is_annual_report("Weblink / Exact Path Of Integrated Annual Report 2025-26"))
+    check("'annual report' always wins over an exclusion word",
+          is_annual_report("Newspaper Publication of the Annual Report 2025-26"))
+    check("the backfilled bse title IS an AR",
+          is_annual_report("Annual Report 2026 from bse"))
+    check("an unknown title is allowed through", is_annual_report("Financial Year 2025"))
+    check("a blank title is allowed through", is_annual_report(""))
+
+    # ---- the shared company_page matcher these mails depend on --------------
+    # Gated HERE because this is the self-test CI runs, and the failure it guards
+    # against is silent: a mail that confidently presents the wrong document.
+    import run_pf_docs_digest as _D
+    _page = """# X
+
+---
+## FY26 Presentation - PPT - May 2026 Transcript AI Summary PPT REC
+*Processed: 2026-05-10*
+
+### Guidance and outlook
+Deck content that must never be served as the annual report of the same year.
+
+---
+## FY24 Annual Report - Financial Year 2024 from bse
+*Processed: 2026-06-20*
+
+## 2. FINANCIAL PERFORMANCE AND TRAJECTORY
+Revenue grew twenty two percent with margin expansion from operating leverage.
+
+---
+## Q1 FY26 Concall - Transcript
+*Processed: 2026-05-10*
+
+### A-1 Executive Summary
+Management guided to twenty percent growth and flagged an export order win.
+"""
+    _secs = _D._split_sections(_page)
+    _ar26 = _D._find_region(_secs, "FY26", "annual_report")
+    # The regression: "ar" matched inside "summARy", so an FY26 AR with no section of
+    # its own was served that year's PRESENTATION, slide references and all.
+    check("an AR never borrows the same year's presentation",
+          _ar26 is None or "Presentation" not in _ar26[0][0])
+    check("'ar' is no longer an annual-report keyword",
+          "ar" not in _D._SECTION_KW["annual_report"])
+    _ar24 = _D._find_region(_secs, "FY24", "annual_report")
+    check("a real AR section still resolves",
+          _ar24 is not None and "Annual Report" in _ar24[0][0])
+    check("a real AR lifts its own prose",
+          "Revenue grew twenty two" in _D._lift_summary(_ar24 or []))
+    check("a presentation still resolves to the presentation",
+          (_D._find_region(_secs, "FY26", "presentation") or [("", "")])[0][0]
+          .find("Presentation") > 0)
+    check("a concall still lifts its own prose",
+          "Management guided" in _D._lift_summary(
+              _D._find_region(_secs, "Q1 FY26", "concall") or []))
+    check("a blank-period concall finds the concall, not the deck",
+          "Concall" in (_D._find_region(_secs, "", "concall") or [("", "")])[0][0])
+
+    # ---- the doc-id marker beats a wrong heading label --------------------
+    # Real shape, live 2026-09-02: APL Apollo's FY2026 annual report sits under a
+    # heading saying FY22, because _extract_fy_year takes the first year of the
+    # report's own "Fiscal Coverage Horizon: FY22 - FY26" line.
+    _mis = """# X
+
+---
+## FY22 Annual Report - Annual Report 2026 from bse
+*Processed: 2026-08-30*
+<!-- doc:abc-123 -->
+
+### 2. FINANCIAL PERFORMANCE AND TRAJECTORY
+Revenue grew twenty two percent with margin expansion from operating leverage.
+
+---
+## Q1 FY27 Concall - Transcript
+*Processed: 2026-08-11*
+
+### A-1 Executive Summary
+Management guided to twenty percent growth.
+"""
+    _ms = _D._split_sections(_mis)
+    check("the FY26 label finds nothing, as the heading says FY22",
+          _D._find_region(_ms, "FY26", "annual_report") is None)
+    check("the doc-id marker finds it anyway",
+          _D._find_region(_ms, "FY26", "annual_report", "abc-123") is not None)
+    check("and it lifts the real prose",
+          "Revenue grew twenty two" in _D._lift_summary(
+              _D._find_region(_ms, "FY26", "annual_report", "abc-123") or []))
+    check("an unknown doc-id falls back to the label logic",
+          _D._find_region(_ms, "FY26", "annual_report", "no-such-id") is None)
+    check("the doc-id region stops at the next document",
+          "Management guided" not in _D._lift_summary(
+              _D._find_region(_ms, "FY26", "annual_report", "abc-123") or []))
+
+    # A rating section carries no period at all, so the old header-only boundary test
+    # let 124,637 chars of rating prose flow into APL Apollo's annual-report region.
+    _rating_head = "## CRISIL AA+ Credit Rating - Rating update 30 Sep 2025 from crisil"
+    check("a rating section IS a document boundary",
+          _D._is_boundary(_rating_head, "*Processed: 2026-08-30*\n<!-- doc:xyz -->"))
+    check("a dated rating heading is a boundary even with no marker",
+          _D._is_boundary(_rating_head))
+    check("an intra-document header is NOT a boundary",
+          not _D._is_boundary("## Section GF1 - Raw Guidance Extraction"))
+    check("a numbered AR sub-section is NOT a boundary",
+          not _D._is_boundary("## 6. FORENSIC FINANCIAL RISK SCORECARD"))
+    check("a marker anywhere in the first lines makes it a boundary",
+          _D._is_boundary("## Anything At All", "*Processed: x*\n<!-- doc:abc -->"))
+
+    # ---- the model sometimes echoes the prompt back into the stored report -------
+    _echo = ("Generate the final report immediately without displaying preliminary "
+             "steps. No individual paragraph may be longer than 3 lines. The ENTIRE "
+             "report must stay under ~1,200 lines. Output must be completely clean.")
+    check("prompt text is recognised as an echo", _is_prompt_echo(_echo))
+    check("real analysis is NOT an echo",
+          not _is_prompt_echo("Revenue grew 22% with margin expansion of 140bps driven "
+                              "by operating leverage and a better export mix."))
+    check("a single incidental phrase is not enough to flag an echo",
+          not _is_prompt_echo("The output must be read alongside the cash flow note."))
+
+    # ---- plain-numbered sections must split, or the whole report is one block ----
+    _plain = [("", "1. SOURCE COVERAGE & DATA INTEGRITY\nParsed FY2025-26.\n"
+                   "2. FINANCIAL PERFORMANCE & GROWTH TRAJECTORY\n"
+                   + "The shift to charter hire altered the return profile. " * 6
+                   + "\n3. CAPITAL EFFICIENCY & ASSET ALLOCATION\n"
+                   + "Capex was prioritised over dividends. " * 6)]
+    _subs = _subsections(_plain)
+    check("plain-numbered sections split into blocks", len(_subs) >= 3)
+    _got = lift_report(_plain, 2000)
+    check("lift_report picks the wanted section", bool(_got))
+    check("and it skips source coverage",
+          all("SOURCE COVERAGE" not in h.upper() for h, _t in _got))
+    check("and it carries the real analysis",
+          any("charter hire" in t for _h, t in _got))
 
     print(f"\npf_company_mails self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

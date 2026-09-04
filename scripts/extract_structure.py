@@ -59,7 +59,23 @@ STRUCT_COLS = ["isin", "symbol", "company_name", "kind", "item", "field", "value
                "extracted_at"]
 KINDS = ("milestone", "subsidiary", "management", "portfolio_unit", "segment", "risk")
 
-MODELS = ["gemini-2.5-flash", "gemini-flash-latest"]
+# Static fallback, used only when the registry cannot be read. Kept in step with
+# CHAINS["NARRATIVE"] in model_registry.py. gemini-flash-latest was probed live on
+# 2026-09-04 and answers; it is an ALIAS, so the registry now probes it daily.
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash"]
+
+
+def _models(drive=None, index_id: str = "") -> list[str]:
+    """The NARRATIVE chain with anything the daily probe found dead removed.
+
+    Imported under an alias: `resolve` in this module is narrative_factpack's token
+    resolver, which is a different thing entirely.
+    """
+    try:
+        from model_registry import resolve as resolve_models
+        return resolve_models("NARRATIVE", drive, index_id) or FALLBACK_MODELS
+    except Exception:
+        return FALLBACK_MODELS
 # Thinking models spend this budget on reasoning too — see narrative_generate for the
 # truncation this caused at 3000.
 MAX_OUTPUT_TOKENS = 14000
@@ -276,7 +292,7 @@ def main():
             print("no Gemini keys — set FREE_POOL_n")
             return 1
         from _extractor_base import GeminiKeyPool
-        pool = GeminiKeyPool(keys, MODELS)
+        pool = GeminiKeyPool(keys, _models(store.drive, store.folder(IDX)))
 
     frames = []
     for token in a.names:

@@ -46,6 +46,7 @@ Only genuine, deterministic failures (bad PDF, 400, auth) raise FatalCallError.
 from __future__ import annotations
 
 import base64
+import random
 import re
 import threading
 import time
@@ -170,6 +171,8 @@ class BucketPool:
                                         # dead for the workload; drop it for the run
         key_fail_drop: int = 10,        # >=N fails of ANY type with 0 ok -> the key is
                                         # dead for the run; drop it
+        start_key: int | None = None,   # 1-based key this run's rotation starts on;
+                                        # None = random. Pin it only in tests.
         logger=print,
     ):
         # NOTE: there is deliberately NO wall-clock cap by default. Termination is
@@ -210,6 +213,21 @@ class BucketPool:
         self._deadline = (self._started + stage_deadline_s
                           if stage_deadline_s else None)
         self._clients: dict[int, genai.Client] = {}
+        # WHERE THIS RUN'S KEY ROTATION STARTS.
+        # _next_bucket() breaks its final tie on key order, and at the start of a run
+        # every bucket is tied at zero calls — so a fixed order handed key1 the first
+        # call of every run, forever. Measured over 2026-08-05..09-04
+        # (gemini_usage.parquet, 4,253 rows, 29 keys): key1 took 32.2% of all calls and
+        # key2 18.2%, while keys 19-28 took under 1.5% EACH.
+        #
+        # The mechanism is the per-bucket RPM gate: it leaves inter_call_s (6s) between
+        # a bucket's own calls, but a document extraction takes far longer than 6s, so
+        # key1 is ALWAYS recovered by the time the next document is picked. Replayed
+        # against the old sort, a 58-call run gave key1 58 of 58; the same run here
+        # gives 29 keys two calls each. The daily quota behind the idle keys was simply
+        # never reached.
+        self._key_offset = (random.randrange(len(api_keys)) if not api_keys or
+                            start_key is None else (int(start_key) - 1) % len(api_keys))
         # buckets ordered best-model-first, then by key
         self.buckets: list[_Bucket] = [
             _Bucket(key_idx=ki + 1, model=m, model_rank=rank)
@@ -247,12 +265,32 @@ class BucketPool:
     def _any_in_flight(self) -> bool:
         return any(b.in_flight for b in self.buckets)
 
+    def _key_order(self, key_idx: int) -> int:
+        """This key's position in the run's rotation. 0 goes first."""
+        return (key_idx - 1 - self._key_offset) % max(len(self.keys), 1)
+
     def _next_bucket(self, now: float) -> _Bucket | None:
-        """Lowest (model_rank, key_idx) bucket that is live right now."""
+        """Best model, then the lightest-loaded key, then this run's rotation.
+
+        model_rank is STILL the primary sort key, so nothing about quality changes:
+        the best model is spent across every key before the chain drops to the next
+        one. What changed is the order WITHIN a model rank.
+
+          - ok + fail  — least-used first, so a long run levels the keys instead of
+            draining key1, then key2, then key3. Self-correcting: a bucket that has
+            served goes to the back until the others catch up.
+          - _key_order — breaks the tie at the start of a run, when every bucket is
+            at zero. Without it a short run (most runs are short) always begins on
+            the same key, which is how key1 ended up with a third of all traffic.
+
+        A failed call counts as load on purpose: a bucket that is 503-ing should fall
+        behind a quiet one, not be retried ahead of it.
+        """
         live = [b for b in self.buckets if self._live(b, now)]
         if not live:
             return None
-        live.sort(key=lambda b: (b.model_rank, b.key_idx))
+        live.sort(key=lambda b: (b.model_rank, b.ok + b.fail,
+                                 self._key_order(b.key_idx)))
         return live[0]
 
     def _earliest_wakeup(self, now: float) -> float | None:
@@ -603,3 +641,97 @@ def load_keys_multi(env: dict, prefixes_csv: str) -> list[str]:
             if k not in out:
                 out.append(k)
     return out
+
+
+# ── self-test ─────────────────────────────────────────────────────────────────
+# Guards the BUCKET SELECTION ORDER, which is easy to break by accident and whose
+# breakage is invisible: the pool still works, it just drains one key. See the
+# _key_offset note in __init__ for the measurement that prompted these.
+
+def _self_test() -> int:
+    import time as _t
+    keys = [f"k{i}" for i in range(1, 30)]
+    models = ["m-best", "m-mid", "m-worst"]
+    quiet = lambda *_a, **_k: None
+    mk = lambda **kw: BucketPool(keys, models, logger=quiet, **kw)
+
+    def drive(pool, n, step=7.0):
+        """Mimic the real caller: pick, honour the per-bucket RPM gate, succeed."""
+        now, picks = 1_000_000.0, []
+        for _ in range(n):
+            b = None
+            for _try in range(500):
+                b = pool._next_bucket(now)
+                if b is None:
+                    now += 1.0
+                    continue
+                if b.last_call_ts and now - b.last_call_ts < pool.inter_call_s:
+                    b.not_before = b.last_call_ts + pool.inter_call_s
+                    now += 0.5
+                    b = None
+                    continue
+                break
+            assert b is not None, "pool starved"
+            b.ok += 1
+            b.last_call_ts = now
+            picks.append((b.model, b.key_idx))
+            now += step
+        return picks
+
+    passed, failed = 0, []
+    def check(name, cond):
+        nonlocal passed
+        if cond:
+            passed += 1
+        else:
+            failed.append(name)
+
+    # Quality still degrades LAST: the best model is spent on every key first.
+    picks = drive(mk(start_key=1), len(keys))
+    check("best model spans all keys before degrading",
+          {m for m, _ in picks} == {"m-best"} and len({k for _, k in picks}) == len(keys))
+
+    # Load levels inside a rank: no key takes a second call before all have taken one.
+    counts: dict[int, int] = {}
+    for m, k in drive(mk(start_key=1), 2 * len(keys)):
+        if m == "m-best":
+            counts[k] = counts.get(k, 0) + 1
+    check("load levels within a model rank",
+          len(counts) == len(keys) and set(counts.values()) == {2})
+
+    # A short run must not always begin on the same key (this is the actual bug:
+    # a document takes longer than inter_call_s, so key1 was always recovered).
+    firsts = {mk()._next_bucket(_t.time()).key_idx for _ in range(200)}
+    check("the first call of a run rotates", len(firsts) >= len(keys) // 2)
+
+    # Pinned rotation stays reproducible, so this test is not flaky by design.
+    check("start_key pins the rotation",
+          all(mk(start_key=7)._next_bucket(_t.time()).key_idx == 7 for _ in range(20)))
+
+    # A dead top tier still falls through to the NEXT model, never to nothing.
+    pool = mk(start_key=1)
+    for b in pool.buckets:
+        if b.model == "m-best":
+            b.state = DEAD_TODAY
+    check("a dead best model degrades to the next model",
+          pool._next_bucket(_t.time()).model == "m-mid")
+
+    # Single-key pools (most utility scripts) behave exactly as before.
+    check("single-key pool unchanged",
+          BucketPool(["only"], models, logger=quiet)._next_bucket(_t.time()).key_idx == 1)
+
+    for name in failed:
+        print(f"  FAIL  {name}")
+    print(f"gemini_pool self-test: {passed} passed, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="bucket-based Gemini call engine")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check bucket selection order; no keys, no network")
+    a = ap.parse_args()
+    if a.self_test:
+        raise SystemExit(_self_test())
+    ap.print_help()

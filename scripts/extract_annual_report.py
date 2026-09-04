@@ -38,7 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
-    load_queue, save_queue,
+    load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
+    squeeze_padding,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -67,6 +68,14 @@ AR_MAX_OUTPUT_TOKENS = 4096                       # model-level cap on the REPOR
                                                   # what bounds the bloat. ~67k chars
                                                   # still covers the forensic/guidance
                                                   # sections the structured pass reads.
+MIN_REPORT_CHARS = 2000     # below this the report call FAILED, however cleanly it
+                            # returned. Measured over 51 PF FY2026 annual reports on
+                            # 2026-09-02 the distribution is bimodal and the band
+                            # 1,000-2,500 chars is EMPTY: 8 failures sit under 1,000
+                            # (UNIVASTU 0, INDOMIM 108, APLAPOLLO 764, ending mid-word)
+                            # and the smallest genuine report is 3,004. 2,000 therefore
+                            # sits in open space, ~1,200 clear of the worst failure and
+                            # ~1,000 clear of the smallest real report.
 DOC_TYPE_LABEL  = "Annual Report"
 
 OUTPUT_COMPANY_MD   = True
@@ -357,37 +366,74 @@ def _upsert_ar(drive, index_id: str, filename: str, cols: list[str],
 #  Map-reduce chunked processing                                       #
 # ------------------------------------------------------------------ #
 
-def _split_pdf_chunks(pdf_bytes: bytes, chunk_mb: float = 4.0) -> list[bytes]:
-    """Split a PDF into ~chunk_mb sized byte slices.
+def _pages_per_chunk(pdf_bytes: bytes, n_pages: int, chunk_mb: float) -> int:
+    return max(1, int((chunk_mb * 1024 * 1024) /
+                      (len(pdf_bytes) / max(n_pages, 1))))
 
-    Uses pypdf if available; falls back to naive byte-chunking otherwise.
+
+def _split_pdf_chunks(pdf_bytes: bytes, chunk_mb: float = 4.0) -> list[bytes]:
+    """Split a PDF into ~chunk_mb slices, ALWAYS as valid PDFs.
+
+    NEVER SPLIT THE RAW BYTES. That was the old fallback and it is not a PDF split at
+    all: cutting a PDF mid-object yields files with no trailer and no xref, which the
+    model cannot open. Every chunk of a large annual report would come back empty or
+    near-empty, the synthesis would then have nothing to work from, and the result was
+    stored and marked done - indistinguishable from a genuine short report. Handing over
+    ONE valid oversized PDF is strictly better than N invalid ones, so that is what
+    happens when no page-level splitter is available.
+
+    Two splitters, because both are already declared in scripts/requirements.txt and
+    either alone can be missing from an environment: pypdf first, then PyMuPDF (fitz).
+    Measured 2026-09-02 on the dev box: pypdf absent, fitz present - so a local run took
+    the byte-splitting path and produced garbage, silently.
     """
     try:
         from pypdf import PdfReader, PdfWriter  # type: ignore
-
         reader = PdfReader(io.BytesIO(pdf_bytes))
         n = len(reader.pages)
-        pages_per_chunk = max(1, int((chunk_mb * 1024 * 1024) /
-                                     (len(pdf_bytes) / max(n, 1))))
+        step = _pages_per_chunk(pdf_bytes, n, chunk_mb)
         chunks = []
-        for start in range(0, n, pages_per_chunk):
+        for start in range(0, n, step):
             writer = PdfWriter()
-            for p in reader.pages[start: start + pages_per_chunk]:
+            for p in reader.pages[start: start + step]:
                 writer.add_page(p)
             buf = io.BytesIO()
             writer.write(buf)
             chunks.append(buf.getvalue())
+        log(f"  split with pypdf: {n} pages -> {len(chunks)} chunk(s)")
         return chunks
     except ImportError:
-        # Naive fallback: split bytes evenly (Gemini may reject malformed PDFs)
-        size = len(pdf_bytes)
-        chunk_size = int(chunk_mb * 1024 * 1024)
-        return [pdf_bytes[i: i + chunk_size]
-                for i in range(0, size, chunk_size)]
+        pass
+    except Exception as e:
+        log(f"  pypdf split failed ({str(e)[:70]}) — trying PyMuPDF")
+
+    try:
+        import fitz  # type: ignore
+        src = fitz.open(stream=pdf_bytes, filetype="pdf")
+        n = src.page_count
+        step = _pages_per_chunk(pdf_bytes, n, chunk_mb)
+        chunks = []
+        for start in range(0, n, step):
+            out = fitz.open()
+            out.insert_pdf(src, from_page=start, to_page=min(start + step, n) - 1)
+            chunks.append(out.tobytes())
+            out.close()
+        src.close()
+        log(f"  split with PyMuPDF: {n} pages -> {len(chunks)} chunk(s)")
+        return chunks
+    except ImportError:
+        pass
+    except Exception as e:
+        log(f"  PyMuPDF split failed ({str(e)[:70]})")
+
+    log("  WARNING: no PDF splitter available (pypdf and PyMuPDF both unusable) — "
+        "sending the whole document as ONE chunk rather than invalid byte slices")
+    return [pdf_bytes]
 
 
 def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
-                              prompt: str, display_name: str) -> str:
+                              prompt: str, display_name: str,
+                              max_tokens: int = AR_MAX_OUTPUT_TOKENS) -> str:
     """Chunk large PDF, summarise each chunk, then synthesise."""
     log(f"  PDF > {MAP_REDUCE_THRESHOLD_MB}MB — using map-reduce chunking")
     chunks = _split_pdf_chunks(pdf_bytes)
@@ -397,7 +443,7 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
     for i, chunk in enumerate(chunks, 1):
         log(f"  Chunk {i}/{len(chunks)}: {len(chunk):,} bytes")
         summary = gemini.call(chunk, prompt, f"{display_name}_chunk{i}",
-                              max_output_tokens=AR_MAX_OUTPUT_TOKENS)
+                              max_output_tokens=max_tokens)
         chunk_summaries.append(f"=== CHUNK {i} ===\n{summary}")
 
     if len(chunk_summaries) == 1:
@@ -406,7 +452,7 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
     synthesis_prompt = SYNTHESIS_PROMPT_PREFIX + "\n\n".join(chunk_summaries)
     # Text-only call: all content is already in the prompt, no PDF needed
     return gemini.call_text(synthesis_prompt, f"{display_name}_synthesis",
-                            max_output_tokens=AR_MAX_OUTPUT_TOKENS)
+                            max_output_tokens=max_tokens)
 
 
 # ------------------------------------------------------------------ #
@@ -414,10 +460,35 @@ def _process_with_map_reduce(gemini: GeminiKeyPool, pdf_bytes: bytes,
 # ------------------------------------------------------------------ #
 
 def _extract_fy_year(text: str, row: pd.Series) -> str:
-    """Try to identify the fiscal year from title or text."""
-    # Check title first
-    title = str(row.get("title", ""))
-    for src in (title, text[:2000]):
+    """The financial year an annual report COVERS, as "FY26".
+
+    THE QUEUE ROW IS AUTHORITATIVE; THE REPORT TEXT IS NOT. This used to take the first
+    "FY<digits>" out of the title and then out of the report body - but the body opens
+    with the report's own coverage SPAN, "Annual Report Fiscal Coverage Horizon:
+    FY22 - FY26", so the first match is the START of the span, not the year covered.
+    Measured 2026-09-02: APL Apollo's FY2026 report was labelled FY22 and CG Power's
+    FY2024 report FY20, and that label reached the company_page.md heading AND the
+    fy_year column of ar_guidance and ar_red_flags.
+
+    announcement_date answers it unambiguously in either shape it arrives in:
+      2026-03-31  the FY-END stamp the backfill writes -> names its own year -> FY26
+      2026-09-02  a real filing date from the sweep -> the report is for the year that
+                  last ended -> FY26
+    """
+    period = str(row.get("period") or "").strip()
+    m = re.search(r"FY\s*(\d{4}|\d{2})", period, re.IGNORECASE)
+    if m:
+        return f"FY{m.group(1)[-2:]}"
+
+    d = str(row.get("announcement_date") or "")[:10]
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+        y, mth, day = int(d[:4]), int(d[5:7]), int(d[8:10])
+        fy = y if (mth, day) == (3, 31) or mth >= 4 else y - 1
+        return f"FY{str(fy)[-2:]}"
+
+    # Last resort only: a row with no period and no parseable date still gets a label
+    # rather than none, and a title is far likelier to name the year than the body is.
+    for src in (str(row.get("title", "")), text[:2000]):
         m = re.search(r"FY\s*(\d{2,4})", src, re.IGNORECASE)
         if m:
             yr = m.group(1)
@@ -515,6 +586,23 @@ def main() -> None:
     parser.add_argument("--key-prefix", type=str, default=None,
                         help="T8: load keys from this env prefix (e.g. "
                              "BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
+    parser.add_argument("--prompt-file", default=PROMPT_FILE,
+                        help=f"Report prompt to use (default {PROMPT_FILE}). "
+                             f"annual_report_prompt_v2.txt reorders the report to "
+                             f"management letter / business / industry / financial / "
+                             f"risk and gives each section a hard LINE budget, so a "
+                             f"verbose early section cannot starve a later one.")
+    parser.add_argument("--max-output-tokens", type=int, default=AR_MAX_OUTPUT_TOKENS,
+                        help=f"Model-level cap on the REPORT call (default "
+                             f"{AR_MAX_OUTPUT_TOKENS}). The prompt asks for ~45k chars; "
+                             f"too low truncates the LATE sections (management letter, "
+                             f"scorecard, thesis) because the model emits in document "
+                             f"order. Raise only with measurement - a lite model rambles "
+                             f"non-linearly as the cap grows.")
+    parser.add_argument("--symbols", default="",
+                        help="Restrict to these NSE symbols (comma separated). --limit "
+                             "caps a count but cannot choose WHICH company, so this is "
+                             "what makes a single-company test or re-read possible.")
     parser.add_argument("--max-age-hours", type=float, default=None,
                         help="T8: only rows discovered within N hours (guards "
                              "against draining quota on stale legacy rows).")
@@ -552,17 +640,31 @@ def main() -> None:
     # Backfill (--all-companies) gets extra quota-bucket models; Phase-2 PF keeps P1_MODELS.
     from _extractor_base import BACKFILL_EXTRA_MODELS
     from provider_router import make_extraction_pool
-    _models = list(GEMINI_MODEL) + (BACKFILL_EXTRA_MODELS if args.all_companies else [])
+    # Prefer the registry: it drops models a daily probe found retired, so a model
+    # dying does not have to be chased through every script by hand. Falls back to the
+    # static chains whenever the registry is missing or stale.
+    try:
+        from model_registry import resolve as _resolve
+        _p1 = _resolve("P1", drive, index_id) or list(GEMINI_MODEL)
+        _extra = _resolve("BACKFILL_EXTRA", drive, index_id) or list(BACKFILL_EXTRA_MODELS)
+        if _p1 != list(GEMINI_MODEL):
+            log(f"  model registry: P1 -> {_p1}")
+    except Exception as e:
+        log(f"  model registry unavailable ({str(e)[:60]}) — using static chains")
+        _p1, _extra = list(GEMINI_MODEL), list(BACKFILL_EXTRA_MODELS)
+    _models = _p1 + (_extra if args.all_companies else [])
     # Phase 2: BACKFILL-ONLY Groq/Cerebras fallback when Gemini is exhausted (PF path =
     # pure Gemini, unchanged). make_extraction_pool returns a plain GeminiKeyPool unless
     # --all-companies AND alt keys exist.
     gemini = make_extraction_pool(api_keys, _models, enable_fallback=args.all_companies)
 
-    prompt_path = Path(__file__).resolve().parent / PROMPT_FILE
+    prompt_path = Path(__file__).resolve().parent / args.prompt_file
     if not prompt_path.exists():
         print(f"ERROR: prompt file not found: {prompt_path}")
         sys.exit(1)
     prompt = prompt_path.read_text(encoding="utf-8")
+    if args.prompt_file != PROMPT_FILE:
+        log(f"  prompt: {args.prompt_file} ({len(prompt):,} chars)")
 
     # Structured-extraction prompt (separate, bounded JSON-only pass). Optional — if
     # absent, tabulation is silently skipped and the markdown report still works.
@@ -618,6 +720,13 @@ def main() -> None:
                        if str(queue.loc[i, "discovered_at"]) >= cutoff]
         log(f"  After {args.max_age_hours:.0f}h freshness filter: "
             f"{len(pending_idx)}/{before} to process")
+
+    if args.symbols:
+        _want = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        _before = len(pending_idx)
+        pending_idx = [i for i in pending_idx
+                       if str(queue.loc[i, "symbol"]).strip().upper() in _want]
+        log(f"  After --symbols {sorted(_want)}: {len(pending_idx)}/{_before} to process")
 
     # Portfolio filter: skip non-portfolio companies (rows stay pending for
     # future runs). T8 --all-companies bypasses (every fresh AR gets judged).
@@ -689,11 +798,11 @@ def main() -> None:
             size_mb = len(pdf_bytes) / (1024 * 1024)
             if size_mb > MAP_REDUCE_THRESHOLD_MB:
                 markdown_text = _process_with_map_reduce(
-                    gemini, pdf_bytes, prompt, display_name
+                    gemini, pdf_bytes, prompt, display_name, args.max_output_tokens
                 )
             else:
                 markdown_text = gemini.call(pdf_bytes, prompt, display_name,
-                                            max_output_tokens=AR_MAX_OUTPUT_TOKENS)
+                                            max_output_tokens=args.max_output_tokens)
 
             log(f"  Gemini response: {len(markdown_text):,} chars")
 
@@ -711,6 +820,59 @@ def main() -> None:
                       f"red_flags={len(rf_rows)} --\n{'='*60}\n")
                 counts["processed"] += 1
                 continue
+
+            # ── QUALITY GATE ──────────────────────────────────────────────────
+            # A response can come back cleanly and still be a failed generation. Marking
+            # it "done" is what made that permanent: done is terminal, nothing revisits
+            # it, and 8 of 51 PF annual reports were holding a failed generation for good
+            # (UNIVASTU 0 chars, INDOMIM 108, APL Apollo 764 ending mid-word, CG Power the
+            # prompt echoed back). "error" is cycled by requeue_error_docs, so a bad draw
+            # is retried instead of frozen.
+            def _bad(txt: str) -> str:
+                if is_prompt_echo(txt):
+                    return "prompt echoed back instead of a report"
+                # Measure the REPORT, not the padding. A degenerate generation that
+                # emits 76k spaces after 3.5k of prose used to score 80k and pass.
+                n = len(squeeze_padding(txt).strip())
+                if n < MIN_REPORT_CHARS:
+                    return f"thin report: {n:,} chars (min {MIN_REPORT_CHARS:,})"
+                return ""
+
+            _why = _bad(markdown_text)
+            if _why:
+                # ONE retry in-run. The pool rotates key and model per call, so the second
+                # attempt is a genuinely different generation rather than the same one
+                # repeated. Rate-limit exhaustion propagates untouched.
+                log(f"  {_why} — retrying once")
+                try:
+                    markdown_text = (
+                        _process_with_map_reduce(gemini, pdf_bytes, prompt, display_name,
+                                                 args.max_output_tokens)
+                        if size_mb > MAP_REDUCE_THRESHOLD_MB
+                        else gemini.call(pdf_bytes, prompt, display_name,
+                                         max_output_tokens=args.max_output_tokens))
+                    log(f"  retry response: {len(markdown_text):,} chars")
+                except RateLimitExhausted:
+                    raise
+                except Exception as e:
+                    log(f"  retry call failed ({str(e)[:80]})")
+                _why = _bad(markdown_text)
+            if _why:
+                mark_queue_error(queue, queue_idx, _why)
+                _save_queue_batched()
+                counts["error"] += 1
+                log(f"  {row.get('symbol')}: {_why} after retry — left pending retry, "
+                    f"NOT marked done")
+                continue
+
+            # ADDITIVE: keep an exact, doc-keyed copy of the narrative alongside the
+            # company_page.md section. Nothing downstream changes; this only adds a way
+            # to ask for "the report for THIS document" without parsing an append log.
+            # Normalise once, here, so the page, the doc_reports store, the parse and
+            # the supersede size comparison all see the same text. Doing it only at the
+            # store would leave company_page.md holding the padding.
+            markdown_text = squeeze_padding(markdown_text)
+            save_doc_report(drive, index_id, row, markdown_text)
 
             facts = parse_gemini_response(markdown_text, row)
             log(f"  Parsed: fy={facts['fy_year'] or 'unknown'}, "

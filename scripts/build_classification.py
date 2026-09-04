@@ -130,15 +130,30 @@ Companies (symbol — name — NSE macro-sector — one-line business if known):
 """
 
 
-def _build_pool():
+# Static fallback, used only when the registry cannot be read. Kept in step with
+# CHAINS["LITE_UTILITY"] in model_registry.py.
+FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+                   "gemini-3.5-flash-lite"]
+
+
+def _build_pool(drive=None, index_id: str = ""):
     from gemini_pool import BucketPool, load_keys
     keys = load_keys(os.environ, prefix="BACKFILL_GEMINI_KEY")
     for p in ("GEMINI_API_KEY",):
         keys += [k for k in load_keys(os.environ, prefix=p) if k not in keys]
     if not keys:
         return None
-    return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"],
-                      inter_call_s=3.0, logger=log)
+    # WAS ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]. The second of those is
+    # 404 - retired by Google, probed 2026-09-04 - so this nightly job effectively ran
+    # on ONE model, with nothing to fall back to when that model was busy.
+    try:
+        from model_registry import resolve
+        models = resolve("LITE_UTILITY", drive, index_id) or FALLBACK_MODELS
+    except Exception as e:                       # a registry outage must not stop the job
+        log(f"  model registry unavailable ({str(e)[:60]}) - using the static chain")
+        models = FALLBACK_MODELS
+    log(f"  models: {', '.join(models)}")
+    return BucketPool(keys, models, inter_call_s=3.0, logger=log)
 
 
 def gemini_refine(pool, batch: list[dict]) -> dict[str, tuple]:
@@ -269,7 +284,7 @@ def main() -> None:
         f"segment {int((df['segment'].astype(str).str.len()>0).sum())}")
 
     if args.with_gemini:
-        pool = _build_pool()
+        pool = _build_pool(drive, index_id)
         if pool is None:
             log("no Gemini keys — skipping refine.")
         else:

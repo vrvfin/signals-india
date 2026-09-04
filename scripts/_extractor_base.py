@@ -144,6 +144,122 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               "attempts", "last_error", "last_attempt_at"]
 
 
+# A model sometimes returns the PROMPT instead of an answer. Measured 2026-09-02:
+# CG Power's stored annual-report analysis opens with annual_report_prompt.txt itself
+# ("Generate the final report immediately... The ENTIRE report must stay under ~1,200
+# lines"). That text is long and prose-like, so every length-based quality test rates it
+# highly and every "best passage" heuristic picks it first. Two or more of these phrases
+# together is the signal; one alone can appear in genuine prose.
+_PROMPT_ECHO_MARKERS = (
+    "generate the final report", "visible report structure", "no individual paragraph",
+    "must stay under", "output must be", "formatting style", "make absolutely zero",
+    "do not continue or loop", "report structure", "you are a lead forensic",
+    "your task is", "never repeat a sentence",
+)
+
+
+def is_prompt_echo(text: str) -> bool:
+    """True when a model response is the prompt talking back, not an answer."""
+    t = str(text or "").lower()
+    return sum(1 for k in _PROMPT_ECHO_MARKERS if k in t) >= 2
+
+
+# A run this long is never typesetting. MEASURED on the eight stored annual-report
+# narratives, 2026-09-04 - the longest space run in each:
+#     SHADOWFAX 0 · SENORES 5 · RISHABH 18 || RATEGAIN 4,712 · INDOBORAX 9,393 ·
+#     GOLDIAM 64,883 · WELSPUNLIV 67,934 · RATEGAIN 76,272
+# The gap between 18 and 4,712 is empty, so 40 separates real markdown-table alignment
+# from a degenerate generation with a wide margin on both sides.
+PAD_RUN_MIN = 40
+
+
+def squeeze_padding(text: str) -> str:
+    """Collapse the runaway space runs these models emit, leaving tables intact.
+
+    THE BUG THIS FIXES. A model that loses its stop condition mid-report emits tens of
+    thousands of consecutive spaces and then stops. Nothing noticed, because every check
+    downstream measured len(): the MIN_REPORT_CHARS gate scored RATEGAIN's report as
+    80,039 chars and passed it, when it held 3,528 chars of report followed by 76,272
+    spaces. Worse, DOC_REPORT_MAX_CHARS then truncated INSIDE the padding, so whatever
+    the model wrote after the run was thrown away.
+
+    Runs shorter than PAD_RUN_MIN are left exactly as they are, so markdown table
+    alignment survives. Four or more blank lines collapse to two, which markdown treats
+    identically.
+    """
+    s = str(text or "")
+    s = re.sub(r"[ \t]{%d,}" % PAD_RUN_MIN, " ", s)
+    return re.sub(r"\n{4,}", "\n\n", s)
+
+
+# ADDITIVE (2026-09-03). A narrative keyed by the DOCUMENT that produced it.
+#
+# WHY THIS EXISTS. Until now the only durable copy of an extraction's prose was the
+# section it appended to company_repo/<isin>/company_page.md, and that page is an
+# APPEND LOG: a re-extraction adds a second section for the same document rather than
+# replacing the first, and the supersede path drops the <!-- doc:... --> marker, so the
+# STALE copy keeps the only exact key. Measured on APL Apollo 2026-09-03: 21 annual
+# report sections, two of them for the same FY2026 document - one 764 chars holding the
+# marker, one 4,474 chars without it. Any reader then has to GUESS which is current, and
+# two readers guessing differently is exactly what produced a mail with the wrong report.
+#
+# Rather than change how that page is written - 25+ scripts parse it, including
+# ar_scorecard, daily_ar_summary, company_deep_report, ask_company and the Obsidian
+# fetchers - this INTRODUCES a second, exact record. company_page.md is untouched and
+# every existing reader keeps working. Readers that want "the report for document X"
+# can now ask for it by id instead of parsing a page.
+DOC_REPORT_COLS = ["source_doc_id", "isin", "symbol", "company_name", "doc_type",
+                   "period", "report_md", "chars", "processed_at"]
+DOC_REPORT_FILE = "doc_reports.parquet"
+DOC_REPORT_MAX_CHARS = 80000       # a runaway lite-model response must not bloat the table
+
+
+def save_doc_report(drive, index_id: str, row: dict, report_md: str) -> None:
+    """Record one extraction's narrative against its doc_id. Never raises.
+
+    upsert_structured deletes any existing rows for this source_doc_id before appending,
+    so a re-extraction REPLACES its own record - one row per document, always current.
+    Failure here must never fail an extraction that has already succeeded, so everything
+    is caught: the page write remains the system of record.
+    """
+    try:
+        did = str(row.get("doc_id") or "").strip()
+        # Squeeze BEFORE the cap: truncating inside a padding run discards real report.
+        md = squeeze_padding(report_md)
+        if not did or not md.strip():
+            return
+        if len(md) > DOC_REPORT_MAX_CHARS:
+            md = md[:DOC_REPORT_MAX_CHARS] + "\n\n_[truncated at DOC_REPORT_MAX_CHARS]_"
+        upsert_structured(drive, index_id, DOC_REPORT_FILE, DOC_REPORT_COLS, [{
+            "source_doc_id": did,
+            "isin": str(row.get("isin") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "company_name": str(row.get("company_name") or ""),
+            "doc_type": str(row.get("doc_type") or ""),
+            "period": str(row.get("period") or ""),
+            "report_md": md,
+            "chars": len(md),
+            "processed_at": datetime.now().isoformat(timespec="seconds"),
+        }])
+    except Exception as e:
+        log(f"  NOTE: doc_reports write skipped ({str(e)[:70]})")
+
+
+def load_doc_report(drive, index_id: str, doc_id: str) -> str:
+    """The stored narrative for one document, or "" when there is none."""
+    try:
+        did = str(doc_id or "").strip()
+        if not did:
+            return ""
+        df = load_parquet(drive, index_id, DOC_REPORT_FILE, DOC_REPORT_COLS)
+        if df is None or df.empty:
+            return ""
+        hit = df[df["source_doc_id"].astype(str).str.strip() == did]
+        return str(hit.iloc[-1]["report_md"]) if not hit.empty else ""
+    except Exception:
+        return ""
+
+
 def mark_queue_error(queue, idx, reason: str, status: str = "error") -> None:
     """Record a failure ON the queue row: status, reason, attempt count, timestamp.
 
@@ -386,7 +502,12 @@ def salvage_json_objects(text: str) -> list[dict]:
 # bucket that is reliably up (the catalyst pool uses it), so the pool has more total
 # free-tier quota to draw on. Nothing removed; the startup probe drops any that flap.
 # The new gemini_usage.parquet log shows which models actually contribute.
-P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.0-flash"]
+# STATIC FALLBACK ONLY. model_registry.CHAINS["P1"] is the declared source of truth and
+# resolve() filters it by what a daily probe found alive; these literals are what the
+# system falls back to when the registry is missing or stale, so they must stay valid.
+# gemini-2.0-flash was retired by Google and 404s - it sat LAST here, so it only failed
+# once the two ahead of it were overloaded, i.e. exactly on the busy days.
+P1_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"]
 
 # Extra models added to the BACKFILL chain ONLY (not Phase-2 PF) for more per-(project,
 # model) daily-quota buckets. Measured live (2026-06-22) as having free quota on the
