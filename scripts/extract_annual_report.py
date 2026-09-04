@@ -625,7 +625,19 @@ def main() -> None:
     # Backfill (--all-companies) gets extra quota-bucket models; Phase-2 PF keeps P1_MODELS.
     from _extractor_base import BACKFILL_EXTRA_MODELS
     from provider_router import make_extraction_pool
-    _models = list(GEMINI_MODEL) + (BACKFILL_EXTRA_MODELS if args.all_companies else [])
+    # Prefer the registry: it drops models a daily probe found retired, so a model
+    # dying does not have to be chased through every script by hand. Falls back to the
+    # static chains whenever the registry is missing or stale.
+    try:
+        from model_registry import resolve as _resolve
+        _p1 = _resolve("P1", drive, index_id) or list(GEMINI_MODEL)
+        _extra = _resolve("BACKFILL_EXTRA", drive, index_id) or list(BACKFILL_EXTRA_MODELS)
+        if _p1 != list(GEMINI_MODEL):
+            log(f"  model registry: P1 -> {_p1}")
+    except Exception as e:
+        log(f"  model registry unavailable ({str(e)[:60]}) — using static chains")
+        _p1, _extra = list(GEMINI_MODEL), list(BACKFILL_EXTRA_MODELS)
+    _models = _p1 + (_extra if args.all_companies else [])
     # Phase 2: BACKFILL-ONLY Groq/Cerebras fallback when Gemini is exhausted (PF path =
     # pure Gemini, unchanged). make_extraction_pool returns a plain GeminiKeyPool unless
     # --all-companies AND alt keys exist.

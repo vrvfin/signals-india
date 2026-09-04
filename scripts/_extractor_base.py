@@ -473,7 +473,12 @@ def salvage_json_objects(text: str) -> list[dict]:
 # bucket that is reliably up (the catalyst pool uses it), so the pool has more total
 # free-tier quota to draw on. Nothing removed; the startup probe drops any that flap.
 # The new gemini_usage.parquet log shows which models actually contribute.
-P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.0-flash"]
+# STATIC FALLBACK ONLY. model_registry.CHAINS["P1"] is the declared source of truth and
+# resolve() filters it by what a daily probe found alive; these literals are what the
+# system falls back to when the registry is missing or stale, so they must stay valid.
+# gemini-2.0-flash was retired by Google and 404s - it sat LAST here, so it only failed
+# once the two ahead of it were overloaded, i.e. exactly on the busy days.
+P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
 # Extra models added to the BACKFILL chain ONLY (not Phase-2 PF) for more per-(project,
 # model) daily-quota buckets. Measured live (2026-06-22) as having free quota on the

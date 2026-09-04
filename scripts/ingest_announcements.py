@@ -380,7 +380,9 @@ def _build_pool():
     # exhausted (429 PerDay) and was making the pool give up early — lead with 2.5
     # and use 2.0-flash (non-lite) as the fallback, not 2.0-flash-lite.
     log(f"Gemini pool: {len(keys)} keys (FREE_POOL then BACKFILL/GEMINI)")
-    return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash"],
+    # gemini-2.0-flash was retired and 404s; gemini-3.1-flash-lite is the live lite
+    # fallback (model_registry.CHAINS["LITE_UTILITY"]).
+    return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite"],
                       inter_call_s=0.5, logger=log, overload_budget=3)
 
 

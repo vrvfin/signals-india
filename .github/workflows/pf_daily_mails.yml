@@ -114,6 +114,18 @@ jobs:
           python scripts/pf_coverage.py --self-test
           python scripts/pf_company_mails.py --self-test
           python scripts/pf_season_status.py --self-test
+          python scripts/model_registry.py --self-test
+
+      # Refresh which models are alive BEFORE anything spends quota on them. Six tiny
+      # calls; the registry is cached on Drive and every extractor falls back to its
+      # static chain if this step fails, so it is safe to lose.
+      - name: Refresh the model registry
+        env:
+          FREE_POOL: ${{ secrets.FREE_POOL }}
+        run: |
+          echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')" >> .env
+          python scripts/model_registry.py --probe
+        continue-on-error: true
 
       # DOCUMENT-TRIGGERED. Sweep first, so a deck or rating that appeared since the
       # last run is discovered, downloaded and extracted BEFORE the mail step decides
