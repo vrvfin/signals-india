@@ -115,6 +115,7 @@ jobs:
           python scripts/pf_company_mails.py --self-test
           python scripts/pf_season_status.py --self-test
           python scripts/model_registry.py --self-test
+          python scripts/gemini_pool.py --self-test
 
       # Refresh which models are alive BEFORE anything spends quota on them. Six tiny
       # calls; the registry is cached on Drive and every extractor falls back to its
