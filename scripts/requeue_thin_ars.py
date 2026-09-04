@@ -81,6 +81,20 @@ def section_chars(sections, period: str, doc_id: str) -> tuple[int, str]:
     return len(squeeze_padding(text)), text
 
 
+def _ar_fy(announcement_date) -> str:
+    """The "FY26"-shaped period pf_company_mails derives before looking a section up.
+
+    Imported from the mail rather than reimplemented, so the two cannot drift; falls
+    back to "" if that import ever fails, which just restores doc-id-only behaviour.
+    """
+    try:
+        from pf_company_mails import ar_fy_year
+        fy = ar_fy_year(announcement_date, "")
+        return f"FY{str(fy)[-2:]}" if fy else ""
+    except Exception:
+        return ""
+
+
 def is_thin(n_chars: int, text: str, min_chars: int = MIN_CHARS) -> bool:
     """A stored analysis that is a failed generation rather than a short report.
 
@@ -161,8 +175,20 @@ def main() -> None:
     from run_pf_docs_digest import _company_page
     cache, thin = {}, []
     for _, r in cand.iterrows():
-        n, text = section_chars(_company_page(drive, repo, str(r["isin"]), cache),
-                                str(r.get("period") or ""), str(r["doc_id"]))
+        # THE PERIOD MATTERS, AND AR QUEUE ROWS DO NOT CARRY ONE. pf_company_mails
+        # derives it from announcement_date before it looks the section up, and the
+        # region you get with a period is NOT the region you get without one: Navin
+        # Fluorine's doc-id lookup returned a clean 4.4k section while the mail's
+        # FY26 walk returned 10.7k containing a 99x repeat loop. Inspecting the
+        # doc-id region alone therefore declared a mailed failure "clean". Check both
+        # and judge the WORSE, so this tool can never pass what the mail will render.
+        page = _company_page(drive, repo, str(r["isin"]), cache)
+        n, text = section_chars(page, str(r.get("period") or ""), str(r["doc_id"]))
+        _fy = _ar_fy(r.get("announcement_date"))
+        if _fy:
+            n2, text2 = section_chars(page, _fy, str(r["doc_id"]))
+            if text2 and is_thin(n2, text2, args.min_chars):
+                n, text = n2, text2
         if is_thin(n, text, args.min_chars):
             why = ("prompt echo" if is_prompt_echo(text)
                    else degenerate_reason(text) or f"{n} chars")
@@ -251,6 +277,8 @@ def _self_test() -> int:
     _real = "\n".join([f"| FY20{i:02d} | revenue {i * 137} cr | segment note {i} |"
                         for i in range(60)] + ["| Total | | |"] * 3)
     check("a genuine report with some repetition survives", not degenerate_reason(_real))
+    check("_ar_fy matches the mail's period shape", _ar_fy("2026-03-31") == "FY26")
+    check("_ar_fy is empty when there is no date", _ar_fy("") == "")
     check("...and is not thin either, once it is report-length",
           not is_thin(len(_real) + MIN_CHARS, _real))
 

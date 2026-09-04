@@ -1683,7 +1683,8 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
     headings, and a divergent copy here would drift away from it.
     """
     from run_pf_docs_digest import _company_page, _find_region, _lift_summary
-    from _extractor_base import log as _log, load_doc_report, is_prompt_echo
+    from _extractor_base import (log as _log, load_doc_report, is_prompt_echo,
+                                 degenerate_reason)
     out = {}
     for (isin, dt), d in latest.items():
         if dt not in SCOPED_TYPES:
@@ -1712,8 +1713,11 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
             # The echo guard must sit on BOTH paths. It was added to the page walk only,
             # so a doc_reports row holding a prompt echo went straight to the reader -
             # the exact-record lookup runs first and returned before the check.
-            if is_prompt_echo(exact):
-                _log(f"  {dt} for {isin}: doc_reports row is a prompt echo — ignored")
+            _bad_exact = ("prompt echo" if is_prompt_echo(exact)
+                          else degenerate_reason(exact))
+            if _bad_exact:
+                _log(f"  {dt} for {isin}: doc_reports row is a failed generation "
+                     f"({_bad_exact}) — ignored")
             else:
                 out[(isin, dt)] = {"period": period, "text": exact}
                 continue
@@ -1736,6 +1740,19 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
         if txt and is_prompt_echo(txt):
             _log(f"  {dt} for {isin}: stored report is a prompt echo — treated as empty")
             txt = ""
+        # A REPEAT LOOP IS NOT A REPORT EITHER, AND IT IS THE ONE THAT GOT MAILED.
+        # Navin Fluorine's FY26 mail was 66 KB of "| FY2025 | 64 | N/A |" ninety-nine
+        # times — seven pages of NA. The loop is not reachable by doc_id: the model's own
+        # "## 1. SOURCE COVERAGE & DATA INTEGRITY" line parses as a page section, so the
+        # doc-marker lookup lands on a clean neighbouring section and only the PERIOD
+        # walk reaches the bad one. Guard the text that is about to be rendered, which is
+        # the one place both paths meet.
+        if txt:
+            _why_loop = degenerate_reason(txt)
+            if _why_loop:
+                _log(f"  {dt} for {isin}: stored report is a {_why_loop} — "
+                     f"treated as empty")
+                txt = ""
         out[(isin, dt)] = {"period": period, "text": txt}
     return out
 
