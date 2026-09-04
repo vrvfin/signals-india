@@ -77,8 +77,20 @@ from _t4_store import Store
 #  Gemini pool + note generation                                      #
 # ------------------------------------------------------------------ #
 
-def _build_gemini_pool():
-    """GEMINI_API_KEY -> BACKFILL_GEMINI_KEY cascade, lite models (rule #4)."""
+# Static fallback, used only when the registry cannot be read. Kept in step with
+# CHAINS["LITE_UTILITY"] in model_registry.py.
+FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+                   "gemini-3.5-flash-lite"]
+
+
+def _build_gemini_pool(drive=None, index_id: str = ""):
+    """GEMINI_API_KEY -> BACKFILL_GEMINI_KEY cascade, lite models (rule #4).
+
+    WAS ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]. The second is 404 — retired
+    by Google, probed 2026-09-04 — so this nightly job had no working fallback when
+    the first model was busy. The chain now comes from model_registry, which drops a
+    model the day after it dies.
+    """
     try:
         from gemini_pool import BucketPool, load_keys
         keys = load_keys(os.environ, prefix="GEMINI_API_KEY")
@@ -87,8 +99,14 @@ def _build_gemini_pool():
         if not keys:
             log("no GEMINI keys found — cannot generate notes.")
             return None
-        return BucketPool(keys, ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"],
-                          inter_call_s=6.0, logger=log)
+        try:
+            from model_registry import resolve
+            models = resolve("LITE_UTILITY", drive, index_id) or FALLBACK_MODELS
+        except Exception as e:
+            log(f"  model registry unavailable ({str(e)[:60]}) — static chain")
+            models = FALLBACK_MODELS
+        log(f"  models: {', '.join(models)}")
+        return BucketPool(keys, models, inter_call_s=6.0, logger=log)
     except Exception as e:
         log(f"Gemini pool init failed: {str(e)[:80]}")
         return None
@@ -358,7 +376,11 @@ def main():
         log("Nothing to do.")
         return
 
-    pool = _build_gemini_pool()
+    # Local mode has no Drive handle; resolve() then returns the declared chain,
+    # which is exactly the intended fail-safe.
+    pool = _build_gemini_pool(
+        None if store.local else store.drive,
+        "" if store.local else store._folder(["company_repo", "_index"]))
     if pool is None:
         return
 

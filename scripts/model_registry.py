@@ -11,6 +11,14 @@ it sat LAST in P1_MODELS the failure only showed when the two models ahead of it
 overloaded - so extraction died exactly on the busy days. Measured 2026-09-03: it is
 still 404, and it is still referenced in at least two live chains.
 
+RETIRED, MEASURED, DO NOT RE-ADD (probed 2026-09-04, one FREE_POOL key):
+    gemini-2.0-flash        404 "no longer available"
+    gemini-2.0-flash-lite   404 "no longer available"
+The -lite one was the ONLY fallback in build_classification and build_catalyst_notes,
+both of which run nightly - so once gemini-2.5-flash-lite was busy those two had no
+second model at all. That is the failure this module exists to make impossible, which
+is why they were the first two migrated.
+
 THE SPLIT THAT MAKES THIS WORK. Two different questions, answered in two different ways:
 
   AVAILABILITY  is discovered. It changes without warning when a provider retires a
@@ -86,6 +94,13 @@ CHAINS: dict[str, list[str]] = {
     # Short utility passes: announcement one-liners, classification, tagging.
     "LITE_UTILITY": ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
                      "gemini-3.5-flash-lite"],
+    # N7/N8 narrative passes (company structure, management quotes). Every record is
+    # kept only if its evidence span is found VERBATIM in the source, so a lite model's
+    # paraphrasing costs records outright - this stays on the flash tier. Led by
+    # gemini-2.5-flash rather than gemini-3.5-flash on purpose: 3.5-flash leads CONCALL
+    # (P0), and an enrichment pass must never eat the live concall run's daily bucket.
+    # It sits third here, reachable only once the two ahead of it are spent.
+    "NARRATIVE": ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash"],
 }
 
 
