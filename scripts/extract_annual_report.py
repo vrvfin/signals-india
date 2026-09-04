@@ -39,7 +39,7 @@ from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
-    squeeze_padding,
+    squeeze_padding, degenerate_reason,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -836,7 +836,8 @@ def main() -> None:
                 n = len(squeeze_padding(txt).strip())
                 if n < MIN_REPORT_CHARS:
                     return f"thin report: {n:,} chars (min {MIN_REPORT_CHARS:,})"
-                return ""
+                # A LOOP is long, so it passes every length test. Judge its shape.
+                return degenerate_reason(txt)
 
             _why = _bad(markdown_text)
             if _why:

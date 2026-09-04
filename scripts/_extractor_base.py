@@ -192,6 +192,41 @@ def squeeze_padding(text: str) -> str:
     return re.sub(r"\n{4,}", "\n\n", s)
 
 
+# A REPEAT LOOP is the other way one of these generations dies, and it is the one that
+# reached the inbox. Navin Fluorine's mailed annual report was 66 KB of:
+#       | FY2025 | 64 | N/A |
+#       | FY2026 | 64 | N/A |
+# repeated 99 times - seven pages of "NA" - and it sailed through every check, because
+# a loop is LONG. Measured across the 45 rendered annual-report mails on 2026-09-04:
+#       healthy  92-100% distinct rows, worst row repeated 1-2 times  (44 reports)
+#       NAVINFLUOR         14% distinct, worst row repeated 99 times  ( 1 report)
+# The gap is enormous, so the thresholds below sit far from both edges: a report is
+# only condemned when it is BOTH mostly duplicates AND has one line repeated 8+ times.
+REPEAT_MIN_LINES = 20      # too few lines to judge; the length gate covers those
+REPEAT_MAX_RUN = 8         # one line repeated this often is not a report
+REPEAT_MIN_DISTINCT = 0.70  # healthy floor is 0.92; this is 22 points of headroom
+
+
+def degenerate_reason(text: str) -> str:
+    """Why this response is a failed generation rather than a short report, or "".
+
+    Length cannot answer this. A padded response and a looping response are both long,
+    and both are worthless - so they are judged on SHAPE, not size.
+    """
+    from collections import Counter
+    lines = [ln.strip() for ln in squeeze_padding(text).splitlines()
+             if len(ln.strip()) > 8]
+    if len(lines) < REPEAT_MIN_LINES:
+        return ""
+    counts = Counter(lines)
+    line, run = counts.most_common(1)[0]
+    distinct = len(counts) / len(lines)
+    if run >= REPEAT_MAX_RUN and distinct < REPEAT_MIN_DISTINCT:
+        return (f"repetition loop: {distinct:.0%} distinct lines, one repeated "
+                f"{run}x ({line[:40]!r})")
+    return ""
+
+
 # ADDITIVE (2026-09-03). A narrative keyed by the DOCUMENT that produced it.
 #
 # WHY THIS EXISTS. Until now the only durable copy of an extraction's prose was the
