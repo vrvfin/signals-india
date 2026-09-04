@@ -65,8 +65,17 @@ STALE_DAYS = 7          # beyond this the probe is not trusted and chains pass t
 CHAINS: dict[str, list[str]] = {
     # Phase-2 structured extraction (AR / results / rating / presentation). Lite tier:
     # these run in bulk and the parse is bounded, so throughput beats eloquence.
-    "P1": ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
-    # Extra buckets a backfill may burn once the P1 buckets are spent.
+    #
+    # ORDERED BY MEASURED FAILURE RATE, NOT BY VERSION NUMBER. From gemini_usage.parquet
+    # over 2026-08-05..09-04, 4,253 rows:
+    #     gemini-3.1-flash-lite   9,837 ok /   805 fail =  7.6%
+    #     gemini-2.5-flash-lite   5,934 ok / 2,039 fail = 25.6%
+    # 2.5-flash-lite led this chain on judgement and was wrong: it fails more than three
+    # times as often as the model behind it, and the chain is walked in order, so the
+    # worse model was absorbing the first attempt on every document.
+    "P1": ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"],
+    # Extra buckets a backfill may burn once the P1 buckets are spent. Measured:
+    # 2.5-flash 21.7% fail, 3.5-flash 27.8% - so the steadier one goes first here too.
     "BACKFILL_EXTRA": ["gemini-2.5-flash", "gemini-3.5-flash"],
     # Concall (P0). Deliberately DISJOINT from P1 so a backfill can never eat the daily
     # bucket the live concall run depends on.
@@ -75,7 +84,7 @@ CHAINS: dict[str, list[str]] = {
     "QUALITY": ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash",
                 "gemini-2.5-flash-lite"],
     # Short utility passes: announcement one-liners, classification, tagging.
-    "LITE_UTILITY": ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite",
+    "LITE_UTILITY": ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
                      "gemini-3.5-flash-lite"],
 }
 

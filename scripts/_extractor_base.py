@@ -478,7 +478,7 @@ def salvage_json_objects(text: str) -> list[dict]:
 # system falls back to when the registry is missing or stale, so they must stay valid.
 # gemini-2.0-flash was retired by Google and 404s - it sat LAST here, so it only failed
 # once the two ahead of it were overloaded, i.e. exactly on the busy days.
-P1_MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+P1_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite"]
 
 # Extra models added to the BACKFILL chain ONLY (not Phase-2 PF) for more per-(project,
 # model) daily-quota buckets. Measured live (2026-06-22) as having free quota on the
