@@ -667,6 +667,17 @@ def md_to_html(md: str, limit: int = None) -> str:
     return "".join(out)
 
 
+# A4 landscape, because these reports are mostly TABLES.
+#   portrait  595 x 842pt -> 523pt of usable width after margins
+#   landscape 842 x 595pt -> 770pt
+# fitz.Story CLIPS what does not fit the frame; it does not wrap or shrink a table. The
+# attachment HTML declared max-width:820px against a 523pt frame, so every table wider
+# than the frame lost its right-hand columns and long cells were cut mid-word. 770pt of
+# frame with an 760px body is the smallest change that makes the two agree.
+PDF_LANDSCAPE = True
+PDF_BODY_PX = 760
+
+
 def html_to_pdf(doc_html: str, max_pages: int = 200) -> bytes | None:
     """A4 PDF of a standalone HTML document, or None if it cannot be produced.
 
@@ -678,7 +689,7 @@ def html_to_pdf(doc_html: str, max_pages: int = 200) -> bytes | None:
         story = fitz.Story(html=doc_html)
         buf = io.BytesIO()
         writer = fitz.DocumentWriter(buf)
-        page = fitz.paper_rect("a4")
+        page = fitz.paper_rect("a4-l" if PDF_LANDSCAPE else "a4")
         frame = page + (36, 40, -36, -40)
         more, n = 1, 0
         while more and n < max_pages:
@@ -713,7 +724,8 @@ def report_attachment(symbol: str, label: str, subtitle: str,
         return None
     doc = (f"<!doctype html><html><head><meta charset='utf-8'>"
            f"<title>{_esc(symbol, 20)} {_esc(label, 60)}</title></head>"
-           f"<body style='{_WRAP};max-width:820px;margin:24px auto;padding:0 18px'>"
+           f"<body style='{_WRAP};max-width:{PDF_BODY_PX}px;margin:18px auto;"
+           f"padding:0 10px'>"
            f"<h2 style='margin:0 0 2px'>{_esc(symbol, 20)} &middot; {_esc(label, 80)}</h2>"
            f"<div style='color:{MUTED};font-size:12px;margin:0 0 16px'>"
            f"{_esc(subtitle, 120)}</div>{inner}</body></html>")
@@ -1694,6 +1706,56 @@ def annual_report_body(isin, symbol, name, fy_label, doc_id, narrative, tables) 
     return "".join(out)
 
 
+_QTR_IN_HEADING = re.compile(r"\bQ([1-4])\s*FY\s*'?(\d{2,4})\b", re.I)
+
+
+def heading_quarter(heading: str) -> str:
+    """"Q1FY27" out of "## Q1 FY27 Concall - PPT", or "" when the heading names none."""
+    m = _QTR_IN_HEADING.search(str(heading or ""))
+    if not m:
+        return ""
+    yr = m.group(2)
+    return f"Q{m.group(1)}FY{yr[-2:]}"
+
+
+_CONCALL_HEAD_RE = re.compile(r"concall|earnings\s+call|conference\s+call"
+                              r"|earnings\s+summary|transcript", re.I)
+
+
+def concall_section_is_for(heading: str, want_quarter: str) -> bool:
+    """Is this section the concall the mail asked for - right TYPE and right QUARTER?
+
+    A CONCALL SECTION CARRIES NO "<!-- doc:... -->" MARKER - extract_concall does not
+    stamp one - so _find_region can only match on the quarter written in the heading.
+    When the wanted quarter's own section is EMPTY, the walk lands on a neighbouring
+    document and the mail serves that instead, under the right subject.
+
+    Measured on MOREPENLAB, 2026-09-05: its "## Q1 FY27 Concall - PPT" section holds 24
+    characters - an empty stub - and the mail carried "## Morepen Laboratories Limited -
+    Q4 FY25 Earnings Call Summary", 25,364 characters, a call five quarters stale.
+
+    TWO WAYS IT GOES WRONG, both measured on MOREPENLAB 2026-09-05:
+      * WRONG QUARTER - with no period the walk landed on "## Q4 FY25 Concall -
+        Transcript" and served 25,364 characters of a call five quarters stale.
+      * WRONG DOCUMENT TYPE - with the period derived, the walk landed on
+        "## 2026-07-28 Announcement - Morepen Laboratories Ltd - Board Meeting". A
+        quarter test alone waves that through, because a board-meeting heading names
+        no quarter to contradict.
+
+    So the heading must READ like a concall, and where both quarters are known they
+    must agree. A concall heading that names no quarter is still allowed - this rejects
+    a wrong one, it does not demand a label that may not exist.
+    """
+    head = str(heading or "")
+    if head.strip() and not _CONCALL_HEAD_RE.search(head):
+        return False
+    want = str(want_quarter or "").replace(" ", "").upper()
+    got = heading_quarter(head)
+    if not want or not got:
+        return True
+    return got == want
+
+
 def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -> dict:
     """{(isin, doc_type): {'period':.., 'text':..}} for the newest concall / AR per holding.
 
@@ -1720,6 +1782,17 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
             _fy = ar_fy_year(d.get("date"), "")
             if _fy:
                 period = f"FY{str(_fy)[-2:]}"
+        if not period and dt == "concall":
+            # CONCALL QUEUE ROWS CARRY NO PERIOD EITHER - measured on MOREPENLAB, all 34
+            # of its rows have period=None - and unlike an annual report a concall
+            # section carries no doc marker for the finder to fall back on. With neither,
+            # _find_region matched nothing specific and walked onto a NEIGHBOURING
+            # document: MOREPENLAB's own Q1 FY27 section is a 24-character stub, so the
+            # mail carried its Q4 FY25 call, 25,364 characters and five quarters stale,
+            # under a Q1 FY27 subject.
+            # concall_quarter() answers this from the filing date, which is the same rule
+            # the presentation mail already uses and is not open to interpretation.
+            period = concall_quarter(d.get("date"))
         txt = ""
         # EXACT FIRST. doc_reports is keyed on the document, so there is nothing to
         # guess; the page walk below stays as the fallback for every document extracted
@@ -1743,6 +1816,16 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
         try:
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
                                doc_id)
+            # THE MATCHED SECTION MUST BELONG TO THE DOCUMENT WE ASKED FOR. Concall
+            # sections carry no doc marker, so a walk that starts on an empty stub can
+            # land on another quarter's call and the mail would send it under today's
+            # subject. See concall_section_is_for() for the MOREPENLAB measurement.
+            if reg and dt == "concall":
+                _head = str((reg[0][0] if reg[0] else "") or "")
+                if not concall_section_is_for(_head, period):
+                    _log(f"  concall for {isin}: section {_head[:40]!r} is not "
+                         f"{period} — refusing to serve another quarter's call")
+                    reg = []
             # The whole region, headings and tables intact. lift_report stays for
             # anything that wants a short extract; the mail wants the report.
             txt = "\n".join(((h + "\n") if h else "") + b
@@ -2587,6 +2670,11 @@ Capacity reaches eight million tons by FY28.
            "    | :--- | :--- | :--- |\n"
            "    | Domestic | 73,438 | 84,769 |\n")
     _bh = md_to_html(_bt)
+    # The PDF must not CLIP a wide table: fitz.Story does not wrap or shrink one, so the
+    # frame and the body width have to agree. Portrait lost the last two columns of the
+    # ten-column concall Table_A; landscape at 760px carries all of them.
+    check("the PDF page is landscape, so wide tables fit", PDF_LANDSCAPE)
+    check("the body width fits inside the landscape frame", PDF_BODY_PX <= 770)
     check("a table indented under a bullet still renders as a table",
           "<table" in _bh and "73,438" in _bh)
     check("...and its separator row is not shown to the reader",
@@ -2799,6 +2887,25 @@ Management guided to twenty percent growth.
     _echo = ("Generate the final report immediately without displaying preliminary "
              "steps. No individual paragraph may be longer than 3 lines. The ENTIRE "
              "report must stay under ~1,200 lines. Output must be completely clean.")
+    # A concall must never be served from another quarter (MOREPENLAB Q1FY27 -> Q4FY25).
+    check("heading_quarter reads the label", heading_quarter("## Q1 FY27 Concall — PPT")
+          == "Q1FY27")
+    check("heading_quarter handles a 4-digit year",
+          heading_quarter("## Q3 FY2021 Concall — Transcript") == "Q3FY21")
+    check("a matching quarter is served",
+          concall_section_is_for("## Q1 FY27 Concall — PPT", "Q1FY27"))
+    check("a DIFFERENT quarter is refused",
+          not concall_section_is_for("## Q4 FY25 Concall — Transcript", "Q1FY27"))
+    check("an unlabelled CONCALL heading is not blocked",
+          concall_section_is_for("## Morepen Laboratories — Earnings Call", "Q1FY27"))
+    check("an ANNOUNCEMENT section is refused, even with no quarter to contradict",
+          not concall_section_is_for(
+              "## 2026-07-28 Announcement — Morepen Laboratories Ltd - Board Meeting",
+              "Q1FY27"))
+    check("an annual-report section is refused",
+          not concall_section_is_for("## FY26 Annual Report — from bse", "Q1FY27"))
+    check("no wanted quarter means no opinion",
+          concall_section_is_for("## Q4 FY25 Concall — Transcript", ""))
     check("prompt text is recognised as an echo", _is_prompt_echo(_echo))
     check("real analysis is NOT an echo",
           not _is_prompt_echo("Revenue grew 22% with margin expansion of 140bps driven "
