@@ -61,17 +61,28 @@ def _index(drive):
         drive, get_or_create_subfolder(drive, root, "company_repo"), "_index")
 
 
-def list_revisions(drive, fid) -> None:
+# The columns can come back EMPTY: a writer whose list names them writes them as None.
+# So a usable source revision is one where these actually hold VALUES, not one that
+# merely has the column. Report the non-null count, which is the thing that matters.
+WATCH = ["backfill_process_date", "source", "period", "content_sha256"]
+
+
+def list_revisions(drive, fid, limit: int = 0) -> None:
     revs = drive.revisions().list(
         fileId=fid, fields="revisions(id,modifiedTime,size)").execute().get(
             "revisions", [])
     log(f"{len(revs)} revision(s) retained by Drive")
-    for r in revs[-25:]:
+    log(f"  {'modifiedTime':19s}  {'cols':>4s} {'rows':>7s}  "
+        + "  ".join(f"{c[:12]:>12s}" for c in WATCH) + "   id")
+    for r in (revs[-limit:] if limit else revs):
         try:
             df = pd.read_parquet(io.BytesIO(drive.revisions().get_media(
                 fileId=fid, revisionId=r["id"]).execute()))
-            log(f"  {r.get('modifiedTime', '?')[:19]}  {len(df.columns):>2} cols  "
-                f"{len(df):>7,} rows   {r['id']}")
+            counts = "  ".join(
+                f"{int(df[c].notna().sum()):>12,}" if c in df.columns else f"{'-':>12s}"
+                for c in WATCH)
+            log(f"  {r.get('modifiedTime', '?')[:19]}  {len(df.columns):>4} "
+                f"{len(df):>7,}  {counts}   {r['id']}")
         except Exception as e:
             log(f"  {r.get('modifiedTime', '?')[:19]}  unreadable ({str(e)[:40]})")
 
@@ -83,12 +94,19 @@ def restore(drive, fid, revision: str, live: bool) -> int:
     log(f"pre-loss revision : {len(old):,} rows, {len(old.columns)} cols")
     log(f"current file      : {len(cur):,} rows, {len(cur.columns)} cols")
 
-    missing = [c for c in old.columns if c not in cur.columns]
+    # A column that is PRESENT BUT EMPTY needs restoring just as much as an absent one:
+    # a writer whose list names it writes None. Judge on values, not on the header.
+    missing = [c for c in old.columns
+               if c not in cur.columns
+               or (cur[c].notna().sum() == 0 and old[c].notna().sum() > 0)]
     if not missing:
-        log("nothing to restore — the current file already has every column.")
+        log("nothing to restore — every column is present and populated.")
         return 0
     log(f"columns to restore: {missing}")
 
+    for c in missing:
+        if c in cur.columns:
+            cur = cur.drop(columns=[c])          # present but empty; refill it
     src = old.set_index(old["doc_id"].astype(str))[missing]
     src = src[~src.index.duplicated(keep="last")]
     key = cur["doc_id"].astype(str)
@@ -166,6 +184,8 @@ def main() -> int:
     ap.add_argument("--revision", default="",
                     help="Drive revision id of a pre-loss copy of the queue.")
     ap.add_argument("--list-revisions", action="store_true")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="With --list-revisions: only the newest N (0 = all).")
     ap.add_argument("--dry-run", action="store_true", default=True)
     ap.add_argument("--live", action="store_true",
                     help="Actually write. Without this nothing is changed.")
@@ -181,7 +201,7 @@ def main() -> int:
         log(f"{QUEUE_FILE} not found.")
         return 1
     if a.list_revisions:
-        list_revisions(drive, fid)
+        list_revisions(drive, fid, a.limit)
         return 0
     if not a.revision:
         log("--revision is required (see --list-revisions).")
