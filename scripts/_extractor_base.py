@@ -158,10 +158,83 @@ _PROMPT_ECHO_MARKERS = (
 )
 
 
+# THE MARKER LIST ABOVE ONLY KNOWS THE ANNUAL-REPORT PROMPT, and a model can echo any
+# of them. AVALON's stored concall was 260,730 chars that opened with concall_prompt.txt
+# verbatim — "[FINANCIAL GRID ENFORCEMENT RULES]", "[CROSS-INDUSTRY METRIC ADAPTATION
+# MAPPING]", the whole RATE/ABS/LVL instruction block — and only THEN gave a real
+# Table_A of Avalon's numbers. Zero of the twelve markers matched, so the mail carried
+# the instructions to the reader.
+#
+# A response that quotes its own prompt back is provable rather than guessable: compare
+# it against the prompt FILES on disk. A genuine summary does not reproduce three
+# separate 45-character instruction lines word for word.
+_PROMPT_LINE_MIN = 45      # short lines are shared by chance; long ones are not
+_PROMPT_LINE_HITS = 3      # three verbatim INSTRUCTION lines is not coincidence
+_prompt_lines_cache: list | None = None
+
+# A LINE THE MODEL IS TOLD TO REPRODUCE IS NOT AN ECHO. The concall prompt names the
+# output sections and the model is required to write those headings out; measured across
+# 831 stored concall sections on 2026-09-05, the distribution of verbatim matches is
+# bimodal — 416 sections at ZERO and a spike of 355 at exactly FOUR, and the four are:
+#     "section gf3 - operational visibility extraction"        (398 sections)
+#     "e-1) forward visibility & monitoring framework"          (397)
+#     "section 1) unified financial intelligence & guidance..." (389)
+#     "section 2) executive summaries & commentary section"     (382)
+# Counting those made 45% of every concall look like an echo. Excluding heading-shaped
+# lines leaves only real instruction prose, so the threshold means what it says.
+_PROMPT_HEADING_RE = re.compile(
+    r"^(?:output\s+)?section\b"          # "Section 1) ...", "OUTPUT SECTION C ..."
+    r"|^[a-z]-?\d*[\)\.]\s"              # "e-1) ...", "a-2) ...", "c) ..."
+    r"|^table_[a-z0-9]", re.I)
+
+
+def _prompt_lines() -> list:
+    """Distinctive instruction lines from every prompt file next to this module."""
+    global _prompt_lines_cache
+    if _prompt_lines_cache is not None:
+        return _prompt_lines_cache
+    import glob
+    out: list = []
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in glob.glob(os.path.join(here, "*prompt*.txt")):
+            try:
+                txt = open(path, encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            for ln in txt.splitlines():
+                s = " ".join(ln.split())
+                # skip table rows and rule bars - those DO appear in real reports
+                if (len(s) >= _PROMPT_LINE_MIN and not s.startswith("|")
+                        and not set(s) <= set("=-_* ")
+                        and not _PROMPT_HEADING_RE.match(s)):
+                    out.append(s.lower())
+    except Exception:
+        pass
+    _prompt_lines_cache = out
+    return out
+
+
+def echoes_prompt_verbatim(text: str) -> int:
+    """How many distinct prompt instruction lines this response reproduces word for word."""
+    t = " ".join(str(text or "").split()).lower()
+    if not t:
+        return 0
+    return sum(1 for ln in _prompt_lines() if ln in t)
+
+
 def is_prompt_echo(text: str) -> bool:
-    """True when a model response is the prompt talking back, not an answer."""
+    """True when a model response carries its own prompt rather than only an answer.
+
+    Two independent tests, either of which condemns it: the phrase markers above, and
+    verbatim reproduction of lines from the prompt files themselves. The second catches
+    a PARTIAL echo — instructions followed by a genuine answer — which the first cannot,
+    because such a response also contains real content.
+    """
     t = str(text or "").lower()
-    return sum(1 for k in _PROMPT_ECHO_MARKERS if k in t) >= 2
+    if sum(1 for k in _PROMPT_ECHO_MARKERS if k in t) >= 2:
+        return True
+    return echoes_prompt_verbatim(text) >= _PROMPT_LINE_HITS
 
 
 # A run this long is never typesetting. MEASURED on the eight stored annual-report
@@ -202,6 +275,66 @@ def squeeze_padding(text: str) -> str:
 #       NAVINFLUOR         14% distinct, worst row repeated 99 times  ( 1 report)
 # The gap is enormous, so the thresholds below sit far from both edges: a report is
 # only condemned when it is BOTH mostly duplicates AND has one line repeated 8+ times.
+# Models sometimes decorate markdown with literal HTML - SGFIN's report carried
+#     <p style="font-size:0.8em; color:#808080;"><i>Source: ... (Page 56)</i></p>
+#     <span style="color:purple;">Structural Shift in Operations</span>
+# The mail renderer escapes anything it did not build itself, so the reader sees the tag
+# soup verbatim instead of the sentence - and the PDF carries it too. Measured on the 43
+# rendered annual reports, 2026-09-05: 1 report affected, and it was the one drawn at
+# random to show the user. Keep the TEXT, drop the tags.
+_INLINE_HTML_RE = re.compile(
+    r"</?(?:p|span|div|i|b|em|strong|u|small|font|br|sub|sup)\b[^>]*>", re.I)
+
+
+# A MARKDOWN TABLE THE MODEL WROTE ON ONE LINE IS NOT A TABLE TO ANY RENDERER.
+# Measured on TD Power Systems' v2 report, 2026-09-05 — the whole revenue table arrived
+# as a single line:
+#     | Geography | FY 2026 | FY 2025 | | :--- | :--- | :--- | | Domestic | 73,438 | ...
+# so the mail rendered a wall of pipes instead of rows. The giveaway is a separator row
+# (:--- / ---) sitting INSIDE a line that also holds data cells; a real markdown table
+# always puts it on its own line. Row boundaries in the flattened form are "| |".
+_SEP_INLINE_RE = re.compile(r"\|\s*:?-{2,}:?\s*\|")
+_ROW_BREAK_RE = re.compile(r"\|\s+\|")
+
+
+def unflatten_tables(text: str) -> str:
+    """Restore row breaks in a markdown table the model emitted on a single line."""
+    out = []
+    for ln in str(text or "").splitlines():
+        if ln.count("|") >= 6 and _SEP_INLINE_RE.search(ln):
+            # A LABEL IN FRONT OF THE TABLE KEEPS IT FROM BEING ONE. md_to_html
+            # only treats a line as a table row when it STARTS with "|", so
+            # "Revenue by Geography: | Geography | ..." still rendered as prose.
+            head, sep, rest = ln.partition("|")
+            if head.strip():
+                out.append(head.rstrip())
+            out.append(_ROW_BREAK_RE.sub("|\n|", sep + rest))
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+# THE RUPEE SIGN ARRIVES AS A BACKTICK. Many Indian annual reports embed the rupee glyph
+# in a font whose extraction maps it to U+0060, so the report reads "` 2,400 Crore".
+# Only a backtick immediately in front of a number is converted — code spans and any
+# other backtick use are untouched.
+_RUPEE_BACKTICK_RE = re.compile(r"`\s?(?=\d)")
+
+
+def fix_rupee_glyph(text: str) -> str:
+    return _RUPEE_BACKTICK_RE.sub("\u20b9", str(text or ""))
+
+
+def strip_inline_html(text: str) -> str:
+    """Remove decorative HTML tags a model emitted inside markdown, keeping the words."""
+    s = _INLINE_HTML_RE.sub("", str(text or ""))
+    for a, b in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                 ("&quot;", '"'), ("&#x27;", "'"), ("&#39;", "'")):
+        s = s.replace(a, b)
+    # a second pass: unescaping may have revealed tags that were double-encoded
+    return _INLINE_HTML_RE.sub("", s)
+
+
 REPEAT_MIN_LINES = 20      # too few lines to judge; the length gate covers those
 REPEAT_MAX_RUN = 8         # one line repeated this often is not a report
 REPEAT_MIN_DISTINCT = 0.70  # healthy floor is 0.92; this is 22 points of headroom

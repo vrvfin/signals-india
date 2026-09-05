@@ -39,7 +39,8 @@ from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
-    squeeze_padding, degenerate_reason,
+    squeeze_padding, degenerate_reason, strip_inline_html,
+    unflatten_tables, fix_rupee_glyph,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -56,7 +57,16 @@ _LOCK_MAX_AGE_MIN = 360
 # ---- Config ----
 DOC_TYPE        = "annual_report"
 GEMINI_MODEL    = P1_MODELS          # lite chain, disjoint from concall (P0)
-PROMPT_FILE     = "annual_report_prompt.txt"
+# V2 IS THE DEFAULT, ON MEASUREMENT. The v1 prompt asks for NINE numbered sections
+# and the model reliably delivers about six: measured across 43 rendered reports on
+# 2026-09-05, sections 1-5B arrived 81-95% of the time, section 6 dropped to 70%, and
+# sections 7 and 8 arrived in 40% and 42%. Reports simply stop. v1 also has no BUSINESS
+# and no INDUSTRY OUTLOOK section at all, which is the half of the report a reader
+# actually wants first.
+# v2 asks for FIVE sections with an explicit per-section LINE budget (18/20/12/26/22),
+# so the model cannot spend the whole response on section 1 and run out before risk.
+# v1 is still reachable with --prompt-file annual_report_prompt.txt.
+PROMPT_FILE     = "annual_report_prompt_v2.txt"
 STRUCT_PROMPT_FILE = "ar_structured_prompt.txt"   # JSON-only structured 2nd pass
 STRUCT_INPUT_CHARS = 60000                        # cap report text fed to the 2nd call
 MAX_REPORT_CHARS   = 120000                       # cap stored markdown (lite model can
@@ -68,6 +78,12 @@ AR_MAX_OUTPUT_TOKENS = 4096                       # model-level cap on the REPOR
                                                   # what bounds the bloat. ~67k chars
                                                   # still covers the forensic/guidance
                                                   # sections the structured pass reads.
+                                                  # UNCHANGED for v2: its 98 budgeted
+                                                  # lines fit well inside 4096, and the
+                                                  # bloat above is what a LOOSE cap buys.
+                                                  # Real reports measure 4-5k chars, so
+                                                  # the cap was never the thing cutting
+                                                  # sections 7-8 - the 9-section ask was.
 MIN_REPORT_CHARS = 2000     # below this the report call FAILED, however cleanly it
                             # returned. Measured over 51 PF FY2026 annual reports on
                             # 2026-09-02 the distribution is bimodal and the band
@@ -588,7 +604,7 @@ def main() -> None:
                              "BACKFILL_GEMINI_KEY) instead of GEMINI_API_KEY.")
     parser.add_argument("--prompt-file", default=PROMPT_FILE,
                         help=f"Report prompt to use (default {PROMPT_FILE}). "
-                             f"annual_report_prompt_v2.txt reorders the report to "
+                             f"annual_report_prompt.txt is the older 9-section v1; v2 "
                              f"management letter / business / industry / financial / "
                              f"risk and gives each section a hard LINE budget, so a "
                              f"verbose early section cannot starve a later one.")
@@ -872,7 +888,8 @@ def main() -> None:
             # Normalise once, here, so the page, the doc_reports store, the parse and
             # the supersede size comparison all see the same text. Doing it only at the
             # store would leave company_page.md holding the padding.
-            markdown_text = squeeze_padding(markdown_text)
+            markdown_text = fix_rupee_glyph(unflatten_tables(
+                strip_inline_html(squeeze_padding(markdown_text))))
             save_doc_report(drive, index_id, row, markdown_text)
 
             facts = parse_gemini_response(markdown_text, row)

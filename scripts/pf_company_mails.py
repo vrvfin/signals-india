@@ -572,6 +572,16 @@ def md_to_html(md: str, limit: int = None) -> str:
     is the "*Processed:*" stamp and the doc marker.
     """
     limit = REPORT_LIMIT if limit is None else limit
+    # Reports stored BEFORE strip_inline_html existed still carry literal HTML, and this
+    # renderer escapes anything it did not build, so the reader would see the tags.
+    # Clean here as well as at extraction; every already-stored report benefits.
+    try:
+        from _extractor_base import (strip_inline_html as _strip,
+                                     unflatten_tables as _unflat,
+                                     fix_rupee_glyph as _rupee)
+        md = _rupee(_unflat(_strip(md)))
+    except Exception:
+        pass
     text = re.sub(r"<!--.*?-->", " ", str(md or ""), flags=re.S)
     lines = text.splitlines()
     out, i, n = [], 0, len(lines)
@@ -627,6 +637,15 @@ def md_to_html(md: str, limit: int = None) -> str:
                 t = lines[j].strip()
                 if re.match(r"^[-*\u2022]\s+", t):
                     items.append(re.sub(r"^[-*\u2022]\s+", "", t))
+                elif t.startswith("|"):
+                    # A TABLE INDENTED UNDER A BULLET IS STILL A TABLE. Without this,
+                    # the continuation rule below appended every row to the bullet
+                    # text joined by spaces, and the reader got a wall of pipes:
+                    #   Revenue by Geography: | Geography | FY 2026 | | :--- | :--- |
+                    #   | Domestic Sales | 73,438.95 | ...
+                    # Measured on TD Power Systems, 2026-09-05: 2 of its 3 tables were
+                    # lost this way. Stop the bullet here and let the table branch run.
+                    break
                 elif t and items and lines[j].startswith(("   ", "\t")):
                     items[-1] += " " + t          # continuation of the same bullet
                 else:
@@ -2562,6 +2581,16 @@ Capacity reaches eight million tons by FY28.
     check("the doc marker is dropped", "doc:zz" not in _out and "<!--" not in _out)
     check("markup in the source cannot leak",
           "&lt;script&gt;" in md_to_html("<script>alert(1)</script>"))
+    # A table indented under a bullet must render as a TABLE, not as bullet prose.
+    _bt = ("*   Revenue by Geography:\n"
+           "    | Geography | FY26 | FY25 |\n"
+           "    | :--- | :--- | :--- |\n"
+           "    | Domestic | 73,438 | 84,769 |\n")
+    _bh = md_to_html(_bt)
+    check("a table indented under a bullet still renders as a table",
+          "<table" in _bh and "73,438" in _bh)
+    check("...and its separator row is not shown to the reader",
+          ":---" not in re.sub(r"<[^>]+>", " ", _bh))
     check("it carries far more than the old lift",
           len(_out) > 6 * sum(len(t) for _h, t in lift_report([("", _rep)], 2600)))
 
