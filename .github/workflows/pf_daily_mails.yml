@@ -212,16 +212,20 @@ jobs:
       # A holding that entered the portfolio in the last 30 days bypasses both and is
       # onboarded with its LATEST call and report - the same way a new holding picks up
       # the current quarter's deck simply by having no ledger row yet.
+      # ANNUAL REPORT IS OFF THE SCHEDULED TYPES, DELIBERATELY. Measured 2026-09-05
+      # across 43 rendered reports, the v1 prompt's sections 7 and 8 arrived 40% and
+      # 42% of the time, so a scheduled run would mail an incomplete report to the
+      # whole book. v2 is now the default prompt, pending review of its output.
+      # Re-add ",annual_report" to the default below once that review passes.
+      # Manual dispatch still sends annual reports:
+      #   gh workflow run pf_daily_mails.yml -f types=annual_report -f symbols=X
+      # NOTE: `run: >` is a FOLDED scalar — every line joins into ONE shell command, so
+      # a "#" comment inside it comments out the rest of the command. That is exactly
+      # what happened on 2026-09-05: run 33964896717 silently dropped --types and
+      # --symbols and mailed the defaults instead. Comments belong out here.
       - name: Per-company mails (presentation, rating, concall, annual report)
         run: >
           python scripts/pf_company_mails.py
-          # ANNUAL REPORT IS OFF THE SCHEDULE, DELIBERATELY. The v1 prompt asks for
-          # nine sections and delivers about six (measured 2026-09-05 across 43
-          # reports: sections 7 and 8 arrive 40% and 42% of the time), so the
-          # scheduled run would mail an incomplete report to the whole book. v2 is
-          # now the default prompt but its output has not been reviewed yet.
-          # Re-add ",annual_report" here once it has. Manual dispatch still sends it:
-          #   gh workflow run pf_daily_mails.yml -f types=annual_report -f symbols=X
           --types "${{ inputs.types || 'presentation,rating,concall' }}"
           --scope "${{ inputs.scope || 'current' }}"
           --symbols "${{ inputs.symbols }}"
