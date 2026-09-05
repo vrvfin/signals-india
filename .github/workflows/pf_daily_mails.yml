@@ -215,7 +215,14 @@ jobs:
       - name: Per-company mails (presentation, rating, concall, annual report)
         run: >
           python scripts/pf_company_mails.py
-          --types "${{ inputs.types || 'presentation,rating,concall,annual_report' }}"
+          # ANNUAL REPORT IS OFF THE SCHEDULE, DELIBERATELY. The v1 prompt asks for
+          # nine sections and delivers about six (measured 2026-09-05 across 43
+          # reports: sections 7 and 8 arrive 40% and 42% of the time), so the
+          # scheduled run would mail an incomplete report to the whole book. v2 is
+          # now the default prompt but its output has not been reviewed yet.
+          # Re-add ",annual_report" here once it has. Manual dispatch still sends it:
+          #   gh workflow run pf_daily_mails.yml -f types=annual_report -f symbols=X
+          --types "${{ inputs.types || 'presentation,rating,concall' }}"
           --scope "${{ inputs.scope || 'current' }}"
           --symbols "${{ inputs.symbols }}"
           ${{ inputs.force == true && '--force' || '' }}
