@@ -213,6 +213,45 @@ _INLINE_HTML_RE = re.compile(
     r"</?(?:p|span|div|i|b|em|strong|u|small|font|br|sub|sup)\b[^>]*>", re.I)
 
 
+# A MARKDOWN TABLE THE MODEL WROTE ON ONE LINE IS NOT A TABLE TO ANY RENDERER.
+# Measured on TD Power Systems' v2 report, 2026-09-05 — the whole revenue table arrived
+# as a single line:
+#     | Geography | FY 2026 | FY 2025 | | :--- | :--- | :--- | | Domestic | 73,438 | ...
+# so the mail rendered a wall of pipes instead of rows. The giveaway is a separator row
+# (:--- / ---) sitting INSIDE a line that also holds data cells; a real markdown table
+# always puts it on its own line. Row boundaries in the flattened form are "| |".
+_SEP_INLINE_RE = re.compile(r"\|\s*:?-{2,}:?\s*\|")
+_ROW_BREAK_RE = re.compile(r"\|\s+\|")
+
+
+def unflatten_tables(text: str) -> str:
+    """Restore row breaks in a markdown table the model emitted on a single line."""
+    out = []
+    for ln in str(text or "").splitlines():
+        if ln.count("|") >= 6 and _SEP_INLINE_RE.search(ln):
+            # A LABEL IN FRONT OF THE TABLE KEEPS IT FROM BEING ONE. md_to_html
+            # only treats a line as a table row when it STARTS with "|", so
+            # "Revenue by Geography: | Geography | ..." still rendered as prose.
+            head, sep, rest = ln.partition("|")
+            if head.strip():
+                out.append(head.rstrip())
+            out.append(_ROW_BREAK_RE.sub("|\n|", sep + rest))
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+# THE RUPEE SIGN ARRIVES AS A BACKTICK. Many Indian annual reports embed the rupee glyph
+# in a font whose extraction maps it to U+0060, so the report reads "` 2,400 Crore".
+# Only a backtick immediately in front of a number is converted — code spans and any
+# other backtick use are untouched.
+_RUPEE_BACKTICK_RE = re.compile(r"`\s?(?=\d)")
+
+
+def fix_rupee_glyph(text: str) -> str:
+    return _RUPEE_BACKTICK_RE.sub("\u20b9", str(text or ""))
+
+
 def strip_inline_html(text: str) -> str:
     """Remove decorative HTML tags a model emitted inside markdown, keeping the words."""
     s = _INLINE_HTML_RE.sub("", str(text or ""))

@@ -40,6 +40,7 @@ from _extractor_base import (
     log, get_or_create_subfolder,
     load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
     squeeze_padding, degenerate_reason, strip_inline_html,
+    unflatten_tables, fix_rupee_glyph,
     load_parquet, save_parquet,
     download_bytes, upload_bytes, find_file,
     extract_md_tables, clean_val, try_float, identify_metric,
@@ -887,7 +888,8 @@ def main() -> None:
             # Normalise once, here, so the page, the doc_reports store, the parse and
             # the supersede size comparison all see the same text. Doing it only at the
             # store would leave company_page.md holding the padding.
-            markdown_text = strip_inline_html(squeeze_padding(markdown_text))
+            markdown_text = fix_rupee_glyph(unflatten_tables(
+                strip_inline_html(squeeze_padding(markdown_text))))
             save_doc_report(drive, index_id, row, markdown_text)
 
             facts = parse_gemini_response(markdown_text, row)
