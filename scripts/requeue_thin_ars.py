@@ -53,8 +53,15 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(_D), ".env"))
 
-from _extractor_base import (get_drive, get_or_create_subfolder, load_parquet,
-                             save_parquet, QUEUE_COLS, acquire_lock, release_lock,
+# load_queue / save_queue, NOT load_parquet(QUEUE_COLS) / save_parquet.
+# load_parquet ends in `return df[cols]` — it SLICES — so writing the result back
+# erases every column this module's list does not name. On 2026-09-05 that erased
+# backfill_process_date, period and content_sha256 from the live queue, because this
+# module was run from a checkout whose QUEUE_COLS had 17 entries against a file that
+# had 21. load_queue() returns the frame unsliced and only ADDS missing columns, so a
+# column another pipeline owns survives a round trip through here untouched.
+from _extractor_base import (get_drive, get_or_create_subfolder, load_queue,
+                             save_queue, QUEUE_COLS, acquire_lock, release_lock,
                              is_prompt_echo, squeeze_padding,
                              degenerate_reason, log)
 
@@ -161,7 +168,7 @@ def main() -> None:
     if not args.all_companies:
         from daily_brief import load_pf
         isins = {str(t[0]).strip() for t in load_pf(drive, fid, idx)}
-    queue = load_parquet(drive, idx, "processing_queue.parquet", QUEUE_COLS)
+    queue = load_queue(drive, idx)
     syms = {s.strip() for s in args.symbols.split(",") if s.strip()} or None
 
     cand = select(queue, isins, syms, args.include_errors)
@@ -213,7 +220,7 @@ def main() -> None:
         log("Could not take the lock — nothing changed.")
         sys.exit(1)
     try:
-        queue = load_parquet(drive, idx, "processing_queue.parquet", QUEUE_COLS)
+        queue = load_queue(drive, idx)
         ids = {d for _s, d, _n, _w in thin}
         hit = queue["doc_id"].astype(str).isin(ids)
         queue.loc[hit, "status"] = "pending"
@@ -226,7 +233,7 @@ def main() -> None:
         # runs every 3 hours in pf_daily_mails, so no new fetching machinery is needed.
         if "drive_file_id" in queue.columns:
             queue.loc[hit, "drive_file_id"] = ""
-        save_parquet(drive, idx, "processing_queue.parquet", queue)
+        save_queue(drive, idx, queue)
         log(f"{hit.sum()} annual_report row(s) set to pending with drive_file_id "
             f"cleared — run pf_docs_sweep.py --hydrate, then extract_annual_report.")
     finally:
