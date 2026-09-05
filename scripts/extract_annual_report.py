@@ -71,19 +71,21 @@ STRUCT_PROMPT_FILE = "ar_structured_prompt.txt"   # JSON-only structured 2nd pas
 STRUCT_INPUT_CHARS = 60000                        # cap report text fed to the 2nd call
 MAX_REPORT_CHARS   = 120000                       # cap stored markdown (lite model can
                                                   # run away to ~2M chars on big ARs)
-AR_MAX_OUTPUT_TOKENS = 4096                       # model-level cap on the REPORT call.
-                                                  # The lite model rambles non-linearly
-                                                  # (measured: 4096→~67k, 8192→~194k,
-                                                  # 16384→~448k chars), so a TIGHT cap is
-                                                  # what bounds the bloat. ~67k chars
-                                                  # still covers the forensic/guidance
-                                                  # sections the structured pass reads.
-                                                  # UNCHANGED for v2: its 98 budgeted
-                                                  # lines fit well inside 4096, and the
-                                                  # bloat above is what a LOOSE cap buys.
-                                                  # Real reports measure 4-5k chars, so
-                                                  # the cap was never the thing cutting
-                                                  # sections 7-8 - the 9-section ask was.
+AR_MAX_OUTPUT_TOKENS = 16384
+# RAISED FROM 4096 FOR THE v2.1 PROMPT, WHICH BUDGETS 386 LINES ACROSS SEVEN SECTIONS
+# (31/60/20/90/70/50/65). 4096 tokens carries roughly a third of that, so the old cap
+# would have truncated the report mid-way through FINANCIAL and the reader would never
+# reach notes, auditor or risk - the four sections that were asked for by name.
+#
+# THE RISK THIS RE-OPENS, STATED PLAINLY. A loose cap is what let the lite model ramble
+# on the OLD unbudgeted prompt: measured 4096→~67k, 8192→~194k, 16384→~448k chars. Three
+# things now bound it that did not exist then:
+#   1. v2.1 states a MAXIMUM per section and says in RULE 4 that the number is a ceiling
+#      and padding to reach it is a failure. The old prompt gave no per-section bound.
+#   2. degenerate_reason() rejects a repeat loop, which is how rambling actually shows up.
+#   3. MAX_REPORT_CHARS still truncates the stored markdown at 120k.
+# If measured output starts approaching six figures again, lower this first - the cap is
+# the cheapest lever and the least destructive to quality.
 MIN_REPORT_CHARS = 2000     # below this the report call FAILED, however cleanly it
                             # returned. Measured over 51 PF FY2026 annual reports on
                             # 2026-09-02 the distribution is bimodal and the band
