@@ -16,7 +16,8 @@ number, because the reader acts on these.
 RULE 2 - SAY IT ONCE.
 No fact, sentence, table row or heading may appear twice anywhere in the report. If a
 point belongs in two sections, put it in the earlier one and do not repeat it. Do not
-restate a section's content in its own summary line.
+restate a section's content in its own summary line. If you find yourself repeating a
+row to fill space, STOP - see RULE 4.
 
 RULE 3 - A TIGHT BRIEF IS NOT A BLINDFOLD.
 The fields listed under each section are what is USUALLY material. They are not the
@@ -29,48 +30,68 @@ write it. Write NONE only when there is genuinely nothing. Prefer reporting a su
 fact over filling a routine field - a fact we did not think to ask for is worth more
 than one we did.
 
-RULE 4 - THE BUDGET IS A HARD CEILING, AND IT IS PER SECTION.
-Each section states a maximum number of LINES. Do not exceed it. If you run out of room,
-drop the least material point in THAT section - never borrow room from a later section.
-ALSO MATERIAL is inside the section's budget, not extra to it. Sections 4 and 5 are the
-ones a reader can least afford to lose, so reaching them matters more than exhausting
-sections 1-3. Stop when section 5 is complete.
+RULE 4 - THE LINE BUDGET IS A CEILING, NOT A TARGET.
+Each section states a MAXIMUM number of lines. It is an upper bound and nothing else.
 
-Prefer dense bullets and tables to prose. No preamble, no restatement of these
-instructions, no closing summary. Begin directly with section 1.
+  * NEVER pad, pad-repeat, restate, or invent content to approach the number. A section
+    that says max 90 lines and honestly supports 22 must be 22 lines. Coming in far
+    under budget is a correct outcome, not a failure.
+  * If the document genuinely does not discuss something, write DATA_MISSING once and
+    move on. Do not expand DATA_MISSING into prose.
+  * Do not exceed the ceiling. If you run out of room, drop the least material point in
+    THAT section - never borrow room from a later section.
+  * ALSO MATERIAL is inside the section's budget, not extra to it.
+  * Sections 2, 4, 5, 6 and 7 are the ones a reader can least afford to lose, so
+    reaching them matters more than exhausting sections 1 and 3.
+
+Prefer dense bullets and tables to prose. Write every table as a proper markdown table:
+each row on its OWN line, starting with "|", with a header separator row. Never put a
+whole table on one line. No preamble, no restatement of these instructions, no closing
+summary. Begin directly with section 1.
 
 =====================================================================
-1. MANAGEMENT LETTER - max 18 lines
+1. MANAGEMENT LETTER - max 31 lines
 =====================================================================
 Management's own voice. Use the MD&A as the backbone; fold in the Chairman's / MD's
 letter where the report contains one. Many annual reports carry no chairman's letter at
 all - that is not a failure, write DATA_MISSING for the letter-specific fields and take
 the substance from the MD&A.
 *   Tone: POSITIVE / NEUTRAL / CAUTIOUS, plus one sentence justifying the call.
-*   2-3 VERBATIM quotes carrying the year's message, in quotation marks, each cited.
+*   3-5 VERBATIM quotes carrying the year's message, in quotation marks, each cited.
     Choose quotes that commit to something, not ceremonial ones.
 *   Every explicit forward-looking commitment: growth %, margin, order book, capacity,
     target year. One per line, each cited. DATA_MISSING if nothing is committed.
 *   What management says went WRONG, or admits it got wrong. Cited.
     If nothing is admitted, write: "No shortfall acknowledged."
+*   Strategy stated for the next 1-3 years, and how it differs from last year's if the
+    report says. Cited.
 *   ALSO MATERIAL: per RULE 3, or NONE.
 
 =====================================================================
-2. BUSINESS - max 20 lines
+2. BUSINESS - max 60 lines          [PRIORITY SECTION]
 =====================================================================
-What this company actually does, as the report describes it.
+What this company actually does, as the report describes it. This is the section a
+reader turns to first - be concrete, and prefer tables to adjectives.
 *   One-paragraph description: what it makes or sells, and to whom.
-*   Revenue by segment / product / geography - a table, each figure cited, with the
-    prior year alongside where the report gives it.
-*   Customers: concentration, named anchor customers, contract length. Cited.
-*   Capacity and utilisation, by plant or line where stated. Cited.
+*   Revenue by SEGMENT - a table, each figure cited, with the prior year alongside where
+    the report gives it, and the segment margin where disclosed.
+*   Revenue by GEOGRAPHY - a table, same treatment. Note export dependence explicitly.
+*   Revenue by PRODUCT or channel where the report separates them.
+*   Customers: concentration (top-1, top-5, top-10 share), named anchor customers,
+    contract length and renewal terms. Cited.
+*   Suppliers and inputs: key raw materials, import dependence, single-source exposure,
+    any pass-through mechanism the report describes. Cited.
+*   Capacity and utilisation, by plant or line where stated, with any expansion under
+    way and its commissioning date. Cited.
+*   Subsidiaries and joint ventures: what each does and whether it made or lost money.
+*   Employees and attrition where disclosed.
 *   Claimed competitive position AND the evidence offered for it (market share,
     certifications, patents, switching costs). Mark an unevidenced claim [UNEVIDENCED] -
     a company calling itself a market leader with no cited figure is a claim, not a fact.
 *   ALSO MATERIAL: per RULE 3, or NONE.
 
 =====================================================================
-3. INDUSTRY OUTLOOK - max 12 lines
+3. INDUSTRY OUTLOOK - max 20 lines
 =====================================================================
 Only what THIS report says about its industry - never general knowledge.
 *   Tailwinds, each cited, each marked [COMFORT].
@@ -80,33 +101,89 @@ Only what THIS report says about its industry - never general knowledge.
 *   ALSO MATERIAL: per RULE 3, or NONE.
 
 =====================================================================
-4. FINANCIAL - max 26 lines
+4. FINANCIAL - max 90 lines          [PRIORITY SECTION]
 =====================================================================
-*   5-year table: Revenue, EBITDA, PAT, CFO. State the unit. Cite the statement page.
-    Where fewer years are disclosed, give what exists and mark the rest DATA_MISSING.
-*   Ratio table: ROE, ROCE, net margin, debt/equity, working-capital days.
+*   5-year table: Revenue, EBITDA, EBITDA margin, PAT, CFO. State the unit. Cite the
+    statement page. Where fewer years are disclosed, give what exists and mark the rest
+    DATA_MISSING - do NOT pad the table with invented years.
+*   Ratio table: ROE, ROCE, net margin, gross margin, debt/equity, interest cover,
+    current ratio, working-capital days. Prior year alongside.
+*   Segment profitability where the report separates it.
 *   CFO vs PAT: the ratio, its direction across the years shown, and what the report
     attributes it to. CFO/PAT below 1.0 for two consecutive years is [WARNING].
-*   Working capital: inventory days and receivable days, direction, cited.
-*   Capex: how much, on what, commissioning timeline.
+*   Working capital: inventory days, receivable days, payable days, cash conversion
+    cycle, direction, cited.
+*   Debt: gross and net, maturity profile, cost of borrowing, covenants, any breach or
+    waiver. Cited.
+*   Capex: how much, on what, funded how, commissioning timeline, and capex vs
+    depreciation.
 *   Capital allocation: dividend, buyback, debt repayment, reinvestment - what the money
-    actually did.
-*   Any accounting policy change, restatement, or auditor Emphasis of Matter. Cited.
+    actually did, and the payout ratio.
+*   Tax: effective rate and why it differs from the statutory rate, if the report says.
+*   Any accounting policy change, restatement, or reclassification. Cited.
 *   ALSO MATERIAL: per RULE 3, or NONE.
 
 =====================================================================
-5. RISK - max 22 lines
+5. NOTES TO THE ACCOUNTS - max 70 lines          [PRIORITY SECTION]
+=====================================================================
+The notes are where the real disclosure lives. Read them, do not skim them. Report only
+what is THERE - a company with few notes gets a short section, and that is correct.
+*   Contingent liabilities: each one, its amount, and its nature. Cited. Total as a % of
+    net worth where both figures exist.
+*   Related-party transactions: a table of counterparty, relationship, nature, and
+    amount, with the prior year. Flag any transaction that is large relative to revenue
+    or that lacks a stated commercial rationale.
+*   Loans, advances and guarantees given to related parties or others - amount, terms,
+    recoverability.
+*   Provisions and write-offs: what was provided for, reversed, or written off, and why.
+*   Impairments: asset, amount, trigger, cited.
+*   Capital work-in-progress and intangibles under development: amount, ageing, and how
+    long items have been sitting there. Long-ageing CWIP is [WARNING].
+*   Inventory: valuation basis, any write-down, slow-moving or obsolete provision.
+*   Receivables ageing and expected-credit-loss provision.
+*   Employee benefit obligations and their key actuarial assumptions.
+*   Litigation and tax disputes: matter, amount, stage, management's view. Cited.
+*   Subsequent events after the balance-sheet date.
+*   ALSO MATERIAL: per RULE 3, or NONE.
+
+=====================================================================
+6. AUDITOR'S REPORT AND CARO - max 50 lines          [PRIORITY SECTION]
+=====================================================================
+Quote the auditor rather than paraphrasing. This section is worthless if it is vague.
+*   Auditor name, and whether they changed this year. Tenure if stated. Cited.
+*   Opinion type: UNMODIFIED / QUALIFIED / ADVERSE / DISCLAIMER. State it plainly.
+*   Every QUALIFICATION, verbatim and cited, with the amount involved.
+*   Every EMPHASIS OF MATTER paragraph, verbatim and cited.
+*   Key Audit Matters: for each, the matter and how the auditor addressed it. Cited.
+*   CARO reporting: go through the order's clauses and report every ADVERSE or
+    qualified remark verbatim - fixed assets and title deeds, inventory verification,
+    loans to related parties, statutory dues in arrears, default to lenders, fraud
+    reported, whistle-blower complaints, undisclosed income, cash losses, resignation of
+    the previous auditor. Where the auditor reports nothing adverse on a clause, say so
+    in one line - a clean clause is information.
+*   Internal financial controls: opinion, and any material weakness reported. Cited.
+*   Any adverse remark by the secretarial auditor or cost auditor, if included.
+*   ALSO MATERIAL: per RULE 3, or NONE.
+
+=====================================================================
+7. RISK - max 65 lines          [PRIORITY SECTION]
 =====================================================================
 *   Red flags, one per line: SEVERITY (HIGH/MEDIUM/LOW) | area | finding | evidence,
     cited. Cover at least cash conversion, working capital, CWIP and capitalisation,
     related-party transactions, promoter pledging, auditor qualifications and CARO
-    adverse remarks, contingent liabilities, KMP churn. Where an area is clean, say so
+    adverse remarks, contingent liabilities, debt and covenants, customer and supplier
+    concentration, KMP churn, and any regulatory action. Where an area is clean, say so
     in one line - a clean finding is information.
-*   Governance: board independence, audit committee, auditor tenure and any change.
+*   The risks MANAGEMENT itself names in its risk-management section, and what mitigation
+    it claims. Mark a mitigation with no evidence [UNEVIDENCED].
+*   Governance: board size and independence, board and audit-committee meeting
+    attendance, auditor tenure and any change, chairman/CEO separation, any resignation
+    of a director or KMP during the year and the reason given.
+*   Promoter holding, change during the year, and pledging. Cited.
 *   Weighted risk score out of 5 and a label: Clean / Monitor / Elevated / Avoid, with
     one line naming the single largest contributor to that score.
 *   ALSO MATERIAL: per RULE 3, or NONE.
 
 =====================================================================
-END OF REPORT. Write nothing after section 5.
+END OF REPORT. Write nothing after section 7.
 =====================================================================
