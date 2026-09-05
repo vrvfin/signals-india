@@ -1,0 +1,67 @@
+# One-off repair, run from CI so the code and the live data cannot drift apart.
+#
+# A manual repair tool run from a LOCAL checkout narrowed processing_queue.parquet on
+# 2026-09-05: that checkout's QUEUE_COLS had 17 entries, the live file had 21, and
+# load_parquet(..., cols) slices. Running the repair here removes the drift entirely —
+# CI always runs the committed code against the same Drive.
+#
+# Dispatch with dry_run first, read the log, then dispatch again with dry_run off.
+name: queue column restore (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Drive revision id of a PRE-LOSS queue (blank = just list revisions)"
+        default: ""
+      dry_run:
+        description: "Report only, write nothing"
+        type: boolean
+        default: true
+
+concurrency:
+  group: queue-column-restore
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Same shape as every other workflow's credentials step.
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+          } > .env
+
+      - name: Install deps
+        run: pip install -r scripts/requirements.txt
+
+      - name: Self-test (fail fast)
+        run: python scripts/restore_queue_columns.py --self-test
+
+      - name: List revisions
+        if: inputs.revision == ''
+        run: python scripts/restore_queue_columns.py --list-revisions
+
+      - name: Restore
+        if: inputs.revision != ''
+        run: >
+          python scripts/restore_queue_columns.py
+          --revision "${{ inputs.revision }}"
+          ${{ inputs.dry_run == false && '--live' || '--dry-run' }}
