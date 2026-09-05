@@ -572,6 +572,14 @@ def md_to_html(md: str, limit: int = None) -> str:
     is the "*Processed:*" stamp and the doc marker.
     """
     limit = REPORT_LIMIT if limit is None else limit
+    # Reports stored BEFORE strip_inline_html existed still carry literal HTML, and this
+    # renderer escapes anything it did not build, so the reader would see the tags.
+    # Clean here as well as at extraction; every already-stored report benefits.
+    try:
+        from _extractor_base import strip_inline_html as _strip
+        md = _strip(md)
+    except Exception:
+        pass
     text = re.sub(r"<!--.*?-->", " ", str(md or ""), flags=re.S)
     lines = text.splitlines()
     out, i, n = [], 0, len(lines)

@@ -202,6 +202,27 @@ def squeeze_padding(text: str) -> str:
 #       NAVINFLUOR         14% distinct, worst row repeated 99 times  ( 1 report)
 # The gap is enormous, so the thresholds below sit far from both edges: a report is
 # only condemned when it is BOTH mostly duplicates AND has one line repeated 8+ times.
+# Models sometimes decorate markdown with literal HTML - SGFIN's report carried
+#     <p style="font-size:0.8em; color:#808080;"><i>Source: ... (Page 56)</i></p>
+#     <span style="color:purple;">Structural Shift in Operations</span>
+# The mail renderer escapes anything it did not build itself, so the reader sees the tag
+# soup verbatim instead of the sentence - and the PDF carries it too. Measured on the 43
+# rendered annual reports, 2026-09-05: 1 report affected, and it was the one drawn at
+# random to show the user. Keep the TEXT, drop the tags.
+_INLINE_HTML_RE = re.compile(
+    r"</?(?:p|span|div|i|b|em|strong|u|small|font|br|sub|sup)\b[^>]*>", re.I)
+
+
+def strip_inline_html(text: str) -> str:
+    """Remove decorative HTML tags a model emitted inside markdown, keeping the words."""
+    s = _INLINE_HTML_RE.sub("", str(text or ""))
+    for a, b in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                 ("&quot;", '"'), ("&#x27;", "'"), ("&#39;", "'")):
+        s = s.replace(a, b)
+    # a second pass: unescaping may have revealed tags that were double-encoded
+    return _INLINE_HTML_RE.sub("", s)
+
+
 REPEAT_MIN_LINES = 20      # too few lines to judge; the length gate covers those
 REPEAT_MAX_RUN = 8         # one line repeated this often is not a report
 REPEAT_MIN_DISTINCT = 0.70  # healthy floor is 0.92; this is 22 points of headroom
