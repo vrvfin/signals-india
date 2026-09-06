@@ -531,7 +531,8 @@ def _quarter_filename(quarter: str) -> str:
 
 def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
                     company_name: str, quarter: str, content: str,
-                    run_time: str = "", backfill: bool = False) -> None:
+                    run_time: str = "", backfill: bool = False,
+                    origin: str = "") -> None:
     """Append this company's analysis to the daily digest file in _daily/.
 
     UPDATED: Uses EXTRACTION_DATE (today) for filename, not announcement_date.
@@ -559,13 +560,20 @@ def append_day_page(drive, repo_id, announcement_date: str, symbol: str,
     Ctrl+F / search "concall_3" jumps directly to the third entry.
     The Index list and Total count are fully rewritten on every append.
     """
+    origin = (origin or ("backfill" if backfill else "live")).strip().lower()
     daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
     # USE EXTRACTION DATE (today) for the daily digest filename
     # This groups concalls by "when processed" not "when announced"
     extraction_date = datetime.now().strftime("%Y-%m-%d")  # e.g., "2026-06-06"
     # Backfill output goes to its own digest file/title (T1.3); live Phase 2 unchanged.
-    digest_prefix = "daily_backfill" if backfill else "concall"
-    digest_title = "Daily Backfill Digest" if backfill else "Daily Concall Digest"
+    # THE DIGEST FILE FOLLOWS THE ORIGIN, so a swept document can never be written into
+    # the live page. "sweep" is a third value, not a variant of either existing one.
+    if origin == "backfill":
+        digest_prefix, digest_title = "daily_backfill", "Daily Backfill Digest"
+    elif origin == "sweep":
+        digest_prefix, digest_title = "daily_pf_sweep", "Daily PF Sweep Digest"
+    else:
+        digest_prefix, digest_title = "concall", "Daily Concall Digest"
     fname = _day_filename(extraction_date, digest_prefix)
     now_str = datetime.now().strftime("%d %b %Y %H:%M")
     date_str = extraction_date[:10]  # "2026-06-06"
@@ -1540,6 +1548,10 @@ def main() -> None:
                         help="Process at most N pending rows then stop.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run Gemini but skip all Drive writes.")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Drain ONLY rows enqueued by pf_docs_sweep "
+                             "(source='pf_sweep'). Their analysis goes to its own "
+                             "daily file, never to the live Daily Concall Digest.")
     parser.add_argument("--backfill", action="store_true",
                         help="Backfill mode: use the dedicated key pool "
                              "(FREE_POOL + BACKFILL_GEMINI_KEY), route the daily "
@@ -1659,7 +1671,25 @@ def main() -> None:
     # main key pool (and vice-versa). A blank/absent source is legacy => "live".
     _src = queue["source"].astype(str).str.strip().str.lower()
     is_backfill_row = _src.eq("backfill")
-    origin_mask = is_backfill_row if args.backfill else (~is_backfill_row)
+    # THIRD ORIGIN (2026-09-06). pf_docs_sweep enqueues PF documents with
+    # source="pf_sweep". The old test was BINARY - `~is_backfill_row` means "anything
+    # that is not literally the word backfill" - so a swept row fell through to the LIVE
+    # run and its analysis was appended to the live Daily Concall Digest. Concall was
+    # therefore kept OUT of the sweep types entirely, which is why PF concalls could only
+    # ever be discovered by Screener and never by NSE or BSE.
+    #
+    # LIVE AND BACKFILL BEHAVIOUR IS UNCHANGED, by construction:
+    #   * a --backfill run still selects exactly source=="backfill";
+    #   * a live run still selects every legacy blank source, and everything else that
+    #     is not backfill - it now excludes ONLY the new "pf_sweep" tag, of which there
+    #     were 0 concall rows when this was written.
+    is_sweep_row = _src.eq("pf_sweep")
+    if args.backfill:
+        origin_mask = is_backfill_row
+    elif args.sweep:
+        origin_mask = is_sweep_row
+    else:
+        origin_mask = ~(is_backfill_row | is_sweep_row)
     pending_mask = ((queue["status"] == "pending")
                     & (queue["doc_type"] == "concall")
                     & origin_mask)
@@ -1976,6 +2006,8 @@ def main() -> None:
                     content=markdown_text,
                     run_time=run_time,
                     backfill=args.backfill,
+                    origin=("backfill" if args.backfill
+                            else "sweep" if args.sweep else "live"),
                 )
 
             # 5c. Quarterly guidance tracker
