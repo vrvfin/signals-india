@@ -6,7 +6,7 @@
 # CI always runs the committed code against the same Drive.
 #
 # Dispatch with dry_run first, read the log, then dispatch again with dry_run off.
-name: queue column restore (manual)
+name: queue repair (manual)
 
 on:
   workflow_dispatch:
@@ -18,6 +18,12 @@ on:
         description: "Report only, write nothing"
         type: boolean
         default: true
+      requeue_doc_ids:
+        description: "Re-queue these doc_ids (comma separated). Blank = skip."
+        default: ""
+      requeue_as_origin:
+        description: "Origin for the re-queued rows: backfill | live | (blank = leave)"
+        default: ""
 
 concurrency:
   group: queue-column-restore
@@ -53,7 +59,9 @@ jobs:
         run: pip install -r scripts/requirements.txt
 
       - name: Self-test (fail fast)
-        run: python scripts/restore_queue_columns.py --self-test
+        run: |
+          python scripts/restore_queue_columns.py --self-test
+          python scripts/requeue_documents.py --self-test
 
       - name: List revisions
         if: inputs.revision == ''
@@ -65,3 +73,22 @@ jobs:
           python scripts/restore_queue_columns.py
           --revision "${{ inputs.revision }}"
           ${{ inputs.dry_run == false && '--live' || '--dry-run' }}
+
+      # Re-queue named documents, optionally moving them to another origin. Setting
+      # origin=backfill sends the re-read down the backfill path, so its output goes to
+      # daily_backfill_<date>.md and never into the live Daily Concall Digest.
+      # drive_file_id is cleared, so run the hydrate step below before extracting.
+      - name: Re-queue documents
+        if: inputs.requeue_doc_ids != ''
+        run: >
+          python scripts/requeue_documents.py
+          --doc-ids "${{ inputs.requeue_doc_ids }}"
+          ${{ inputs.requeue_as_origin != '' && format('--as-origin {0}', inputs.requeue_as_origin) || '' }}
+          ${{ inputs.dry_run == false && '--live' || '' }}
+
+      # Retention deletes the raw PDF two days after processing, so a re-queued document
+      # has to be fetched again before any extractor can read it.
+      - name: Re-fetch the PDFs
+        if: inputs.requeue_doc_ids != '' && inputs.dry_run == false
+        run: python scripts/pf_docs_sweep.py --hydrate --limit 20
+        continue-on-error: true
