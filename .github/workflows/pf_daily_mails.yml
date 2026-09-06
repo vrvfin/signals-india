@@ -137,19 +137,18 @@ jobs:
       # which carry no bse_code). --one-per-quarter keeps this to one document per
       # quarter per type instead of re-ingesting a company's whole history.
       #
-      # CONCALL IS STILL NOT SWEPT HERE, AND THE REASON HAS NARROWED TO ONE THING.
-      # Swept rows now carry source="live" (2026-09-06), which is what they are, so the
-      # ORIGIN objection is gone: extract_concall's binary test treats them as live
-      # because they ARE live, not by accident of a tag nothing understood.
-      #
-      # WHAT REMAINS IS THE DATE WINDOW. This sweep runs with --days 30, and
-      # append_day_page writes into concall_<TODAY>.md - a file that is meant to hold
-      # the calls processed TODAY. Sweeping concall therefore dumps up to a month of
-      # backdated filings into one day's digest, which is what produced the flood of
-      # entries that looked like a backfill.
-      # Re-enable by appending ",concall" ONLY together with a lookback for concall that
-      # matches the digest's meaning (a day or two, not thirty). extract_concall.py is P0
-      # and is not touched from here.
+      # CONCALL IS SWEPT AGAIN (2026-09-06), on a DAILY window. Both reasons it was
+      # pulled are now closed:
+      #   ORIGIN - swept rows carry source="live", which is what they are, so
+      #     extract_concall's binary test routes them live by design rather than by the
+      #     accident of a third tag nothing understood.
+      #   DATE   - concall uses --concall-days 2 while everything else keeps --days 30.
+      #     Its analysis lands in concall_<TODAY>.md, a digest meaning "the calls
+      #     processed today"; the wide window is what tipped weeks of backdated filings
+      #     into one day's file and produced the flood that read like a backfill.
+      # This is what lets a PF concall be found on NSE and BSE at all - Screener was the
+      # only source that ever worked for it. extract_concall.py is P0 and is not touched
+      # from here; phase2 still drains the rows on its own schedule.
       #
       # annual_report is unaffected: its digest has no live/backfill split.
       #
@@ -166,7 +165,8 @@ jobs:
       - name: Daily sweep — find new documents (screener + nse + bse)
         run: >
           python scripts/pf_docs_sweep.py --enqueue --nse --bse --one-per-quarter
-          --days 30 --types presentation,rating,results,annual_report
+          --days 30 --concall-days 2
+          --types presentation,rating,results,annual_report,concall
         continue-on-error: true
 
       - name: Fetch what the sweep found

@@ -645,11 +645,16 @@ def nse_session():
 
 
 def missing_vs_queue(docs: list[dict], queue: pd.DataFrame, isin: str,
-                     since: str) -> list[dict]:
+                     since: str, since_by_type: dict | None = None) -> list[dict]:
     """Docs this company has filed that the ONE global queue does not know about.
 
     Identity is the PDF url — the only stable key across both fetch paths. Rule 7:
     consult the shared queue, never a parallel one.
+
+    `since_by_type` narrows the window for particular doc types. Concall needs it: its
+    analysis is appended to concall_<TODAY>.md, a digest meaning "the calls processed
+    today", so a ten- or thirty-day window tips weeks of backdated filings into one
+    day's file. Types absent from the dict keep the wide `since`.
     """
     if not docs:
         return []
@@ -661,12 +666,41 @@ def missing_vs_queue(docs: list[dict], queue: pd.DataFrame, isin: str,
     for d in docs:
         if d["pdf_url"] in known:
             continue
-        if since and d["announcement_date"] and d["announcement_date"] < since:
+        _cut = (since_by_type or {}).get(str(d.get("doc_type") or ""), since)
+        if _cut and d["announcement_date"] and d["announcement_date"] < _cut:
             continue
         if not d["announcement_date"]:
             continue
         out.append(d)
     return out
+
+
+def _self_test_window() -> list:
+    """[(name, ok)] — the concall window must be NARROWER than every other type's.
+
+    concall_<TODAY>.md means "the calls processed today". A wide window tips weeks of
+    backdated filings into one day's digest; that is the flood that looked like a
+    backfill.
+    """
+    import pandas as _pd
+    empty = _pd.DataFrame()
+    docs = [
+        {"pdf_url": "u1", "doc_type": "concall", "announcement_date": "2026-09-05"},
+        {"pdf_url": "u2", "doc_type": "concall", "announcement_date": "2026-08-20"},
+        {"pdf_url": "u3", "doc_type": "annual_report",
+         "announcement_date": "2026-08-20"},
+    ]
+    got = missing_vs_queue(docs, empty, "X", "2026-08-15",
+                           since_by_type={"concall": "2026-09-04"})
+    urls = {d["pdf_url"] for d in got}
+    return [
+        ("a concall inside its own narrow window is kept", "u1" in urls),
+        ("a BACKDATED concall is dropped even though the wide window allows it",
+         "u2" not in urls),
+        ("another type still uses the wide window", "u3" in urls),
+        ("no per-type entry means the wide window applies",
+         len(missing_vs_queue(docs, empty, "X", "2026-08-15")) == 3),
+    ]
 
 
 def _doc_id(url: str) -> str:
@@ -677,6 +711,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--symbols", default="", help="Comma-separated; default = all PF.")
+    ap.add_argument("--concall-days", type=int, default=2,
+                    help="Lookback for CONCALL only, in days (default 2). Concall "
+                         "analysis is appended to concall_<TODAY>.md, a digest that "
+                         "means 'the calls processed today', so a wide window would "
+                         "tip a month of backdated filings into one day's file. Every "
+                         "other type keeps --days.")
     ap.add_argument("--days", type=int, default=10,
                     help="Only consider filings this recent (default 10).")
     ap.add_argument("--enqueue", action="store_true",
@@ -737,7 +777,17 @@ def main() -> None:
 
     want_types = {t.strip() for t in args.types.split(",") if t.strip()}
     since = (datetime.now() - timedelta(days=args.days)).date().isoformat()
+    # CONCALL IS A DAILY FEED, NOT A MONTHLY ONE. Its analysis lands in
+    # concall_<TODAY>.md, which means "the calls processed today". Sweeping it on the
+    # same 10-30 day window as the other types tipped weeks of backdated filings into a
+    # single day's digest - the flood that read like a backfill. Everything else keeps
+    # the wide window, because a deck or a rating carries its own date in the mail and
+    # does not share a dated digest file.
+    concall_days = max(1, min(int(args.concall_days), int(args.days)))
+    since_concall = (datetime.now()
+                     - timedelta(days=concall_days)).date().isoformat()
     log(f"PF docs sweep — {len(pf)} holdings, filings since {since}"
+        + (f" (concall since {since_concall})" if "concall" in want_types else "")
         + (f", types={sorted(want_types)}" if want_types else ""))
 
     queue = load_queue(drive, idx)
@@ -804,7 +854,8 @@ def main() -> None:
         docs = dedupe_across_sources(docs)
         if args.one_per_quarter:
             docs = select_one_per_quarter(docs)
-        miss = missing_vs_queue(docs, queue, isin, since)
+        miss = missing_vs_queue(docs, queue, isin, since,
+                                since_by_type={"concall": since_concall})
         if want_types:
             miss = [d for d in miss if d["doc_type"] in want_types]
         # One gate for BOTH sources (Screener and NSE): never let a recording through.
@@ -1062,6 +1113,11 @@ def _self_test() -> int:
               {"doc_type": "results", "title": "T", "announcement_date": "2026-05-11"},
               {"doc_type": "presentation", "title": "T", "announcement_date": "2026-05-11"},
           ])) == 2)
+
+    # THE CONCALL WINDOW: its digest file means "today", so its lookback must be
+    # narrower than every other type's. See _self_test_window().
+    for _name, _ok in _self_test_window():
+        check(_name, _ok)
 
     print(f"\npf_docs_sweep self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
