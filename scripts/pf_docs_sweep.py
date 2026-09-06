@@ -854,7 +854,17 @@ def main() -> None:
             "doc_type": d["doc_type"], "title": d["title"], "description": "",
             "announcement_date": d["announcement_date"], "pdf_url": d["pdf_url"],
             "drive_file_id": "", "status": "pending", "discovered_at": now,
-            "processed_at": "", "source": "pf_sweep",
+            # SOURCE IS THE PIPELINE ORIGIN, NOT THE DISCOVERY CHANNEL. This sweep
+            # fetches documents companies filed in the last few days - they ARE live
+            # filings, so they carry the live tag and the live extractors drain them,
+            # exactly as a Phase-2-ingested document does.
+            #
+            # It was briefly tagged "pf_sweep", which nothing downstream understood:
+            # every consumer tests only for "backfill" (extract_concall:1661,
+            # guidance_digest_email:242, run_growth_guidance_mail:89, requeue_orphans:72,
+            # run_backfill:445), so a third value was live-by-accident rather than
+            # live-by-design. One tag, meaning what it says.
+            "processed_at": "", "source": "live",
         } for d in found if d["pdf_url"] not in known]
         if not rows:
             log("Another run queued these first — nothing to add.")

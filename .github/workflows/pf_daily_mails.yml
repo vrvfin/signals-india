@@ -17,10 +17,9 @@ name: pf_daily_mails
 # (presentation, rating, annual report), on Phase 2's prompts and the FREE_POOL keys,
 # each capped and deadline-bounded.
 #
-# PHASE-2 CONCALL KEEPS ABSOLUTE PRIORITY. extract_concall.py is never run here. The
-# sweep only enqueues concall rows (source=pf_sweep) and phase2.yml drains them on its
-# next scheduled pass, so the P0 path is untouched. The extractors that DO run here take
-# _extract.lock with defer_to_phase2=True.
+# PHASE-2 CONCALL KEEPS ABSOLUTE PRIORITY. extract_concall.py is never run here, and the
+# sweep does not enqueue concall at all (see the sweep step below). The extractors that
+# DO run here take _extract.lock with defer_to_phase2=True.
 
 on:
   schedule:
@@ -138,17 +137,19 @@ jobs:
       # which carry no bse_code). --one-per-quarter keeps this to one document per
       # quarter per type instead of re-ingesting a company's whole history.
       #
-      # CONCALL IS DELIBERATELY NOT SWEPT HERE (reverted 2026-09-03).
-      # Sweeping it worked, and that was the problem. Swept rows carry source="pf_sweep",
-      # and extract_concall.py:1662 splits the queue with a BINARY test -
-      # `origin_mask = is_backfill_row if args.backfill else (~is_backfill_row)` - so any
-      # source that is not literally "backfill" counts as live. The live extractor then
-      # drained them and append_day_page wrote them to concall_*.md, the Daily Concall
-      # Digest, with no date guard: 30 days of backdated filings landed in a file that is
-      # meant to hold today's calls only.
-      # Re-enable by appending ",concall" once the digest routing names the live origin
-      # explicitly instead of inferring it by exclusion. extract_concall.py is P0 and is
-      # not touched from here.
+      # CONCALL IS STILL NOT SWEPT HERE, AND THE REASON HAS NARROWED TO ONE THING.
+      # Swept rows now carry source="live" (2026-09-06), which is what they are, so the
+      # ORIGIN objection is gone: extract_concall's binary test treats them as live
+      # because they ARE live, not by accident of a tag nothing understood.
+      #
+      # WHAT REMAINS IS THE DATE WINDOW. This sweep runs with --days 30, and
+      # append_day_page writes into concall_<TODAY>.md - a file that is meant to hold
+      # the calls processed TODAY. Sweeping concall therefore dumps up to a month of
+      # backdated filings into one day's digest, which is what produced the flood of
+      # entries that looked like a backfill.
+      # Re-enable by appending ",concall" ONLY together with a lookback for concall that
+      # matches the digest's meaning (a day or two, not thirty). extract_concall.py is P0
+      # and is not touched from here.
       #
       # annual_report is unaffected: its digest has no live/backfill split.
       #
@@ -197,8 +198,7 @@ jobs:
           # so the cap is lower than the others. Whatever is not drained now stays pending
           # and phase2 / backfill_nightly picks it up; the mail is self-healing and
           # reports it the next morning. CONCALL is deliberately NOT extracted here - that
-          # path is P0 and belongs to Phase 2, whose live step already drains the swept
-          # rows (source=pf_sweep) on its next scheduled pass.
+          # path is P0 and belongs to Phase 2.
           python scripts/extract_annual_report.py \
             --key-prefix FREE_POOL,BACKFILL_GEMINI_KEY --limit 10 --deadline-min 20 || true
         continue-on-error: true
