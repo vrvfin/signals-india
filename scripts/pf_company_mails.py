@@ -838,7 +838,31 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
     want = QT.norm_q(season)
 
     def _q(df):
-        if df.empty or "quarter" not in df.columns:
+        """Rows belonging to THIS season — by filing date first, stated label second.
+
+        A DECK'S OWN LABEL CANNOT BE TRUSTED, and pf_coverage.doc_quarter_map already
+        says so; has_season_rows() has preferred the filing date for a while. This
+        renderer did not, so the two disagreed: coverage marked a holding PRESENT, the
+        mail became due, and then the renderer found no rows matching the season and
+        produced an empty body — a mail promised and never sent.
+
+        Measured 2026-09-08 across the portfolio: 171 of 362 ppt_highlights rows carry a
+        label that contradicts their filing date, and 15 holdings that filed a deck THIS
+        SEASON were silently skipped. The labels fail in three different ways, all of
+        which the filing date settles:
+            LTELEVATOR   FY23        a Sep-2026 deck opening with a multi-year chart
+            MMFL/RPTECH  FY27        a financial year, no quarter at all
+            CPPLUS       Q1FY2027    right quarter, four-digit year the norm misses
+        """
+        if df.empty:
+            return df
+        qmap = (tables or {}).get("_qmap") or {}
+        if qmap and "source_doc_id" in df.columns:
+            by_date = df[df["source_doc_id"].astype(str).str.strip()
+                         .map(lambda d: qmap.get(d) == want)]
+            if not by_date.empty:
+                return by_date
+        if "quarter" not in df.columns:
             return df
         return df[df["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
 
@@ -2103,6 +2127,15 @@ def main() -> None:
     tables.update(_extra)
     if "_narr" in _pre:
         tables["_narr"] = _pre["_narr"]
+    # {source_doc_id: season quarter} FROM THE FILING DATE. pf_coverage has preferred
+    # this over a deck's own label for a while; the renderer did not, so the two
+    # disagreed and a deck could be "due" yet render empty. Same map, same rule, both
+    # sides.
+    try:
+        tables["_qmap"] = COV.doc_quarter_map(queue)
+    except Exception as e:
+        log(f"  NOTE: filing-date quarter map unavailable ({str(e)[:60]})")
+        tables["_qmap"] = {}
 
     if args.symbols:
         want_sym = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
