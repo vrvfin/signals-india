@@ -290,6 +290,42 @@ _SUMMARY_SECTIONS = (
 )
 
 
+def season_rows(df, season, tables):
+    """Rows belonging to THIS season — by EXCHANGE UPLOAD DATE first, stated label second.
+
+    ONE RULE FOR EVERY DOCUMENT TYPE. A document's own text cannot be trusted to say
+    which quarter it belongs to; the date the exchange received it can. pf_coverage
+    has worked this way for a while (doc_quarter_map / has_season_rows) but each
+    renderer still filtered on the label written INSIDE the document, so coverage and
+    the mail disagreed and a holding could be marked due and then render nothing.
+
+    MEASURED ACROSS THE PORTFOLIO, 2026-09-08: 171 of 362 ppt_highlights rows (47%)
+    carry a label contradicting their filing date, and 15 holdings that filed a deck
+    THIS SEASON were skipped entirely. Three separate failure modes, all settled by
+    the upload date:
+        LTELEVATOR        FY23        a Sep-2026 deck opening on a multi-year chart
+        MMFL, RPTECH...   FY27        a financial year, no quarter at all
+        CPPLUS            Q1FY2027    right quarter, four-digit year the norm misses
+
+    The map only contains documents actually filed in a given season, so this can
+    never surface the WRONG quarter; when it has nothing to say the stated label is
+    used exactly as before. Frames without source_doc_id or without quarter are
+    returned untouched.
+    """
+    want = QT.norm_q(season)
+    if df is None or getattr(df, "empty", True):
+        return df
+    qmap = (tables or {}).get("_qmap") or {}
+    if qmap and "source_doc_id" in df.columns:
+        by_date = df[df["source_doc_id"].astype(str).str.strip()
+                     .map(lambda d: qmap.get(d) == want)]
+        if not by_date.empty:
+            return by_date
+    if "quarter" not in df.columns:
+        return df
+    return df[df["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+
+
 def standalone_summary(isin, season, tables) -> str:
     """The deck read as a company note in its own right.
 
@@ -304,9 +340,7 @@ def standalone_summary(isin, season, tables) -> str:
     ds = _slice(tables.get("deck_summary"), isin)
     if ds.empty:
         return ""
-    if "quarter" in ds.columns:
-        want = QT.norm_q(season)
-        ds = ds[ds["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+    ds = season_rows(ds, season, tables)
     if ds.empty:
         return ""
 
@@ -854,17 +888,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
             MMFL/RPTECH  FY27        a financial year, no quarter at all
             CPPLUS       Q1FY2027    right quarter, four-digit year the norm misses
         """
-        if df.empty:
-            return df
-        qmap = (tables or {}).get("_qmap") or {}
-        if qmap and "source_doc_id" in df.columns:
-            by_date = df[df["source_doc_id"].astype(str).str.strip()
-                         .map(lambda d: qmap.get(d) == want)]
-            if not by_date.empty:
-                return by_date
-        if "quarter" not in df.columns:
-            return df
-        return df[df["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+        return season_rows(df, season, tables)
 
     cur_hi, cur_gu = _q(hi), _q(gu)
     # The standalone summary is computed BEFORE the gate: a company that holds no concall
@@ -1083,9 +1107,7 @@ def _business_view(isin, season, tables) -> str:
                           f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}",
                           str(r.get("slide_ref") or "")))
     if not items and not hi.empty:
-        h = hi
-        if "quarter" in h.columns:
-            h = h[h["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+        h = season_rows(hi, season, tables)
         for _, r in h.iterrows():
             if _is_esg(r.get("statement"), r.get("category")):
                 continue
@@ -1289,8 +1311,7 @@ def _deck_changed(isin, season, tables) -> str:
     """What moved versus the previous deck. Deterministic set comparison."""
     diff = _slice(tables.get("deck_diff"), isin)
     want = QT.norm_q(season)
-    if not diff.empty and "quarter" in diff.columns:
-        diff = diff[diff["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
+    diff = season_rows(diff, season, tables)
     if not diff.empty:
         tone = {"kpi_dropped": DOWN, "target_moved": DOWN, "definition_changed": AMBER,
                 "de_emphasised": AMBER, "new_emphasis": UP}
@@ -2939,6 +2960,19 @@ Management guided to twenty percent growth.
           not concall_section_is_for("## FY26 Annual Report — from bse", "Q1FY27"))
     check("no wanted quarter means no opinion",
           concall_section_is_for("## Q4 FY25 Concall — Transcript", ""))
+    # ONE RULE FOR EVERY TYPE: the exchange upload date beats the document's own label.
+    _sr = pd.DataFrame({"source_doc_id": ["d1", "d2"], "quarter": ["FY23", "Q1FY27"],
+                        "v": [1, 2]})
+    _tb = {"_qmap": {"d1": "Q1FY27", "d2": "Q3FY26"}}
+    _got = season_rows(_sr, "Q1FY27", _tb)
+    check("the upload date wins over a wrong in-document label",
+          list(_got["v"]) == [1])
+    check("no map means the stated label is used, exactly as before",
+          list(season_rows(_sr, "Q1FY27", {})["v"]) == [2])
+    check("a frame with no quarter column is returned untouched",
+          len(season_rows(pd.DataFrame({"source_doc_id": ["z"], "v": [9]}),
+                          "Q1FY27", {})) == 1)
+    check("an empty frame is safe", season_rows(pd.DataFrame(), "Q1FY27", _tb).empty)
     check("prompt text is recognised as an echo", _is_prompt_echo(_echo))
     check("real analysis is NOT an echo",
           not _is_prompt_echo("Revenue grew 22% with margin expansion of 140bps driven "
