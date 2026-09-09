@@ -495,6 +495,39 @@ def load_parquet(drive, index_id: str, filename: str,
         return pd.DataFrame(columns=cols)
 
 
+def load_table(drive, index_id: str, filename: str,
+               cols: list[str]) -> pd.DataFrame:
+    """The file AS IT IS, plus any of `cols` it is missing. It never removes a column.
+
+    THE DIFFERENCE FROM load_parquet, AND WHY IT MATTERS. load_parquet ends in
+    `return df[cols]` - it SLICES - so a caller that reads with a fixed list and writes
+    the result straight back DELETES every column its list does not name, for every
+    other pipeline that relies on them. Measured on the live queue, 2026-09-09:
+
+        load_parquet(..., QUEUE_COLS)  ->  9,328 rows, 17 columns
+        load_table(...,   QUEUE_COLS)  ->  9,328 rows, 21 columns
+
+    and the four it dropped held 2,710 / 3,334 / 4,777 / 4,777 real values. That is
+    what erased them on 2026-09-05.
+
+    load_queue() has always behaved this way for the queue specifically; this is the
+    same guarantee for every other shared table. Use load_parquet only when you want a
+    projection you are NOT going to save back.
+    """
+    fid = find_file(drive, index_id, filename)
+    if not fid:
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        return df
+    except Exception as e:
+        log(f"  WARNING: could not read {filename} ({str(e)[:80]}) — fresh.")
+        return pd.DataFrame(columns=cols)
+
+
 def save_parquet(drive, index_id: str, filename: str,
                  df: pd.DataFrame) -> None:
     buf = io.BytesIO()
@@ -632,7 +665,11 @@ def persist_gemini_usage(drive, index_id: str, summary: dict, doc_type: str,
         recs = [r for r in recs if r["ok"] or r["fail"] or r["rpm_cool"] or r["overload_503"]]
         if not recs:
             return
-        df = load_parquet(drive, index_id, "gemini_usage.parquet", GEMINI_USAGE_COLS)
+        # load_table, not load_parquet: this reads and then WRITES BACK, so a slicing
+        # read would delete any column another writer has added. The two lists agree
+        # today (10 and 10, measured 2026-09-09), so this changes nothing now — it
+        # stops the next added column from being erased.
+        df = load_table(drive, index_id, "gemini_usage.parquet", GEMINI_USAGE_COLS)
         df = pd.concat([df, pd.DataFrame(recs)], ignore_index=True)
         cut = (datetime.now() - timedelta(days=keep_days)).isoformat()
         df = df[df["ts"].astype(str) >= cut].reset_index(drop=True)

@@ -43,7 +43,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
-from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
+from _extractor_base import (get_drive, get_or_create_subfolder, find_file, load_table,
                              download_bytes, upload_bytes, load_parquet,
                              save_parquet, log)
 from mailer import send_email, load_mail_settings, esc
@@ -185,7 +185,10 @@ def fetch_range(date_from: str, date_to: str) -> None:
     root = os.environ["GDRIVE_FOLDER_ID"]
     repo_id = get_or_create_subfolder(drive, root, "company_repo")
     index_id = get_or_create_subfolder(drive, repo_id, "_index")
-    df = load_parquet(drive, index_id, "ar_focus.parquet", AR_FOCUS_COLS)
+    # load_table, NOT load_parquet: this frame is written straight back, and
+    # load_parquet ends in `return df[cols]` - it SLICES - so any column this
+    # module's list does not name would be DELETED for every other pipeline.
+    df = load_table(drive, index_id, "ar_focus.parquet", AR_FOCUS_COLS)
     sel = df[(df["as_of"] >= date_from) & (df["as_of"] <= date_to)] \
         .sort_values(["as_of", "list", "symbol"])
     log(f"ar_focus rows {date_from}..{date_to}: {len(sel)} "
@@ -313,7 +316,8 @@ def main() -> None:
             "as_of": as_of, "list": v["list"], "reasons": v["reasons"],
             "computed_at": today.isoformat(timespec="seconds"),
         } for v in verdicts], columns=AR_FOCUS_COLS)
-        old = load_parquet(drive, index_id, "ar_focus.parquet", AR_FOCUS_COLS)
+        # written back a few lines below — must not slice. See load_table.
+        old = load_table(drive, index_id, "ar_focus.parquet", AR_FOCUS_COLS)
         keep = old[~(old["symbol"].isin(new["symbol"]) & (old["as_of"] == as_of))] \
             if not old.empty else old
         out = pd.concat([keep, new], ignore_index=True)

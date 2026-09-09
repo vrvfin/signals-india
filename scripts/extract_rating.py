@@ -30,6 +30,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _extractor_base import (
+    load_table,
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue,
@@ -486,7 +487,10 @@ def upsert_ratings(drive, index_id: str, facts) -> None:
     items = facts if isinstance(facts, list) else [facts]
     if not items:
         return
-    df = load_parquet(drive, index_id, "ratings.parquet", RATINGS_COLS)
+    # load_table, NOT load_parquet: this frame is written straight back, and
+    # load_parquet ends in `return df[cols]` - it SLICES - so any column this
+    # module's list does not name would be DELETED for every other pipeline.
+    df = load_table(drive, index_id, "ratings.parquet", RATINGS_COLS)
     keys = {(str(f.get("isin")), str(f.get("source_doc_id"))) for f in items}
     if not df.empty and {"isin", "source_doc_id"} <= set(df.columns):
         df = df[~df.apply(lambda r: (str(r["isin"]), str(r["source_doc_id"])) in keys, axis=1)]

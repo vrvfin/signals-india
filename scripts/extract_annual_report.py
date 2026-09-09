@@ -39,6 +39,7 @@ from _extractor_base import (
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue, mark_queue_error, is_prompt_echo, save_doc_report,
+    load_table,
     squeeze_padding, degenerate_reason, strip_inline_html,
     unflatten_tables, fix_rupee_glyph,
     load_parquet, save_parquet,
@@ -314,7 +315,10 @@ def _purge_ar_fy(drive, index_id: str, isin: str, fy: str, new_doc_id: str) -> N
     on quarter==FY so ONLY AR rows are touched — concall rows (quarter='Q2FY26') are safe."""
     isin, fy, new_doc_id = str(isin), str(fy), str(new_doc_id)
     # quarterly_facts: AR rows for this FY, excluding the new doc.
-    qf = load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
+    # load_table, NOT load_parquet: this frame is written straight back, and
+    # load_parquet ends in `return df[cols]` - it SLICES - so any column this
+    # module's list does not name would be DELETED for every other pipeline.
+    qf = load_table(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
     if not qf.empty:
         m = ((qf["isin"].astype(str) == isin)
              & (qf["quarter"].astype(str) == fy)
@@ -575,7 +579,10 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
 
 
 def upsert_facts(drive, index_id: str, facts: dict) -> None:
-    df = load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
+    # load_table, NOT load_parquet: this frame is written straight back, and
+    # load_parquet ends in `return df[cols]` - it SLICES - so any column this
+    # module's list does not name would be DELETED for every other pipeline.
+    df = load_table(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
     mask = (
         (df["isin"].astype(str) == str(facts["isin"])) &
         (df["quarter"].astype(str) == str(facts["quarter"])) &

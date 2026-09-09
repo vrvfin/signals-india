@@ -31,6 +31,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _extractor_base import (
+    load_table,
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue,
@@ -176,7 +177,10 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
 
 
 def upsert_results_gemini(drive, index_id: str, facts: dict) -> None:
-    df = load_parquet(drive, index_id, "results_gemini.parquet", RESULTS_GEMINI_COLS)
+    # load_table, NOT load_parquet: this frame is written straight back, and
+    # load_parquet ends in `return df[cols]` - it SLICES - so any column this
+    # module's list does not name would be DELETED for every other pipeline.
+    df = load_table(drive, index_id, "results_gemini.parquet", RESULTS_GEMINI_COLS)
     mask = (
         (df["isin"].astype(str) == str(facts["isin"])) &
         (df["quarter"].astype(str) == str(facts["quarter"])) &
