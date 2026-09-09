@@ -39,7 +39,18 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(_D), ".env"))
 
-from _extractor_base import (get_drive, get_or_create_subfolder, load_parquet, save_parquet,
+# load_queue / save_queue, NOT load_parquet(QUEUE_COLS) / save_parquet.
+#
+# load_parquet ends in `return df[cols]` - it SLICES - so saving the result back deletes
+# every column this module's list does not name, for every other pipeline that relies on
+# them. On 2026-09-05 that erased four columns from the live queue; measured again on
+# 2026-09-09 the live file holds 21 columns while QUEUE_COLS names 17, so running this
+# script as it stood would have deleted backfill_process_date, source, period and
+# content_sha256 all over again.
+#
+# load_queue() returns the frame unsliced and only ADDS columns it is missing, so a
+# column another pipeline owns survives a round trip through here untouched.
+from _extractor_base import (get_drive, get_or_create_subfolder, load_queue, save_queue,
                              QUEUE_COLS, acquire_lock, release_lock, log)
 
 
@@ -89,7 +100,7 @@ def main() -> None:
 
     from daily_brief import load_pf
     pf_isins = {str(t[0]).strip() for t in load_pf(drive, fid, idx)}
-    queue = load_parquet(drive, idx, "processing_queue.parquet", QUEUE_COLS)
+    queue = load_queue(drive, idx)
     syms = {s.strip() for s in args.symbols.split(",") if s.strip()} or None
 
     work = select(queue, pf_isins, args.before, syms)
@@ -115,12 +126,12 @@ def main() -> None:
         log("Could not take the lock — nothing changed.")
         sys.exit(1)
     try:
-        queue = load_parquet(drive, idx, "processing_queue.parquet", QUEUE_COLS)
+        queue = load_queue(drive, idx)
         ids = set(work["doc_id"].astype(str))
         hit = queue["doc_id"].astype(str).isin(ids)
         queue.loc[hit, "status"] = "pending"
         queue.loc[hit, "processed_at"] = ""
-        save_parquet(drive, idx, "processing_queue.parquet", queue)
+        save_queue(drive, idx, queue)
         log(f"{hit.sum()} rating row(s) set to pending — run extract_rating to re-read them.")
     finally:
         release_lock(drive, idx, "_extract.lock")
