@@ -30,6 +30,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _extractor_base import (
+    load_table,
     RateLimitExhausted, GeminiKeyPool, get_drive, load_api_keys, P1_MODELS,
     log, get_or_create_subfolder,
     load_queue, save_queue,
@@ -229,7 +230,12 @@ def parse_gemini_response(text: str, row: pd.Series) -> dict:
 
 
 def upsert_facts(drive, index_id: str, facts: dict) -> None:
-    df = load_parquet(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
+    # THIS ONE WAS ACTIVELY DESTROYING DATA. Measured 2026-09-09: quarterly_facts holds
+    # 16 columns, this module's QFACTS_COLS names 15, so every run deleted
+    # `response_chars` from all 34,015 rows - the richness proxy the SUPERSEDE decision
+    # reads. The annual-report and concall extractors wrote it back, this one wiped it
+    # again, and only 1,430 rows still held a value.
+    df = load_table(drive, index_id, "quarterly_facts.parquet", QFACTS_COLS)
     mask = (
         (df["isin"].astype(str) == str(facts["isin"])) &
         (df["quarter"].astype(str) == str(facts["quarter"])) &

@@ -360,7 +360,13 @@ def _load_parquet(drive, index_id, filename, cols) -> pd.DataFrame:
         for c in cols:
             if c not in df.columns:
                 df[c] = None
-        return df[cols]
+        # RETURN THE FRAME AS IT IS. This used to `return df[cols]`, which SLICES: every
+        # caller here reads a shared table and writes it straight back, so any column
+        # this module's list did not name was DELETED for every other pipeline that
+        # relies on it. quarterly_facts and guidance_tracker are both written by three
+        # different extractors, each with its own hand-maintained list.
+        # Adding a missing column (above) is safe and wanted; removing one is not.
+        return df
     except Exception as e:
         log(f"  WARNING: could not read {filename} ({str(e)[:80]}) — fresh.")
         return pd.DataFrame(columns=cols)

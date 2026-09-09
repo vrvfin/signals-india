@@ -54,7 +54,7 @@ load_dotenv(ROOT / ".env")
 # Shared infra (CLAUDE.md rule 4 — reuse, never hand-roll Drive calls).
 from _extractor_base import (
     log, get_drive, get_or_create_subfolder, find_file, download_bytes,
-    load_parquet, save_parquet, find_latest_portfolio_file, isin_symbol_map,
+    load_parquet, save_parquet, load_table, find_latest_portfolio_file, isin_symbol_map,
 )
 from mailer import send_email, load_mail_settings, esc
 
@@ -1802,9 +1802,14 @@ def main() -> None:
     pf = resolve_symbols(drive, root_id, pf)
 
     # 2. Load ledgers.
-    snaps = load_parquet(drive, out_id, "pf_snapshots.parquet", SNAP_COLS)
-    decs = load_parquet(drive, out_id, "pf_decisions.parquet", DEC_COLS)
-    cohorts = load_parquet(drive, out_id, "pf_cohorts.parquet", COHORT_COLS)
+    # All three are written back further down (pf_snapshots, pf_decisions, pf_cohorts),
+    # so they must be read WITHOUT slicing: load_parquet ends in `return df[cols]` and
+    # would delete any column this module's lists do not name. None of these three files
+    # exists on Drive yet, so this is purely pre-emptive - which is the cheapest moment
+    # to get it right.
+    snaps = load_table(drive, out_id, "pf_snapshots.parquet", SNAP_COLS)
+    decs = load_table(drive, out_id, "pf_decisions.parquet", DEC_COLS)
+    cohorts = load_table(drive, out_id, "pf_cohorts.parquet", COHORT_COLS)
     price_cache: dict = {}
 
     # 3. Snapshot capture (change-gated) + decision diff.
