@@ -1,0 +1,163 @@
+name: mgmt_interviews
+
+# Management interviews (user 2026-09-11) — INDEPENDENT work stream, see
+# scripts/fetch_mgmt_interviews.py. Own ledger (interview_ledger.parquet), own daily
+# page (company_repo/_daily/mgmt_interviews_*.md -> Streamlit Daily Digests), own
+# evening mail. Never touches processing_queue or company_page.md.
+#
+# Two jobs:
+#   poll  4x/day, each run LOOPS every 30 min for ~5h40m. YouTube channel RSS holds
+#         only the latest 15 uploads — about an hour on the busiest channels — so it
+#         must be read often. 48 separate runs/day would flood check_infra_health,
+#         which reads only the 40 most recent runs across ALL workflows; one long run
+#         per 6 h keeps its view of the other workflows intact. Public repo, so the
+#         minutes are free.
+#   run   19:00 IST: classify, match to PF + watchlist, let Gemini watch each matched
+#         video, write the day's page, send the mail (evening batch).
+
+on:
+  schedule:
+    - cron: "5 0,6,12,18 * * *"     # poll loops (UTC)
+    - cron: "30 13 * * *"           # 13:30 UTC = 19:00 IST daily run
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = classify + summarise + page + mail; poll = one poll"
+        required: false
+        default: "run"
+        type: choice
+        options: [run, poll]
+      names:
+        description: "run only: company token(s), comma separated (ISIN / NSE symbol / name)"
+        required: false
+        type: string
+      dry_run:
+        description: "no Drive writes, no mail, no video calls"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '5 0,6,12,18 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'poll')
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    concurrency:
+      group: mgmt-interviews-poll
+      cancel-in-progress: false
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          YOUTUBE_API_KEY:         ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            # optional: when set, the poll reads full upload lists instead of RSS
+            echo "YOUTUBE_API_KEY=$YOUTUBE_API_KEY"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas pyarrow python-dotenv google-genai \
+            google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Poll business-channel uploads
+        env:
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY" = "true" ]; then
+            python scripts/fetch_mgmt_interviews.py --poll --dry-run
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python scripts/fetch_mgmt_interviews.py --poll
+          else
+            python scripts/fetch_mgmt_interviews.py --poll --loop-min 340 --every-min 30
+          fi
+
+  run:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '30 13 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'run')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: mgmt-interviews-run
+      cancel-in-progress: false
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          FREE_POOL:               ${{ secrets.FREE_POOL }}
+          BACKFILL_GEMINI_KEY:     ${{ secrets.BACKFILL_GEMINI_KEY }}
+          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+          YOUTUBE_API_KEY:         ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            # FREE_POOL is the default pool for new programs (CLAUDE.md); the secret
+            # may be a multi-line blob — flatten so dotenv keeps every key.
+            echo "FREE_POOL=$(printf '%s' "$FREE_POOL" | tr '\r\n' ',,')"
+            echo "BACKFILL_GEMINI_KEY=$(printf '%s' "$BACKFILL_GEMINI_KEY" | tr '\r\n' ',,')"
+            echo "GEMINI_API_KEY=$GEMINI_API_KEY"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+            echo "YOUTUBE_API_KEY=$YOUTUBE_API_KEY"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas pyarrow python-dotenv google-genai openpyxl xlrd \
+            google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Classify, summarise, publish
+        env:
+          # Via env, not inline ${{ }}, so a value cannot break out of the command.
+          NAMES: ${{ inputs.names }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          ARGS="--run --deadline-min 50"
+          if [ "$DRY" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "$NAMES" ]; then
+            python scripts/fetch_mgmt_interviews.py $ARGS --names "$NAMES"
+          else
+            python scripts/fetch_mgmt_interviews.py $ARGS
+          fi

@@ -398,6 +398,28 @@ class BucketPool:
         return self._run([genai_types.Part.from_text(text=prompt)],
                          max_output_tokens=max_output_tokens)
 
+    def call_video(self, video_url: str, prompt: str,
+                   max_output_tokens: int | None = None,
+                   end_offset_s: int | None = None) -> tuple[str, str]:
+        """Run prompt over a PUBLIC video URL (e.g. a YouTube watch link) that the model
+        fetches itself — no download, no transcript scraping. Returns (response_text,
+        model_used), with the same bucket failover and error typing as call_pdf.
+
+        `end_offset_s` clips processing to the first N seconds, which bounds what one
+        long upload can take out of the free tier's daily video allowance.
+
+        Additive (2026-09-11, fetch_mgmt_interviews.py): call_pdf / call_text / _run
+        are unchanged, so Phase 2 and backfill behave exactly as before."""
+        file_data = genai_types.FileData(file_uri=video_url)
+        if end_offset_s:
+            video = genai_types.Part(
+                file_data=file_data,
+                video_metadata=genai_types.VideoMetadata(end_offset=f"{int(end_offset_s)}s"))
+        else:
+            video = genai_types.Part(file_data=file_data)
+        return self._run([video, genai_types.Part.from_text(text=prompt)],
+                         max_output_tokens=max_output_tokens)
+
     def _run(self, parts, max_output_tokens: int | None = None) -> tuple[str, str]:
         # Build the generation config once. Default (None) is byte-identical to before.
         _cfg_kw = {"temperature": 0.1}
