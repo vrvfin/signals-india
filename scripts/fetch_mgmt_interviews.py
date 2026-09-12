@@ -450,6 +450,15 @@ def news_candidates(targets: pd.DataFrame, days: int, sweep: bool) -> list[dict]
 #  Watchlist + company matching                                      #
 # ------------------------------------------------------------------ #
 
+# Every spelling a null takes across pandas/pyarrow versions, lower-cased.
+_NULLISH = frozenset({"", "none", "nan", "nat", "<na>", "null"})
+
+
+def is_null(v) -> bool:
+    """True for every spelling of 'no value' pandas/pyarrow can hand back."""
+    return _s(v).strip().lower() in _NULLISH
+
+
 def _s(v) -> str:
     """str() that maps None/NaN to '' (a NaN name must not become the word 'nan')."""
     if v is None or (isinstance(v, float) and v != v):
@@ -802,7 +811,11 @@ def load_ledger(drive, idx: str) -> pd.DataFrame:
     for c in LEDGER_COLS:
         if c not in df.columns:
             df[c] = None
-    return df[LEDGER_COLS]
+    # Normalise on READ, not only on write: pandas/pyarrow hand an all-null text column
+    # back as None here and as NaN or pd.NA on the CI runner, and a null test that knew
+    # only one spelling silently changed behaviour there (2026-09-12: every recent row
+    # counted against the video budget, and no row looked unmailed).
+    return normalize_ledger(df[LEDGER_COLS])
 
 
 def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
@@ -815,8 +828,9 @@ def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].map(lambda v: bool(v) if isinstance(v, (bool, int)) else
                               str(v).strip().lower() == "true")
         else:
-            df[c] = df[c].map(lambda v: None if v is None or (isinstance(v, float) and v != v)
-                              else str(v))
+            # is_null(), not a None check: pd.NA would otherwise be stored as the
+            # literal string "<NA>" and later print as a speaker's name.
+            df[c] = df[c].map(lambda v: None if is_null(v) else str(v))
     return df
 
 
@@ -897,8 +911,8 @@ def _summary_lines(summary: str) -> list[str]:
 
 
 def _who(r) -> str:
-    person = str(r.get("person") or "").strip()
-    role = str(r.get("role") or "").strip()
+    person = _s(r.get("person")).strip()
+    role = _s(r.get("role")).strip()
     return f"{person} ({role})" if person and role else (person or role)
 
 
@@ -1129,7 +1143,7 @@ def _make_pool(chain: str, static: list[str], drive, idx, call_timeout_s: float)
 def _video_used_24h(ledger: pd.DataFrame) -> int:
     t = pd.to_datetime(ledger["processed_at"], errors="coerce")
     recent = t >= (utc_now() - timedelta(hours=24))
-    real = ~ledger["model"].astype(str).isin(["", "None", "fallback", "nan"])
+    real = ~ledger["model"].map(lambda v: is_null(v) or _s(v).strip().lower() == "fallback")
     return int((recent & real & (ledger["source"] == "youtube")).sum())
 
 
@@ -1294,8 +1308,7 @@ def do_run(args) -> int:
             clips.setdefault(str(r["dup_of"]), []).append(r)
     md = render_page_md(todays, today, rank, clips) if not todays.empty else ""
     cutoff = utc_now() - timedelta(days=MAIL_MAX_AGE_DAYS)
-    unmailed = done[done["mailed_at"].map(lambda v: not str(v or "").strip()
-                                          or str(v) in ("None", "nan"))
+    unmailed = done[done["mailed_at"].map(is_null)
                     & (pd.to_datetime(done["processed_at"], errors="coerce") >= cutoff)]
     if names_mode:
         unmailed = unmailed[unmailed["isin"].isin(wl_by_isin)]
@@ -1562,6 +1575,25 @@ def _self_test() -> int:
           list(m2["status"]) == ["done"])
     check("merge: empty ledger + new rows (no concat onto an empty frame)", len(m2) == 1)
 
+    for null in (None, float("nan"), pd.NA, "", "  ", "None", "nan", "<NA>"):
+        check(f"null spelling {null!r} reads as empty", is_null(null))
+    check("a real value is not null", not is_null("gemini-3.7-flash"))
+    nulls = pd.DataFrame([
+        dict(item_id="yt:a", source="youtube", status="done", model="gemini-3.7-flash",
+             processed_at=utc_iso(), mailed_at=None, person="A", role="CEO"),
+        dict(item_id="yt:b", source="youtube", status="not_interview", model=pd.NA,
+             processed_at=utc_iso(), mailed_at=pd.NA, person=pd.NA, role=pd.NA),
+        dict(item_id="yt:c", source="youtube", status="done", model=float("nan"),
+             processed_at=utc_iso(), mailed_at="2026-09-11T10:00:00", person=float("nan"),
+             role=None),
+    ], columns=LEDGER_COLS)
+    norm = normalize_ledger(nulls)
+    check("budget counts only rows a model actually ran on (CI counted 17 of 18)",
+          _video_used_24h(norm) == 1 and _video_used_24h(nulls) == 1)
+    check("a NaN/<NA> mailed_at still reads as unmailed",
+          list(norm["mailed_at"].map(is_null)) == [True, True, False])
+    check("a null speaker never prints the word 'nan'",
+          _who(norm.iloc[1]) == "" and _who(nulls.iloc[2]) == "")
     check("daily name matches app.py's parser",
           re.match(r"^(.+)_(\d{2})_([a-z]{3})(\d{4})\.md$", daily_name(date(2026, 9, 11)),
                    re.IGNORECASE) is not None
