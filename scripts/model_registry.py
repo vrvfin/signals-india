@@ -101,6 +101,14 @@ CHAINS: dict[str, list[str]] = {
     # (P0), and an enrichment pass must never eat the live concall run's daily bucket.
     # It sits third here, reachable only once the two ahead of it are spent.
     "NARRATIVE": ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash"],
+    # Video understanding: Gemini watches a public YouTube URL (management interviews,
+    # fetch_mgmt_interviews.py, 2026-09-11). Led by models NO other chain names, so the
+    # interviews never share a daily bucket with Phase 2 - and never led by the CONCALL
+    # leader. Probed 2026-09-11 (--probe-video, 120 s clip of a 17-min interview): all
+    # four accept YouTube URLs; 3.7/3.6/3.5-lite took ~6 s and 10,943 tokens, 2.5-flash
+    # 27 s and 35,422. No failure-rate data yet - re-order from gemini_usage once it exists.
+    "MEDIA": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite",
+              "gemini-2.5-flash"],
 }
 
 
@@ -277,6 +285,8 @@ def _self_test() -> int:
           len(_candidates()) == len(set(_candidates())))
     check("concall stays disjoint from P1 (separate daily buckets)",
           not (set(CHAINS["CONCALL"]) & set(CHAINS["P1"])))
+    check("MEDIA is never led by the CONCALL (P0) leader",
+          CHAINS["MEDIA"][0] != CHAINS["CONCALL"][0])
 
     # resolution
     reg = dict(fresh, dead={"gemini-2.5-flash-lite": "404"})
