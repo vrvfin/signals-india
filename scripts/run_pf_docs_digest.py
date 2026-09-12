@@ -106,6 +106,34 @@ def _other_type_heading(hn: str, doc_type: str) -> bool:
         if any(k in hn for k in kws):
             return True
     return False
+
+
+_FY4_RE = re.compile(r"(q[1-4]fy)20(\d{2})")
+_TYPE_SPLIT_RE = re.compile(r"\s+[—–-]\s+")
+
+
+def _qnorm(s: str) -> str:
+    """_norm, with a four-digit financial year folded to two.
+
+    THE PAGE AND THE MAIL SPELL THE SAME QUARTER DIFFERENTLY. extract_concall heads a
+    section "## Q1 FY2027 Concall - PPT"; the mail asks for the season key "Q1FY27".
+    Normalised, those are "q1fy2027..." and "q1fy27" - and a substring test can never
+    match them, so a finished brief was invisible to its own mail. Measured on GRAPHITE
+    2026-09-10: 12,152 characters present, nothing lifted. Folding BOTH sides to two
+    digits makes the comparison about the quarter rather than about its spelling.
+    Bare "FY26" (annual reports) is deliberately untouched - only a Q-prefixed year.
+    """
+    return _FY4_RE.sub(lambda m: m.group(1) + m.group(2), _norm(s))
+
+
+def _type_words(h: str) -> str:
+    """The part of a heading that names the document TYPE: everything left of the first
+    spaced dash. What follows is the SOURCE DOCUMENT'S OWN TITLE, and Screener titles a
+    deck-sourced call "PPT" - so testing the whole heading for "ppt" threw away every
+    concall that was read from a deck rather than a transcript (2,309 of 7,177 concall
+    rows in the queue, 324 companies).
+    """
+    return _TYPE_SPLIT_RE.split(str(h or ""), maxsplit=1)[0]
 # priority order of narrative subsections to lift from a company_page section.
 # Covers concall headers (A-1 Executive Summary…) AND AR headers (numbered
 # "2. FINANCIAL PERFORMANCE…", "7. INVESTMENT THESIS…").
@@ -218,7 +246,7 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
     summary, even though Phase 2 wrote a full forensic report. Concall sections carry no
     marker, so they still fall through to the period logic below.
     """
-    pn = _norm(period)
+    pn = _qnorm(period)
     kws = _SECTION_KW.get(doc_type, (doc_type,))
 
     def _walk(i):
@@ -248,21 +276,29 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
         marker = f"<!-- doc:{str(doc_id).strip()} -->"
         cands += [i for i, (h, b) in enumerate(sections) if marker in b or marker in h]
 
-    def _starts_here(hn: str) -> bool:
+    def _starts_here(h: str) -> bool:
+        hn = _qnorm(h)
         if not (pn and pn in hn and any(_norm(k) in hn for k in kws)):
             return False
-        if doc_type == "concall" and "ppt" in hn:   # don't grab the presentation
+        # THE TYPE IS NAMED LEFT OF THE DASH. This used to reject any heading containing
+        # "ppt" anywhere, to stop a concall lift grabbing the quarter's deck - but the
+        # text right of the dash is the source document's own title, and a call read
+        # from a deck is titled "PPT". The guard was therefore rejecting precisely the
+        # section it was looking for. Testing the TYPE WORDS keeps the protection (a
+        # real "## FY26 Presentation - ..." is still refused) without it.
+        if doc_type == "concall" and _other_type_heading(
+                _norm(_type_words(h)), doc_type):
             return False
         return True
 
-    cands += [i for i, (h, _b) in enumerate(sections) if _starts_here(_norm(h))]
+    cands += [i for i, (h, _b) in enumerate(sections) if _starts_here(h)]
     if cands:
         return _walk(max(cands))
 
     start = None
     if start is None:                                # fallback: period-only match
         for i, (h, _b) in enumerate(sections):
-            hn = _norm(h)
+            hn = _qnorm(h)
             if pn and pn in hn and not _other_type_heading(hn, doc_type):
                 start = i
                 break
