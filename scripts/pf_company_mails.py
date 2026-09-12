@@ -1801,6 +1801,30 @@ def concall_section_is_for(heading: str, want_quarter: str) -> bool:
     return got == want
 
 
+def _clean_period(value) -> str:
+    """A queue period as text, with every not-a-value spelling collapsed to "".
+
+    A FLOAT NaN IS TRUTHY. `str(value or "")` therefore kept it and produced the WORD
+    "nan", with two consequences, both measured in run 34391358280 (2026-09-09):
+      * the date-derived quarter below was skipped, because "nan" is not empty; and
+      * _find_region matched "nan" inside "Fi-nan-cial", so the walk started on
+        "## Section 1) Unified Financial Intelligence & Guidance Section" - an
+        intra-document heading - and the quarter guard then refused it, logging
+        "section '## Section 1) Unified Financial Intellig' is not nan" for ~30 holdings.
+    The mail fell back to its tables and carried no attachment.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+    s = str(value).strip()
+    return "" if s.lower() in ("nan", "nat", "none", "null") else s
+
+
 def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -> dict:
     """{(isin, doc_type): {'period':.., 'text':..}} for the newest concall / AR per holding.
 
@@ -1815,7 +1839,7 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
     for (isin, dt), d in latest.items():
         if dt not in SCOPED_TYPES:
             continue
-        period = str(d.get("period") or "").strip()
+        period = _clean_period(d.get("period"))
         doc_id = str(d.get("doc_id") or "").strip()
         if not period and dt == "annual_report":
             # MOST AR QUEUE ROWS CARRY NO PERIOD - measured on APL Apollo, the field is
@@ -2865,6 +2889,13 @@ Revenue grew twenty two percent with margin expansion from operating leverage.
 
 ### A-1 Executive Summary
 Management guided to twenty percent growth and flagged an export order win.
+
+---
+## Q2 FY2027 Concall — PPT
+*Processed: 2026-11-05*
+
+### A-1 Executive Summary
+The call that reached this page from a deck rather than from a transcript.
 """
     _secs = _D._split_sections(_page)
     _ar26 = _D._find_region(_secs, "FY26", "annual_report")
@@ -2887,6 +2918,35 @@ Management guided to twenty percent growth and flagged an export order win.
               _D._find_region(_secs, "Q1 FY26", "concall") or []))
     check("a blank-period concall finds the concall, not the deck",
           "Concall" in (_D._find_region(_secs, "", "concall") or [("", "")])[0][0])
+
+    # ---- the two faults that hid 12 finished concall briefs (2026-09-12) -----
+    # Both are GRAPHITE's shape, measured that day: the page heads the section
+    # "## Q1 FY2027 Concall - PPT" while the mail asks for the season key "Q1FY27",
+    # and the text after the dash is the SOURCE DOCUMENT's title - "PPT" for a call
+    # read from a deck, which 2,309 of 7,177 queue rows are. The old code compared
+    # the spellings as substrings (never equal) and rejected any heading containing
+    # "ppt" (the very sections it wanted). 12,346 characters of finished analysis
+    # never reached the mail, which arrived with tables and no attachment.
+    _deck_call = _D._find_region(_secs, "Q2FY27", "concall")
+    check("a four-digit FY heading answers a two-digit ask",
+          _deck_call is not None and "Q2 FY2027" in _deck_call[0][0])
+    check("a call whose source document is titled PPT is still a call",
+          "reached this page from a deck" in _D._lift_summary(_deck_call or []))
+    check("and the DECK's own section is still not served as that call",
+          "Deck content" not in _D._lift_summary(_deck_call or []))
+    check("a presentation still resolves to the presentation",
+          (_D._find_region(_secs, "FY26", "presentation") or [("", "")])[0][0]
+          .find("Presentation") > 0)
+    check("the quarter fold touches a Q-prefixed year only",
+          _D._qnorm("Q1 FY2026") == "q1fy26" and _D._qnorm("FY2026") == "fy2026")
+
+    # ---- a missing period must not become the WORD "nan" --------------------
+    # A float NaN is truthy, so `str(v or "")` produced "nan", which skipped the
+    # date-derived quarter AND matched inside "Fi-nan-cial".
+    check("a real period survives", _clean_period("Q1FY27") == "Q1FY27")
+    check("None is empty", _clean_period(None) == "")
+    check("a float NaN is empty, not the word nan", _clean_period(float("nan")) == "")
+    check("the literal string nan is empty too", _clean_period("nan") == "")
 
     # ---- the doc-id marker beats a wrong heading label --------------------
     # Real shape, live 2026-09-02: APL Apollo's FY2026 annual report sits under a
