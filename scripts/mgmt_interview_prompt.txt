@@ -17,10 +17,15 @@ Write in English even when the interview is in Hindi. Keep every number exactly 
 with its unit and period ("15-17% revenue growth in FY27", "Rs 1,200 crore capex over two
 years").
 
-[OUTPUT — plain text, exactly these seven lines, no markdown, no preamble]
+[OUTPUT — plain text, exactly these eight lines, no markdown, no preamble]
 SPEAKER: <name>, <role>, <company> — as introduced in the video
 TOPIC: <one line: why they are on air — results, order win, IPO, expansion, deal, guidance>
-GUIDANCE: <every forward number they gave: growth, margins, capex, order book, debt, timelines; or NOT_STATED>
+GROWTH & GUIDANCE: <every forward NUMBER they gave, each with its period: revenue or
+  volume growth, margins, capex, order book or pipeline, debt, utilisation, store or
+  capacity additions, timelines. Quote the number as spoken. NOT_STATED if they gave none>
+STRATEGY: <HOW they intend to get there, in their words: new capacity, new products,
+  new markets or geographies, pricing, mix shift, acquisitions, cost programmes,
+  funding plan. NOT_STATED if unsaid>
 DEMAND & OUTLOOK: <one or two lines on demand, pricing, competition, sector conditions>
 RISKS: <one line: risks or concerns raised, or questions they deflected>
 TONE: <confident | cautious | defensive | mixed> — <half a line on why>
