@@ -44,6 +44,7 @@ Usage:
   python scripts/fetch_mgmt_interviews.py --poll --loop-min 340 --every-min 30   # CI
   python scripts/fetch_mgmt_interviews.py --run --dry-run [--classify] # no writes
   python scripts/fetch_mgmt_interviews.py --run --names TCS --limit 1  # live, 1 co
+  python scripts/fetch_mgmt_interviews.py --run --pf-only              # holdings only
   python scripts/fetch_mgmt_interviews.py --run                        # daily (CI)
   python scripts/fetch_mgmt_interviews.py --probe-video <youtube url>  # model check
 """
@@ -117,7 +118,10 @@ LOCK_OWNER = "interviews"
 LOCK_MAX_AGE_MIN = 30                    # holds last seconds; a crashed holder is stolen
 DAILY_PREFIX = "mgmt_interviews"
 DAILY_KEEP_DAYS = 90
-MAIL_KEY = "mgmt_interviews"
+# TWO mails (user 2026-09-12): holdings and watchlist names never share an inbox item,
+# and each can be switched off on its own.
+MAIL_KEY_PF = "mgmt_interviews"
+MAIL_KEY_WL = "mgmt_interviews_watchlist"
 MAX_HTML_BYTES = 90_000                  # Gmail clips a body at ~102 KB
 MAIL_ITEMS_PER_CO = 8                    # bounds one company's block; the rest wait a day
 MAIL_MAX_AGE_DAYS = 7                    # never mail a backlog older than a week
@@ -517,6 +521,14 @@ class Matcher:
             best = max(n for n, _ in full)
             top = {isin for n, isin in full if n == best}
             return top.pop() if len(top) == 1 else None
+        # The spoken name is a PREFIX of the listed one: media say "Sri Lotus
+        # Developers", the exchange lists "Sri Lotus Developers & Realty Ltd". Needs >= 2
+        # distinctive words and exactly one candidate, so "Tata Motors" can never land on
+        # "Tata Motors Finance" while both are listed. Surfaced by the near-miss log.
+        if len(spoken) >= 2:
+            sub = {isin for isin, _, t, _ in self.rows if t and spoken < set(t)}
+            if len(sub) == 1:
+                return sub.pop()
         first = {isin for isin, _, t, allw in self.rows
                  if t and t[0] in self.unique_first and t[0] in words and spoken <= allw}
         return first.pop() if len(first) == 1 else None
@@ -625,22 +637,24 @@ def resolve_names(drive, root_id: str, tokens: list[str], pf: set) -> pd.DataFra
 #  Classify + summarise                                              #
 # ------------------------------------------------------------------ #
 
-def prefilter(item: dict, matcher: Matcher, names_mode: bool) -> bool:
+def prefilter(item: dict, matcher: Matcher, focused: bool) -> bool:
     """Free first cut before any LLM call.
       video             a management role word in the title or description
       per-company news  a role word or 'interview'/'exclusive' in the headline
       sweep news        that, AND a watchlist company named in the headline (strict)
-      --names mode      the target company must be named (a cue alone is too broad)"""
+      focused mode      (--names / --pf-only) the target must be NAMED; a role word is
+                        not required, because a holding's interview is worth a classify
+                        call even when the title only says "... on Q1 numbers"."""
     title = str(item.get("title", ""))
     text = f"{title} {item.get('description', '')}"
     if item.get("source") == "youtube":
         if NOT_INTERVIEW.search(title):
             return False
-        if names_mode:
+        if focused:
             return matcher.mentions(text)
         return bool(MGMT_CUE.search(text))
     cue = bool(MGMT_CUE.search(title) or NEWS_CUE.search(title))
-    if item.get("_hint_isin") or names_mode:
+    if item.get("_hint_isin") or focused:
         return cue
     return cue and matcher.mentions(title, strict=True)
 
@@ -968,7 +982,7 @@ def render_page_md(rows: pd.DataFrame, day: date, rank: dict,
 
 
 def render_mail_html(rows: pd.DataFrame, day: date, rank: dict, clips: dict | None = None,
-                     max_bytes: int = MAX_HTML_BYTES) -> tuple[str, str, list[str]]:
+                     scope: str = "", max_bytes: int = MAX_HTML_BYTES) -> tuple[str, str, list[str]]:
     """-> (subject, html, item_ids included). Whole company blocks are added until the
     body would pass max_bytes (Gmail clips at ~102 KB); the rest stay unmailed and go
     out the next evening."""
@@ -976,11 +990,20 @@ def render_mail_html(rows: pd.DataFrame, day: date, rank: dict, clips: dict | No
     clips = clips or {}
     blocks = company_blocks(rows, rank)
     n_pf = sum(1 for b in blocks if b["pf"])
-    subject = (f"🎙️ Mgmt interviews — {len(blocks)} compan(ies)"
-               + (f" (PF {n_pf})" if n_pf else "") + f" · {day.strftime('%d %b')}")
+    n = len(blocks)
+    if scope == "pf":
+        subject = f"💼 PF mgmt interviews — {n} compan(ies) · {day.strftime('%d %b')}"
+        title, lead = "Management interviews — your holdings", "Companies you hold. "
+    elif scope == "watchlist":
+        subject = f"🎙️ Watchlist mgmt interviews — {n} compan(ies) · {day.strftime('%d %b')}"
+        title, lead = "Management interviews — watchlist", "Watchlist names you do NOT hold. "
+    else:
+        subject = (f"🎙️ Mgmt interviews — {n} compan(ies)"
+                   + (f" (PF {n_pf})" if n_pf else "") + f" · {day.strftime('%d %b')}")
+        title, lead = "Management interviews", "PF first, then watchlist. "
     head = ("<div style='font-family:Arial,sans-serif;font-size:14px;color:#222'>"
-            f"<h2 style='margin:0 0 6px'>Management interviews — {esc(day.strftime('%d %b %Y'))}</h2>"
-            "<p style='color:#666;margin:0 0 14px'>PF first, then watchlist. Video notes are "
+            f"<h2 style='margin:0 0 6px'>{esc(title, 60)} — {esc(day.strftime('%d %b %Y'))}</h2>"
+            f"<p style='color:#666;margin:0 0 14px'>{lead}Video notes are "
             "written by Gemini from the video itself; news items are headline-only. Also on "
             "the dashboard: Company Intel → Daily Digests → Mgmt Interviews.</p>")
     tail = "</div>"
@@ -988,7 +1011,7 @@ def render_mail_html(rows: pd.DataFrame, day: date, rank: dict, clips: dict | No
     for b in blocks:
         part = []
         group = "Portfolio" if b["pf"] else "Watchlist"
-        if group != cur:
+        if group != cur and not scope:        # a single-scope mail needs no divider
             part.append(f"<h3 style='margin:18px 0 6px;color:#0b5394'>{group}</h3>")
         part.append("<div style='border-left:3px solid #0b5394;padding:4px 10px;margin:8px 0'>"
                     f"<b>{esc(b['symbol'] or b['name'], 30)}</b> — {esc(b['name'], 80)}"
@@ -1150,6 +1173,9 @@ def _video_used_24h(ledger: pd.DataFrame) -> int:
 def do_run(args) -> int:
     deadline = time.monotonic() + args.deadline_min * 60
     names_mode = bool(args.names)
+    # focused = a specific target set (named companies, or the portfolio). It widens the
+    # prefilter to "is my company named?" and never re-labels items outside that set.
+    focused = names_mode or args.pf_only
     if args.dry_run:
         log("DRY RUN — no Drive writes, no mail, no video calls"
             + (" (one classify call allowed: --classify)" if args.classify else " (no LLM)"))
@@ -1169,6 +1195,8 @@ def do_run(args) -> int:
         wl = resolve_names(drive, root, args.names.split(","), pf)
     else:
         wl = load_watchlist(drive, root, args.top)
+        if args.pf_only:
+            wl = wl[wl["in_pf"].astype(bool)].reset_index(drop=True)
     if wl.empty:
         log("no target companies (watchlist empty / names not found) — stopping")
         return 1
@@ -1180,21 +1208,28 @@ def do_run(args) -> int:
             for r in wl.itertuples()}
 
     # 3. Google News: per-company for PF (or the named set) + outlet sweeps
-    news_targets = wl if names_mode else wl[wl["in_pf"].astype(bool)]
+    news_targets = wl if focused else wl[wl["in_pf"].astype(bool)]
     news = news_candidates(news_targets, NAMES_NEWS_DAYS if names_mode else NEWS_DAYS,
-                           sweep=not names_mode)
+                           sweep=not focused)
     seen = set(ledger["item_id"].astype(str))
     news = [n for n in news if n["item_id"] not in seen]
     log(f"news: {len(news)} new headline(s) ({news_fetch.calls_made()} RSS call(s))")
 
     # 4. the free prefilter
     cands = ledger[ledger["status"].astype(str) == "candidate"].to_dict("records")
+    if focused:
+        # Rows the cheap prefilter dropped were never shown to the classifier. For a
+        # named set or the portfolio, reconsider them: a holding's interview can carry
+        # no role word at all in its title.
+        rej = ledger[(ledger["status"].astype(str) == "not_interview")
+                     & (ledger["last_error"].astype(str) == "prefilter")]
+        cands += rej.to_dict("records")
     pool_items, updates = [], {}
     now_s = utc_iso()
     for it in cands + news:
-        if prefilter(it, matcher, names_mode):
+        if prefilter(it, matcher, focused):
             pool_items.append(it)
-        elif not names_mode and it["source"] == "youtube":
+        elif not focused and it["source"] == "youtube":
             updates[it["item_id"]] = {"status": "not_interview", "processed_at": now_s,
                                       "last_error": "prefilter"}
     n_vid = sum(1 for it in pool_items if it["source"] == "youtube")
@@ -1244,7 +1279,7 @@ def do_run(args) -> int:
         if iid in rows:
             rows[iid] = dict(rows[iid], **f)
     matched = [r for r in rows.values() if r.get("status") == "matched"
-               and (not names_mode or r.get("isin") in wl_by_isin)]
+               and (not focused or r.get("isin") in wl_by_isin)]
     for r in matched:
         if r["source"] != "youtube":
             updates.setdefault(r["item_id"], {}).update(status="done", processed_at=now_s)
@@ -1262,6 +1297,17 @@ def do_run(args) -> int:
     videos = sorted(reps, key=lambda r: (0 if r.get("in_pf") in (True, "True") else 1,
                                          rank.get(r.get("isin"), 10**6),
                                          str(r.get("published_at") or "")))
+    if args.resummarise_days:
+        # Deliberate re-run of notes that already exist, after a prompt change. The rows
+        # keep their place in the ledger; only summary and model are rewritten.
+        since = utc_now() - timedelta(days=args.resummarise_days)
+        redo = [r for r in rows.values()
+                if r.get("status") == "done" and r.get("source") == "youtube"
+                and (parse_utc(r.get("processed_at")) or datetime(1970, 1, 1)) >= since
+                and (not focused or r.get("isin") in wl_by_isin)]
+        have = {r["item_id"] for r in redo}
+        videos = redo + [v for v in videos if v["item_id"] not in have]
+        log(f"resummarise: {len(redo)} existing note(s) to regenerate")
     budget = max(0, VIDEO_BUDGET - _video_used_24h(ledger))
     if args.limit:
         videos = videos[: args.limit]
@@ -1307,36 +1353,48 @@ def do_run(args) -> int:
         if r.get("status") == "duplicate" and r.get("dup_of"):
             clips.setdefault(str(r["dup_of"]), []).append(r)
     md = render_page_md(todays, today, rank, clips) if not todays.empty else ""
-    cutoff = utc_now() - timedelta(days=MAIL_MAX_AGE_DAYS)
-    unmailed = done[done["mailed_at"].map(is_null)
-                    & (pd.to_datetime(done["processed_at"], errors="coerce") >= cutoff)]
-    if names_mode:
+    proc = pd.to_datetime(done["processed_at"], errors="coerce")
+    if args.resend_days:
+        # deliberate one-off: mail what was already sent, e.g. the first portfolio-only
+        # mail after the watchlist-wide one has gone out
+        pick = proc >= (utc_now() - timedelta(days=args.resend_days))
+    else:
+        pick = done["mailed_at"].map(is_null) & (proc >= utc_now()
+                                                 - timedelta(days=MAIL_MAX_AGE_DAYS))
+    unmailed = done[pick]
+    if focused:
         unmailed = unmailed[unmailed["isin"].isin(wl_by_isin)]
         for _, r in unmailed.iterrows():
             print(f"\n{r['symbol']} · {r['channel']} · {ist_label(r['published_at'])}\n"
                   f"{r['title']}\n{r['url']}\n" + "\n".join(_summary_lines(r["summary"])))
-    subject, html, ids = (render_mail_html(unmailed, today, rank, clips)
-                          if not unmailed.empty else ("", "", []))
+    # TWO mails: holdings and watchlist never share one (user 2026-09-12).
+    in_pf = unmailed["in_pf"].astype(bool) if not unmailed.empty else pd.Series(dtype=bool)
+    mails = [("pf", MAIL_KEY_PF, unmailed[in_pf] if not unmailed.empty else unmailed),
+             ("watchlist", MAIL_KEY_WL, unmailed[~in_pf] if not unmailed.empty else unmailed)]
+    built = [(scope, key, *render_mail_html(part, today, rank, clips, scope=scope))
+             for scope, key, part in mails if not part.empty]
     if args.dry_run:
         PREVIEW_FILE.write_text(
-            (html or "<p>(no unmailed interviews)</p>")
+            ("<hr>".join(h for _, _, _, h, _ in built) or "<p>(no unmailed interviews)</p>")
             + "<hr><pre style='white-space:pre-wrap'>"
             + (md or "(no page for today yet)").replace("<", "&lt;") + "</pre>",
             encoding="utf-8")
-        log(f"DRY RUN — mail + page preview -> {PREVIEW_FILE.name} "
-            f"({len(ids)} interview(s) in the mail)")
+        log(f"DRY RUN — {len(built)} mail(s) + page preview -> {PREVIEW_FILE.name}: "
+            + ", ".join(f"{sc}={len(i)}" for sc, _, _, _, i in built))
         return 0
     if md:
         write_daily_page(drive, daily_id, today, md)
     prune_daily_pages(drive, daily_id, today)
-    if ids and not names_mode and not args.no_mail:
-        from mailer import send_email, load_mail_settings
-        if not load_mail_settings(drive, idx).get(MAIL_KEY, True):
-            log(f"  mail toggled OFF ('{MAIL_KEY}') — {len(ids)} interview(s) stay unmailed")
-        elif send_email(subject, html):
-            commit_ledger(drive, idx, {i: {"mailed_at": utc_iso()} for i in ids}, [])
-    elif not ids:
+    if not built:
         log("  no new interviews to mail")
+    elif not names_mode and not args.no_mail:
+        from mailer import send_email, load_mail_settings
+        settings = load_mail_settings(drive, idx)
+        for scope, key, subject, html, ids in built:
+            if not settings.get(key, True):
+                log(f"  {scope} mail toggled OFF ('{key}') — {len(ids)} interview(s) held")
+            elif send_email(subject, html):
+                commit_ledger(drive, idx, {i: {"mailed_at": utc_iso()} for i in ids}, [])
     return 0
 
 
@@ -1674,11 +1732,49 @@ def _self_test() -> int:
           Matcher(pd.DataFrame({"isin": ["S1"], "symbol": ["SBIN"],
                                 "name": ["State Bank of India"]})).match("SBI") == "S1")
     check("alias: trailing 'Ltd' ignored for symbol match", mt.match("TCS Ltd") == "INE467B01029")
+    lotus = Matcher(pd.DataFrame({
+        "isin": ["L1", "T1", "T2"], "symbol": ["LOTUSDEV", "TATAMOTORS", "TMF"],
+        "name": ["Sri Lotus Developers & Realty Ltd", "Tata Motors Ltd",
+                 "Tata Motors Finance Ltd"]}))
+    check("prefix: the spoken name is a prefix of the listed one",
+          lotus.match("Sri Lotus Developers") == "L1")
+    check("prefix: exact listed name still wins over the longer sibling",
+          lotus.match("Tata Motors") == "T1")
+    check("prefix: two possible longer names stay ambiguous",
+          Matcher(pd.DataFrame({"isin": ["A", "B"], "symbol": ["X", "Y"],
+                                "name": ["Sri Lotus Developers & Realty Ltd",
+                                         "Sri Lotus Developers & Infra Ltd"]}))
+          .match("Sri Lotus Developers") is None)
+    check("prefix: one distinctive word is not enough to pick a longer name",
+          Matcher(pd.DataFrame({"isin": ["R1", "R2"], "symbol": ["RPOWER", "RELINFRA"],
+                                "name": ["Reliance Power Ltd",
+                                         "Reliance Infrastructure Ltd"]}))
+          .match("Reliance") is None)
+    check("focused prefilter: a holding named without any role word still passes",
+          prefilter({"source": "youtube", "title": "Dixon on Q1 numbers", "description": ""},
+                    mt, True)
+          and not prefilter({"source": "youtube", "title": "Dixon on Q1 numbers",
+                             "description": ""}, mt, False))
     check("near-miss: same first word as a watchlist name",
           mt.near_miss("HDFC Life") == "HDFCBANK")
     check("near-miss: a shared LATER word is not a near-miss ('Hero Motors' vs Tata Motors)",
           mt.near_miss("Hero Motors") is None)
     check("near-miss: unrelated name is not a near-miss", mt.near_miss("PhonePe") is None)
+    _, pf_html, pf_ids = render_mail_html(done.head(4), date(2026, 9, 11), rank, scope="pf")
+    pf_subj, _, _ = render_mail_html(done.head(4), date(2026, 9, 11), rank, scope="pf")
+    wl_subj, wl_html, _ = render_mail_html(done.head(4), date(2026, 9, 11), rank,
+                                           scope="watchlist")
+    check("mail: a PF-scoped mail says so and drops the divider",
+          pf_subj.startswith("💼 PF mgmt interviews") and "your holdings" in pf_html
+          and ">Portfolio<" not in pf_html)
+    check("mail: a watchlist-scoped mail says so",
+          wl_subj.startswith("🎙️ Watchlist mgmt interviews")
+          and "do NOT hold" in wl_html)
+    check("mail: default scope still shows both sections",
+          ">Portfolio<" in render_mail_html(done.head(4), date(2026, 9, 11), rank)[1])
+    check("prompt asks for growth guidance AND strategy",
+          all(k in PROMPT_FILE.read_text(encoding="utf-8")
+              for k in ("GROWTH & GUIDANCE:", "STRATEGY:")))
     check("prompt file present with all placeholders",
           PROMPT_FILE.exists() and all(
               "{{" + k + "}}" in PROMPT_FILE.read_text(encoding="utf-8")
@@ -1711,6 +1807,13 @@ def main() -> int:
                     help="--poll: keep polling for this many minutes (CI).")
     ap.add_argument("--every-min", type=float, default=30,
                     help="--poll: minutes between polls in a loop.")
+    ap.add_argument("--resummarise-days", type=float, default=0,
+                    help="--run: regenerate notes written within this many days "
+                         "(use after changing the prompt).")
+    ap.add_argument("--resend-days", type=float, default=0,
+                    help="--run: also mail interviews already sent within this many days.")
+    ap.add_argument("--pf-only", action="store_true",
+                    help="--run: portfolio holdings only (no watchlist names).")
     ap.add_argument("--names", default="",
                     help="--run: comma-separated ISIN / NSE symbol / name fragment.")
     ap.add_argument("--limit", type=int, default=0,

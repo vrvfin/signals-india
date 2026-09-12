@@ -36,6 +36,19 @@ on:
         required: false
         default: false
         type: boolean
+      pf_only:
+        description: "run only: holdings only, no watchlist names"
+        required: false
+        default: false
+        type: boolean
+      resend_days:
+        description: "run only: also mail interviews already sent within N days"
+        required: false
+        type: string
+      resummarise_days:
+        description: "run only: regenerate notes written within N days (after a prompt change)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -153,9 +166,15 @@ jobs:
           # Via env, not inline ${{ }}, so a value cannot break out of the command.
           NAMES: ${{ inputs.names }}
           DRY: ${{ inputs.dry_run }}
+          PF_ONLY: ${{ inputs.pf_only }}
+          RESEND: ${{ inputs.resend_days }}
+          RESUM: ${{ inputs.resummarise_days }}
         run: |
           ARGS="--run --deadline-min 50"
           if [ "$DRY" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "$PF_ONLY" = "true" ]; then ARGS="$ARGS --pf-only"; fi
+          if [ -n "$RESEND" ]; then ARGS="$ARGS --resend-days $RESEND"; fi
+          if [ -n "$RESUM" ]; then ARGS="$ARGS --resummarise-days $RESUM"; fi
           if [ -n "$NAMES" ]; then
             python scripts/fetch_mgmt_interviews.py $ARGS --names "$NAMES"
           else
