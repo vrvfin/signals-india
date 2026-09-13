@@ -110,6 +110,28 @@ def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None) -
     return {i for i, f in first.items() if str(f) >= cutoff and str(f) > hist_start}
 
 
+def _processed_within(stamp, days: int) -> bool:
+    """Was this document EXTRACTED within the last `days`? 0 or less means no limit.
+
+    This is the concall scope (user, 2026-09-13): a call is mailed because it was just
+    processed, not because the quarter it names matches the calendar. processed_at is
+    the right clock and discovered_at is the wrong one - the queue rebuild of
+    2026-08-30 stamped discovered_at = "now" on rows going back to 2017, so a window on
+    that would tip the whole back catalogue into one morning.
+
+    A document that was never processed returns False: there is nothing to mail yet.
+    """
+    if int(days) <= 0:
+        return True
+    s = str(stamp or "")[:19]
+    if not s:
+        return False
+    try:
+        return (datetime.now() - datetime.fromisoformat(s)).days <= int(days)
+    except Exception:
+        return False
+
+
 def concall_quarter(doc_date) -> str:
     """The season quarter a concall belongs to, from its FILING date.
 
@@ -1794,11 +1816,16 @@ def concall_section_is_for(heading: str, want_quarter: str) -> bool:
     head = str(heading or "")
     if head.strip() and not _CONCALL_HEAD_RE.search(head):
         return False
-    want = str(want_quarter or "").replace(" ", "").upper()
-    got = heading_quarter(head)
-    if not want or not got:
-        return True
-    return got == want
+    # THE QUARTER NO LONGER REFUSES THE SECTION (user, 2026-09-13). A call is news
+    # because it was just processed, and it goes out under ITS OWN quarter: a call
+    # covering Q4 FY26 that lands in the Q1 FY27 season is mailed AS Q4 FY26. Demanding
+    # the two agree threw away a late filer for the whole quarter, and a half-yearly
+    # filer permanently - ANONDITA heads its sections "H1 FY26" and "H2 FY26" and can
+    # never name a Q. The protection that mattered is the TYPE test above: it is what
+    # stopped MOREPENLAB being served "## 2026-07-28 Announcement - Board Meeting" as a
+    # concall. Serving the wrong QUARTER is now harmless because the label follows the
+    # section instead of the subject - see _narratives, which reports what it found.
+    return True
 
 
 def _clean_period(value) -> str:
@@ -1883,8 +1910,11 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
                 out[(isin, dt)] = {"period": period, "text": exact}
                 continue
         try:
+            # allow_newest for a concall: if the page does not carry the quarter the
+            # queue names, take the newest call it does carry. The label then follows
+            # the section (below), so the mail can never claim a quarter it has not got.
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
-                               doc_id)
+                               doc_id, allow_newest=(dt == "concall"))
             # THE MATCHED SECTION MUST BELONG TO THE DOCUMENT WE ASKED FOR. Concall
             # sections carry no doc marker, so a walk that starts on an empty stub can
             # land on another quarter's call and the mail would send it under today's
@@ -1892,9 +1922,21 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
             if reg and dt == "concall":
                 _head = str((reg[0][0] if reg[0] else "") or "")
                 if not concall_section_is_for(_head, period):
-                    _log(f"  concall for {isin}: section {_head[:40]!r} is not "
-                         f"{period} — refusing to serve another quarter's call")
+                    _log(f"  concall for {isin}: section {_head[:40]!r} does not read "
+                         f"like a concall — refusing to serve another document")
                     reg = []
+                else:
+                    # TELL THE TRUTH ABOUT WHICH CALL THIS IS. The section names the
+                    # quarter the call actually covers; the subject used to name the
+                    # season it was filed in, so a Q4 FY26 call filed in the Q1 FY27
+                    # season went out titled Q1 FY27. Report what was found, and the
+                    # subject, the content_key and the mail all follow it.
+                    _hq = heading_quarter(_head)
+                    if _hq and _hq != period:
+                        _was = period or "an unknown season"
+                        _log(f"  concall for {isin}: filed in {_was}, but the call "
+                             f"covers {_hq} — mailing it as {_hq}")
+                        period = _hq
             # The whole region, headings and tables intact. lift_report stays for
             # anything that wants a short extract; the mail wants the report.
             txt = "\n".join(((h + "\n") if h else "") + b
@@ -1966,6 +2008,16 @@ def main() -> None:
                          "concalls (the quarter the presentation mail already uses) and "
                          "this financial year's annual reports. 'all' disables both "
                          "scopes and mails the latest of each, whenever it was filed.")
+    ap.add_argument("--concall-fresh-days", type=int, default=3,
+                    help="A concall is in scope when it was EXTRACTED within this many "
+                         "days, whatever quarter it covers - a call filed late, or by a "
+                         "half-yearly filer, is still news the day it is processed. "
+                         "0 disables the window. Replaces the season test, which "
+                         "dropped both of those cases silently. THREE, not thirty: a "
+                         "backfill re-stamps processed_at across the whole book, and a "
+                         "month-wide window then mails all 50-odd holdings in one "
+                         "morning (measured 2026-09-13). Widen it deliberately for a "
+                         "one-off catch-up.")
     ap.add_argument("--new-holding-days", type=int, default=30,
                     help="A holding that entered the portfolio within this many days is "
                          "ONBOARDED: its latest concall and latest annual report are "
@@ -2083,9 +2135,22 @@ def main() -> None:
             # against it - --force found nothing, because "annual_report" is not a
             # substring of "Q1FY27".
             if d["doc_type"] == "concall":
-                got, expect = concall_quarter(d.get("doc_date")), season_q
-            else:
-                got, expect = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
+                # A CALL IS NEWS BECAUSE IT WAS JUST PROCESSED (user, 2026-09-13):
+                # "any concall updated on the day needs to be sent", and one covering
+                # Q4 FY26 goes out LABELLED Q4 FY26 rather than as the season it landed
+                # in. The season test used to gate this, which silently dropped a late
+                # filer for a whole quarter and a half-yearly filer for ever - ANONDITA
+                # heads its sections "H1 FY26"/"H2 FY26" and can never name a Q.
+                # This cannot flood: latest_doc_per_type returns the NEWEST row per
+                # (isin, doc_type), so the ceiling is one call per holding no matter
+                # how much history a backfill re-stamps.
+                if _processed_within(d.get("processed_at"),
+                                     args.concall_fresh_days):
+                    kept.append(d)
+                else:
+                    out_of_scope += 1
+                continue
+            got, expect = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
             if not got:
                 # Undatable. Skipped rather than assumed current, and COUNTED so that it
                 # is visible rather than silent.
@@ -2096,7 +2161,8 @@ def main() -> None:
                 out_of_scope += 1
         n_scoped = sum(1 for k in kept
                        if k["doc_type"] in SCOPED_TYPES and not k.get("onboarding"))
-        log(f"scope: concall={season_q} AR=FY{ar_fy} -> {n_scoped} in scope"
+        log(f"scope: concall=processed within {args.concall_fresh_days}d "
+            f"AR=FY{ar_fy} -> {n_scoped} in scope"
             + (f", {onboarded} onboarding a new holding" if onboarded else "")
             + (f", {out_of_scope} from an earlier quarter/FY" if out_of_scope else "")
             + (f", {undated} undatable" if undated else ""))
@@ -3001,15 +3067,30 @@ Management guided to twenty percent growth.
     _echo = ("Generate the final report immediately without displaying preliminary "
              "steps. No individual paragraph may be longer than 3 lines. The ENTIRE "
              "report must stay under ~1,200 lines. Output must be completely clean.")
-    # A concall must never be served from another quarter (MOREPENLAB Q1FY27 -> Q4FY25).
+    # WHAT A CONCALL SECTION MUST BE: a concall. NOT a particular quarter (user,
+    # 2026-09-13) - a call covering Q4 FY26 that is filed in the Q1 FY27 season is
+    # mailed AS Q4 FY26, because it is news the day it is processed. The label comes
+    # from heading_quarter, so the subject cannot claim a quarter the section does not.
     check("heading_quarter reads the label", heading_quarter("## Q1 FY27 Concall — PPT")
           == "Q1FY27")
     check("heading_quarter handles a 4-digit year",
           heading_quarter("## Q3 FY2021 Concall — Transcript") == "Q3FY21")
     check("a matching quarter is served",
           concall_section_is_for("## Q1 FY27 Concall — PPT", "Q1FY27"))
-    check("a DIFFERENT quarter is refused",
-          not concall_section_is_for("## Q4 FY25 Concall — Transcript", "Q1FY27"))
+    check("a call from another quarter is SERVED, and it is the label that moves",
+          concall_section_is_for("## Q4 FY25 Concall — Transcript", "Q1FY27")
+          and heading_quarter("## Q4 FY25 Concall — Transcript") == "Q4FY25")
+    check("a half-yearly filer, which can never name a Q, is served",
+          concall_section_is_for("## H1 FY26 Concall — PPT", "Q1FY27"))
+
+    # ---- the freshness window that replaced the season test -----------------
+    _now = datetime.now().isoformat(timespec="seconds")
+    _old = (datetime.now() - timedelta(days=45)).isoformat(timespec="seconds")
+    check("a call processed today is in scope", _processed_within(_now, 30))
+    check("a call processed 45 days ago is not", not _processed_within(_old, 30))
+    check("days=0 disables the window", _processed_within(_old, 0))
+    check("a never-processed document is not mailed", not _processed_within("", 30))
+    check("an unparseable stamp is not mailed", not _processed_within("soon", 30))
     check("an unlabelled CONCALL heading is not blocked",
           concall_section_is_for("## Morepen Laboratories — Earnings Call", "Q1FY27"))
     check("an ANNOUNCEMENT section is refused, even with no quarter to contradict",
