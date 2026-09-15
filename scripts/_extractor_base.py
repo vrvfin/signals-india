@@ -141,7 +141,17 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               # and save_queue writes the frame as-is, so extra columns survive every
               # load/save cycle in every pipeline (this is how backfill_process_date
               # and source already work).
-              "attempts", "last_error", "last_attempt_at"]
+              "attempts", "last_error", "last_attempt_at",
+              # WHAT THE EXCHANGE ITSELF CALLED IT (added 2026-09-13, ADDITIVE).
+              # BSE files every announcement against a controlled vocabulary -
+              # CATEGORYNAME and SUBCATNAME, 8 categories and 76 subcategories across
+              # our own 5,197-row announcement ledger. We were discarding it at enqueue
+              # and re-deriving doc_type from keywords in the title, which is how 19
+              # SEBI rights-issue pages entered the queue as annual reports. Keeping
+              # the exchange's answer makes the classification auditable after the
+              # fact: you can ask WHY a document was typed the way it was.
+              # Blank for rows from sources that publish no category (Screener, NSE).
+              "exch_category", "exch_subcategory"]
 
 
 # A model sometimes returns the PROMPT instead of an answer. Measured 2026-09-02:

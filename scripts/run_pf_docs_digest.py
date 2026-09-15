@@ -232,7 +232,8 @@ def _is_boundary(header: str, body: str = "") -> bool:
                                               for k in _BOUNDARY_KW))
 
 
-def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str | None:
+def _find_region(sections, period: str, doc_type: str, doc_id: str = "",
+                 allow_newest: bool = False) -> str | None:
     """Concatenated body of a document's FULL block: its boundary section plus the
     following intra-doc sections, up to the next document boundary.
 
@@ -302,7 +303,12 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
             if pn and pn in hn and not _other_type_heading(hn, doc_type):
                 start = i
                 break
-    if start is None and not pn:
+    # LAST RESORT, opt-in: the NEWEST section of this type, whatever period it names.
+    # Reached when the caller asked for a period the page does not carry - a call filed
+    # late, or by a half-yearly filer whose headings read "H1 FY26". The per-company
+    # mail wants that call and labels it with the quarter the SECTION names, so nothing
+    # can be presented as a quarter it is not; the digest leaves this off.
+    if start is None and (not pn or allow_newest):
         # PERIOD UNKNOWN. Concall sections carry no <!-- doc:... --> marker
         # (extract_concall.py writes the header without one), and `period` on the queue
         # row is frequently blank - which renders the heading as "##  Concall - Title"
@@ -310,10 +316,13 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
         # summary at all. Fall back to the doc_type keyword alone and take the LAST
         # match, i.e. the most recent document of that type on the page.
         for i, (h, _b) in enumerate(sections):
-            hn = _norm(h)
+            hn = _qnorm(h)
             if not any(_norm(k) in hn for k in kws):
                 continue
-            if _other_type_heading(hn, doc_type):          # not another doc's section
+            # TYPE WORDS, not the whole heading - the title after the dash names the
+            # SOURCE DOCUMENT ("PPT" for a call read from a deck), and testing it here
+            # skipped the newest call and fell back to a much older transcript.
+            if _other_type_heading(_norm(_type_words(h)), doc_type):
                 continue
             start = i
     if start is None:
