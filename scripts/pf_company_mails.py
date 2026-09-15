@@ -79,7 +79,8 @@ NARRATIVE_LIMIT = 2600
 SCOPED_TYPES = ("concall", "annual_report")
 
 
-def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None) -> set:
+def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None,
+                    min_snapshots: int = 2) -> set:
     """ISINs that ENTERED the portfolio within the last `days`.
 
     THE POINT. The month scope answers "what did the exchanges send this month", which is
@@ -105,9 +106,31 @@ def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None) -
         return set()
     d = snaps["snapshot_date"].astype(str).str.slice(0, 10)
     hist_start = d.min()
-    first = snaps.assign(_d=d).groupby(snaps["isin"].astype(str))["_d"].min()
+    _isin = snaps["isin"].astype(str)
+    first = snaps.assign(_d=d).groupby(_isin)["_d"].min()
     cutoff = ((today or date.today()) - timedelta(days=days)).isoformat()
-    return {i for i, f in first.items() if str(f) >= cutoff and str(f) > hist_start}
+
+    # FIRST-SEEN IS NOT THE SAME AS BOUGHT, because the history has holes. Measured
+    # 2026-09-15 over 31 snapshots of a 61-name book: 97 distinct ISINs have appeared,
+    # the membership moves by 1-4 names on almost every snapshot, and SIX holdings
+    # vanish and come back (MOLBIO "##........##", MVELECTRO "#####....###########").
+    # A position that drops out of one export and returns reads as a fresh purchase,
+    # and 28 of 61 holdings were being onboarded — nearly half the book, each bypassing
+    # the season scope to be sent its latest call AND its latest annual report.
+    #
+    # TWO CORROBORATIONS, because one snapshot is an observation and two are evidence:
+    #   in the LATEST snapshot - a holding absent from the newest file is not something
+    #                            just bought, whatever the history says. Drops 8 of 28.
+    #   seen >= min_snapshots  - a single appearance is indistinguishable from a parse
+    #                            glitch; a real purchase is still there the next day.
+    # Together: 28 -> 19 at 30 days, 7 -> 4 at 7 days.
+    latest = d.max()
+    in_latest = set(_isin[d == latest])
+    seen = _isin.value_counts()
+    return {i for i, f in first.items()
+            if str(f) >= cutoff and str(f) > hist_start
+            and i in in_latest
+            and int(seen.get(i, 0)) >= int(min_snapshots)}
 
 
 def _processed_within(stamp, days: int) -> bool:
@@ -2018,7 +2041,7 @@ def main() -> None:
                          "month-wide window then mails all 50-odd holdings in one "
                          "morning (measured 2026-09-13). Widen it deliberately for a "
                          "one-off catch-up.")
-    ap.add_argument("--new-holding-days", type=int, default=30,
+    ap.add_argument("--new-holding-days", type=int, default=7,
                     help="A holding that entered the portfolio within this many days is "
                          "ONBOARDED: its latest concall and latest annual report are "
                          "mailed whatever month they were filed, once. 0 disables it, "
@@ -2889,6 +2912,8 @@ Capacity reaches eight million tons by FY28.
 
     # ---- track 2: holdings that just entered the portfolio -----------------
     _T = date(2026, 9, 2)
+    # The LATEST snapshot in this fixture is 2026-08-31 — that is what "still held"
+    # means below.
     _snaps = pd.DataFrame([
         # history starts 2026-07-23; OLD was there from the first snapshot
         {"snapshot_date": "2026-07-23", "isin": "OLD"},
@@ -2896,6 +2921,11 @@ Capacity reaches eight million tons by FY28.
         {"snapshot_date": "2026-08-27", "isin": "NEW"},      # bought 6 days ago
         {"snapshot_date": "2026-08-31", "isin": "NEW"},
         {"snapshot_date": "2026-08-06", "isin": "MID"},      # bought 27 days ago
+        {"snapshot_date": "2026-08-31", "isin": "MID"},      # and still held
+        {"snapshot_date": "2026-08-28", "isin": "BLIP"},     # listed once, then gone
+        {"snapshot_date": "2026-08-29", "isin": "GONE"},     # held briefly, then sold
+        {"snapshot_date": "2026-08-30", "isin": "GONE"},
+        {"snapshot_date": "2026-08-31", "isin": "ONCE"},     # in the latest file only
     ])
     _n30 = new_pf_holdings(_snaps, 30, _T)
     check("a holding bought 6 days ago is new", "NEW" in _n30)
@@ -2903,6 +2933,18 @@ Capacity reaches eight million tons by FY28.
     check("a holding held since before the history is NOT new", "OLD" not in _n30)
     check("a 7-day window excludes the 27-day-old buy",
           new_pf_holdings(_snaps, 7, _T) == {"NEW"})
+
+    # THE TWO CORROBORATIONS. Measured over 31 real snapshots of a 61-name book: 97
+    # distinct ISINs have appeared, membership moves by 1-4 names almost every time,
+    # and six holdings vanish and come back. Without these, 28 of 61 were onboarded.
+    check("a single appearance is a parse glitch, not a purchase",
+          "BLIP" not in _n30 and "ONCE" not in _n30)
+    check("a holding missing from the LATEST snapshot is not newly bought",
+          "GONE" not in _n30)
+    check("min_snapshots can be relaxed deliberately",
+          "ONCE" in new_pf_holdings(_snaps, 30, _T, min_snapshots=1))
+    check("relaxing it still will not resurrect a sold holding",
+          "GONE" not in new_pf_holdings(_snaps, 30, _T, min_snapshots=1))
     # The guard that matters: once the window outruns the history, everything present on
     # the first snapshot would otherwise read as newly bought.
     check("a 60-day window does NOT declare the whole book new",
