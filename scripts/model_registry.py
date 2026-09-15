@@ -275,7 +275,14 @@ def _self_test() -> int:
             fail += 1
             print(f"  FAIL {name}")
 
-    now = datetime(2026, 9, 3, 12, 0, 0)
+    # RELATIVE TO NOW, NEVER A WALL-CLOCK DATE. This fixture used to be pinned to
+    # datetime(2026, 9, 3): is_fresh() compares checked_at against the REAL clock and
+    # STALE_DAYS is 7, so on 2026-09-10 the fixture silently aged out, resolve() stopped
+    # filtering, and the two assertions below began to fail. They are in the fail-fast
+    # block of pf_daily_mails.yml, so from 2026-09-11 every scheduled mail run died at
+    # that step and NO MAIL WAS SENT FOR FOUR DAYS. A test that expires is worse than no
+    # test: it fails long after the change that "broke" it, pointing at nothing.
+    now = datetime.now()
     fresh = {"checked_at": now.isoformat(), "live": [], "dead": {}, "unknown": {}}
 
     check("every chain is non-empty", all(CHAINS.values()))
@@ -300,6 +307,8 @@ def _self_test() -> int:
               "P1", reg=dict(fresh, unknown={"gemini-2.5-flash-lite": "429"})))
 
     # fail-safe
+    # The guard that would have caught the expiry the moment it happened.
+    check("the fixture this file tests with is itself FRESH", is_fresh(fresh))
     check("no registry -> declared chain", resolve("P1", reg={}) == CHAINS["P1"])
     stale = {"checked_at": (now - timedelta(days=30)).isoformat(), "dead": {"x": "y"}}
     check("stale registry -> declared chain",
