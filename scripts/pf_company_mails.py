@@ -80,7 +80,7 @@ SCOPED_TYPES = ("concall", "annual_report")
 
 
 def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None,
-                    min_snapshots: int = 2) -> set:
+                    min_snapshots: int = 1) -> set:
     """ISINs that ENTERED the portfolio within the last `days`.
 
     THE POINT. The month scope answers "what did the exchanges send this month", which is
@@ -110,20 +110,26 @@ def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None,
     first = snaps.assign(_d=d).groupby(_isin)["_d"].min()
     cutoff = ((today or date.today()) - timedelta(days=days)).isoformat()
 
-    # FIRST-SEEN IS NOT THE SAME AS BOUGHT, because the history has holes. Measured
-    # 2026-09-15 over 31 snapshots of a 61-name book: 97 distinct ISINs have appeared,
-    # the membership moves by 1-4 names on almost every snapshot, and SIX holdings
-    # vanish and come back (MOLBIO "##........##", MVELECTRO "#####....###########").
-    # A position that drops out of one export and returns reads as a fresh purchase,
-    # and 28 of 61 holdings were being onboarded — nearly half the book, each bypassing
-    # the season scope to be sent its latest call AND its latest annual report.
+    # STILL HELD, OR DO NOT MAIL ABOUT IT. A holding absent from the newest file has
+    # been sold, and sending its annual report is noise. At a 30-day window that alone
+    # removes 8 of 28 - DEEPA, EMIL, ENS, LALITHAA, LUMINO, SUSAN and two SME names -
+    # every one of them bought and sold inside the window.
     #
-    # TWO CORROBORATIONS, because one snapshot is an observation and two are evidence:
-    #   in the LATEST snapshot - a holding absent from the newest file is not something
-    #                            just bought, whatever the history says. Drops 8 of 28.
-    #   seen >= min_snapshots  - a single appearance is indistinguishable from a parse
-    #                            glitch; a real purchase is still there the next day.
-    # Together: 28 -> 19 at 30 days, 7 -> 4 at 7 days.
+    # WHAT THIS DELIBERATELY DOES *NOT* DO is second-guess the churn. An earlier version
+    # required TWO snapshots on the theory that the history had holes and a single
+    # appearance was a parse glitch. That theory was WRONG, and the data says so: every
+    # snapshot comes from its own distinct holdings file (0 files reused across dates,
+    # 0 dates drawing on two files), every row carries a real weight_pct, and only 3
+    # rows in 1,770 have a symbol that is not a ticker. The membership differences are
+    # what the files said - i.e. actual trading, at roughly one upload a day.
+    # The cost of that wrong theory was exactly one holding, and the worst possible one:
+    # MANINDS, bought on the most recent upload and still held, whose concall and annual
+    # report would have been withheld until the next file arrived. The freshest buy is
+    # the one most worth reading about. min_snapshots stays as a parameter for a caller
+    # that genuinely wants corroboration, but 1 is the honest default.
+    #
+    # The WINDOW, not a heuristic, is what controls volume: 1 at 3 days, 4 at 7,
+    # 16 at 14, 20 at 30.
     latest = d.max()
     in_latest = set(_isin[d == latest])
     seen = _isin.value_counts()
@@ -2932,19 +2938,21 @@ Capacity reaches eight million tons by FY28.
     check("a holding bought 27 days ago is new at 30d", "MID" in _n30)
     check("a holding held since before the history is NOT new", "OLD" not in _n30)
     check("a 7-day window excludes the 27-day-old buy",
-          new_pf_holdings(_snaps, 7, _T) == {"NEW"})
+          new_pf_holdings(_snaps, 7, _T) == {"NEW", "ONCE"})
 
-    # THE TWO CORROBORATIONS. Measured over 31 real snapshots of a 61-name book: 97
-    # distinct ISINs have appeared, membership moves by 1-4 names almost every time,
-    # and six holdings vanish and come back. Without these, 28 of 61 were onboarded.
-    check("a single appearance is a parse glitch, not a purchase",
-          "BLIP" not in _n30 and "ONCE" not in _n30)
+    # STILL HELD IS THE ONLY CORROBORATION. The user trades daily, every snapshot is
+    # its own uploaded file, and a position appearing once is a PURCHASE, not a glitch -
+    # so a buy on the newest file is onboarded immediately. That is the case worth
+    # getting right: the freshest buy is the one most worth reading about.
+    check("a buy that appears only in the NEWEST file is onboarded at once",
+          "ONCE" in _n30)
+    check("a holding listed once and then gone is not onboarded", "BLIP" not in _n30)
     check("a holding missing from the LATEST snapshot is not newly bought",
           "GONE" not in _n30)
-    check("min_snapshots can be relaxed deliberately",
-          "ONCE" in new_pf_holdings(_snaps, 30, _T, min_snapshots=1))
-    check("relaxing it still will not resurrect a sold holding",
-          "GONE" not in new_pf_holdings(_snaps, 30, _T, min_snapshots=1))
+    check("min_snapshots stays available for a caller that wants corroboration",
+          "ONCE" not in new_pf_holdings(_snaps, 30, _T, min_snapshots=2))
+    check("demanding corroboration still will not resurrect a sold holding",
+          "GONE" not in new_pf_holdings(_snaps, 30, _T, min_snapshots=2))
     # The guard that matters: once the window outruns the history, everything present on
     # the first snapshot would otherwise read as newly bought.
     check("a 60-day window does NOT declare the whole book new",
