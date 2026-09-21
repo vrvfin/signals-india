@@ -1881,6 +1881,40 @@ def _clean_period(value) -> str:
     return "" if s.lower() in ("nan", "nat", "none", "null") else s
 
 
+# extract_annual_report.MIN_REPORT_CHARS. Deliberately NOT imported: that module pulls
+# in Drive auth and a model pool at import time, which this mail path does not want.
+MIN_REAL_CHARS = 2000
+
+
+def real_report(text: str) -> tuple[str, str]:
+    """(text with padding squeezed, reason it is not a report) — "" reason means fine.
+
+    A REPORT THAT IS MOSTLY SPACES IS NOT A REPORT, and every size-based guard is blind
+    to it because the spaces COUNT. Measured on RAYMONDREL's FY26 annual report:
+
+        stored                120,166 chars
+        one run of spaces     119,686
+        actual content            481   - a title and one table heading
+
+    The extractor's own "thin report" rule squeezes before measuring and would have
+    caught it, but that landed 2026-09-04 and this report was written on 2026-08-23.
+    The mail had no such rule at all: it saw 120 KB, concluded "report present", and
+    sent a heading followed by "[report truncated]".
+
+    SQUEEZING IS ALSO A FIX IN ITS OWN RIGHT, not just a test. The rendered report is
+    capped at REPORT_LIMIT characters, and padding eats that budget: TIRUPATIFL's FY26
+    report is 5,014 real characters followed by 83,111 spaces. Handing the renderer the
+    squeezed text spends the budget on content. New reports are already stored squeezed
+    (extract_annual_report does it on write), so this only brings older ones into line.
+    """
+    from _extractor_base import squeeze_padding    # deferred: see _narratives
+    t = squeeze_padding(str(text or ""))
+    n = len(t.strip())
+    if n and n < MIN_REAL_CHARS:
+        return t, f"hollow report: {n:,} real chars (min {MIN_REAL_CHARS:,})"
+    return t, ""
+
+
 def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -> dict:
     """{(isin, doc_type): {'period':.., 'text':..}} for the newest concall / AR per holding.
 
@@ -1930,8 +1964,9 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
             # The echo guard must sit on BOTH paths. It was added to the page walk only,
             # so a doc_reports row holding a prompt echo went straight to the reader -
             # the exact-record lookup runs first and returned before the check.
+            exact, _hollow = real_report(exact)
             _bad_exact = ("prompt echo" if is_prompt_echo(exact)
-                          else degenerate_reason(exact))
+                          else (degenerate_reason(exact) or _hollow))
             if _bad_exact:
                 _log(f"  {dt} for {isin}: doc_reports row is a failed generation "
                      f"({_bad_exact}) — ignored")
@@ -1990,7 +2025,8 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
         # walk reaches the bad one. Guard the text that is about to be rendered, which is
         # the one place both paths meet.
         if txt:
-            _why_loop = degenerate_reason(txt)
+            txt, _hollow = real_report(txt)
+            _why_loop = degenerate_reason(txt) or _hollow
             if _why_loop:
                 _log(f"  {dt} for {isin}: stored report is a {_why_loop} — "
                      f"treated as empty")
@@ -3112,6 +3148,32 @@ Management guided to twenty percent growth.
           not _D._is_boundary("## 6. FORENSIC FINANCIAL RISK SCORECARD"))
     check("a marker anywhere in the first lines makes it a boundary",
           _D._is_boundary("## Anything At All", "*Processed: x*\n<!-- doc:abc -->"))
+
+    # ---- a report that is mostly SPACES is not a report ------------------------
+    # RAYMONDREL's FY26 annual report, measured 2026-09-18: 120,166 stored characters,
+    # of which 119,686 were one run of spaces. 481 characters of actual content - a
+    # title and one table heading - and the mail sent it as a summary.
+    _pad = " " * 119686
+    _hollow_src = chr(10).join(["# Raymond Realty - Forensic Report", "",
+                               "## 1. SOURCE COVERAGE", _pad])
+    _sq, _why = real_report(_hollow_src)
+    check("a report that is mostly spaces is refused",
+          _why.startswith("hollow report"))
+    check("and the padding is gone from what would be rendered", len(_sq) < 200)
+    check("the reason names the REAL size, not the stored size", "120,166" not in _why)
+
+    # TIRUPATIFL's shape: real content, then padding. That IS a report - short, but
+    # real - and squeezing is what stops the padding eating the render budget.
+    _short_real = ("Revenue rose twelve percent on volume. " * 130)   # ~5,000 chars
+    _sq2, _why2 = real_report(_short_real + " " * 83111)
+    check("real content followed by padding is still a report", _why2 == "")
+    check("but it is handed on squeezed, so the render budget is spent on content",
+          len(_sq2) < 6000 and "Revenue rose twelve percent" in _sq2)
+
+    check("a genuine report is returned unchanged",
+          real_report("x" * 5000) == ("x" * 5000, ""))
+    check("nothing at all is not reported as hollow", real_report("") == ("", "")
+          and real_report(None)[1] == "")
 
     # ---- the model sometimes echoes the prompt back into the stored report -------
     _echo = ("Generate the final report immediately without displaying preliminary "
