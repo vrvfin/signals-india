@@ -144,7 +144,8 @@ BREADTH_NOTES = {
 
 _C = {"ma10": "#e67e22", "ma20": "#d35400", "ma50": "#16a085",
       "ma100": "#2980b9", "ma200": "#8e44ad", "up": "#1a7a3a", "dn": "#c0392b",
-      "neutral": "#1a3d6e", "amber": "#a66300"}
+      "neutral": "#1a3d6e", "amber": "#a66300", "faint": "#a9bcd6",
+      "grey": "#8a94a6"}
 
 
 def _load_breadth():
@@ -197,6 +198,7 @@ def _ctx_strip(g):
     items = [
         ("% above 50 DMA", "pct_above_50dma", "{:.0f}%", False),
         ("% above 200 DMA", "pct_above_200dma", "{:.0f}%", False),
+        ("% in a golden cross", "pct_ma50_above_ma200", "{:.0f}%", False),
         ("% >20% below own 52w high", "pct_dd20", "{:.0f}%", True),
         ("Median dist. from 52w high", "median_dd_from_52w_high", "{:.0f}%", False),
         ("New 52w highs − lows", "net_hl", "{:+.0f}", False),
@@ -219,7 +221,7 @@ def _ctx_strip(g):
             pc = "#1a7a3a" if rank >= 65 else ("#c0392b" if rank <= 35 else "#a66300")
             ptxt = f"{_ord(p)} pct"
         out.append(
-            f'<div style="flex:1;min-width:132px;background:#fff;border:1px solid #e3e7ee;'
+            f'<div style="flex:1;min-width:92px;box-sizing:border-box;background:#fff;border:1px solid #e3e7ee;'
             f'border-radius:8px;padding:7px 9px">'
             f'<div style="font-size:10px;color:#666;line-height:1.25">{label}</div>'
             f'<div style="font-size:19px;font-weight:800;color:{pc}">{disp}</div>'
@@ -228,40 +230,61 @@ def _ctx_strip(g):
     return "".join(out)
 
 
-def _nifty_for_dates(dates, drive, idx_folder):
-    """Nifty 50 close aligned to the breadth date index. Drive's copy is
-    CI-fresh but shallow-ish; guru/data/macro_hist goes back to 2007 and is
-    stale (refresh_daily.py does not touch macro_hist). Union them and prefer
-    Drive, so the line is both deep and current without a new fetch."""
+# guru/data/macro_hist is deep (2001-2007 onward) but stale — refresh_daily.py
+# never touches it. Drive's data/indices/ and data/macro/ are CI-fresh but start
+# 2016-05-19. Measured on 2,495-2,634 shared days per series, the two agree to a
+# MEDIAN gap of 0.000%, so they are one source and can be joined: Drive wins on
+# every shared date and local only supplies the pre-2016 history.
+MACRO_LOCAL = os.path.join(os.path.dirname(_SD), "guru", "data", "macro_hist")
+
+
+def _close_series(drive, folder_id, name):
     frames = []
-    loc = os.path.join(os.path.dirname(_SD), "guru", "data", "macro_hist",
-                       "NIFTY_50.parquet")
+    loc = os.path.join(MACRO_LOCAL, f"{name}.parquet")
     if os.path.exists(loc):
         try:
             frames.append(pd.read_parquet(loc, columns=["date", "close"]))
         except Exception:
             pass
     try:
-        dr = _read_parquet(drive, idx_folder, "NIFTY_50.parquet")
+        dr = _read_parquet(drive, folder_id, f"{name}.parquet")
         if not dr.empty and {"date", "close"} <= set(dr.columns):
-            frames.append(dr[["date", "close"]])
+            frames.append(dr[["date", "close"]])     # appended LAST, so it wins
     except Exception:
         pass
     if not frames:
         return None
-    n = pd.concat(frames, ignore_index=True)
-    n["date"] = pd.to_datetime(n["date"], errors="coerce")
-    n = (n.dropna(subset=["date"]).drop_duplicates("date", keep="last")
-           .sort_values("date").set_index("date")["close"])
-    return pd.to_numeric(n, errors="coerce").reindex(dates).ffill()
+    s = pd.concat(frames, ignore_index=True)
+    s["date"] = pd.to_datetime(s["date"], errors="coerce").dt.normalize()
+    s["close"] = pd.to_numeric(s["close"], errors="coerce")
+    s = s.dropna().drop_duplicates("date", keep="last").sort_values("date")
+    return s.set_index("date")["close"]
 
 
-# Chart id -> (heading, one-line explanation of what it tells you)
+def _nifty_for_dates(dates, drive, idx_folder):
+    """Nifty 50 close aligned to the breadth date index (see _close_series)."""
+    n = _close_series(drive, idx_folder, "NIFTY_50")
+    return None if n is None else n.reindex(dates).ffill()
+
+
+def _ser(n, c, v, t="line", f="dec1", ax="right", w=2):
+    """One chart series. f is the value format used on the axis AND in the
+    legend: int, abs (whole number with the sign dropped — the mirror bars are
+    plotted negative but a count of 35 decliners is 35, not -35), dec1/2/3.
+    ax puts a second UNIT on the left axis, so a 0-100 share and a -70..0
+    distance do not squash each other onto one scale."""
+    return {"n": n, "c": c, "t": t, "v": v, "f": f, "ax": ax, "w": w}
+
+
+# Chart id -> (heading, what it tells you)
 BREADTH_CHARTS = [
     ("bd_ma", "% of stocks above their moving average",
      "The core breadth picture. All five lines high = a broad advance; price "
      "holding while the 10/20 roll over = the rally narrowing."),
-    ("bd_mv3", "Stocks moving more than 3% in a day (up above, down below)", ""),
+    ("bd_gc", "% of stocks in a golden cross (50 DMA above 200 DMA)",
+     "The slow regime line — it moves over months, not days. Above 50% means "
+     "most stocks are themselves in an uptrend, whatever the index is doing."),
+    ("bd_mv3", "Stocks moving more than 3% in a day (up above the line, down below)", ""),
     ("bd_mv5", "Stocks moving more than 5% in a day", ""),
     ("bd_mv10", "Stocks moving more than 10% in a day",
      "Clusters of big down-days mark capitulation; clusters of big up-days "
@@ -274,22 +297,34 @@ BREADTH_CHARTS = [
      "drifts downward even through bull markets (more names fall than rise on "
      "a typical day), so read the SLOPE, not the level: above its 200-day mean "
      "and rising is broadening participation."),
-    ("bd_updown", "Up-share of daily turnover",
+    ("bd_updown", "Up-share of daily turnover (faint = daily, bold = 10-day average)",
      "Share of the day's traded value in advancing stocks. Below 50 for a "
      "stretch is distribution, whatever the index is doing."),
     ("bd_dd", "How beaten-up the average stock is",
-     "Share of names more than 20% below their own 52-week high, and the "
-     "median distance from that high. Answers 'the index is fine, so why "
-     "does my book hurt?'"),
-    ("bd_eqw", "Average stock vs Nifty 50 (ratio, rebased)",
-     "Rising = the typical stock is beating the index. Falling = the index is "
-     "being carried by a few heavyweights."),
-    ("bd_mcc", "McClellan oscillator and summation index",
-     "Ratio-adjusted, so it stays comparable as the universe grows."),
+     "Share of names more than 20% below their own 52-week high (right axis), "
+     "and the median distance from that high (left axis). Answers 'the index "
+     "is fine, so why does my book hurt?'"),
+    ("bd_eqw", "Average stock vs Nifty 50 (ratio), with its 200-day mean",
+     "Risk appetite. Rising = the typical stock is beating the index; falling = "
+     "the index is being carried by a few heavyweights. Read the DIRECTION "
+     "against the 200-day mean, not the level: an equal-weight index rebalanced "
+     "daily on noisy prices overstates what anyone could have earned, so the "
+     "long-run level drifts up."),
+    ("bd_mcc", "McClellan oscillator (right axis) and summation index (left axis)",
+     "Ratio-adjusted, so it stays comparable as the universe grows. The "
+     "oscillator is short-term momentum in breadth; the summation is its "
+     "running total and moves like a trend line."),
     ("bd_thrust", "Zweig breadth thrust",
      "10-day average of advancers / (advancers + decliners). A move from below "
      "0.40 to above 0.615 inside 10 sessions has marked major bottoms."),
 ]
+
+# Horizontal guides: [price, series index they sit on]
+BREADTH_REFS = {
+    "bd_ma": [[50, 0]], "bd_gc": [[50, 0]], "bd_updown": [[50, 0]],
+    "bd_mcc": [[0, 0]],
+    "bd_thrust": [[0.40, 0], [0.615, 0]],
+}
 
 
 def _breadth_payload(bd, nifty_by_uni):
@@ -302,24 +337,25 @@ def _breadth_payload(bd, nifty_by_uni):
             continue
         ctx[uni] = _ctx_strip(g)
 
+        # 10/20 are twitchy; thin lines keep them from hiding the slower three
         charts["bd_ma"][uni] = [
-            {"n": f"{w} DMA", "c": _C[f"ma{w}"], "t": "line",
-             "v": _vals(g[f"pct_above_{w}dma"], 1)}
+            _ser(f"{w} DMA", _C[f"ma{w}"], _vals(g[f"pct_above_{w}dma"], 1),
+                 w=1 if w in (10, 20) else 2)
             for w in (10, 20, 50, 100, 200) if f"pct_above_{w}dma" in g.columns]
+        charts["bd_gc"][uni] = [
+            _ser("% in golden cross", _C["ma200"], _vals(g["pct_ma50_above_ma200"], 1))]
 
         for cid, t in (("bd_mv3", 3), ("bd_mv5", 5), ("bd_mv10", 10)):
             charts[cid][uni] = [
-                {"n": f"up >{t}%", "c": _C["up"], "t": "hist",
-                 "v": _vals(g[f"up_{t}"], as_int=True)},
-                {"n": f"down >{t}%", "c": _C["dn"], "t": "hist",
-                 "v": _vals(g[f"dn_{t}"], as_int=True, neg=True)},
+                _ser(f"up >{t}%", _C["up"], _vals(g[f"up_{t}"], as_int=True),
+                     t="hist", f="abs"),
+                _ser(f"down >{t}%", _C["dn"], _vals(g[f"dn_{t}"], as_int=True, neg=True),
+                     t="hist", f="abs"),
             ]
 
         charts["bd_hl"][uni] = [
-            {"n": "new highs", "c": _C["up"], "t": "line",
-             "v": _vals(g["new_52w_high"], as_int=True)},
-            {"n": "new lows", "c": _C["dn"], "t": "line",
-             "v": _vals(g["new_52w_low"], as_int=True)},
+            _ser("new highs", _C["up"], _vals(g["new_52w_high"], as_int=True), f="int"),
+            _ser("new lows", _C["dn"], _vals(g["new_52w_low"], as_int=True), f="int"),
         ]
         # The A/D line drifts DOWN across the whole sample even through big bull
         # markets, because in a broad universe more names fall than rise on a
@@ -328,29 +364,26 @@ def _breadth_payload(bd, nifty_by_uni):
         # alongside makes that readable: above the mean = breadth improving.
         ad = pd.to_numeric(g["ad_line_norm"], errors="coerce")
         charts["bd_ad"][uni] = [
-            {"n": "A/D line", "c": _C["neutral"], "t": "line",
-             "v": _vals(ad, 1)},
-            {"n": "200d mean", "c": _C["ma10"], "t": "line",
-             "v": _vals(ad.rolling(200, min_periods=50).mean(), 1)},
+            _ser("A/D line", _C["neutral"], _vals(ad, 1)),
+            _ser("200d mean", _C["ma10"], _vals(ad.rolling(200, min_periods=50).mean(), 1)),
         ]
+        up = pd.to_numeric(g["pct_turnover_up"], errors="coerce")
         charts["bd_updown"][uni] = [
-            {"n": "up-share %", "c": _C["neutral"], "t": "line",
-             "v": _vals(g["pct_turnover_up"], 1)}]
+            _ser("daily", _C["faint"], _vals(up, 1), w=1),
+            _ser("10-day average", _C["neutral"], _vals(up.rolling(10, min_periods=5).mean(), 1)),
+        ]
         charts["bd_dd"][uni] = [
-            {"n": "% >20% below high", "c": _C["dn"], "t": "line",
-             "v": _vals(g["pct_dd20"], 1)},
-            {"n": "median dist. from high", "c": _C["amber"], "t": "line",
-             "v": _vals(g["median_dd_from_52w_high"], 1)},
+            _ser("% >20% below high", _C["dn"], _vals(g["pct_dd20"], 1)),
+            _ser("median dist. from high", _C["amber"],
+                 _vals(g["median_dd_from_52w_high"], 1), ax="left"),
         ]
         charts["bd_mcc"][uni] = [
-            {"n": "oscillator", "c": _C["neutral"], "t": "line",
-             "v": _vals(g["mcclellan_osc"], 1)},
-            {"n": "summation", "c": _C["ma200"], "t": "line",
-             "v": _vals(g["mcclellan_summation"], 0)},
+            _ser("oscillator", _C["neutral"], _vals(g["mcclellan_osc"], 1)),
+            _ser("summation", _C["ma200"], _vals(g["mcclellan_summation"], 0),
+                 f="int", ax="left"),
         ]
         charts["bd_thrust"][uni] = [
-            {"n": "thrust", "c": _C["neutral"], "t": "line",
-             "v": _vals(g["zweig_thrust"], 3)}]
+            _ser("thrust", _C["neutral"], _vals(g["zweig_thrust"], 3), f="dec3")]
 
         # Average stock vs Nifty, as a RATIO. The equal-weight index is
         # rebalanced daily on noisy prices, so its ABSOLUTE level overstates an
@@ -358,6 +391,7 @@ def _breadth_payload(bd, nifty_by_uni):
         # form and is also the more useful read.
         nif = nifty_by_uni.get(uni)
         eq = pd.to_numeric(g["eqw_index"], errors="coerce").to_numpy("float64")
+        charts["bd_eqw"][uni] = []
         if nif is not None:
             nv = nif.to_numpy("float64")
             both = np.isfinite(eq) & np.isfinite(nv) & (nv > 0) & (eq > 0)
@@ -365,12 +399,22 @@ def _breadth_payload(bd, nifty_by_uni):
             if both.any():
                 i0 = int(np.argmax(both))
                 ratio[both] = ((eq[both] / eq[i0]) / (nv[both] / nv[i0])) * 100.0
+            rs = pd.Series(ratio)
             charts["bd_eqw"][uni] = [
-                {"n": "avg stock / Nifty", "c": _C["neutral"], "t": "line",
-                 "v": _vals(pd.Series(ratio), 1)}]
-        else:
-            charts["bd_eqw"][uni] = []
+                _ser("avg stock / Nifty", _C["neutral"], _vals(rs, 1)),
+                _ser("200d mean", _C["ma10"],
+                     _vals(rs.rolling(200, min_periods=50).mean(), 1))]
     return charts, ctx
+
+
+def _card(cid, human, note, cls="chart bchart"):
+    """Heading, note and a legend strip ABOVE the plot. The series names and
+    live values used to be drawn inside the plot at the latest bar, where they
+    covered exactly the readings that matter most."""
+    return (f'<div class="card"><h3>{human}</h3>'
+            + (f'<div class="note">{note}</div>' if note else "")
+            + f'<div class="lg" id="lg_{cid}"></div>'
+            + f'<div class="{cls}" id="{cid}"></div></div>')
 
 
 def _breadth_block(bd, drive, idx_folder):
@@ -401,33 +445,103 @@ def _breadth_block(bd, drive, idx_folder):
     btns = "".join(
         f'<button class="ub" data-u="{u}" onclick="setUni(\'{u}\')">{lbl}</button>'
         for u, lbl in BREADTH_UNIS)
-    zbtns = "".join(
-        f'<button class="zb" data-z="{b}" onclick="setZoom({b})">{lbl}</button>'
-        for lbl, b in (("1y", 252), ("3y", 756), ("5y", 1260), ("10y", 2520), ("max", 0)))
-    cards = "".join(
-        f'<div class="card"><h3>{human}</h3>'
-        + (f'<div class="note">{note}</div>' if note else "")
-        + f'<div class="chart bchart" id="{cid}"></div></div>'
-        for cid, human, note in BREADTH_CHARTS)
+    cards = "".join(_card(cid, human, note) for cid, human, note in BREADTH_CHARTS)
 
     return (
-        f'<h2>Market breadth — {dates[0].date()} to {last.date()}</h2>'
+        f'<h2 id="sec-breadth">Market breadth — {dates[0].date()} to {last.date()}</h2>'
         f'{warn}'
         f'<div style="font-size:11px;color:#888;margin:0 6px 6px">'
         f'{len(dates):,} trading days from the local 25-year price store, which '
         f'includes delisted securities — so past bear markets are not flattered '
         f'by survivorship. Percentages use each measure\'s own denominator '
-        f'(a 3-year-old stock has no 200 DMA and is excluded from that line).'
+        f'(a 3-year-old stock has no 200 DMA and is excluded from that line). '
+        f'Hover any chart to read every line on that date.'
         f'</div>'
         f'<div class="btnrow"><span class="btnlbl">Universe</span>{btns}</div>'
-        f'<div class="btnrow"><span class="btnlbl">Window</span>{zbtns}</div>'
         f'<div style="font-size:10px;color:#999;margin:2px 6px 8px" id="unote"></div>'
         f'<div class="tiles" id="bctx"></div>'
         f'<div class="charts">{cards}</div>',
         {"dates": [d.strftime("%Y-%m-%d") for d in dates],
          "charts": charts, "ctx": ctx, "notes": BREADTH_NOTES,
-         "default": BREADTH_DEFAULT},
+         "refs": BREADTH_REFS, "default": BREADTH_DEFAULT},
     )
+
+
+# ------------------------------------------------------------ macro drivers --
+# (id, heading, file, Drive folder, colour, value format, what it tells you)
+MACRO_CHARTS = [
+    ("mc_brent", "Brent crude (USD / barrel)", "BRENT_CRUDE", "data/macro",
+     "#6d4c41", "dec2",
+     "India imports most of the crude it uses, so a sustained rise tends to "
+     "feed inflation, widen the current-account deficit and weigh on the rupee. "
+     "Businesses that burn crude derivatives — paints, aviation, chemicals — "
+     "typically feel it first."),
+    ("mc_usdinr", "USD / INR (rupees per dollar)", "USD_INR", "data/macro",
+     "#1a3d6e", "dec2",
+     "RISING = a weaker rupee. A falling rupee erodes foreign investors' "
+     "returns in dollars, so it has tended to travel with FII selling; "
+     "exporters (IT, pharma) are the usual beneficiaries."),
+    ("mc_gold", "Gold (USD / oz)", "GOLD", "data/macro", "#b8860b", "int",
+     "A fear gauge: gold rising while equities fall is money leaving risk."),
+    ("mc_spx", "S&P 500", "SP500", "data/macro", "#2980b9", "int",
+     "The global risk backdrop — foreign flows into India respond to US risk "
+     "appetite."),
+]
+
+
+def _macro_block(drive):
+    """Returns (section_html, payload). Each chart carries its own dates: crude
+    and the S&P do not trade on NSE's calendar. A 200-day average rides along,
+    because above or below it is the quickest honest read of the trend."""
+    charts, cards, spans = {}, [], []
+    for cid, human, name, folder, color, fmt, note in MACRO_CHARTS:
+        try:
+            s = _close_series(drive, _folder(drive, folder), name)
+        except Exception as e:
+            log(f"macro: {name} unavailable ({str(e)[:60]})")
+            s = None
+        if s is None or s.dropna().empty:
+            continue
+        s = s.dropna()
+        charts[cid] = {
+            "d": [d.strftime("%Y-%m-%d") for d in s.index],
+            "s": [_ser(human.split(" (")[0], color, _vals(s, 2), f=fmt),
+                  _ser("200-day average", _C["grey"],
+                       _vals(s.rolling(200, min_periods=150).mean(), 2), f=fmt, w=1)],
+        }
+        cards.append(_card(cid, human, note, cls="chart bchart"))
+        spans.append(f"{name} {s.index[0].year}-{s.index[-1].date()}")
+    if not charts:
+        return "", {}
+    log("macro: " + " | ".join(spans))
+    return (
+        '<h2 id="sec-macro">Macro drivers — crude, the rupee, gold, global risk</h2>'
+        '<div style="font-size:11px;color:#888;margin:0 6px 6px">Drive\'s daily '
+        'series (from 2016) joined to the local deep history (to 2001-2007); the '
+        'two agree to a median 0.000% where they overlap. Grey line = 200-day '
+        'average.</div>'
+        f'<div class="charts">{"".join(cards)}</div>',
+        {"charts": charts},
+    )
+
+def _jump_bar(has_macro, has_breadth):
+    """Sticky strip: section links, and the Window toggle that drives every
+    long-history chart (macro + breadth). One page-level control, because the
+    macro and breadth charts share a time axis the reader compares across."""
+    links = ['<a href="#sec-top">Top</a>', '<a href="#sec-trends">Trends</a>']
+    if has_macro:
+        links.append('<a href="#sec-macro">Macro</a>')
+    if has_breadth:
+        links.append('<a href="#sec-breadth">Breadth</a>')
+    links.append('<a href="#sec-tables">Tables</a>')
+    win = ""
+    if has_macro or has_breadth:
+        win = ('<span class="sp"></span><span class="btnlbl">Window</span>'
+               + "".join(f'<button class="zb" data-z="{y}" onclick="setWin({y})">'
+                         f'{lbl}</button>'
+                         for lbl, y in (("1y", 1), ("3y", 3), ("5y", 5),
+                                        ("10y", 10), ("max", 0))))
+    return f'<div class="jump">{"".join(links)}{win}</div>'
 
 
 _TPL = """<!doctype html><html><head><meta charset="utf-8">
@@ -436,33 +550,43 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;margin:0;padding:14px;color:#222}
  h1{font-size:20px;margin:4px 6px}
- h2{font-size:14px;margin:18px 6px 6px;color:#1a3d6e}
+ h2{font-size:14px;margin:18px 6px 6px;color:#1a3d6e;scroll-margin-top:48px}
  .wrap{max-width:1180px;margin:0 auto}
  .tiles{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
- .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+ .charts{display:grid;grid-template-columns:1fr;gap:14px}
  .card{background:#fff;border:1px solid #e3e7ee;border-radius:8px;padding:8px 10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
  .card h3{font-size:12px;margin:2px 0 6px;color:#555;font-weight:600}
- .chart{height:200px}
+ .chart{height:260px}
  table{border-collapse:collapse;width:100%;font-size:12px}
  th,td{padding:3px 6px;border-bottom:1px solid #eee}
  th{text-align:right;color:#666;font-weight:600}
  th:first-child,td:first-child{text-align:left}
  .btnrow{margin:4px 6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
  .btnlbl{font-size:11px;color:#666;min-width:56px}
- .btnrow button{font:inherit;font-size:11px;padding:4px 10px;border:1px solid #d5dbe5;background:#fff;color:#333;border-radius:14px;cursor:pointer}
- .btnrow button:hover{border-color:#1a3d6e}
- .btnrow button.on{background:#1a3d6e;border-color:#1a3d6e;color:#fff;font-weight:600}
- .note{font-size:10px;color:#888;margin:0 0 5px;line-height:1.35}
- .bchart{height:230px}
+ .btnrow button,.jump button{font:inherit;font-size:11px;padding:4px 10px;border:1px solid #d5dbe5;background:#fff;color:#333;border-radius:14px;cursor:pointer}
+ .btnrow button:hover,.jump button:hover{border-color:#1a3d6e}
+ .btnrow button.on,.jump button.on{background:#1a3d6e;border-color:#1a3d6e;color:#fff;font-weight:600}
+ .note{font-size:11px;color:#777;margin:0 0 4px;line-height:1.4}
+ .bchart{height:300px}
+ .lg{display:flex;flex-wrap:wrap;gap:3px 14px;font-size:11px;color:#555;margin:2px 0 4px;min-height:17px;align-items:center}
+ .lg b{color:#1f2937;font-weight:700;margin-left:2px}
+ .lg .lgd{color:#8a94a6;font-weight:600;min-width:78px}
+ .sw{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+ .empty{display:flex;align-items:center;justify-content:center;height:100%;color:#aaa;font-size:12px}
+ .jump{position:sticky;top:0;z-index:5;background:rgba(244,246,249,.96);padding:6px;margin:0 0 6px;border-bottom:1px solid #e3e7ee;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;font-size:12px}
+ .jump a{color:#1a3d6e;text-decoration:none;font-weight:600}
+ .jump .sp{flex:1}
  @media(max-width:820px){.charts{grid-template-columns:1fr}}
-</style></head><body><div class="wrap">
+</style></head><body><div class="wrap" id="sec-top">
+__JUMP__
 <h1>__HEADLINE__</h1>
 <div style="font-size:11px;color:#888;margin:-2px 6px 8px">__SUB__</div>
 <div class="tiles">__TILES__</div>
-<h2>Trends (daily)</h2>
+<h2 id="sec-trends">Trends (daily)</h2>
 <div class="charts">__CHARTS__</div>
+__MACRO__
 __BREADTH__
-<h2>Index dashboard — returns by horizon</h2>
+<h2 id="sec-tables">Index dashboard — returns by horizon</h2>
 <div class="card"><table>__IDXTABLE__</table></div>
 <h2>Sector rotation (vs Nifty 500)</h2>
 <div class="card"><table>__SECTABLE__</table></div>
@@ -472,11 +596,39 @@ __BREADTH__
 <div class="card"><table>__SECBREADTH__</table></div>
 </div>
 <script>
+/* ---- shared formatting. Defined FIRST: the line() charts below are drawn the
+   moment the script runs, and they call _tmf. ---- */
+const _MN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function _p2(n){return (n<10?'0':'')+n;}
+function _ymd(t){
+ if(t&&typeof t==='object') return {y:t.year,m:t.month,d:t.day};
+ if(typeof t==='string'){const a=t.split('-');return {y:+a[0],m:+a[1],d:+a[2]};}
+ const x=new Date(t*1000); return {y:x.getUTCFullYear(),m:x.getUTCMonth()+1,d:x.getUTCDate()};
+}
+/* "Mar '25" instead of the library's bare "3" for a month tick */
+function _tmf(t,type){const q=_ymd(t);
+ if(type===0) return String(q.y);
+ if(type===1) return _MN[q.m-1]+" '"+String(q.y).slice(2);
+ return q.d+' '+_MN[q.m-1];}
+function _dstr(t){const q=_ymd(t); return q.d+' '+_MN[q.m-1]+' '+q.y;}
+function _fmt(v,f){
+ if(v===null||v===undefined||!isFinite(v)) return '—';
+ if(f==='int') return Math.round(v).toLocaleString('en-IN');
+ if(f==='abs') return Math.abs(Math.round(v)).toLocaleString('en-IN');
+ if(f==='dec3') return v.toFixed(3);
+ if(f==='dec2') return v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+ return v.toFixed(1);}
+function _pf(f){return {type:'custom',
+ minMove:f==='dec3'?0.001:(f==='dec2'?0.01:((f==='int'||f==='abs')?1:0.1)),
+ formatter:function(v){return _fmt(v,f);}};}
+/* whole numbers above 100 ("8,000" not "8000.00"), two decimals below */
+function _axis(v){return (Math.abs(v)>=100||Number.isInteger(v))?Math.round(v).toLocaleString('en-IN'):v.toFixed(2);}
 const S=__PAYLOAD__;
 function line(id,color,area){
  const el=document.getElementById(id); if(!el)return;
- const ch=LightweightCharts.createChart(el,{height:200,layout:{textColor:'#333',background:{color:'#fff'}},
-   rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},
+ const ch=LightweightCharts.createChart(el,{autoSize:true,layout:{textColor:'#333',background:{color:'#fff'}},
+   localization:{priceFormatter:_axis},
+   rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee',tickMarkFormatter:_tmf},
    grid:{horzLines:{color:'#f3f3f3'},vertLines:{color:'#fafafa'}}});
  (S[id]||[]).forEach(function(s){
    let ser = s.type==='hist'? ch.addHistogramSeries({color:s.color||color})
@@ -487,54 +639,94 @@ function line(id,color,area){
 }
 __DRAW__
 
-/* ---- breadth history. Separate from line() above on purpose: these series
-   ship as compact parallel arrays against one shared date index (~4x smaller
-   than {time,value} objects over 25 years x 4 universes), and they are rebuilt
-   on every universe switch. The seven charts above are untouched. ---- */
-const BP=__BPAYLOAD__;
-let _bch=[], _buni=(BP&&BP.default)||'liquid', _bwin=756;
-function _bmk(cid,spec){
- const el=document.getElementById(cid); if(!el) return null;
- const ch=LightweightCharts.createChart(el,{height:230,
-   layout:{textColor:'#333',background:{color:'#fff'}},
-   rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},
-   grid:{horzLines:{color:'#f3f3f3'},vertLines:{color:'#fafafa'}}});
- const D=BP.dates;
- (spec||[]).forEach(function(s){
-   const d=[],v=s.v||[];
-   for(let i=0;i<v.length;i++){ if(v[i]===null||v[i]===undefined) continue;
-     d.push({time:D[i],value:v[i]}); }
-   const ser = s.t==='hist'
-     ? ch.addHistogramSeries({color:s.c,title:s.n,priceLineVisible:false})
-     : ch.addLineSeries({color:s.c,lineWidth:2,title:s.n,priceLineVisible:false});
-   ser.setData(d);
+/* ---- long-history charts: breadth + macro. Separate from line() above on
+   purpose. Series ship as compact arrays against a date index (~4x smaller
+   than {time,value} objects), each carries its own value format and axis, and
+   they label themselves in a legend strip ABOVE the plot: the library's own
+   in-plot labels were drawn at the latest bar, on top of the readings that
+   matter most. Hovering rewrites the legend for the hovered date. ---- */
+const BP=__BPAYLOAD__, MP=__MPAYLOAD__;
+let _bch=[], _mch=[], _buni=(BP&&BP.default)||'liquid_nse', _win=3;
+function _legend(lg,made,p){
+ const hov=!!(p&&p.time&&p.seriesData);
+ let h='<span class="lgd">'+(hov?_dstr(p.time):'latest')+'</span>';
+ made.forEach(function(m){
+   let v=m.last;
+   if(hov){const d=p.seriesData.get(m.ser); v=d?d.value:null;}
+   h+='<span><span class="sw" style="background:'+m.s.c+'"></span>'+m.s.n+
+      ' <b>'+_fmt(v,m.s.f)+'</b></span>';
  });
- return ch;
+ lg.innerHTML=h;
 }
-function bwin(){
- const n=BP.dates.length;
- _bch.forEach(function(ch){ try{
-   if(_bwin>0 && _bwin<n) ch.timeScale().setVisibleLogicalRange({from:n-_bwin,to:n-1});
-   else ch.timeScale().fitContent();
- }catch(e){} });
+function _applyWin(c){ try{
+ const ts=c.ch.timeScale(); let lt=null;
+ c.made.forEach(function(m){ if(m.lastT&&(!lt||m.lastT>lt)) lt=m.lastT; });
+ if(!_win||!lt){ ts.fitContent(); return; }
+ const q=_ymd(lt);
+ ts.setVisibleRange({from:(q.y-_win)+'-'+_p2(q.m)+'-'+_p2(q.d),to:lt});
+}catch(e){} }
+function _mk(el,series,refs,D0){
+ const left=(series||[]).some(function(s){return s.ax==='left';});
+ const ch=LightweightCharts.createChart(el,{autoSize:true,
+   layout:{textColor:'#333',background:{color:'#fff'},fontSize:11},
+   rightPriceScale:{borderColor:'#eee'},
+   leftPriceScale:{visible:left,borderColor:'#eee'},
+   /* minBarSpacing: the library's 0.5px default caps a chart at ~2,200 bars
+      (~9 years) on a 1,100px plot, so 'max' silently showed 2017 onward. */
+   timeScale:{borderColor:'#eee',tickMarkFormatter:_tmf,minBarSpacing:0.02},
+   grid:{horzLines:{color:'#f3f3f3'},vertLines:{color:'#fafafa'}}});
+ const made=[];
+ (series||[]).forEach(function(s){
+   const D=s.d||D0||BP.dates, v=s.v||[], data=[];
+   for(let k=0;k<v.length;k++){ if(v[k]===null||v[k]===undefined) continue;
+     data.push({time:D[k],value:v[k]}); }
+   const o={color:s.c,priceLineVisible:false,lastValueVisible:false,
+            priceScaleId:s.ax||'right',priceFormat:_pf(s.f)};
+   const ser=s.t==='hist'? ch.addHistogramSeries(o)
+           : ch.addLineSeries(Object.assign({lineWidth:s.w||2},o));
+   ser.setData(data);
+   made.push({ser:ser,s:s,last:data.length?data[data.length-1].value:null,
+              lastT:data.length?data[data.length-1].time:null});
+ });
+ /* dashed guides (50%, 0, the 0.40 / 0.615 thrust levels): value on the axis
+    only, no title, so nothing is drawn across the plot */
+ (refs||[]).forEach(function(r){ const m=made[r[1]||0]; if(!m) return;
+   m.ser.createPriceLine({price:r[0],color:'#9aa3b2',lineWidth:1,lineStyle:2,
+     axisLabelVisible:true,title:''}); });
+ const lg=document.getElementById('lg_'+el.id);
+ if(lg){ _legend(lg,made,null);
+   ch.subscribeCrosshairMove(function(p){_legend(lg,made,p);}); }
+ const c={ch:ch,made:made}; _applyWin(c); return c;
 }
 function bdraw(){
- _bch.forEach(function(c){ try{c.remove();}catch(e){} }); _bch=[];
- Object.keys(BP.charts||{}).forEach(function(cid){
-   const ch=_bmk(cid,(BP.charts[cid]||{})[_buni]); if(ch)_bch.push(ch); });
- const cx=document.getElementById('bctx'); if(cx) cx.innerHTML=(BP.ctx||{})[_buni]||'';
- const un=document.getElementById('unote'); if(un) un.innerHTML=(BP.notes||{})[_buni]||'';
- bwin();
+ _bch.forEach(function(c){ try{c.ch.remove();}catch(e){} }); _bch=[];
+ Object.keys((BP&&BP.charts)||{}).forEach(function(cid){
+   const el=document.getElementById(cid); if(!el) return;
+   const spec=(BP.charts[cid]||{})[_buni];
+   el.innerHTML='';
+   if(!spec||!spec.length){
+     el.innerHTML='<div class="empty">no data for this universe</div>';
+     const lg=document.getElementById('lg_'+cid); if(lg) lg.innerHTML=''; return; }
+   _bch.push(_mk(el,spec,(BP.refs||{})[cid]));
+ });
+ const cx=document.getElementById('bctx'); if(cx) cx.innerHTML=((BP&&BP.ctx)||{})[_buni]||'';
+ const un=document.getElementById('unote'); if(un) un.innerHTML=((BP&&BP.notes)||{})[_buni]||'';
+}
+function mdraw(){
+ Object.keys((MP&&MP.charts)||{}).forEach(function(cid){
+   const el=document.getElementById(cid); if(!el) return;
+   const c=MP.charts[cid]; _mch.push(_mk(el,c.s,null,c.d));
+ });
 }
 function _bmark(cls,attr,val){
  document.querySelectorAll('.'+cls).forEach(function(b){
    b.classList.toggle('on', b.getAttribute(attr)===String(val)); });
 }
 function setUni(u){ _buni=u; _bmark('ub','data-u',u); bdraw(); }
-function setZoom(b){ _bwin=b; _bmark('zb','data-z',b); bwin(); }
-if(BP && BP.dates && BP.dates.length){
- _bmark('ub','data-u',_buni); _bmark('zb','data-z',_bwin); bdraw();
-}
+function setWin(y){ _win=y; _bmark('zb','data-z',y); _bch.concat(_mch).forEach(_applyWin); }
+mdraw();
+if(BP&&BP.dates&&BP.dates.length){ _bmark('ub','data-u',_buni); bdraw(); }
+_bmark('zb','data-z',_win);
 </script></body></html>"""
 
 
@@ -714,9 +906,11 @@ def main():
         log(f"breadth: {bd['date'].nunique():,} days x "
             f"{bd['universe'].nunique()} universes, "
             f"{bd['date'].min().date()} -> {bd['date'].max().date()}")
+    macro_html, mpayload = _macro_block(drive)
 
     if args.dry_run:
         log(f"DRY-RUN — {len(chart_ids)} trend charts, "
+            f"{len(mpayload.get('charts', {}))} macro charts, "
             f"{len(BREADTH_CHARTS) if breadth_html else 0} breadth charts, "
             f"{len(body)} indices, {len(sect)} sectors; no file written.")
         return
@@ -729,7 +923,10 @@ def main():
                 .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
                 .replace("__DRAW__", draw)
                 .replace("__BREADTH__", breadth_html)
-                .replace("__BPAYLOAD__", json.dumps(bpayload, separators=(",", ":"))))
+                .replace("__BPAYLOAD__", json.dumps(bpayload, separators=(",", ":")))
+                .replace("__MACRO__", macro_html)
+                .replace("__MPAYLOAD__", json.dumps(mpayload, separators=(",", ":")))
+                .replace("__JUMP__", _jump_bar(bool(macro_html), bool(breadth_html))))
     out = os.path.join(os.path.dirname(_SD), args.out)
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
