@@ -30,6 +30,7 @@ import sys
 import webbrowser
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -109,6 +110,326 @@ def _tile(label, score, extra=""):
             f'<div style="font-size:10px;color:#999">{extra}</div></div>')
 
 
+# ---------------------------------------------------------------- breadth ----
+# guru/data/metrics/market_breadth.parquet — one row per (trading day, universe)
+# back to 2001, built by guru/build_market_breadth.py. LOCAL and gitignored, so
+# every function below fails soft: no file, no section, page renders as before.
+BREADTH_PATH = os.path.join(os.path.dirname(_SD), "guru", "data", "metrics",
+                            "market_breadth.parquet")
+BREADTH_UNIS = [("liquid_nse", "Liquid NSE (>Rs1cr/day)"),
+                ("top500_nse", "Top 500 NSE by turnover"),
+                ("nse", "All NSE-listed"), ("all", "Everything (incl. BSE)")]
+BREADTH_DEFAULT = "liquid_nse"
+STALE_SESSIONS = 3
+BREADTH_NOTES = {
+    "liquid_nse": "NSE securities whose 20-day average turnover was at least "
+                  "Rs1cr on that day. Membership moves with the market, which "
+                  "is the point. NSE-only deliberately: the price store gets BSE "
+                  "volume from yfinance, which reports none for a third of BSE "
+                  "bars — so a turnover filter over the whole store was "
+                  "silently selecting NSE names anyway and calling them liquid.",
+    "top500_nse": "That day's 500 most-traded NSE securities — a turnover-rank "
+                  "PROXY for large-cap, not index membership. No historical "
+                  "Nifty 500 constituent list exists locally, and today's "
+                  "market-cap segments cannot be applied backwards without "
+                  "labelling a stock by what it later became.",
+    "nse": "Every security carrying an NSE symbol (~2,365), including ones "
+           "since delisted. No liquidity filter.",
+    "all": "Every security with a bar that day, illiquid microcaps and BSE-only "
+           "names included. Widest coverage and the noisiest movers counts — a "
+           "thinly traded counter clears 5% on one trade. NOTE: the up-share-of-"
+           "turnover chart is indicative only here, because yfinance reports no "
+           "volume for many BSE names.",
+}
+
+_C = {"ma10": "#e67e22", "ma20": "#d35400", "ma50": "#16a085",
+      "ma100": "#2980b9", "ma200": "#8e44ad", "up": "#1a7a3a", "dn": "#c0392b",
+      "neutral": "#1a3d6e", "amber": "#a66300"}
+
+
+def _load_breadth():
+    if not os.path.exists(BREADTH_PATH):
+        return None
+    try:
+        d = pd.read_parquet(BREADTH_PATH)
+    except Exception as e:
+        log(f"market_breadth.parquet unreadable ({e}) — breadth section skipped")
+        return None
+    if d.empty or "universe" not in d.columns:
+        return None
+    d["date"] = pd.to_datetime(d["date"])
+    return d.sort_values("date")
+
+
+def _vals(s, nd=2, as_int=False, neg=False):
+    """Series -> compact JSON list. NaN becomes null so the chart breaks the line
+    instead of drawing a zero, which would read as a real reading of zero."""
+    a = pd.to_numeric(s, errors="coerce").to_numpy(dtype="float64")
+    if neg:
+        a = -a
+    ok = np.isfinite(a)
+    if as_int:
+        return [int(round(v)) if k else None for v, k in zip(a, ok)]
+    return [round(float(v), nd) if k else None for v, k in zip(a, ok)]
+
+
+def _pctile(series, value):
+    """Where today sits in its own history, 0-100. This is the whole point of
+    keeping 25 years: 46% above the 50 DMA means nothing until you know it is
+    the 38th percentile of every day since 2001."""
+    a = pd.to_numeric(series, errors="coerce").dropna().to_numpy()
+    if not len(a) or value is None or not np.isfinite(value):
+        return None
+    return float((a <= value).mean() * 100)
+
+
+def _ord(n):
+    n = int(round(n))
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def _ctx_strip(g):
+    """'Today in context' — each headline number beside its own 25-year
+    percentile, so the reader can tell a normal day from an extreme one."""
+    last = g.iloc[-1]
+    items = [
+        ("% above 50 DMA", "pct_above_50dma", "{:.0f}%", False),
+        ("% above 200 DMA", "pct_above_200dma", "{:.0f}%", False),
+        ("% >20% below own 52w high", "pct_dd20", "{:.0f}%", True),
+        ("Median dist. from 52w high", "median_dd_from_52w_high", "{:.0f}%", False),
+        ("New 52w highs − lows", "net_hl", "{:+.0f}", False),
+        ("Advancing", "pct_advancing", "{:.0f}%", False),
+        ("Up-share of turnover", "pct_turnover_up", "{:.0f}%", False),
+        ("McClellan oscillator", "mcclellan_osc", "{:+.0f}", False),
+    ]
+    out = []
+    for label, col, fmt, invert in items:
+        if col not in g.columns:
+            continue
+        v = last.get(col)
+        v = None if v is None or pd.isna(v) else float(v)
+        p = _pctile(g[col], v)
+        disp = "—" if v is None else fmt.format(v)
+        if p is None:
+            pc, ptxt = "#bbb", "—"
+        else:
+            rank = 100 - p if invert else p
+            pc = "#1a7a3a" if rank >= 65 else ("#c0392b" if rank <= 35 else "#a66300")
+            ptxt = f"{_ord(p)} pct"
+        out.append(
+            f'<div style="flex:1;min-width:132px;background:#fff;border:1px solid #e3e7ee;'
+            f'border-radius:8px;padding:7px 9px">'
+            f'<div style="font-size:10px;color:#666;line-height:1.25">{label}</div>'
+            f'<div style="font-size:19px;font-weight:800;color:{pc}">{disp}</div>'
+            f'<div style="font-size:10px;color:#999">{ptxt} since {g["date"].iloc[0].year}</div>'
+            f'</div>')
+    return "".join(out)
+
+
+def _nifty_for_dates(dates, drive, idx_folder):
+    """Nifty 50 close aligned to the breadth date index. Drive's copy is
+    CI-fresh but shallow-ish; guru/data/macro_hist goes back to 2007 and is
+    stale (refresh_daily.py does not touch macro_hist). Union them and prefer
+    Drive, so the line is both deep and current without a new fetch."""
+    frames = []
+    loc = os.path.join(os.path.dirname(_SD), "guru", "data", "macro_hist",
+                       "NIFTY_50.parquet")
+    if os.path.exists(loc):
+        try:
+            frames.append(pd.read_parquet(loc, columns=["date", "close"]))
+        except Exception:
+            pass
+    try:
+        dr = _read_parquet(drive, idx_folder, "NIFTY_50.parquet")
+        if not dr.empty and {"date", "close"} <= set(dr.columns):
+            frames.append(dr[["date", "close"]])
+    except Exception:
+        pass
+    if not frames:
+        return None
+    n = pd.concat(frames, ignore_index=True)
+    n["date"] = pd.to_datetime(n["date"], errors="coerce")
+    n = (n.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+           .sort_values("date").set_index("date")["close"])
+    return pd.to_numeric(n, errors="coerce").reindex(dates).ffill()
+
+
+# Chart id -> (heading, one-line explanation of what it tells you)
+BREADTH_CHARTS = [
+    ("bd_ma", "% of stocks above their moving average",
+     "The core breadth picture. All five lines high = a broad advance; price "
+     "holding while the 10/20 roll over = the rally narrowing."),
+    ("bd_mv3", "Stocks moving more than 3% in a day (up above, down below)", ""),
+    ("bd_mv5", "Stocks moving more than 5% in a day", ""),
+    ("bd_mv10", "Stocks moving more than 10% in a day",
+     "Clusters of big down-days mark capitulation; clusters of big up-days "
+     "mark both bottoms and blow-off tops."),
+    ("bd_hl", "New 52-week highs vs new 52-week lows",
+     "Made an actual new 52-week extreme that day, on intraday high/low."),
+    ("bd_ad", "Advance/decline line (normalised), with its 200-day mean",
+     "Cumulative net advancers as a share of the universe — normalised because "
+     "the universe grows from a few hundred names in 2001 to ~4,500 today. It "
+     "drifts downward even through bull markets (more names fall than rise on "
+     "a typical day), so read the SLOPE, not the level: above its 200-day mean "
+     "and rising is broadening participation."),
+    ("bd_updown", "Up-share of daily turnover",
+     "Share of the day's traded value in advancing stocks. Below 50 for a "
+     "stretch is distribution, whatever the index is doing."),
+    ("bd_dd", "How beaten-up the average stock is",
+     "Share of names more than 20% below their own 52-week high, and the "
+     "median distance from that high. Answers 'the index is fine, so why "
+     "does my book hurt?'"),
+    ("bd_eqw", "Average stock vs Nifty 50 (ratio, rebased)",
+     "Rising = the typical stock is beating the index. Falling = the index is "
+     "being carried by a few heavyweights."),
+    ("bd_mcc", "McClellan oscillator and summation index",
+     "Ratio-adjusted, so it stays comparable as the universe grows."),
+    ("bd_thrust", "Zweig breadth thrust",
+     "10-day average of advancers / (advancers + decliners). A move from below "
+     "0.40 to above 0.615 inside 10 sessions has marked major bottoms."),
+]
+
+
+def _breadth_payload(bd, nifty_by_uni):
+    """{chart_id: {universe: [series...]}} plus a shared date index."""
+    charts = {cid: {} for cid, _, _ in BREADTH_CHARTS}
+    ctx = {}
+    for uni, _ in BREADTH_UNIS:
+        g = bd[bd["universe"].eq(uni)].sort_values("date")
+        if g.empty:
+            continue
+        ctx[uni] = _ctx_strip(g)
+
+        charts["bd_ma"][uni] = [
+            {"n": f"{w} DMA", "c": _C[f"ma{w}"], "t": "line",
+             "v": _vals(g[f"pct_above_{w}dma"], 1)}
+            for w in (10, 20, 50, 100, 200) if f"pct_above_{w}dma" in g.columns]
+
+        for cid, t in (("bd_mv3", 3), ("bd_mv5", 5), ("bd_mv10", 10)):
+            charts[cid][uni] = [
+                {"n": f"up >{t}%", "c": _C["up"], "t": "hist",
+                 "v": _vals(g[f"up_{t}"], as_int=True)},
+                {"n": f"down >{t}%", "c": _C["dn"], "t": "hist",
+                 "v": _vals(g[f"dn_{t}"], as_int=True, neg=True)},
+            ]
+
+        charts["bd_hl"][uni] = [
+            {"n": "new highs", "c": _C["up"], "t": "line",
+             "v": _vals(g["new_52w_high"], as_int=True)},
+            {"n": "new lows", "c": _C["dn"], "t": "line",
+             "v": _vals(g["new_52w_low"], as_int=True)},
+        ]
+        # The A/D line drifts DOWN across the whole sample even through big bull
+        # markets, because in a broad universe more names fall than rise on a
+        # typical day (returns are positively skewed). The level therefore says
+        # little; the slope says everything. Plotting its own 200-day mean
+        # alongside makes that readable: above the mean = breadth improving.
+        ad = pd.to_numeric(g["ad_line_norm"], errors="coerce")
+        charts["bd_ad"][uni] = [
+            {"n": "A/D line", "c": _C["neutral"], "t": "line",
+             "v": _vals(ad, 1)},
+            {"n": "200d mean", "c": _C["ma10"], "t": "line",
+             "v": _vals(ad.rolling(200, min_periods=50).mean(), 1)},
+        ]
+        charts["bd_updown"][uni] = [
+            {"n": "up-share %", "c": _C["neutral"], "t": "line",
+             "v": _vals(g["pct_turnover_up"], 1)}]
+        charts["bd_dd"][uni] = [
+            {"n": "% >20% below high", "c": _C["dn"], "t": "line",
+             "v": _vals(g["pct_dd20"], 1)},
+            {"n": "median dist. from high", "c": _C["amber"], "t": "line",
+             "v": _vals(g["median_dd_from_52w_high"], 1)},
+        ]
+        charts["bd_mcc"][uni] = [
+            {"n": "oscillator", "c": _C["neutral"], "t": "line",
+             "v": _vals(g["mcclellan_osc"], 1)},
+            {"n": "summation", "c": _C["ma200"], "t": "line",
+             "v": _vals(g["mcclellan_summation"], 0)},
+        ]
+        charts["bd_thrust"][uni] = [
+            {"n": "thrust", "c": _C["neutral"], "t": "line",
+             "v": _vals(g["zweig_thrust"], 3)}]
+
+        # Average stock vs Nifty, as a RATIO. The equal-weight index is
+        # rebalanced daily on noisy prices, so its ABSOLUTE level overstates an
+        # investable return badly; the ratio against the index is the honest
+        # form and is also the more useful read.
+        nif = nifty_by_uni.get(uni)
+        eq = pd.to_numeric(g["eqw_index"], errors="coerce").to_numpy("float64")
+        if nif is not None:
+            nv = nif.to_numpy("float64")
+            both = np.isfinite(eq) & np.isfinite(nv) & (nv > 0) & (eq > 0)
+            ratio = np.full(len(eq), np.nan)
+            if both.any():
+                i0 = int(np.argmax(both))
+                ratio[both] = ((eq[both] / eq[i0]) / (nv[both] / nv[i0])) * 100.0
+            charts["bd_eqw"][uni] = [
+                {"n": "avg stock / Nifty", "c": _C["neutral"], "t": "line",
+                 "v": _vals(pd.Series(ratio), 1)}]
+        else:
+            charts["bd_eqw"][uni] = []
+    return charts, ctx
+
+
+def _breadth_block(bd, drive, idx_folder):
+    """Returns (section_html, payload_dict). ("", {}) when the table is absent,
+    so the page is byte-identical to before in that case."""
+    if bd is None or bd.empty:
+        return "", {}
+    dates = pd.DatetimeIndex(sorted(bd["date"].unique()))
+    nifty = _nifty_for_dates(dates, drive, idx_folder)
+    nifty_by_uni = {}
+    for uni, _ in BREADTH_UNIS:
+        g = bd[bd["universe"].eq(uni)].sort_values("date")
+        nifty_by_uni[uni] = (None if nifty is None
+                             else nifty.reindex(pd.DatetimeIndex(g["date"])))
+    charts, ctx = _breadth_payload(bd, nifty_by_uni)
+
+    last = dates[-1]
+    age = int(np.busday_count(last.date(), datetime.now().date()))
+    warn = ""
+    if age > STALE_SESSIONS:
+        warn = (f'<div style="margin:6px 0;padding:7px 10px;background:#fff4e5;'
+                f'border-left:4px solid #e67e22;border-radius:6px;font-size:12px">'
+                f'<b>Breadth data is {age} sessions behind.</b> The local price '
+                f'store ends {last.date()}. Refresh it with '
+                f'<code>python guru/refresh_daily.py --prices</code>, then '
+                f'<code>python guru/build_market_breadth.py</code>.</div>')
+
+    btns = "".join(
+        f'<button class="ub" data-u="{u}" onclick="setUni(\'{u}\')">{lbl}</button>'
+        for u, lbl in BREADTH_UNIS)
+    zbtns = "".join(
+        f'<button class="zb" data-z="{b}" onclick="setZoom({b})">{lbl}</button>'
+        for lbl, b in (("1y", 252), ("3y", 756), ("5y", 1260), ("10y", 2520), ("max", 0)))
+    cards = "".join(
+        f'<div class="card"><h3>{human}</h3>'
+        + (f'<div class="note">{note}</div>' if note else "")
+        + f'<div class="chart bchart" id="{cid}"></div></div>'
+        for cid, human, note in BREADTH_CHARTS)
+
+    return (
+        f'<h2>Market breadth — {dates[0].date()} to {last.date()}</h2>'
+        f'{warn}'
+        f'<div style="font-size:11px;color:#888;margin:0 6px 6px">'
+        f'{len(dates):,} trading days from the local 25-year price store, which '
+        f'includes delisted securities — so past bear markets are not flattered '
+        f'by survivorship. Percentages use each measure\'s own denominator '
+        f'(a 3-year-old stock has no 200 DMA and is excluded from that line).'
+        f'</div>'
+        f'<div class="btnrow"><span class="btnlbl">Universe</span>{btns}</div>'
+        f'<div class="btnrow"><span class="btnlbl">Window</span>{zbtns}</div>'
+        f'<div style="font-size:10px;color:#999;margin:2px 6px 8px" id="unote"></div>'
+        f'<div class="tiles" id="bctx"></div>'
+        f'<div class="charts">{cards}</div>',
+        {"dates": [d.strftime("%Y-%m-%d") for d in dates],
+         "charts": charts, "ctx": ctx, "notes": BREADTH_NOTES,
+         "default": BREADTH_DEFAULT},
+    )
+
+
 _TPL = """<!doctype html><html><head><meta charset="utf-8">
 <title>Market State __DATE__</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -126,6 +447,13 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
  th,td{padding:3px 6px;border-bottom:1px solid #eee}
  th{text-align:right;color:#666;font-weight:600}
  th:first-child,td:first-child{text-align:left}
+ .btnrow{margin:4px 6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+ .btnlbl{font-size:11px;color:#666;min-width:56px}
+ .btnrow button{font:inherit;font-size:11px;padding:4px 10px;border:1px solid #d5dbe5;background:#fff;color:#333;border-radius:14px;cursor:pointer}
+ .btnrow button:hover{border-color:#1a3d6e}
+ .btnrow button.on{background:#1a3d6e;border-color:#1a3d6e;color:#fff;font-weight:600}
+ .note{font-size:10px;color:#888;margin:0 0 5px;line-height:1.35}
+ .bchart{height:230px}
  @media(max-width:820px){.charts{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 <h1>__HEADLINE__</h1>
@@ -133,6 +461,7 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
 <div class="tiles">__TILES__</div>
 <h2>Trends (daily)</h2>
 <div class="charts">__CHARTS__</div>
+__BREADTH__
 <h2>Index dashboard — returns by horizon</h2>
 <div class="card"><table>__IDXTABLE__</table></div>
 <h2>Sector rotation (vs Nifty 500)</h2>
@@ -157,6 +486,55 @@ function line(id,color,area){
  ch.timeScale().fitContent();
 }
 __DRAW__
+
+/* ---- breadth history. Separate from line() above on purpose: these series
+   ship as compact parallel arrays against one shared date index (~4x smaller
+   than {time,value} objects over 25 years x 4 universes), and they are rebuilt
+   on every universe switch. The seven charts above are untouched. ---- */
+const BP=__BPAYLOAD__;
+let _bch=[], _buni=(BP&&BP.default)||'liquid', _bwin=756;
+function _bmk(cid,spec){
+ const el=document.getElementById(cid); if(!el) return null;
+ const ch=LightweightCharts.createChart(el,{height:230,
+   layout:{textColor:'#333',background:{color:'#fff'}},
+   rightPriceScale:{borderColor:'#eee'},timeScale:{borderColor:'#eee'},
+   grid:{horzLines:{color:'#f3f3f3'},vertLines:{color:'#fafafa'}}});
+ const D=BP.dates;
+ (spec||[]).forEach(function(s){
+   const d=[],v=s.v||[];
+   for(let i=0;i<v.length;i++){ if(v[i]===null||v[i]===undefined) continue;
+     d.push({time:D[i],value:v[i]}); }
+   const ser = s.t==='hist'
+     ? ch.addHistogramSeries({color:s.c,title:s.n,priceLineVisible:false})
+     : ch.addLineSeries({color:s.c,lineWidth:2,title:s.n,priceLineVisible:false});
+   ser.setData(d);
+ });
+ return ch;
+}
+function bwin(){
+ const n=BP.dates.length;
+ _bch.forEach(function(ch){ try{
+   if(_bwin>0 && _bwin<n) ch.timeScale().setVisibleLogicalRange({from:n-_bwin,to:n-1});
+   else ch.timeScale().fitContent();
+ }catch(e){} });
+}
+function bdraw(){
+ _bch.forEach(function(c){ try{c.remove();}catch(e){} }); _bch=[];
+ Object.keys(BP.charts||{}).forEach(function(cid){
+   const ch=_bmk(cid,(BP.charts[cid]||{})[_buni]); if(ch)_bch.push(ch); });
+ const cx=document.getElementById('bctx'); if(cx) cx.innerHTML=(BP.ctx||{})[_buni]||'';
+ const un=document.getElementById('unote'); if(un) un.innerHTML=(BP.notes||{})[_buni]||'';
+ bwin();
+}
+function _bmark(cls,attr,val){
+ document.querySelectorAll('.'+cls).forEach(function(b){
+   b.classList.toggle('on', b.getAttribute(attr)===String(val)); });
+}
+function setUni(u){ _buni=u; _bmark('ub','data-u',u); bdraw(); }
+function setZoom(b){ _bwin=b; _bmark('zb','data-z',b); bwin(); }
+if(BP && BP.dates && BP.dates.length){
+ _bmark('ub','data-u',_buni); _bmark('zb','data-z',_bwin); bdraw();
+}
 </script></body></html>"""
 
 
@@ -326,8 +704,20 @@ def main():
                               order=["Largecap", "Midcap", "Smallcap", "Microcap"])
         secbreadth = _breadth("sector", "Sector")
 
+    # ---- breadth history (local guru store; absent -> section omitted) ----
+    bd = _load_breadth()
+    breadth_html, bpayload = _breadth_block(bd, drive, idx)
+    if bd is None:
+        log("breadth: market_breadth.parquet not found — section omitted "
+            "(build it with guru/build_market_breadth.py)")
+    else:
+        log(f"breadth: {bd['date'].nunique():,} days x "
+            f"{bd['universe'].nunique()} universes, "
+            f"{bd['date'].min().date()} -> {bd['date'].max().date()}")
+
     if args.dry_run:
         log(f"DRY-RUN — {len(chart_ids)} trend charts, "
+            f"{len(BREADTH_CHARTS) if breadth_html else 0} breadth charts, "
             f"{len(body)} indices, {len(sect)} sectors; no file written.")
         return
 
@@ -337,7 +727,9 @@ def main():
                 .replace("__IDXTABLE__", idxtable).replace("__SECTABLE__", sectable)
                 .replace("__SEGBREADTH__", segbreadth).replace("__SECBREADTH__", secbreadth)
                 .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
-                .replace("__DRAW__", draw))
+                .replace("__DRAW__", draw)
+                .replace("__BREADTH__", breadth_html)
+                .replace("__BPAYLOAD__", json.dumps(bpayload, separators=(",", ":"))))
     out = os.path.join(os.path.dirname(_SD), args.out)
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
