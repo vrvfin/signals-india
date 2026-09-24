@@ -48,7 +48,7 @@ def _drive_link(svc, report_path: str, root: str) -> str:
         parts = report_path.rsplit("/", 1)
         folder_path = parts[0] if len(parts) == 2 else ""
         file_name   = parts[-1]
-        folder_id   = _folder_id(svc, root, folder_path, create=False)
+        folder_id   = _folder_id(svc, folder_path, root, create=False)
         if folder_id:
             resp = svc.files().list(
                 q=f"'{folder_id}' in parents and name='{file_name}'",
