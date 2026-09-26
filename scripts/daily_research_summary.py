@@ -359,21 +359,28 @@ def build_vocab_block(vocab: pd.DataFrame) -> str:
             "\nDOC_TYPES: " + slugs("doc_type") + "\nTHEMES: " + slugs("theme"))
 
 def alias_map(vocab: pd.DataFrame) -> dict:
+    """{tag_type: {alias: slug}} — per type, because one phrase can name tags of several
+    types ("quick commerce" = an industry AND a theme); a flat map let a theme slug land in
+    the sectors list."""
     m = {}
     for _, r in vocab.iterrows():
         if r.status != "closed":
             continue
-        m[r.tag_slug] = r.tag_slug
+        t = m.setdefault(r.tag_type, {})
+        t[r.tag_slug] = r.tag_slug
         for a in str(r.aliases or "").split("|"):
             if a.strip():
-                m[re.sub(r"\s+", " ", a.strip().lower())] = r.tag_slug
+                t.setdefault(re.sub(r"\s+", " ", a.strip().lower()), r.tag_slug)
     return m
 
 def normalise_list(vals, amap, closed_set, fallback):
+    """amap: the {alias: slug} map of ONE tag type (alias_map(vocab)[type])."""
     out = []
     for v in (vals or []):
         k = re.sub(r"\s+", " ", str(v).strip().lower())
         slug = amap.get(k, k if k in closed_set else fallback)
+        if slug and slug != fallback and slug not in closed_set:
+            slug = fallback                      # never let another type's slug through
         if slug and slug not in out:
             out.append(slug)
     return out
@@ -525,8 +532,12 @@ def main():
     # vocab + universe (from Drive)
     vocab = universe = None; vblock = ""
     vb = drive_download(svc, DRIVE["vocab_parquet"], root)
-    if vb:
-        vocab = pd.read_parquet(io.BytesIO(vb)); vblock = build_vocab_block(vocab)
+    if not vb:
+        # Without the vocabulary the prompt gets no tag list and normalise_list() maps every
+        # sector to other_sector — this silently mistagged 2,694 of 2,761 docs before 2026-09.
+        sys.exit(f"Tag vocabulary missing on Drive ({DRIVE['vocab_parquet']}). "
+                 "Run: python scripts/build_tag_aliases.py --upload")
+    vocab = pd.read_parquet(io.BytesIO(vb)); vblock = build_vocab_block(vocab)
     uv = drive_download(svc, DRIVE["universe_csv"], root)
     if uv:
         universe = pd.read_csv(io.BytesIO(uv))
@@ -615,9 +626,9 @@ def main():
                        processed_at=dt.datetime.now().isoformat(), status="dup")
             seen_hash.add(h); _move_duplicate(pdf); counts["dup"] += 1; continue
 
-        sectors = normalise_list(meta.get("sectors"),  amap, closed.get("sector", set()),  "other_sector")
-        subs    = normalise_list(meta.get("subsectors"), amap, closed.get("subsector", set()), "")
-        themes  = normalise_list(meta.get("themes"),   amap, closed.get("theme", set()),   "")
+        sectors = normalise_list(meta.get("sectors"),  amap.get("sector", {}),    closed.get("sector", set()),    "other_sector")
+        subs    = normalise_list(meta.get("subsectors"), amap.get("subsector", {}), closed.get("subsector", set()), "")
+        themes  = normalise_list(meta.get("themes"),   amap.get("theme", {}),     closed.get("theme", set()),     "")
         isins   = resolve_isins(meta.get("companies", []), universe)
         tags    = [meta["doc_type"]] + sectors + themes
 

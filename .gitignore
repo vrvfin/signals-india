@@ -83,3 +83,7 @@ guru/data/
 guru/backtest/
 guru/*.bak
 guru/**/*.bak
+
+# tag vocabulary v2: hand-reviewed alias corrections are source, not output
+!scripts/tag_aliases_manual.csv
+_vocab_report/
