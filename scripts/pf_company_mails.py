@@ -840,6 +840,24 @@ def _narrative_html(narrative, title: str, sub: str) -> str:
               f"margin:0 0 14px'>{inner}</div>")
 
 
+def _size_band(text) -> str:
+    """How big the report is, to an order of magnitude. NOT a hash.
+
+    Fingerprinting the prose was rejected on purpose and stays rejected: the body is an
+    LLM pass over a long PDF, its wording drifts between extractions, and a hash would
+    mark almost every re-read as changed and re-send the book. A DECIMAL MAGNITUDE does
+    not drift - a report stays in the 10k-99k band while its sentences move around - but
+    it moves decisively when a document is REPAIRED.
+
+    Raymond Realty is the case this exists for. Its FY26 annual report was stored as 481
+    real characters (a title, one table heading, then 119,686 spaces). The re-read that
+    fixed it produced 22,180. Band 3 -> 5. Without this the key was "FY26|1" before and
+    "FY26|1" after - identical - so the good report would never have been mailed, and it
+    had to be forced by hand on 2026-09-23.
+    """
+    return str(len(str(len(str(text or "").strip()))))
+
+
 def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
     """Coarse fingerprint for a narrative document: its period, and whether a narrative
     could be lifted at all.
@@ -857,11 +875,14 @@ def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
     n = (tables.get("_narr") or {}).get((str(isin).strip(), doc_type)) or {}
     per = str(n.get("period") or "").strip().upper()
     _t = n.get("text")
-    has = "1" if (_t if isinstance(_t, str) else "".join(x for _h, x in (_t or []))
-                  ).strip() else "0"
+    _flat = (_t if isinstance(_t, str)
+             else "".join(x for _h, x in (_t or ""))).strip()
+    has = "1" if _flat else "0"
     if not per and has == "0":
         return ""                    # nothing known; no key means no change check
-    return f"{doc_type}|{per}|{has}"
+    # The band is a FOURTH field. pf_coverage compares these keys field-wise, so a row
+    # written before the band existed is not read as changed - see keys_differ().
+    return f"{doc_type}|{per}|{has}|{_size_band(_flat)}"
 
 
 def content_key(doc_type: str, isin: str, tables: dict) -> str:
@@ -3148,6 +3169,18 @@ Management guided to twenty percent growth.
           not _D._is_boundary("## 6. FORENSIC FINANCIAL RISK SCORECARD"))
     check("a marker anywhere in the first lines makes it a boundary",
           _D._is_boundary("## Anything At All", "*Processed: x*\n<!-- doc:abc -->"))
+
+    # ---- the size band: stable under drift, decisive on a repair ---------------
+    # Raymond Realty's real numbers, before and after the re-read that fixed it.
+    check("Raymond's hollow report and its repair sit in different bands",
+          _size_band("x" * 481) == "3" and _size_band("x" * 22180) == "5"
+          and _size_band("x" * 481) != _size_band("x" * 22180))
+    check("wording drift inside a magnitude does not move the band",
+          _size_band("x" * 22180) == _size_band("x" * 31999))
+    check("nothing at all has its own band", _size_band("") == "1"
+          and _size_band(None) == "1")
+    check("the band ignores surrounding whitespace",
+          _size_band("   " + "x" * 22180 + "   ") == _size_band("x" * 22180))
 
     # ---- a report that is mostly SPACES is not a report ------------------------
     # RAYMONDREL's FY26 annual report, measured 2026-09-18: 120,166 stored characters,
