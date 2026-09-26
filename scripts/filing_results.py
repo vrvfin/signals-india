@@ -252,11 +252,56 @@ def apply_unit_check(found: dict[str, dict], refs: dict[str, float], log=None) -
     return found
 
 
+def quarter_end(q) -> str:
+    """'Q2 FY27' -> '2026-09-30' (Indian FY: Q1 Apr-Jun ... Q4 Jan-Mar). '' if unparseable."""
+    m = re.fullmatch(r"Q([1-4])FY(\d{2})", QT.norm_q(q))
+    if not m:
+        return ""
+    qn, fy = int(m.group(1)), 2000 + int(m.group(2))
+    return {1: f"{fy - 1}-06-30", 2: f"{fy - 1}-09-30",
+            3: f"{fy - 1}-12-31", 4: f"{fy}-03-31"}[qn]
+
+
+def drop_impossible_quarters(df: pd.DataFrame, queue: pd.DataFrame | None,
+                             log=None) -> pd.DataFrame:
+    """Drop rows labelled with a quarter that had not ENDED when the filing existed.
+
+    Gemini labels the quarter; nothing checked it. 33 rows filed Aug-Sep 2026 (SYRMA,
+    CPPLUS, HONASA, TDPOWERSYS, SAILIFE ...) read "Q2 FY27" — a quarter that ends 30 Sep —
+    and a few "Q3"/"Q4 FY27". Harmless while the season was Q1; from 1 Oct select_season
+    would have served those Q1 numbers as Q2 results. A quarter cannot be filed before it
+    ends, so the date settles it: the filing date from the queue, else `processed_at`
+    (Gemini ran after the filing, so it is never earlier). Read side only — the stored
+    table is not rewritten. Missing or unparseable dates keep the row (old behaviour).
+    """
+    if df is None or df.empty or "quarter" not in df.columns:
+        return df
+    filed = {}
+    if queue is not None and not queue.empty and {"doc_id", "announcement_date"} <= set(queue.columns):
+        filed = dict(zip(queue["doc_id"].astype(str).str.strip(),
+                         queue["announcement_date"].astype(str).str.slice(0, 10)))
+    keep, dropped = [], []
+    for _, r in df.iterrows():
+        qe = quarter_end(r.get("quarter"))
+        d = filed.get(str(r.get("source_doc_id") or "").strip(), "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            d = str(r.get("processed_at") or "")[:10]
+        ok = not (qe and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d <= qe)
+        keep.append(ok)
+        if not ok:
+            dropped.append(f"{r.get('symbol')} {r.get('quarter')} @{d}")
+    if dropped and log:
+        log(f"filing results: {len(dropped)} row(s) dropped - quarter not yet ended "
+            f"when filed: {', '.join(dropped[:8])}" + (" ..." if len(dropped) > 8 else ""))
+    return df[keep]
+
+
 def load_filing_results(drive, idx, season: str, queue: pd.DataFrame | None = None,
                         log=None, refs: dict | None = None) -> dict[str, dict]:
     """{isin: validated facts} for the season, straight from the filings."""
     from _extractor_base import load_parquet
     df = load_parquet(drive, idx, FILING_NAME, FILING_COLS)
+    df = drop_impossible_quarters(df, queue, log)
     found = select_season(df, season)
     found = attach_filing_dates(found, queue)
     if refs:
@@ -385,6 +430,36 @@ def _self_test() -> int:
     check("pat scaled by the same factor", abs(out["INE9"]["pat_cr"] - 2.62) < 0.01)
     check("a missing ebitda stays missing", out["INE9"]["ebitda_cr"] is None)
     check("the note is carried for the render", "lakh" in out["INE9"]["units_note"])
+
+    # ---- a quarter cannot be filed before it ends (Q1 filings labelled "Q2 FY27")
+    check("quarter_end Q1 FY27", quarter_end("Q1 FY27") == "2026-06-30")
+    check("quarter_end Q2FY27", quarter_end("Q2FY27") == "2026-09-30")
+    check("quarter_end Q3 FY27", quarter_end("Q3 FY27") == "2026-12-31")
+    check("quarter_end Q4 FY27", quarter_end("Q4 FY27") == "2027-03-31")
+    check("quarter_end blank", quarter_end("") == "")
+    dq = _df([
+        {"isin": "INE040", "symbol": "SYRMA", "quarter": "Q2 FY27", "revenue_cr": "900",
+         "processed_at": "2026-07-29T11:06:58", "source_doc_id": "s1"},
+        {"isin": "INE041", "symbol": "REAL2", "quarter": "Q2 FY27", "revenue_cr": "500",
+         "processed_at": "2026-10-20T09:00:00", "source_doc_id": "s2"},
+        {"isin": "INE042", "symbol": "LATEQ1", "quarter": "Q1 FY27", "revenue_cr": "300",
+         "processed_at": "2026-10-05T09:00:00", "source_doc_id": "s3"},
+        {"isin": "INE043", "symbol": "NODATE", "quarter": "Q2 FY27", "revenue_cr": "200",
+         "processed_at": "", "source_doc_id": "s4"},
+    ])
+    qq = pd.DataFrame([{"doc_id": "s3", "announcement_date": "2026-08-12"},
+                       {"doc_id": "s2", "announcement_date": "2026-10-18"}])
+    kept = drop_impossible_quarters(dq, qq)
+    ks = set(kept["symbol"])
+    check("Q2-labelled row processed in July is dropped", "SYRMA" not in ks)
+    check("genuine Q2 row filed in October survives", "REAL2" in ks)
+    check("filing date (queue) wins over processed_at", "LATEQ1" in ks)
+    check("no usable date keeps the row (old behaviour)", "NODATE" in ks)
+    check("Q2 season never serves a Q1 filing",
+          set(select_season(kept, "Q2FY27")) == {"INE041", "INE043"})
+    check("no queue still works (processed_at fallback)",
+          "SYRMA" not in set(drop_impossible_quarters(dq, None)["symbol"]))
+    check("empty frame passes through", drop_impossible_quarters(pd.DataFrame(), qq).empty)
 
     print(f"\nfiling_results self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

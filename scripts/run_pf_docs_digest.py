@@ -667,6 +667,33 @@ def main() -> None:
         print(f"\nDRY RUN — preview saved to {prev.name}; no ledger write, no mail.")
         return
 
+    send_and_record(drive, index_id, mailed, blocks, html, n_docs)
+
+
+def send_and_record(drive, index_id, mailed, blocks, html, n_docs, *,
+                    send=None, save=None, settings=None) -> bool:
+    """Send the digest; ONLY a delivered mail marks its items as mailed.
+
+    The ledger used to be written BEFORE the toggle check and the send, so a failed send
+    or a toggled-off mail burnt those documents for good — they never reached the reader.
+    Now a failed/skipped send leaves the ledger untouched and the items retry on the next
+    run (bounded by the --days arrival window, so switching the toggle back on is no flood).
+    send/save/settings are injectable so the self-test can prove this without Drive/SMTP.
+    """
+    send = send or send_email
+    save = save or save_parquet
+    settings = settings or load_mail_settings
+    if not settings(drive, index_id).get("pf_docs_digest", True):
+        log("pf_docs_digest mail toggled OFF — skipped (items stay unmailed).")
+        return False
+    subject = f"📂 PF new documents — {n_docs} across {len(blocks)} stocks — {date.today()}"
+    sent = send(subject, html)
+    log(f"Email {'sent' if sent else 'FAILED'}: "
+        f"{subject.encode('ascii', 'ignore').decode().strip()}")
+    if not sent:
+        log("send failed — ledger NOT updated; items retry next run.")
+        return False
+
     # record every reported item so it never mails again
     _now = datetime.now().isoformat(timespec="seconds")
     new_rows = [{"item_id": _id, "isin": isin, "symbol": v["symbol"],
@@ -676,22 +703,50 @@ def main() -> None:
                 for (dt, _h, _s, _id, arr) in v["items"]]
     if new_rows:
         combined = pd.concat([mailed, pd.DataFrame(new_rows, columns=MAILED_COLS)],
-                             ignore_index=True) if not mailed.empty \
+                             ignore_index=True) if mailed is not None and not mailed.empty \
             else pd.DataFrame(new_rows, columns=MAILED_COLS)
-        save_parquet(drive, index_id, MAILED_NAME, combined)
+        save(drive, index_id, MAILED_NAME, combined)
         _pend = sum(1 for r in new_rows if r["summary_state"] == "pending")
         log(f"ledger updated: +{len(new_rows)} -> {len(combined)} rows"
             + (f" ({_pend} pending - will retry until extracted or "
                f"{LEDGER_BURN_DAYS}d old)" if _pend else ""))
+    return True
 
-    if not load_mail_settings(drive, index_id).get("pf_docs_digest", True):
-        log("pf_docs_digest mail toggled OFF — skipped.")
-        return
-    subject = f"📂 PF new documents — {n_docs} across {len(blocks)} stocks — {date.today()}"
-    sent = send_email(subject, html)
-    log(f"Email {'sent' if sent else 'FAILED'}: "
-        f"{subject.encode('ascii', 'ignore').decode().strip()}")
+
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        ok, fail = (ok + 1, fail) if cond else (ok, fail + 1)
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+
+    blocks = {"INE1": {"symbol": "AAA", "name": "A Ltd",
+                       "items": [("rating", "h", "summary", "id1", "2026-09-24")]}}
+    saved = []
+    save = lambda d, i, n, df: saved.append(df)
+    on = lambda d, i: {"pf_docs_digest": True}
+    off = lambda d, i: {"pf_docs_digest": False}
+    empty = pd.DataFrame(columns=MAILED_COLS)
+
+    r = send_and_record(None, "x", empty, blocks, "<p>", 1,
+                        send=lambda s, h: False, save=save, settings=on)
+    check("failed send does NOT write the ledger", r is False and not saved)
+    r = send_and_record(None, "x", empty, blocks, "<p>", 1,
+                        send=lambda s, h: True, save=save, settings=off)
+    check("toggled-off mail does NOT write the ledger", r is False and not saved)
+    sent = []
+    r = send_and_record(None, "x", empty, blocks, "<p>", 1,
+                        send=lambda s, h: sent.append(s) or True, save=save, settings=on)
+    check("delivered mail writes the ledger once", r is True and len(saved) == 1)
+    check("ledger row carries the item id",
+          saved and list(saved[0]["item_id"]) == ["id1"])
+    check("exactly one mail sent", len(sent) == 1)
+    print(f"\nrun_pf_docs_digest self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
     main()

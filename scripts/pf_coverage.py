@@ -304,7 +304,23 @@ def scheduled_ahead(calendar: pd.DataFrame, pf, on: date | None = None,
     return {str(i).strip(): by_sym[_norm(s)] for i, s, _n in pf if _norm(s) in by_sym}
 
 
-def mailed_content_keys(ledger: pd.DataFrame, season: str) -> dict:
+def _season_rows(ledger: pd.DataFrame, season: str | None) -> pd.DataFrame:
+    """Ledger rows for `season`, or EVERY row when season is None.
+
+    None is what the mail decisions pass. A document's identity does not change when the
+    quarter label does: filtering on the current season made every rating, deck and FY
+    annual report mailed in Q1 look unmailed the moment Q2 began — measured 2026-09-25 on
+    the live ledger, 3 due mails became 120 on a simulated 1 Oct. An explicit season keeps
+    the old, per-season answer for any caller that wants it.
+    """
+    if season is None:
+        return ledger
+    if "season" not in ledger.columns:
+        return ledger.iloc[0:0]
+    return ledger[ledger["season"].astype(str) == str(season)]
+
+
+def mailed_content_keys(ledger: pd.DataFrame, season: str | None) -> dict:
     """{doc_id: content_key} for ledger rows that recorded one.
 
     A row written before `content_key` existed returns nothing, which is what keeps the
@@ -314,7 +330,7 @@ def mailed_content_keys(ledger: pd.DataFrame, season: str) -> dict:
         return {}
     if "doc_id" not in ledger.columns or "content_key" not in ledger.columns:
         return {}
-    l = ledger[ledger["season"].astype(str) == str(season)]
+    l = _season_rows(ledger, season)
     out = {}
     for _, r in l.iterrows():
         d = str(r.get("doc_id") or "").strip()
@@ -324,16 +340,16 @@ def mailed_content_keys(ledger: pd.DataFrame, season: str) -> dict:
     return out
 
 
-def already_mailed_docs(ledger: pd.DataFrame, season: str) -> set[str]:
-    """Set of doc_ids already mailed this season."""
+def already_mailed_docs(ledger: pd.DataFrame, season: str | None) -> set[str]:
+    """Set of doc_ids already mailed this season (season=None: in any season)."""
     if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
         return set()
-    l = ledger[ledger["season"].astype(str) == str(season)]
+    l = _season_rows(ledger, season)
     return {str(x).strip() for x in l["doc_id"] if str(x).strip()
             and str(x).strip().lower() not in ("none", "nan")}
 
 
-def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
+def tracked_docs(ledger: pd.DataFrame, season: str | None) -> set[tuple[str, str]]:
     """{(isin, doc_type)} that have at least one ledger row CARRYING a doc_id.
 
     Distinguishes "this company has never been mailed under the doc_id scheme" from
@@ -342,7 +358,7 @@ def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     """
     if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
         return set()
-    l = ledger[ledger["season"].astype(str) == str(season)]
+    l = _season_rows(ledger, season)
     out = set()
     for _, r in l.iterrows():
         d = str(r.get("doc_id") or "").strip()
@@ -351,15 +367,15 @@ def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     return out
 
 
-def already_mailed(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
-    """{(isin, doc_type)} already delivered for this season."""
+def already_mailed(ledger: pd.DataFrame, season: str | None) -> set[tuple[str, str]]:
+    """{(isin, doc_type)} already delivered for this season (season=None: any season)."""
     if ledger is None or ledger.empty:
         return set()
     l = ledger.copy()
     for c in ("season", "isin", "doc_type"):
         if c not in l.columns:
             l[c] = ""
-    l = l[l["season"].astype(str) == str(season)]
+    l = _season_rows(l, season)
     return {(str(r["isin"]).strip(), str(r["doc_type"]))
             for _, r in l.iterrows()}
 
@@ -451,9 +467,11 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
     on = on or date.today()
     cov = coverage(pf, queue, season, doc_types=doc_types, tables=tables)
     latest = latest_doc_per_type(pf, queue, doc_types)
-    mailed_docs = already_mailed_docs(ledger, season)
-    legacy = already_mailed(ledger, season)
-    tracked = tracked_docs(ledger, season)
+    # season=None: "delivered" means mailed in ANY season — the same memory mail_due uses,
+    # so a rating mailed in Q1 is not reported as outstanding the day Q2 begins.
+    mailed_docs = already_mailed_docs(ledger, None)
+    legacy = already_mailed(ledger, None)
+    tracked = tracked_docs(ledger, None)
     reporting = reporting_on(calendar, pf, on, window_days=120)   # whole season so far
     upcoming = scheduled_ahead(calendar, pf, on)                  # meetings still to come
 
@@ -537,10 +555,12 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
     on = on or date.today()
     cov = coverage(pf, queue, season, doc_types=doc_types, tables=tables)
     latest = latest_doc_per_type(pf, queue, doc_types)
-    mailed_docs = already_mailed_docs(ledger, season)
-    legacy = already_mailed(ledger, season)          # rows written before doc_id existed
-    tracked = tracked_docs(ledger, season)           # ...and those written after
-    prev_keys = mailed_content_keys(ledger, season)  # what the mail actually SAID
+    # The ledger is read ACROSS seasons (None): a document mailed in Q1 stays mailed in Q2.
+    # Season-scoped reads here re-sent 117 rating/AR/deck mails on a simulated 1 Oct.
+    mailed_docs = already_mailed_docs(ledger, None)
+    legacy = already_mailed(ledger, None)            # rows written before doc_id existed
+    tracked = tracked_docs(ledger, None)             # ...and those written after
+    prev_keys = mailed_content_keys(ledger, None)    # what the mail actually SAID
     reporting = reporting_on(calendar, pf, on, window_days)
 
     out = []
@@ -909,6 +929,40 @@ def _self_test() -> int:
           mailed_content_keys(led_corr, "Q2FY27") == {})
     check("mailed_content_keys tolerates a missing column",
           mailed_content_keys(led_legacy_k, "Q1FY27") == {})
+
+    # ---- THE QUARTER TURNS (1 Oct 2026): a Q1-mailed document is still mailed in Q2.
+    # Season-scoped reads re-sent 117 rating/AR/deck mails on a simulated 1 Oct.
+    check("season change: Q1-mailed rating is NOT due in Q2",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q2FY27",
+                       on=date(2026, 10, 1),
+                       content_keys={"tatva1": "CRISIL|D|STABLE|REAFFIRMED"}))
+    check("season change: a correction still re-sends in Q2",
+          len(mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q2FY27",
+                        on=date(2026, 10, 1),
+                        content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"})) == 1)
+    q_new = _q([{"isin": "INE1", "doc_type": "rating", "status": "done",
+                 "announcement_date": "2026-10-03", "doc_id": "tatva2"}])
+    check("season change: a genuinely NEW rating is due in Q2",
+          [d["doc_id"] for d in mail_due([pf[0]], q_new, pd.DataFrame(), led_corr,
+                                         "Q2FY27", on=date(2026, 10, 4))] == ["tatva2"])
+    check("explicit season still filters (old answer kept for callers)",
+          already_mailed_docs(led_corr, "Q2FY27") == set()
+          and already_mailed_docs(led_corr, None) == {"tatva1"})
+    # Legacy rows (no doc_id) keep their existing per-company suppression, now across
+    # seasons too (user decision 2026-09-26: no date rule — it would have mailed 15
+    # ratings on the first run, 9 of them old ratings re-discovered by a 31 Aug sweep).
+    led_leg = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                             "doc_id": "None", "mailed_at": "2026-08-15T10:00:00"}])
+    check("legacy row suppresses its company's rating across seasons",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_leg, "Q2FY27",
+                       on=date(2026, 10, 1)))
+    check("legacy row keeps today's behaviour for a newer doc (suppressed)",
+          not mail_due([pf[0]], q_new, pd.DataFrame(), led_leg, "Q2FY27",
+                       on=date(2026, 10, 4)))
+    st = season_status([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q2FY27",
+                       on=date(2026, 10, 1), doc_types=("rating",))
+    check("season status: Q1-mailed rating reads delivered in Q2",
+          [r["state"] for r in st] == [DELIVERED])
 
     print(f"\npf_coverage self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
