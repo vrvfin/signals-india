@@ -250,22 +250,114 @@ def parse_results_page(html: str, run_ts: str) -> list[dict]:
             })
     return rows
 
+_BLANK = {"", "nan", "none", "<na>"}
+
+
+def _code(v) -> str:
+    """'533022', 533022, 533022.0 and '533022.0' all -> '533022'. Blank -> ''."""
+    s = str(v if v is not None else "").strip()
+    if s.lower() in _BLANK:
+        return ""
+    return re.sub(r"\.0+$", "", s)
+
+
+def build_slug_isin_map(uni: pd.DataFrame) -> dict:
+    """{feed slug -> isin} from company_universe (NSE symbol, else BSE code).
+
+    The feed's slug is the NSE symbol, or the raw BSE code for BSE-first pages. The
+    universe used to be read without dtype=str, so bse_code came back as a FLOAT and the
+    key was "533022.0" — which no slug ever equals. Measured 2026-09-25: 7,372 of 14,484
+    rows (1,445 companies) carried a blank isin, 1,237 of them resolvable by this fix.
+    """
+    m = {}
+    if uni is None or uni.empty:
+        return m
+    for _, r in uni.iterrows():
+        isin = str(r.get("isin", "") or "").strip()
+        if isin.lower() in _BLANK:
+            continue
+        sym = str(r.get("nse_symbol", "") or "").strip()
+        if sym.lower() not in _BLANK:
+            m[sym] = isin
+        code = _code(r.get("bse_code", ""))
+        if code:
+            m[code] = isin
+    return m
+
+
 def load_slug_isin_map(drive, index_id) -> dict:
     fid = find_file(drive, index_id, "company_universe.csv")
     if not fid:
         return {}
     try:
-        uni = pd.read_csv(io.BytesIO(download_bytes(drive, fid)))
-        m = {}
-        for _, r in uni.iterrows():
-            isin = str(r.get("isin", ""))
-            if str(r.get("nse_symbol", "")):
-                m[str(r["nse_symbol"])] = isin
-            if str(r.get("bse_code", "")) and str(r["bse_code"]) != "nan":
-                m[str(r["bse_code"])] = isin
-        return m
+        uni = pd.read_csv(io.BytesIO(download_bytes(drive, fid)), dtype=str)
+        return build_slug_isin_map(uni)
     except Exception:
         return {}
+
+
+def fill_blank_isins(df: pd.DataFrame, slug2isin: dict) -> tuple[pd.DataFrame, int, int]:
+    """Fill ONLY blank isin cells from the map. Never overwrites an existing isin.
+
+    The upsert only sets isin on rows scraped in the current run, so rows stored while
+    the map was broken stayed blank forever. Running this over the whole table on every
+    scrape heals them. Returns (df, rows_filled, companies_filled).
+    """
+    if df is None or df.empty or "slug" not in df.columns or not slug2isin:
+        return df, 0, 0
+    df = df.copy()
+    if "isin" not in df.columns:
+        df["isin"] = ""
+    cur = df["isin"].astype(str).str.strip()
+    blank = cur.str.lower().isin(_BLANK)
+    cand = df.loc[blank, "slug"].map(lambda s: slug2isin.get(str(s).strip(), ""))
+    hit = cand[cand != ""]
+    if hit.empty:
+        return df, 0, 0
+    df.loc[hit.index, "isin"] = hit
+    return df, len(hit), df.loc[hit.index, "slug"].nunique()
+
+
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        ok, fail = (ok + 1, fail) if cond else (ok, fail + 1)
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+
+    check("float code", _code(533022.0) == "533022")
+    check("float-string code", _code("533022.0") == "533022")
+    check("int code", _code(533022) == "533022")
+    check("plain code", _code(" 533022 ") == "533022")
+    check("nan code is blank", _code(float("nan")) == "" and _code("nan") == "")
+    check("None code is blank", _code(None) == "")
+
+    # universe as the OLD read produced it (float bse_code) and as dtype=str does
+    uni_f = pd.DataFrame({"isin": ["INE1", "INE2", "INE3"],
+                          "nse_symbol": ["AAA", None, "CCC"],
+                          "bse_code": [500001.0, 533022.0, float("nan")]})
+    uni_s = uni_f.astype(object).where(uni_f.notna(), "").astype(str)
+    for label, u in (("float universe", uni_f), ("string universe", uni_s)):
+        m = build_slug_isin_map(u)
+        check(f"{label}: BSE-code slug resolves", m.get("533022") == "INE2")
+        check(f"{label}: NSE slug resolves", m.get("AAA") == "INE1")
+        check(f"{label}: no '.0' keys", not any(k.endswith(".0") for k in m))
+        check(f"{label}: no 'nan' keys", "nan" not in m and "" not in m)
+
+    m = build_slug_isin_map(uni_s)
+    res = pd.DataFrame({"slug": ["533022", "533022", "AAA", "999999", "CCC"],
+                        "isin": ["", "nan", "INE_KEEP", "", "INE3"]})
+    out, n, nco = fill_blank_isins(res, m)
+    check("blank rows filled", list(out["isin"][:2]) == ["INE2", "INE2"])
+    check("existing isin never overwritten", out["isin"][2] == "INE_KEEP")
+    check("unknown slug stays blank", out["isin"][3] == "")
+    check("counts: 2 rows, 1 company", (n, nco) == (2, 1))
+    check("input frame not mutated", list(res["isin"]) == ["", "nan", "INE_KEEP", "", "INE3"])
+    check("empty map is a no-op", fill_blank_isins(res, {})[1] == 0)
+    check("empty frame is a no-op", fill_blank_isins(pd.DataFrame(), m)[1] == 0)
+    print(f"\nscrape_results_table self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
 
 
 # ---------- Main ----------
@@ -276,7 +368,11 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="scrape and report what WOULD change (new vs updated "
                              "rows); no Drive write")
+    parser.add_argument("--self-test", action="store_true",
+                        help="offline checks of the slug->isin map and blank-isin fill")
     args = parser.parse_args()
+    if args.self_test:
+        raise SystemExit(_self_test())
 
     print("Phase 2 / Stage A — Quarterly results table scrape")
     print("-" * 56)
@@ -353,6 +449,10 @@ def main() -> None:
                                          keep="last")
                 .reset_index(drop=True))
     combined = combined[OUT_COLS]
+    # Heal rows stored while the map was broken (only blank cells; never overwrites).
+    combined, n_fill, n_fill_co = fill_blank_isins(combined, slug2isin)
+    n_blank_left = int(combined["isin"].astype(str).str.strip().str.lower()
+                       .isin(_BLANK).sum())
 
     # Split this run into genuinely NEW keys vs updates to keys already stored, so a
     # deeper walk can be judged on what it actually contributes rather than on row
@@ -371,6 +471,8 @@ def main() -> None:
     print(f"  of which updates         : {n_upd}  (upserted, not appended)")
     print(f"results.parquet rows before: {0 if old is None else len(old)}")
     print(f"results.parquet rows after : {len(combined)}")
+    print(f"blank isin filled          : {n_fill} rows ({n_fill_co} companies); "
+          f"{n_blank_left} rows still blank")
 
     if args.dry_run:
         print("DRY RUN — nothing written to Drive.")
