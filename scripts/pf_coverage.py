@@ -320,6 +320,27 @@ def _season_rows(ledger: pd.DataFrame, season: str | None) -> pd.DataFrame:
     return ledger[ledger["season"].astype(str) == str(season)]
 
 
+def keys_differ(prev: str, cur: str) -> bool:
+    """Do two content keys disagree on a field they BOTH carry?
+
+    FIELDS GET ADDED TO THESE KEYS OVER TIME - the narrative size band arrived
+    2026-09-26 - and a stored key written before a field existed is simply SHORTER.
+    Comparing the whole string would read every one of those as changed and re-send the
+    entire book in one morning, which is the same trap the "both keys must be present"
+    rule already guards against one level up.
+
+    So compare only as far as BOTH keys go. A row stored with three fields is unaffected
+    by the fourth; it starts being protected by the new field from its next send onward,
+    because that send records the full key.
+    """
+    if not str(prev or "").strip() or not str(cur or "").strip():
+        return False                 # unknown on either side is never a change
+    a = str(prev).split("|")
+    b = str(cur).split("|")
+    n = min(len(a), len(b))
+    return a[:n] != b[:n]
+
+
 def mailed_content_keys(ledger: pd.DataFrame, season: str | None) -> dict:
     """{doc_id: content_key} for ledger rows that recorded one.
 
@@ -585,7 +606,7 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
             # this field, and treating unknown as changed would re-send the back catalogue.
             prev = prev_keys.get(doc_id, "")
             cur = (content_keys or {}).get(doc_id, "")
-            if not (prev and cur and prev != cur):
+            if not (prev and cur and keys_differ(prev, cur)):
                 continue
             resend = True
         if not doc_id and (isin, r["doc_type"]) in legacy:
@@ -920,6 +941,28 @@ def _self_test() -> int:
           not mail_due([pf[0]], q_corr, pd.DataFrame(), led_legacy_k, "Q1FY27",
                        on=date(2026, 8, 14),
                        content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"}))
+    # ---- keys grow fields over time, and a SHORTER stored key is not a change ----
+    # The narrative band became a 4th field on 2026-09-26. Every row already in the
+    # ledger has 3. Comparing whole strings would read all of them as changed and mail
+    # the entire book in one morning.
+    check("an older key missing the newest field is NOT a change",
+          not keys_differ("annual_report|FY26|1", "annual_report|FY26|1|5"))
+    check("a repair IS a change once both keys carry the band",
+          keys_differ("annual_report|FY26|1|3", "annual_report|FY26|1|5"))
+    check("disagreement on a shared field still fires",
+          keys_differ("CRISIL|D|STABLE", "CRISIL|BBB+|STABLE|DOWNGRADE"))
+    check("identical keys are not a change",
+          not keys_differ("a|b|c", "a|b|c"))
+    check("an empty key is not a change", not keys_differ("", "a|b")
+          and not keys_differ("a|b", ""))
+    # End to end: Raymond's shape, through mail_due. The stored row is a 3-field key.
+    led_old = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                             "doc_id": "tatva1", "content_key": "CRISIL|D|STABLE"}])
+    check("a 3-field ledger row is not re-sent just because a field was added",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_old, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={"tatva1": "CRISIL|D|STABLE|REAFFIRMED"}))
+
     check("no current key means no re-send either",
           not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
                        on=date(2026, 8, 14), content_keys={}))
