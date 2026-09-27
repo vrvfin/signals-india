@@ -3212,6 +3212,25 @@ Management guided to twenty percent growth.
     _echo = ("Generate the final report immediately without displaying preliminary "
              "steps. No individual paragraph may be longer than 3 lines. The ENTIRE "
              "report must stay under ~1,200 lines. Output must be completely clean.")
+    from _extractor_base import is_prompt_echo as _ipe
+
+    # A COMPLIANT REPORT REPRODUCES THE PROMPT'S SECTION TITLES BY CONSTRUCTION, and for
+    # a while that condemned it. The heading filter knew "Section 1)" and "e-1)" but not
+    # a plain numbered title, so these four lines counted as echoed instructions and
+    # three of them was the threshold. Measured 2026-09-27 over the 1,145 stored
+    # annual-report reports: 7 good ones were discarded, SENORES and MOREPENLAB among
+    # them, and their holders saw no summary. The marker test scored zero on every one.
+    _titles = chr(10).join([
+        "5. Governance & Related-Party Transactions (RPT)",
+        "5b. Management Outlook & Expansion (Chairman's/MD Letter + MD&A)",
+        "6. Forensic Financial Risk Scorecard (Mandatory Weighted Matrix)",
+        "8. Probing Questions for the Next Earnings Call",
+        "Revenue grew 22% to Rs 1,240 crore on volume, and the auditor raised no "
+        "qualification. Receivable days moved from 48 to 61.",
+    ])
+    check("a report carrying the prompt's own section titles is NOT an echo",
+          not _ipe(_titles))
+    check("but real echoed instruction prose still is", _ipe(_echo))
     # WHAT A CONCALL SECTION MUST BE: a concall. NOT a particular quarter (user,
     # 2026-09-13) - a call covering Q4 FY26 that is filed in the Q1 FY27 season is
     # mailed AS Q4 FY26, because it is news the day it is processed. The label comes
