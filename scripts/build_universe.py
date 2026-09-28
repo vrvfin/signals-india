@@ -135,6 +135,8 @@ def fetch_bse_only_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFr
             & ~isin.isin(nse_isins))
     bse = uni[mask].copy()
     if bse.empty:
+        log("  BSE-only appended: 0 — company_universe.csv has no BSE-only rows "
+            "(check the weekly Universe Refresh log for a BSE 403).")
         return pd.DataFrame(columns=cols)
     bse["bse_code"] = code[mask].values
     out = pd.DataFrame({
