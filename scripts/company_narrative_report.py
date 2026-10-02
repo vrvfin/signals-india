@@ -126,17 +126,30 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         # deterministic core. The nightly Screener sweep covers 5,381 companies, but a
         # name outside it had NO on-demand path and simply rendered those sections
         # empty. Pull it here so "any company" really means any company.
+        # STALE too, not only missing. Since the weekly sweep became a gap scan
+        # (2026-08-07) a company is refetched only when its new quarter is due, so
+        # off-season its fetched_at ages past the preflight policy and the story
+        # ABORTED on "statements/summary freshness" with no way to close it.
+        # --symbols is a partial run, so summary.parquet is upserted, not replaced.
         st_now = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
-        if st_now.empty:
+        stale = [ch["id"].split(".", 1)[1] for ch in rep["integrity"]
+                 if ch["id"] in ("STALE.statements", "STALE.summary")
+                 and ch["status"] in ("WARN", "FAIL")]
+        refetched = False
+        if st_now.empty or stale:
             log(f"[1a] no fundamentals/statements/{co['symbol']}.parquet — "
-                f"fetching financials from Screener")
+                f"fetching financials from Screener" if st_now.empty else
+                f"[1a] financials stale ({', '.join(stale)}) — "
+                f"refreshing {co['symbol']} from Screener")
             try:
                 import subprocess
                 subprocess.run([sys.executable,
                                 str(Path(_HERE) / "ingest_fundamentals.py"),
                                 "--symbols", co["symbol"]], check=False, timeout=900)
+                refetched = True
                 store._files.pop((f"{FP.FUND}/statements",
                                   f"{co['symbol']}.parquet"), None)
+                store._files.pop((FP.FUND, "summary.parquet"), None)
                 got = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
                 log(f"     statements now: {len(got)} row(s)"
                     if not got.empty else
@@ -147,6 +160,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         fetchable = [r for r in rep["readiness"] if r["state"] == "FETCHABLE"]
         if not fetchable:
             log("[1b] auto-fetch: nothing fetchable — Drive already has what it can")
+            if refetched:
+                # The [1b] branch re-runs preflight; this one must too, or the verdict
+                # below still sees the pre-refresh freshness FAIL.
+                rep = PRE.run(store, token) or rep
         else:
             log(f"[1b] auto-fetch: {len(fetchable)} section(s) short of documents "
                 f"— pulling from Screener/BSE/NSE")
