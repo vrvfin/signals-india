@@ -69,6 +69,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
 
+      # The report is mailed as a PDF (weasyprint, already in requirements.txt). weasyprint
+      # needs pango/cairo from the OS — the same lines deepdive.yml uses for its PDF mail.
+      - name: Install system deps for PDF rendering
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \
+            libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
+
       # get_drive() reads GDRIVE_OAUTH_CLIENT_SECRET_PATH — a FILE PATH, not inline JSON.
       # Passing GDRIVE_OAUTH_TOKEN_JSON as a per-step env var (my earlier mistake) left
       # that file-path var unset and every step crashed with
@@ -154,10 +163,10 @@ jobs:
           echo "the run will pull the missing data itself."
           exit 1
 
-      # BOTH reports in one job: Part B is handed to the story as a file (--forensic-md), which
-      # cannot cross two separate dispatches — so the deep dive runs here, in this job.
-      # company_deep_report.py writes its local .md only via --open (open_report_local); the
-      # OS "open" call itself fails harmlessly on Linux. Drive copy + deep_dive_index as usual.
+      # BOTH reports in one job: the deep dive runs first, then the story attaches it from
+      # Drive as Part B (--part-b-drive started_at: only a deep dive built by THIS run counts)
+      # — the same path run_report.bat takes locally. --open also keeps local copies (.md,
+      # .pdf) for the artefacts; the OS "open" call itself fails harmlessly on Linux.
       - name: Deep dive first (Part B)
         id: deepdive
         if: inputs.with_deepdive && inputs.names != ''
@@ -173,14 +182,18 @@ jobs:
             echo "::error::with_deepdive takes exactly ONE company (its NSE symbol or ISIN, no spaces): '$NAMES'"
             exit 1
           fi
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           python scripts/company_deep_report.py --names "$NAMES" --open
-          f=$(ls -t "$REPORTS_DIR"/deepdive/*.md 2>/dev/null | head -1)
-          if [ -z "$f" ]; then
-            echo "::warning::the deep dive wrote no local .md — the story will be built WITHOUT Part B"
-          else
-            echo "Part B: $f"
-            echo "forensic=$f" >> "$GITHUB_OUTPUT"
-          fi
+
+      # BOTH = two mails (user 2026-10-02): the deep dive's own PDF as soon as it is built,
+      # then the story (which also carries it as Part B). Same notifier as deepdive.yml;
+      # it mails only reports newer than started_at, so a failed deep dive sends nothing.
+      - name: Email the deep dive (PDF)
+        if: inputs.with_deepdive && inputs.names != '' && inputs.mail
+        continue-on-error: true
+        env:
+          NOTIFY_SINCE: ${{ steps.deepdive.outputs.started_at }}
+        run: python scripts/notify_deepdive.py
 
       - name: Generate narrative report
         # Credentials come from the .env written above (scripts call load_dotenv), so no
@@ -202,7 +215,7 @@ jobs:
             ${{ inputs.sections != '' && format('--sections {0}', inputs.sections) || '' }} \
             ${{ inputs.skip_audit == 'true' && '--skip-audit' || '' }} \
             ${{ inputs.ignore_preflight == 'true' && '--ignore-preflight' || '' }} \
-            ${{ steps.deepdive.outputs.forensic != '' && format('--forensic-md "{0}"', steps.deepdive.outputs.forensic) || '' }}
+            ${{ steps.deepdive.outputs.started_at != '' && format('--part-b-drive "{0}"', steps.deepdive.outputs.started_at) || '' }}
 
       - name: Retention — no raw PDF survives the run
         # CLAUDE.md global rule 1: no raw PDF persists more than 2 days after processing.

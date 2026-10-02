@@ -1985,12 +1985,14 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                 last_update=dt.datetime.now().isoformat(),
                 coverage=json.dumps(cov),
                 _report_md=full_md,   # internal — not persisted to parquet
-                _slug=f"{symbol.lower()}_{dt.datetime.now().strftime('%d%b%y').lower()}")
+                # local file name = company _ report type _ date (same rule as the mail)
+                _slug=__import__("format_deepdive_pdf").report_basename(name, "DeepDive"))
 
 def open_report_local(report_md: str, slug: str,
                       name: str = "", symbol: str = "", isin: str = ""):
-    """Open a markdown report locally — Obsidian if available, else HTML in browser.
-    Also saves .docx and .pptx to the local reports folder.
+    """Save the report locally and open it: the PDF (same file and look as the mail), with
+    the .md beside it and in Obsidian. If no PDF can be made: Obsidian, else HTML in the
+    browser, as before. Also saves .docx and .pptx to the local reports folder.
     """
     obsidian_vault = os.path.join(
         os.environ.get("OBSIDIAN_VAULT", r"D:\EMA_Screener\Obsidian"),
@@ -2027,6 +2029,18 @@ def open_report_local(report_md: str, slug: str,
     except Exception as e:
         print(f"    pptx local save skipped: {e}")
 
+    # save .pdf — the file that opens (user 2026-10-02: PDF or MD, same as the story)
+    pdf_path = None
+    try:
+        from format_deepdive_pdf import md_to_pdf
+        pdf_path = os.path.join(local_dir, f"{slug}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(md_to_pdf(report_md, name, symbol, isin))
+        print(f"    saved pdf: {pdf_path}")
+    except Exception as e:
+        pdf_path = None
+        print(f"    pdf local save skipped: {e}")
+
     # try Obsidian for .md
     try:
         os.makedirs(obsidian_vault, exist_ok=True)
@@ -2034,6 +2048,12 @@ def open_report_local(report_md: str, slug: str,
         with open(obs_path, "w", encoding="utf-8") as f:
             f.write(report_md)
         print(f"    saved to Obsidian: {obs_path}")
+        if pdf_path:
+            try:
+                os.startfile(pdf_path)          # noqa (win) — CI/Linux: no-op
+            except Exception:
+                pass
+            return
         # actually OPEN the note in Obsidian (registered obsidian:// handler). Best-effort:
         # a headless/CI run or a machine without Obsidian just skips this silently.
         try:
@@ -2047,6 +2067,12 @@ def open_report_local(report_md: str, slug: str,
         return
     except Exception:
         pass
+    if pdf_path:                                 # Obsidian unavailable: still open the PDF
+        try:
+            os.startfile(pdf_path)              # noqa (win)
+        except Exception:
+            pass
+        return
 
     # HTML fallback
     try:

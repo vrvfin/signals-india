@@ -49,6 +49,7 @@ import narrative_generate as GEN
 import narrative_preflight as PRE
 import narrative_sources as SRC
 import render_narrative_deck as RENDER
+import format_deepdive_pdf as FMT     # PDF + file naming shared with the deep dive
 
 INDEX_FILE = "narrative_index.parquet"
 INDEX_COLS = ["isin", "symbol", "company_name", "report_file", "as_of",
@@ -347,6 +348,21 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     else:
         log("  --upload not set; nothing written to Drive")
 
+    # ---- PDF: what the mail carries and what opens locally ------------------
+    # Same formatter (and look) as the deep dive. Files a person receives are named
+    # company _ report type _ date (FMT.report_basename); Drive keeps md_p.name.
+    base = FMT.report_basename(co["name"], "Narrative")
+    pdf_p, pdf_err = None, ""
+    if args.mail or args.local_render or args.open:
+        try:
+            pdf_p = outdir / f"{base}.pdf"
+            pdf_p.write_bytes(FMT.md_to_pdf(md, co["name"], co["symbol"], co["isin"],
+                                            title="Narrative"))
+            log(f"  {pdf_p.name}")
+        except Exception as e:
+            pdf_p, pdf_err = None, str(e)[:120]
+            log(f"  pdf FAILED ({pdf_err}) — mail and open fall back to the .html")
+
     # ---- local copies (same destinations as run_deepdive.bat) --------------
     # CI has no Obsidian vault, so this is opt-in rather than automatic; the mail
     # below is what makes a CI run reach the user.
@@ -357,9 +373,12 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             dest = Path(os.environ.get(env_key, default))
             try:
                 dest.mkdir(parents=True, exist_ok=True)
-                (dest / md_p.name).write_text(md, encoding="utf-8")
-                (dest / html_p.name).write_text(html_doc, encoding="utf-8")
-                log(f"  local copy -> {dest / md_p.name}")
+                (dest / f"{base}.md").write_text(md, encoding="utf-8")
+                (dest / f"{base}.html").write_text(html_doc, encoding="utf-8")
+                if pdf_p and env_key == "REPORTS_DIR":
+                    (dest / pdf_p.name).write_bytes(pdf_p.read_bytes())
+                    pdf_p = dest / pdf_p.name           # open the copy people keep
+                log(f"  local copy -> {dest / base}.md")
             except Exception as e:
                 log(f"  local copy to {dest} failed: {str(e)[:110]}")
 
@@ -376,30 +395,46 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                           f"</b> claims verified · {asum.get('unsupported', 0)} "
                           f"unsupported · {asum.get('contradicted', 0)} contradicted"
                           if audit else "Audit: not run for this copy.")
+            # PDF ONLY, same formatter (and look) as the deep dive mail (user 2026-10-02:
+            # the .md / raw-markdown body arrived unformatted). The .md is on Drive and
+            # the .html (with the chart) stays next to it locally / in the CI artefacts.
+            # If the PDF cannot be made, say so and attach the .html instead.
+            pdf_note = ""
+            if pdf_p:
+                att = (pdf_p.name, pdf_p.read_bytes(), "pdf")
+            else:
+                pdf_note = (f"<p style='color:#c33'><b>PDF could not be made</b> "
+                            f"({pdf_err}) — the report is attached as .html.</p>")
+                att = (f"{base}.html", html_doc.encode("utf-8"), "octet-stream")
+            notes = "".join(f"<p style='color:#b45309'><b>Data note:</b> {n}</p>"
+                            for n in d.get("data_notes") or [])
+            part_b = ("Part B (forensic deep dive) is included."
+                      if nar.get("forensic_report") else "No Part B (deep dive) in this copy.")
             body = (
                 f"<h2>{co['name']} — narrative report</h2>"
                 f"<p>{co['symbol']} · {co['isin']} · data current to "
                 f"{d['as_of_utc'][:10]}</p>"
+                f"{notes}"
                 f"<p>{audit_line}</p>"
                 f"<p>{len(d['facts'])} facts · {len(d['tables'])} tables · "
                 f"{len(nar['sections'])} sections · {flagged} section(s) with "
                 f"unresolved grounding flags</p>"
-                f"<p>Full report attached (.md and .html). Open the .html for the "
-                f"charts and source footers.</p>"
-                f"<hr><pre style='white-space:pre-wrap;font-size:12px'>"
-                f"{md[:4000].replace('<', '&lt;')}…</pre>")
+                f"<p>{part_b}</p>"
+                f"<p>Attachment: <b>{att[0]}</b>. The .md is on Drive "
+                f"(company_repo/{co['isin']}/).</p>"
+                f"{pdf_note}")
             ok = send_email(
                 f"Narrative report — {co['name']} ({co['symbol']})",
                 body,
-                attachments=[(md_p.name, md.encode("utf-8"), "octet-stream"),
-                             (html_p.name, html_doc.encode("utf-8"), "octet-stream")])
+                attachments=[att])
             log("  mailed" if ok else "  mail SKIPPED (GMAIL_USER / "
                                       "GMAIL_APP_PASSWORD not set)")
         except Exception as e:
             log(f"  mail FAILED: {str(e)[:160]}")
 
     if args.open:
-        webbrowser.open(html_p.resolve().as_uri())
+        # the PDF (same file the mail carries), as the deep dive does; .html if no PDF
+        webbrowser.open((pdf_p or html_p).resolve().as_uri())
     log(f"done in {time.time() - t0:.0f}s")
     return {"company": co, "md": str(md_p), "html": str(html_p),
             "facts": len(d["facts"]), "flagged": flagged,
@@ -540,14 +575,32 @@ def _queued_part_b(store: FP.Store, token: str, outdir: str) -> tuple[str | None
     r = FP.resolve(store, token)
     if r is None:
         return "", ""                    # unresolvable: run_one reports it as an error
-    isin = r[0]
+    p, why = _drive_part_b(store, r[0], outdir)
+    if p is None and not errs.empty:
+        why += f" — deep_dive_queue says error: {str(errs.iloc[-1].get('error'))[:80]}"
+    return p, why
+
+
+def _drive_part_b(store: FP.Store, isin: str, outdir: str,
+                  since: str = "") -> tuple[str | None, str]:
+    """Download the company's latest deep dive from Drive (deep_dive_index ->
+    company_repo/<ISIN>/company_deepdive_*.md) for Part B -> (local path, "") or (None, why).
+
+    since (ISO time, the SAME machine's clock that ran the deep dive — it stamps
+    last_update with datetime.now()): only a deep dive built at/after it counts, so a run
+    whose deep dive just failed never silently attaches an older one. Used by run-now BOTH
+    (local run_report.bat and CI narrative.yml alike) and by the queue drain (no since).
+    """
     idx = store.parquet(FP.IDX, "deep_dive_index.parquet")
     row = idx[idx["isin"].astype(str) == isin] if not idx.empty and "isin" in idx else idx
     if row.empty or not str(row.iloc[-1].get("report_path") or ""):
-        why = "no deep dive on Drive yet"
-        if not errs.empty:
-            why += f" — deep_dive_queue says error: {str(errs.iloc[-1].get('error'))[:80]}"
-        return None, why
+        return None, "no deep dive on Drive yet"
+    if since:
+        built = pd.to_datetime(row.iloc[-1].get("last_update"), errors="coerce")
+        if pd.isna(built) or built < pd.to_datetime(since):
+            return None, (f"latest deep dive on Drive is from {str(row.iloc[-1].get('last_update'))[:16]}"
+                          f", older than this run ({since[:16]}) — this run's deep dive "
+                          f"did not finish")
     name = Path(str(row.iloc[-1]["report_path"])).name
     fid = find_file(store.drive, store.folder(f"company_repo/{isin}"), name)
     if not fid:
@@ -581,6 +634,10 @@ def main():
     ap.add_argument("--sections", nargs="*", type=int, default=None)
     ap.add_argument("--forensic-md", default="",
                     help="existing company_deepdive_*.md to attach as Part B")
+    ap.add_argument("--part-b-drive", default="", metavar="SINCE",
+                    help="BOTH run-now: attach the company's deep dive from Drive as Part B, "
+                         "only if it was built at/after SINCE (ISO time, same clock as the "
+                         "deep dive run). Used identically by run_report.bat and narrative.yml")
     ap.add_argument("--dry-run", action="store_true",
                     help="preflight + fact pack + sources only; no LLM, no writes")
     ap.add_argument("--skip-audit", action="store_true")
@@ -597,8 +654,8 @@ def main():
                     help="before building, pull any documents Drive is missing "
                          "(Screener/BSE/NSE via backfill_company_docs) and extract them")
     ap.add_argument("--mail", action="store_true",
-                    help="email the report (HTML inline + .md and .html attached) to "
-                         "NOTIFY_EMAIL — works identically local or in CI")
+                    help="email the report as a PDF (short summary inline; .html if the "
+                         "PDF cannot be made) to NOTIFY_EMAIL — identical local or in CI")
     ap.add_argument("--local-render", action="store_true",
                     help="also write the report to the Obsidian vault and Reports dir, "
                          "the same places run_deepdive.bat puts a deep dive")
@@ -676,6 +733,14 @@ def main():
                 continue
             if part_b:
                 a_tok = argparse.Namespace(**{**vars(a), "forensic_md": part_b})
+        elif a.part_b_drive and not a.forensic_md:
+            r0 = FP.resolve(store, token)
+            part_b, why = (_drive_part_b(store, r0[0], a.outdir, since=a.part_b_drive)
+                           if r0 else (None, "could not resolve the company"))
+            if part_b:
+                a_tok = argparse.Namespace(**{**vars(a), "forensic_md": part_b})
+            else:
+                log(f"  {token}: built WITHOUT Part B — {why}")
         try:
             r = run_one(store, token, a_tok)
         except Exception as e:

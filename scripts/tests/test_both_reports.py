@@ -194,5 +194,42 @@ check("with --requeue: done TCS back to ONE pending row; INFY untouched",
       n == 1 and sorted(pend["token"]) == ["INFY", "TCS"] and (dq["df"]["token"] == "TCS").sum() == 1
       and pend.loc[pend["token"] == "TCS", "done_at"].isna().all(), dq["df"].to_string())
 
+# ------------------------------------------------------------------ 5 mails ----
+print("5. PDF-only mails")
+import format_deepdive_pdf as FMT                      # noqa: E402
+import notify_deepdive as ND                           # noqa: E402
+md = ("# Deep Dive — X\n\n### 0.4 COST\n• first point [Concall]\n• second point\n"
+      "\n| a | b |\n|---|---|\n| • not a bullet | 2 |\n")
+html = FMT._md_to_html_body(md)
+check("'• ' lines become a real list (not one run-on paragraph)",
+      html.count("<li>") == 2 and "first point" in html and "• first" not in html, html[:200])
+check("a '•' inside a table cell is left alone", "• not a bullet" in html)
+try:
+    FMT._ensure_native_libs()
+    import weasyprint  # noqa: F401
+    have_wp = True
+except Exception:
+    have_wp = False
+if have_wp:
+    msg = ND._build_email("X Ltd", "XLTD", "INE000X01010", md, "https://drive")
+    parts = [(p.get_filename(), p.get_content_type()) for p in msg.walk() if p.get_filename()]
+    check("deep dive mail: exactly ONE attachment, the PDF",
+          len(parts) == 1 and parts[0][0].endswith(".pdf") and parts[0][1] == "application/pdf",
+          str(parts))
+    body = [p for p in msg.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
+    check("deep dive mail body is formatted HTML, not raw markdown",
+          "<li>" in body and "• first" not in body)
+else:
+    print("  [skip] weasyprint not importable here — PDF mail checks run in CI")
+_real = FMT.md_to_pdf
+FMT.md_to_pdf = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no pango"))
+msg = ND._build_email("X Ltd", "XLTD", "INE000X01010", md, "https://drive")
+FMT.md_to_pdf = _real
+parts = [(p.get_filename(), p.get_content_type()) for p in msg.walk() if p.get_filename()]
+body = [p for p in msg.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
+check("PDF failure -> the styled .html is attached instead, and the mail says so",
+      len(parts) == 1 and parts[0][0].endswith(".html") and "PDF could not be made" in body,
+      str(parts))
+
 print(f"\n{len(FAILS)} failure(s)" + (": " + "; ".join(FAILS) if FAILS else ""))
 sys.exit(len(FAILS))
