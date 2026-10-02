@@ -120,9 +120,14 @@ The following have been assembled for [COMPANY_NAME] ([NSE_SYMBOL] / [ISIN]):
 [/COMPANY_PAGE_BRIEF]
 
 [RESEARCH_INDEX_CONTEXT]
-<Rows from research_index.parquet filtered to this company / its sector / its
- promoter / relevant govt policy — i.e. external analyst notes, sector and seminar
- summaries mentioning this name or its theme. Treat as external perspective.>
+<External research from the research store, in up to three parts, each extract headed
+ [research_N · source · date · doc type · company]:
+   A. RESEARCH ON THIS COMPANY — broker/analyst notes, company cards, watch-list flags.
+   B. SECTOR & INDUSTRY RESEARCH — the company's industry/sector, peers included.
+   C. MACRO & POLICY TOUCHING THIS SECTOR.
+ Treat as EXTERNAL PERSPECTIVE: cite as [Research: <source>, <date>]; ratings, targets and
+ forecasts are the named broker's view, never fact; prefer the most recent extract when they
+ disagree and say so. (Older runs may instead supply a plain list of file names.)>
 [/RESEARCH_INDEX_CONTEXT]
 
 [COMMUNITY_RESEARCH]
@@ -311,6 +316,15 @@ the filings are silent — never fill these with generic industry text or a gues
      [News: <source>, <date>] / [BSE/NSE, <date>] / [YouTube: <channel>, <date>]. Flag any
      item that corroborates or contradicts a forensic finding. If none of these inputs were
      supplied, output DATA_MISSING.
+
+0.9 SECTOR & INDUSTRY UPDATE
+   • From RESEARCH_INDEX_CONTEXT parts B and C: what brokers say about this company's industry
+     and sector NOW — demand, pricing, margins, capacity, competition, regulation/policy and
+     macro drivers — 4-8 dated bullets, each cited [Research: <source>, <date>].
+   • Peers named in the research: one small table Peer | What was said | Source/date.
+   • One line: is this company positioned ahead of, in line with, or behind the sector trend
+     on the evidence above (tie to a Layer 1 number where possible)? If parts B and C are
+     empty or absent, output DATA_MISSING — never generic industry text.
 
 ========== END OF LAYER 0 ==========
 
