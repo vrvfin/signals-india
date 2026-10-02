@@ -83,6 +83,17 @@ def _bse_only(drive) -> pd.DataFrame:
     keep = uni[(nse.isin(["", "nan"])) & (~code.isin(["", "nan"]))].copy()
     keep["bse_code"] = keep["bse_code"].astype(str).str.replace(r"\.0$", "",
                                                                 regex=True)
+    # A BSE-only name whose storage key equals an NSE symbol would write into
+    # that NSE company's price file: FOCUS, GSTL, KALYANI, MAL, SEL and ZEAL held
+    # another company's prices for months (measured 2026-10-02). Skip them until
+    # they get a key of their own.
+    nse_keys = set(nse.str.upper()) - {"", "NAN"}
+    if len(keep):
+        clash = keep.apply(lambda r: _storage_key(r) in nse_keys, axis=1)
+        if clash.any():
+            log(f"  skipped {int(clash.sum())} BSE-only names whose key equals an "
+                f"NSE symbol: {sorted(keep[clash].apply(_storage_key, axis=1))}")
+            keep = keep[~clash]
     return keep.reset_index(drop=True)
 
 
