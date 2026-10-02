@@ -208,6 +208,28 @@ def fetch_bse() -> pd.DataFrame:
     return out
 
 
+def previous_bse_rows(drive, index_id) -> pd.DataFrame:
+    """BSE rows from the existing company_universe.csv, shaped like fetch_bse().
+    Empty DF if there is no previous file or it has no bse_code."""
+    cols = ["isin", "bse_code", "bse_symbol", "name"]
+    try:
+        fid = find_file(drive, index_id, "company_universe.csv")
+        if not fid:
+            return pd.DataFrame(columns=cols)
+        raw = drive.files().get_media(fileId=fid).execute()
+        prev = pd.read_csv(io.BytesIO(raw), dtype=str).fillna("")
+    except Exception as e:
+        log(f"  BSE carry-forward failed ({str(e)[:110]}) — none kept.")
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in prev.columns:
+            prev[c] = ""
+    prev = prev[~prev["bse_code"].str.strip().isin(["", "nan"])]
+    out = prev[cols].reset_index(drop=True)
+    log(f"  BSE fetch failed — carried forward {len(out)} BSE rows from previous file")
+    return out
+
+
 # ---------- Main ----------
 
 def main() -> None:
@@ -222,6 +244,17 @@ def main() -> None:
 
     log("Fetching BSE scrip list...")
     bse = fetch_bse()
+
+    drive = get_drive()
+    folder_id = os.environ["GDRIVE_FOLDER_ID"]
+    repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
+    index_id  = get_or_create_subfolder(drive, repo_id, "_index")
+
+    # BSE's API 403s from CI now and then. Writing without it wipes every
+    # bse_code (2,500+ BSE-only names vanish from Phase 1 next morning), so keep
+    # last week's BSE rows instead of dropping them.
+    if bse.empty:
+        bse = previous_bse_rows(drive, index_id)
 
     if nse.empty and bse.empty:
         print("\nERROR: no source returned data. Check network / endpoints.")
@@ -265,12 +298,7 @@ def main() -> None:
     merged = (merged[["isin", "name", "nse_symbol", "bse_code", "bse_symbol", "board", "exchange"]]
               .drop_duplicates("isin").sort_values("name").reset_index(drop=True))
 
-    drive = get_drive()
-    folder_id = os.environ["GDRIVE_FOLDER_ID"]
-
     # 1. company_repo/_index/company_universe.csv  (Phase 2 pipeline key)
-    repo_id   = get_or_create_subfolder(drive, folder_id, "company_repo")
-    index_id  = get_or_create_subfolder(drive, repo_id, "_index")
     upload_csv(drive, index_id, "company_universe.csv", merged,
                find_file(drive, index_id, "company_universe.csv"))
     log("Wrote company_repo/_index/company_universe.csv")
