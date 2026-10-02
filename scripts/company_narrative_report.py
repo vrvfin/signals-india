@@ -126,21 +126,19 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         # deterministic core. The nightly Screener sweep covers 5,381 companies, but a
         # name outside it had NO on-demand path and simply rendered those sections
         # empty. Pull it here so "any company" really means any company.
-        # STALE too, not only missing. Since the weekly sweep became a gap scan
-        # (2026-08-07) a company is refetched only when its new quarter is due, so
-        # off-season its fetched_at ages past the preflight policy and the story
-        # ABORTED on "statements/summary freshness" with no way to close it.
+        # Also when the LATEST DUE QUARTER is missing (preflight quarter_status marks the
+        # check `due`) — the same rule the fundamentals job's gap scan uses, applied to
+        # this one company now instead of at the next scan. A company whose latest
+        # quarter is stored is NOT refetched, however long ago it was downloaded.
         # --symbols is a partial run, so summary.parquet is upserted, not replaced.
         st_now = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
-        stale = [ch["id"].split(".", 1)[1] for ch in rep["integrity"]
-                 if ch["id"] in ("STALE.statements", "STALE.summary")
-                 and ch["status"] in ("WARN", "FAIL")]
+        due = [ch["id"].split(".", 1)[1] for ch in rep["integrity"] if ch.get("due")]
         refetched = False
-        if st_now.empty or stale:
+        if st_now.empty or due:
             log(f"[1a] no fundamentals/statements/{co['symbol']}.parquet — "
                 f"fetching financials from Screener" if st_now.empty else
-                f"[1a] financials stale ({', '.join(stale)}) — "
-                f"refreshing {co['symbol']} from Screener")
+                f"[1a] latest due quarter missing ({', '.join(due)}) — "
+                f"pulling {co['symbol']} from Screener")
             try:
                 import subprocess
                 subprocess.run([sys.executable,
@@ -220,6 +218,12 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     if pack is None:
         return None
     d = pack.to_dict()
+    # A due quarter Screener still does not have: build on the previous quarter and SAY
+    # so at the top of the report (statements + summary carry the same sentence).
+    d["data_notes"] = list(dict.fromkeys(ch["detail"] for ch in rep["integrity"]
+                                         if ch.get("due")))
+    for n in d["data_notes"]:
+        log(f"  DATA NOTE on the report: {n}")
     log(f"  {len(d['facts'])} facts · {len(d['tables'])} tables · "
         f"{len(d['coverage_gaps'])} gaps")
     outdir = Path(args.outdir)
@@ -409,7 +413,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
 # document queue. Dedup-on-write is the correctness guarantee; a token already pending
 # or done is never added twice.
 NQUEUE = "company_repo/_index/narrative_queue.parquet"
-NQUEUE_COLS = ["token", "status", "added_at", "done_at", "error"]
+# with_deepdive (added 2026-10-02, additive): True = BOTH reports were queued; the story
+# waits until the company's deep dive is built (deepdive.yml, 08:00 IST) and attaches it
+# as Part B. Older rows read it as None = story only, exactly as before.
+NQUEUE_COLS = ["token", "status", "added_at", "done_at", "error", "with_deepdive"]
 
 
 def _load_nqueue(store: FP.Store) -> pd.DataFrame:
@@ -435,7 +442,8 @@ def _save_nqueue(store: FP.Store, df: pd.DataFrame):
                  buf.getvalue(), "application/octet-stream", existing_id=fid)
 
 
-def enqueue_narrative(store: FP.Store, tokens: list[str]) -> int:
+def enqueue_narrative(store: FP.Store, tokens: list[str],
+                      with_deepdive: bool = False) -> int:
     """Queue tokens for the next drain. Returns how many are now pending.
 
     Only an ALREADY-PENDING token is skipped. A token whose last run is `done` or
@@ -456,23 +464,34 @@ def enqueue_narrative(store: FP.Store, tokens: list[str]) -> int:
                        if not df.empty else set())
 
     now = datetime.now().isoformat(timespec="seconds")
-    requeued, added = [], []
+    requeued, added, upgraded = [], [], []
     for t in toks:
         if t in already_pending:
+            # Asking for BOTH on a company already queued story-only upgrades the row;
+            # a plain --add never downgrades one that asked for both.
+            if with_deepdive:
+                m = (df["token"].astype(str) == t) & (status == "pending")
+                df.loc[m, "with_deepdive"] = True
+                upgraded.append(t)
             continue
         m = (df["token"].astype(str) == t) if not df.empty else None
         if m is not None and m.any():
             df.loc[m, ["status", "added_at", "done_at", "error"]] = \
                 ["pending", now, None, None]
+            df.loc[m, "with_deepdive"] = bool(with_deepdive)
             requeued.append(t)
         else:
             added.append(t)
     if added:
         df = pd.concat([df, pd.DataFrame([{"token": t, "status": "pending",
-                                           "added_at": now} for t in added])],
+                                           "added_at": now,
+                                           "with_deepdive": bool(with_deepdive)}
+                                          for t in added])],
                        ignore_index=True)
-    if added or requeued:
+    if added or requeued or upgraded:
         _save_nqueue(store, df)
+    if upgraded:
+        log(f"  already queued — now set to BOTH reports: {', '.join(upgraded)}")
     if requeued:
         log(f"  re-queued (previous run finished): {', '.join(requeued)}")
     return len(added) + len(requeued)
@@ -492,6 +511,54 @@ def _mark_nqueue(store: FP.Store, token: str, status: str, error: str = ""):
     _save_nqueue(store, df)
 
 
+def _note_nqueue(store: FP.Store, token: str, note: str):
+    """Record WHY a row is still pending (status unchanged) — visible in the queue file."""
+    df = _load_nqueue(store)
+    m = (df["token"].astype(str) == str(token)) & (df["status"].astype(str) == "pending")
+    if m.any():
+        df.loc[m, "error"] = note[:200]
+        _save_nqueue(store, df)
+
+
+def _queued_part_b(store: FP.Store, token: str, outdir: str) -> tuple[str | None, str]:
+    """For a BOTH row: (path to the deep dive .md to attach, "") once it is built, or
+    (None, why) while the story must keep waiting.
+
+    Linked through deep_dive_queue STATUS, not timestamps: the two queues are stamped by
+    different machines' clocks (IST locally, UTC in CI), so comparing times would mix
+    zones. run_report.bat queues the same token in both queues and re-queues a finished
+    deep dive, so "no pending deep-dive row" means this request's deep dive has run.
+    """
+    dq = store.parquet(FP.IDX, "deep_dive_queue.parquet")
+    if not dq.empty and {"token", "status"} <= set(dq.columns):
+        mine = dq[dq["token"].astype(str).str.strip().str.upper() == token.strip().upper()]
+        if (mine["status"].astype(str) == "pending").any():
+            return None, "deep dive still queued (deepdive.yml drains it at 08:00 IST)"
+        errs = mine[mine["status"].astype(str) == "error"]
+    else:
+        errs = pd.DataFrame()
+    r = FP.resolve(store, token)
+    if r is None:
+        return "", ""                    # unresolvable: run_one reports it as an error
+    isin = r[0]
+    idx = store.parquet(FP.IDX, "deep_dive_index.parquet")
+    row = idx[idx["isin"].astype(str) == isin] if not idx.empty and "isin" in idx else idx
+    if row.empty or not str(row.iloc[-1].get("report_path") or ""):
+        why = "no deep dive on Drive yet"
+        if not errs.empty:
+            why += f" — deep_dive_queue says error: {str(errs.iloc[-1].get('error'))[:80]}"
+        return None, why
+    name = Path(str(row.iloc[-1]["report_path"])).name
+    fid = find_file(store.drive, store.folder(f"company_repo/{isin}"), name)
+    if not fid:
+        return None, f"deep dive {name} listed in deep_dive_index but not found on Drive"
+    p = Path(outdir) / f"_partb_{isin}_{name}"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(download_bytes(store.drive, fid))
+    log(f"  Part B from Drive: company_repo/{isin}/{name}")
+    return str(p), ""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -501,6 +568,10 @@ def main():
                     help="ISIN / symbol / name fragment. Omit to drain the queue.")
     ap.add_argument("--add", nargs="+", default=None,
                     help="enqueue these tokens for the next scheduled run, then exit")
+    ap.add_argument("--with-deepdive", action="store_true",
+                    help="with --add: BOTH reports — the queued story waits for the "
+                         "company's deep dive (queue it too: company_deep_report.py --add "
+                         "X --requeue) and attaches it from Drive as Part B")
     ap.add_argument("--allow-empty-queue", action="store_true",
                     help="an empty queue exits 0 instead of failing. For the SCHEDULED "
                          "run, where nothing queued is normal; a manual dispatch that "
@@ -553,9 +624,10 @@ def main():
 
     # --add: enqueue and exit (the scheduled run will pick these up).
     if a.add:
-        n = enqueue_narrative(store, a.add)
+        n = enqueue_narrative(store, a.add, with_deepdive=a.with_deepdive)
         log(f"enqueued {n} token(s) to narrative_queue "
-            f"({len(a.add) - n} already pending/done)")
+            f"({len(a.add) - n} already pending/done)"
+            + (" — BOTH reports: each waits for its deep dive" if a.with_deepdive else ""))
         return 0
 
     # No --names -> DRAIN the queue, same as company_deep_report.py with no args.
@@ -583,13 +655,29 @@ def main():
         log(f"draining narrative_queue: {len(pending)} pending "
             f"({', '.join(pending[:8])}{'...' if len(pending) > 8 else ''})")
         tokens = pending
+        wd = q["with_deepdive"] if "with_deepdive" in q.columns else pd.Series(dtype=object)
+        both = set(q[(q["status"].astype(str) == "pending")
+                     & wd.apply(lambda v: v is True or str(v).lower() == "true")
+                     ]["token"].astype(str))
     else:
         tokens = a.names
+        both = set()
 
-    results, failures = [], 0
+    results, failures, waiting = [], 0, 0
     for token in tokens:
+        a_tok = a
+        if token in both:
+            part_b, why = _queued_part_b(store, token, a.outdir)
+            if part_b is None:
+                log(f"  {token}: BOTH reports queued — waiting: {why}. Stays queued; "
+                    f"the next run builds it once the deep dive exists.")
+                _note_nqueue(store, token, f"waiting for deep dive: {why}")
+                waiting += 1
+                continue
+            if part_b:
+                a_tok = argparse.Namespace(**{**vars(a), "forensic_md": part_b})
         try:
-            r = run_one(store, token, a)
+            r = run_one(store, token, a_tok)
         except Exception as e:
             log(f"  UNHANDLED for '{token}': {str(e)[:200]}")
             if a.debug:
@@ -614,6 +702,8 @@ def main():
             f"{r['flagged']} gate-flagged section(s), audit "
             f"{au.get('verified', '-')}/{au.get('total', '-')} verified")
         log(f"    {r['md']}")
+    if waiting:
+        log(f"  {waiting} company/companies waiting for their deep dive (still queued)")
     if failures:
         log(f"  {failures} company/companies failed")
     return 1 if failures and not results else 0

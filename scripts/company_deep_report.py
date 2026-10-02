@@ -241,18 +241,32 @@ def queue_update(svc, root, mutate, owner="deepdive"):
         if got:
             _release_queue_lock(svc, root)
 
-def enqueue_tokens(svc, root, tokens, owner="streamlit") -> int:
+def enqueue_tokens(svc, root, tokens, owner="streamlit", requeue=False) -> int:
     """Add pending rows for tokens, skipping any already pending OR done (locked +
     deduped). Returns how many were actually added. Use this from EVERY enqueue path
-    (Streamlit, --add, synthesise) so the queue can never be clobbered or duplicated."""
+    (Streamlit, --add, synthesise) so the queue can never be clobbered or duplicated.
+
+    requeue=True (only `--add X --requeue`, used by run_report.bat "queue BOTH"): a token
+    that is already DONE goes back to pending, because the queued story waits for a FRESH
+    deep dive. Its done rows flip in place — a second, pending row would be dropped by
+    _dedup_queue ("a token that is done is not also left pending")."""
     toks = list(dict.fromkeys(str(t).strip() for t in tokens if str(t).strip()))
     added = {"n": 0}
     def m(df):
+        if requeue and not df.empty:
+            now = dt.datetime.now().isoformat()
+            for t in toks:
+                done = (df["token"].astype(str) == t) & (df["status"].astype(str) == "done")
+                if done.any():
+                    df.loc[done, ["status", "added_at", "done_at"]] = ["pending", now, None]
+                    if "error" in df.columns:
+                        df.loc[done, "error"] = None
+                    added["n"] += 1
         seen = (set(df[df["status"].astype(str).isin(["pending", "done"])]["token"].astype(str))
                 if not df.empty else set())
         new = [dict(token=t, status="pending", added_at=dt.datetime.now().isoformat())
                for t in toks if t not in seen]
-        added["n"] = len(new)
+        added["n"] += len(new)
         return pd.concat([df, pd.DataFrame(new)], ignore_index=True) if new else df
     queue_update(svc, root, m, owner=owner)
     return added["n"]
@@ -2071,6 +2085,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--names",        help="comma-separated tokens, ad-hoc run (bypass queue)")
     ap.add_argument("--add",          help="comma-separated tokens, enqueue only (no processing)")
+    ap.add_argument("--requeue",      action="store_true",
+                    help="with --add: put an already-DONE company back to pending "
+                         "(queue BOTH reports wants a fresh deep dive)")
     ap.add_argument("--open",         action="store_true",
                     help="open report locally in Obsidian / browser after writing")
     ap.add_argument("--interactive",  action="store_true",
@@ -2109,10 +2126,12 @@ def main():
 
     if args.add:
         if args.dry_run:
-            print(f"[dry-run] would enqueue: {[t.strip() for t in args.add.split(',') if t.strip()]}")
+            print(f"[dry-run] would enqueue: {[t.strip() for t in args.add.split(',') if t.strip()]}"
+                  + (" (re-queueing any already done)" if args.requeue else ""))
             return
-        n = enqueue_tokens(svc, root, args.add.split(","), owner="add")
-        print(f"Enqueued {n} (skipped any already pending/done)."); return
+        n = enqueue_tokens(svc, root, args.add.split(","), owner="add", requeue=args.requeue)
+        print(f"Enqueued {n} (skipped any already pending"
+              + ("" if args.requeue else "/done") + ")."); return
 
     if args.dry_run:
         pool = None                     # dry-run never calls Gemini
