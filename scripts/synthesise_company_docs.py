@@ -142,7 +142,7 @@ def search_mentions(query: str, doc_type: str | None) -> pd.DataFrame:
 
     q = query.strip()
     if re.match(r"^INE[A-Z0-9]{9}$", q.upper()):
-        return df[df.isin == q.upper()].copy()
+        return df[df["isin"] == q.upper()].copy()   # df.isin is the pandas METHOD, not the column
 
     slug = _slug(q)
     words = [w for w in slug.split("_") if len(w) >= 4]
@@ -249,7 +249,7 @@ def run_synthesis(label: str, doc_type: str | None,
     result = pool.call_text(prompt)[0]
 
     # Determine ISINs from matches (for Drive folder + queue)
-    isins = sorted({str(i) for i in matches.isin.dropna() if str(i).startswith("INE")})
+    isins = sorted({str(i) for i in matches["isin"].dropna() if str(i).startswith("INE")})
 
     stamp      = dt.datetime.now().strftime("%d%b%Y")
     slug_label = _slug(label)
