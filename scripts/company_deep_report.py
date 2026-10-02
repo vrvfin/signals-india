@@ -1673,6 +1673,66 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
                        "None supplied. Rely on Screener + Document Summaries + Company Page.")
     return tpl
 
+# Visible sections comapnydeepdive_prompt.txt asks for (Layer 0, Layer 1, PM one-pager). A
+# section counts as present when a heading-like line carries ALL its keywords. The single
+# call can stop early or merge sections: measured on the 6 dives on Drive (Jul-Aug 2026),
+# 3 silently lacked sections (Infinity Infoway 5/7/9, Tatva 8/9, one 9).
+REQUIRED_SECTIONS = [
+    ("0.1", "BUSINESS OVERVIEW", ("business overview",)),
+    ("0.2", "SEGMENT / PRODUCT-WISE PERFORMANCE", ("segment",)),
+    ("0.3", "OPERATIONS — CAPACITY & UTILISATION", ("capacity",)),
+    ("0.4", "RAW MATERIAL & COST STRUCTURE", ("raw material",)),
+    ("0.5", "WHY THE BUSINESS WORKS (OR DOESN'T)", ("why the business",)),
+    ("0.6", "MANAGEMENT STRATEGY & GROWTH PLANS", ("strategy",)),
+    ("0.7", "RISKS TO THESIS", ("risks to thesis",)),
+    ("0.8", "NEWS FLOW", ("news flow",)),
+    ("0.9", "SECTOR & INDUSTRY UPDATE", ("sector", "industry")),
+    ("1", "SOURCE COVERAGE & DATA INTEGRITY", ("source coverage",)),
+    ("2", "FINANCIAL TRAJECTORY (5-YEAR)", ("financial trajectory",)),
+    ("3", "CAPITAL EFFICIENCY & MANAGEMENT ALLOCATION", ("capital efficiency",)),
+    ("4", "FORENSIC FINANCIAL SHENANIGANS EXAMINATION", ("shenanigan",)),
+    ("5", "FRAUD & GOVERNANCE DETECTOR", ("fraud",)),
+    ("6", "FORENSIC RISK SCORECARD (WEIGHTED MATRIX)", ("risk scorecard",)),
+    ("7", "INVESTMENT THESIS SUMMARY", ("investment thesis",)),
+    ("8", "EARNINGS QUALITY ASSESSMENT", ("earnings quality",)),
+    ("9", "DATA RELIABILITY CHECK", ("data reliability",)),
+    ("PM", "PM ONE-PAGER TEAR SHEET", ("one-pager",)),
+]
+
+def missing_sections(md: str) -> list[str]:
+    heads = []
+    for line in md.splitlines():
+        s = line.strip()
+        if s.startswith(("#", "**")) or (8 < len(s) < 110 and s.upper() == s):
+            heads.append(s.lower().replace("one pager", "one-pager"))
+    return [num for num, _t, words in REQUIRED_SECTIONS
+            if not any(all(w in h for w in words) for h in heads)]
+
+def complete_sections(pool, prompt: str, report: str) -> tuple[str, list[str]]:
+    """One extra call that writes ONLY the missing sections, inserted before Layer 2 / the
+    one-pager (or appended). Returns (report, still_missing). Never loses the first pass."""
+    missing = missing_sections(report)
+    if not missing:
+        return report, []
+    want = [f"{n} {t}" if n != "PM" else t for n, t, _w in REQUIRED_SECTIONS if n in missing]
+    print(f"    sections missing after first pass: {', '.join(missing)} — one completion call")
+    ask = (prompt + "\n\n================================\nCOMPLETION PASS\n"
+           "================================\nThe report below is MISSING these required sections: "
+           + "; ".join(want) + ". Write ONLY those sections now — exact numbers and titles as "
+           "specified above, same style, same citation rules, using only the inputs above. Do not "
+           "repeat, rewrite or summarise any section that is already present.\n\n"
+           "=== REPORT SO FAR ===\n" + report)
+    try:
+        extra, _m = pool.call_text(ask)
+    except Exception as e:                          # quota/fatal: keep the first pass as-is
+        print(f"    completion call failed ({type(e).__name__}) — report kept with gaps marked")
+        return report, missing
+    extra = _clean_report_md(extra).strip()
+    cut = re.search(r"(?im)^#{1,3}\s*(layer\s*2|analytical notes|phase\s*4|layer\s*4|pm one-pager)", report)
+    merged = (report[:cut.start()].rstrip() + "\n\n" + extra + "\n\n" + report[cut.start():]) if cut \
+        else (report.rstrip() + "\n\n" + extra + "\n")
+    return merged, missing_sections(merged)
+
 def _clean_report_md(md: str) -> str:
     """Strip raw template artifacts the model echoes: ====/---- divider bars,
     'END OF LAYER' separators, $$ LaTeX, and [BRACKET] labels used as headings.
@@ -1738,6 +1798,8 @@ def _dry_run_report(svc, root, isin, symbol, bse_code, do_backfill):
     print(f"    [dry-run] sources: symbol={'yes' if symbol else 'none (BSE-only)'} "
           f"bse_code={bse_code or 'none'} youtube_key={'yes' if os.environ.get('YOUTUBE_API_KEY') else 'no'} "
           f"screener_cookie={'yes' if os.environ.get('SCREENER_SESSION_COOKIE') else 'no'}")
+    import research_context
+    print(f"    [dry-run] {research_context.context_block(svc, root, isin, symbol, '')[1]}")
     print(f"    [dry-run] would write company_repo/{isin}/company_deepdive_"
           f"{dt.datetime.now():%d%b%y}.md/.docx/.pptx + deep_dive_index row")
 
@@ -1835,10 +1897,18 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
           f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'} "
           f"· youtube={'ok' if yt_ok else 'none'} · drhp={'ok' if drhp_ok else 'none'}")
 
+    # Research: the research store (company notes + sector/industry + macro/policy, real
+    # content) when it is available; otherwise the old research_index file-name list.
+    import research_context
+    research_txt, research_stats = research_context.context_block(svc, root, isin, symbol, name)
+    print(f"    {research_stats}")
+    if not research_txt:
+        research_txt = research_block(ridx, isin, symbol, name)
+
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
                           page,
-                          research_block(ridx, isin, symbol, name),
+                          research_txt,
                           exchange,
                           docs=doc_block,
                           screener_cross=screener_cross,
@@ -1849,6 +1919,12 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           community=community)
     report, model_used = pool.call_text(prompt)
     report = _clean_report_md(report)
+    report, still_missing = complete_sections(pool, prompt, report)
+    n_req = len(REQUIRED_SECTIONS)
+    sections_line = (f"*Sections: {n_req}/{n_req}*" if not still_missing else
+                     f"*Sections: {n_req - len(still_missing)}/{n_req} — STILL MISSING: "
+                     f"{', '.join(still_missing)}*")
+    print(f"    {sections_line.strip('*')}")
 
     stamp = dt.datetime.now().strftime("%d%b%y")
     out_path = f"{DRIVE['company_page']}/{isin}/company_deepdive_{stamp}.md"
@@ -1864,7 +1940,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
               f"research~{cov['n_research']} · {len(used_docs)} documents "
               f"(read: {_full} full · {_cached} cached · {_brief} in brief · "
               f"{_partial} partial)*\n\n"
-              f"*Documents fed fresh to synthesis: {prov}*\n\n---\n\n")
+              f"*Documents fed fresh to synthesis: {prov}*\n\n"
+              f"{sections_line} · *{research_stats}*\n\n---\n\n")
     # Deterministic read-confirmation appendix (computed, not model-written).
     full_md = header + report + _read_confirmation_table(used_docs)
     drive_upload(svc, out_path, root, full_md.encode("utf-8"), "text/markdown")
