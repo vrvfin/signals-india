@@ -83,6 +83,7 @@ DAILY_MODELS = [
 INTER_CALL_SLEEP = 6.0            # seconds between successful calls (RPM hygiene)
 MAX_CHARS_CALL   = 400_000        # ~100k tokens; chunk above this (map-reduce)
 MIN_TEXT_CHARS   = 200            # below this -> scanned/empty -> NEEDS_OCR, skip
+STORM_WAIT_MIN   = 10             # one wait-and-retry per run when every model is parked
 
 # Drive layout (reuse existing repo)
 DRIVE = dict(
@@ -359,21 +360,28 @@ def build_vocab_block(vocab: pd.DataFrame) -> str:
             "\nDOC_TYPES: " + slugs("doc_type") + "\nTHEMES: " + slugs("theme"))
 
 def alias_map(vocab: pd.DataFrame) -> dict:
+    """{tag_type: {alias: slug}} — per type, because one phrase can name tags of several
+    types ("quick commerce" = an industry AND a theme); a flat map let a theme slug land in
+    the sectors list."""
     m = {}
     for _, r in vocab.iterrows():
         if r.status != "closed":
             continue
-        m[r.tag_slug] = r.tag_slug
+        t = m.setdefault(r.tag_type, {})
+        t[r.tag_slug] = r.tag_slug
         for a in str(r.aliases or "").split("|"):
             if a.strip():
-                m[re.sub(r"\s+", " ", a.strip().lower())] = r.tag_slug
+                t.setdefault(re.sub(r"\s+", " ", a.strip().lower()), r.tag_slug)
     return m
 
 def normalise_list(vals, amap, closed_set, fallback):
+    """amap: the {alias: slug} map of ONE tag type (alias_map(vocab)[type])."""
     out = []
     for v in (vals or []):
         k = re.sub(r"\s+", " ", str(v).strip().lower())
         slug = amap.get(k, k if k in closed_set else fallback)
+        if slug and slug != fallback and slug not in closed_set:
+            slug = fallback                      # never let another type's slug through
         if slug and slug not in out:
             out.append(slug)
     return out
@@ -525,8 +533,12 @@ def main():
     # vocab + universe (from Drive)
     vocab = universe = None; vblock = ""
     vb = drive_download(svc, DRIVE["vocab_parquet"], root)
-    if vb:
-        vocab = pd.read_parquet(io.BytesIO(vb)); vblock = build_vocab_block(vocab)
+    if not vb:
+        # Without the vocabulary the prompt gets no tag list and normalise_list() maps every
+        # sector to other_sector — this silently mistagged 2,694 of 2,761 docs before 2026-09.
+        sys.exit(f"Tag vocabulary missing on Drive ({DRIVE['vocab_parquet']}). "
+                 "Run: python scripts/build_tag_aliases.py --upload")
+    vocab = pd.read_parquet(io.BytesIO(vb)); vblock = build_vocab_block(vocab)
     uv = drive_download(svc, DRIVE["universe_csv"], root)
     if uv:
         universe = pd.read_csv(io.BytesIO(uv))
@@ -548,6 +560,7 @@ def main():
 
     new_isins_run: set[str] = set()
     counts = dict(processed=0, skipped=0, deferred=0, error=0, ocr=0, dup=0)
+    storm_retry_used = False
 
     for pdf in pdfs:
         if args.limit and counts["processed"] >= args.limit:
@@ -587,9 +600,24 @@ def main():
 
         # ---- Gemini summarise via bucket pool ----
         try:
-            summary = summarise(doc_type, text, vblock, pool)
+            try:
+                summary = summarise(doc_type, text, vblock, pool)
+            except AllBucketsExhausted as exc:
+                # A Google 503 storm parks every model for the run (30 Sep / 1 Oct 2026: 18 and
+                # 22 503s across all 5 models, no PerDay errors) — it usually passes. Wait once,
+                # then retry this doc with a fresh pool before giving up for the night.
+                if storm_retry_used:
+                    raise
+                storm_retry_used = True
+                print(f"\n   all buckets parked ({exc}) — waiting {STORM_WAIT_MIN} min, "
+                      "then one retry with a fresh pool")
+                time.sleep(STORM_WAIT_MIN * 60)
+                pool = build_daily_pool()
+                summary = summarise(doc_type, text, vblock, pool)
         except AllBucketsExhausted as exc:
-            counts["deferred"] = sum(1 for p in pdfs if sha256_file(p) not in seen_hash)
+            # only PDFs still in intake: processed ones were already moved to _processed/,
+            # and hashing a moved path crashed every early stop (FileNotFoundError, exit 1)
+            counts["deferred"] = sum(1 for p in pdfs if p.exists() and sha256_file(p) not in seen_hash)
             print(f"\nStopping: {exc}")
             print(f"{counts['deferred']} PDF(s) remain in intake — they resume on the next "
                   "run (buckets refill at the daily reset).")
@@ -615,9 +643,9 @@ def main():
                        processed_at=dt.datetime.now().isoformat(), status="dup")
             seen_hash.add(h); _move_duplicate(pdf); counts["dup"] += 1; continue
 
-        sectors = normalise_list(meta.get("sectors"),  amap, closed.get("sector", set()),  "other_sector")
-        subs    = normalise_list(meta.get("subsectors"), amap, closed.get("subsector", set()), "")
-        themes  = normalise_list(meta.get("themes"),   amap, closed.get("theme", set()),   "")
+        sectors = normalise_list(meta.get("sectors"),  amap.get("sector", {}),    closed.get("sector", set()),    "other_sector")
+        subs    = normalise_list(meta.get("subsectors"), amap.get("subsector", {}), closed.get("subsector", set()), "")
+        themes  = normalise_list(meta.get("themes"),   amap.get("theme", {}),     closed.get("theme", set()),     "")
         isins   = resolve_isins(meta.get("companies", []), universe)
         tags    = [meta["doc_type"]] + sectors + themes
 
