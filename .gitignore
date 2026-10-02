@@ -87,3 +87,5 @@ guru/**/*.bak
 # tag vocabulary v2: hand-reviewed alias corrections are source, not output
 !scripts/tag_aliases_manual.csv
 _vocab_report/
+# research search store (local, rebuilt from Drive company_repo/_research/)
+_rag/
