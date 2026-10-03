@@ -32,7 +32,10 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 import verify_grounding as VG
 from gemini_pool import load_keys
 
-GEN_MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-pro"]
+# FALLBACK only — the models come from the registry (model_registry.pick("WRITE"):
+# discover -> probe -> quality exam), user 2026-10-03. gemini-2.5-pro was dropped: 404 on
+# 2026-10-03. This list is used only when the registry is missing or stale.
+GEN_MODELS = ["gemini-2.5-flash", "gemini-flash-latest"]
 # Gemini 2.5 models are THINKING models: max_output_tokens covers reasoning tokens as
 # well as the visible answer. At 3000 the budget was spent thinking and the JSON came
 # back truncated mid-sentence (1,721 chars, unparseable) — which looked like a prompt
@@ -275,7 +278,15 @@ def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> d
     if not keys:
         raise RuntimeError("no Gemini keys — set FREE_POOL_n or GEMINI_API_KEY_n")
     from _extractor_base import GeminiKeyPool
-    pool = GeminiKeyPool(keys, GEN_MODELS)
+    from model_registry import pick, overload_keys
+    models = pick("WRITE", GEN_MODELS, log=log)
+    pool = GeminiKeyPool(keys, models)
+    # Give-up rule scales with the keys (a third of them, not 3) — set on THIS pool only,
+    # so the shared GeminiKeyPool / Phase-2 extractors are untouched. 2026-10-03: with 3,
+    # two models were dropped after 3 busy replies each and 10 of 20 sections came back empty.
+    pool._pool.model_overload_keys = overload_keys(len(keys))
+    log(f"  writer pool: {len(keys)} key(s) · {len(models)} model(s) · a model is dropped "
+        f"after busy replies on {pool._pool.model_overload_keys} keys")
     tpl = (Path(_HERE) / PROMPT_FILE).read_text(encoding="utf-8")
 
     have = sorted({f["section"] for f in pack["facts"]}
@@ -290,7 +301,7 @@ def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> d
             time.sleep(INTER_CALL_SLEEP)
     flagged = sum(1 for s in out if s.get("gate_failed"))
     return {"company": pack["company"], "sections": out,
-            "generator_model": GEN_MODELS[0],
+            "generator_model": models[0],
             "sections_with_unresolved_gate_failures": flagged}
 
 
