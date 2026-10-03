@@ -36,6 +36,8 @@ INTAKE_DIR    = Path(os.getenv("RESEARCH_INTAKE_DIR", r"D:\EMA_Screener\research
 MENTIONS_PATH = INTAKE_DIR / "_ledger" / "company_mentions.parquet"
 LEDGER_PATH   = INTAKE_DIR / "_ledger" / "research_index.parquet"   # local copy, has summary_md
 NEW_ISINS_PATH = INTAKE_DIR / "_ledger" / "new_isins_latest.json"
+# When the last DAILY synthesis finished its whole loop (gap 2, 2026-10-03). Local, like the ledger.
+STATE_PATH = INTAKE_DIR / "_ledger" / "synthesis_state.json"
 SCRIPTS_DIR   = Path(__file__).resolve().parent
 PROMPT_FILE   = SCRIPTS_DIR / "company_synthesis_prompt.txt"
 
@@ -152,22 +154,57 @@ def search_mentions(query: str, doc_type: str | None) -> pd.DataFrame:
     return df[mask].copy()
 
 
+def daily_since(now: dt.datetime | None = None) -> dt.datetime:
+    """Start of the daily synthesis window: the EARLIER of the start of today and the moment
+    the last daily synthesis finished its whole loop. A normal day is just today; a run that
+    stopped before its synthesis (or a second run the same day) loses nothing (gap 2)."""
+    now = now or dt.datetime.now()
+    today = dt.datetime.combine(now.date(), dt.time.min)
+    try:
+        done = dt.datetime.fromisoformat(
+            json.loads(STATE_PATH.read_text(encoding="utf-8"))["covered_until"])
+        return min(today, done)
+    except Exception:
+        return today                       # no state yet: today only
+
+
+def isins_since(since: dt.datetime) -> list[str]:
+    """Companies of every document processed after `since` — from the research index and
+    company mentions themselves, not only the last run's new_isins_latest.json."""
+    out: set[str] = set()
+    if LEDGER_PATH.exists():
+        idx = pd.read_parquet(LEDGER_PATH)
+        if "processed_at" in idx.columns:
+            new = idx[pd.to_datetime(idx["processed_at"], errors="coerce") > since]
+            for v in new.get("isins", pd.Series(dtype=str)).dropna():
+                try:
+                    out.update(i for i in json.loads(v) if str(i).startswith("INE"))
+                except Exception:
+                    pass
+            if MENTIONS_PATH.exists():
+                m = pd.read_parquet(MENTIONS_PATH)
+                m = m[m["research_n"].isin(new["research_n"])]
+                out.update(i for i in m["isin"].dropna().astype(str) if i.startswith("INE"))
+    return sorted(out)
+
+
 def get_summaries(research_ns: list[int],
-                  processed_on: dt.date | None = None) -> dict[int, dict]:
+                  processed_after: dt.datetime | None = None) -> dict[int, dict]:
     """Return {research_n: row_dict} from local ledger (has summary_md).
 
-    processed_on: keep only documents PROCESSED on that date (processed_at, stamped on this
-    PC's clock by daily_research_summary, compared with this PC's date) — the daily run's
-    "today only" view (user 2026-10-03)."""
+    processed_after: keep only documents PROCESSED after that moment (processed_at, stamped
+    on this PC's clock by daily_research_summary, compared with this PC's clock) — the daily
+    run's "new research" view (user 2026-10-03; see daily_since()).
+    """
     if not LEDGER_PATH.exists():
         return {}
     idx = pd.read_parquet(LEDGER_PATH)
     if "summary_md" not in idx.columns:
         return {}
     subset = idx[idx.research_n.isin(research_ns)]
-    if processed_on is not None and "processed_at" in subset.columns:
-        day = pd.to_datetime(subset["processed_at"], errors="coerce").dt.date
-        subset = subset[day == processed_on]
+    if processed_after is not None and "processed_at" in subset.columns:
+        at = pd.to_datetime(subset["processed_at"], errors="coerce")
+        subset = subset[at > processed_after]
     out = {}
     for _, r in subset.iterrows():
         summary = str(r.get("summary_md", "")).strip()
@@ -239,12 +276,13 @@ def run_synthesis(label: str, doc_type: str | None,
                   pool, outdir: Path,
                   upload: bool, queue: bool,
                   svc=None, root: str = "",
-                  today_only: bool = False) -> tuple[list[str], Path | None]:
+                  since: dt.datetime | None = None) -> tuple[list[str], Path | None]:
     """Run synthesis for one label. Returns (ISINs synthesised, output file or None).
 
-    today_only (the daily --all-new run, user 2026-10-03): only documents PROCESSED today,
-    so the daily synthesis says what today's research adds — not the company's whole
-    history. A manual run by name keeps the full history.
+    since (the daily --all-new run, user 2026-10-03): only documents PROCESSED after that
+    moment, so the daily synthesis says what NEW research adds — not the company's whole
+    history (daily_since() keeps it to today, plus anything a stopped run left behind). A
+    manual run by name keeps the full history.
 
     The early returns give the SAME two-value shape as success: they used to return a
     bare [], and both callers unpack two values, so one company with no documents
@@ -256,11 +294,10 @@ def run_synthesis(label: str, doc_type: str | None,
         return [], None
 
     research_ns = sorted(matches.research_n.dropna().astype(int).unique().tolist())
-    today = dt.date.today() if today_only else None
-    summaries   = get_summaries(research_ns, processed_on=today)
+    summaries   = get_summaries(research_ns, processed_after=since)
     if not summaries:
         print(f"  No summary_md available for {label!r}"
-              + (" from today's documents." if today_only else
+              + (" from documents new since the last synthesis." if since else
                  " (data predates this feature — re-process PDFs to populate)."))
         return [], None
 
@@ -273,9 +310,9 @@ def run_synthesis(label: str, doc_type: str | None,
 
     stamp      = dt.datetime.now().strftime("%d%b%Y")
     slug_label = _slug(label)
-    scope = (f"{len(summaries)} document(s) processed today ({today:%d %b %Y}) — today's "
+    scope = (f"{len(summaries)} document(s) processed since {since:%d %b %Y %H:%M} — new "
              f"research only; run `synthesise_company_docs.py {label}` for the full history"
-             if today_only else f"{len(summaries)} document(s)")
+             if since else f"{len(summaries)} document(s)")
     header     = (f"# Research Synthesis — {label}\n\n"
                   f"*Generated {dt.datetime.now():%d %b %Y %H:%M} IST · {scope}*\n\n---\n\n")
 
@@ -346,21 +383,23 @@ def main():
     outdir = Path(args.outdir)
 
     if args.all_new:
-        if not NEW_ISINS_PATH.exists():
-            print(f"No new_isins_latest.json found at {NEW_ISINS_PATH}. "
-                  "Nothing to synthesise (run daily_research_summary.py first).")
-            return
-        new_isins = json.loads(NEW_ISINS_PATH.read_text(encoding="utf-8"))
-        if not new_isins:
-            print("new_isins_latest.json is empty — no new docs from last run."); return
-        print(f"--all-new: processing {len(new_isins)} ISIN(s): {new_isins}")
+        # Daily run = NEW research only (user 2026-10-03): documents processed since
+        # daily_since(), companies taken from the index itself (gap 2).
+        run_start = dt.datetime.now()
+        since = daily_since(run_start)
+        new_isins = isins_since(since)
+        print(f"--all-new: documents processed since {since:%d %b %Y %H:%M} -> "
+              f"{len(new_isins)} ISIN(s): {new_isins}")
         created = []
         for isin in new_isins:
-            # daily run = today's research only (user 2026-10-03)
             _, outpath = run_synthesis(isin, None, pool, outdir, args.upload, args.queue, svc, root,
-                                       today_only=True)
+                                       since=since)
             if outpath and outpath.exists():
                 created.append(outpath)
+        # Only now: an interrupted loop leaves the old state, so the next run redoes it all.
+        STATE_PATH.write_text(json.dumps({"covered_until": run_start.isoformat(timespec="seconds"),
+                                          "isins": len(new_isins), "written": len(created)}),
+                              encoding="utf-8")
         # open each synthesis file in Obsidian (same as other bat outputs)
         if created and not args.no_open:
             for p in created:
