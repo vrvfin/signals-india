@@ -280,7 +280,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         log("[5/6] independent audit")
         try:
             from report_auditor import Adjudicator, audit_report
-            adj = Adjudicator(prefer_alt=not args.force_gemini_audit)
+            # Gemini by default (user 2026-10-03): the Cerebras adjudicator failed every
+            # call for 14 days (HTTP 402 payment required), so every story was UNAUDITED.
+            # --alt-audit goes back to Cerebras/Groq once that account works again.
+            adj = Adjudicator(prefer_alt=args.alt_audit and not args.force_gemini_audit)
             log(f"  adjudicator: {adj.model}"
                 + ("  [DEGRADED — same family as the generator]" if adj.degraded
                    else "  [independent family]"))
@@ -652,7 +655,10 @@ def main():
                     help="preflight + fact pack + sources only; no LLM, no writes")
     ap.add_argument("--skip-audit", action="store_true")
     ap.add_argument("--force-gemini-audit", action="store_true",
-                    help="audit on Gemini (DEGRADED: correlated with the generator)")
+                    help="audit on Gemini — now the DEFAULT; kept so old command lines work")
+    ap.add_argument("--alt-audit", action="store_true",
+                    help="audit on Cerebras/Groq (independent family) instead of Gemini; "
+                         "off by default since the Cerebras account returns HTTP 402")
     ap.add_argument("--no-sources", action="store_true",
                     help="skip document re-fetch; qualitative claims become impossible")
     ap.add_argument("--ignore-preflight", action="store_true",
