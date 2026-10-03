@@ -230,19 +230,24 @@ def enqueue_deep_dive(svc, root: str, isins: list[str]):
 def run_synthesis(label: str, doc_type: str | None,
                   pool, outdir: Path,
                   upload: bool, queue: bool,
-                  svc=None, root: str = "") -> list[str]:
-    """Run synthesis for one label. Returns list of ISINs synthesised."""
+                  svc=None, root: str = "") -> tuple[list[str], Path | None]:
+    """Run synthesis for one label. Returns (ISINs synthesised, output file or None).
+
+    The early returns give the SAME two-value shape as success: they used to return a
+    bare [], and both callers unpack two values, so one company with no documents
+    crashed the whole nightly --all-new loop (2 Oct 2026: first of 42 ISINs, nothing built).
+    """
     matches = search_mentions(label, doc_type)
     if matches.empty:
         print(f"  No documents found for: {label!r}")
-        return []
+        return [], None
 
     research_ns = sorted(matches.research_n.dropna().astype(int).unique().tolist())
     summaries   = get_summaries(research_ns)
     if not summaries:
         print(f"  No summary_md available for {label!r} "
               "(data predates this feature — re-process PDFs to populate).")
-        return []
+        return [], None
 
     print(f"  [{label}] {len(summaries)} summaries found. Calling Gemini...")
     prompt = build_prompt(label, summaries)
