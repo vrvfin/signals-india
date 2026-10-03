@@ -438,8 +438,14 @@ def record_usage(pool, source: str, doc_type: str = "report", drive=None,
         summ = pool.summary() if hasattr(pool, "summary") else pool
         if not (summ or {}).get("buckets"):
             return
-        from _extractor_base import persist_gemini_usage
-        persist_gemini_usage(*_drive_index(drive, index_id), summ, doc_type, source)
+        from _extractor_base import persist_gemini_usage, get_drive
+        d, idx = _drive_index(drive, index_id)
+        if drive is None:
+            # Logging runs at the END of long model work; the cached connection is stale
+            # by then (ssl.SSLEOFError lost the story writer's rows, 2026-10-03). The
+            # folder id stays valid, so only the connection is renewed.
+            d = get_drive()
+        persist_gemini_usage(d, idx, summ, doc_type, source)
     except Exception as e:
         log(f"  model usage not recorded ({str(e)[:80]})")
 

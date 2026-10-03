@@ -210,6 +210,7 @@ def extract_call(pool, company: dict, doc_id: str, call_date: str,
 
 
 def save(store: Store, rows: pd.DataFrame, dry_run: bool) -> str:
+    store.refresh()          # after minutes of model calls the first connection is stale
     drive = store.drive
     folder = store.folder(IDX)
     existing = pd.DataFrame(columns=QUOTE_COLS)

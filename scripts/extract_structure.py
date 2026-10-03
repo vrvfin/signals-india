@@ -183,7 +183,8 @@ def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save(store: Store, rows: pd.DataFrame, dry_run: bool) -> str:
-    drive, root = store.drive, store.root
+    store.refresh()          # after minutes of model calls the first connection is stale
+    drive, root = store.drive, store.root          # (ssl.SSLEOFError lost every row, 2026-10-03)
     fid_folder = store.folder(IDX)
     existing = pd.DataFrame(columns=STRUCT_COLS)
     fid = find_file(drive, fid_folder, STRUCT_FILE)
