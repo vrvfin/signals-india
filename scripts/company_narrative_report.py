@@ -295,6 +295,9 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             # computed figure comes back UNSUPPORTED, because those numbers live in
             # Screener statements rather than in any filing in the document bundle.
             audit = audit_report(adj, secs, chosen, factpack=d)
+            if getattr(adj, "_gem", None) is not None:    # Gemini audit: log its models
+                from model_registry import record_usage
+                record_usage(adj._gem, "narrative_audit", "narrative", log=log)
             s = audit["summary"]
             if not audit.get("ran"):
                 log(f"  AUDIT DID NOT RUN — every section failed adjudication: "

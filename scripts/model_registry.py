@@ -384,6 +384,19 @@ def rank(reg: dict, profile: str) -> list[str]:
 _REG_CACHE: dict = {}
 
 
+def _drive_index(drive=None, index_id: str = ""):
+    """(drive, company_repo/_index id) — the caller's handle, else one connection per
+    process (cached), shared by pick() and record_usage()."""
+    if drive is not None and index_id:
+        return drive, index_id
+    if "drive" not in _REG_CACHE:
+        from _extractor_base import get_drive, get_or_create_subfolder
+        d = get_drive()
+        repo = get_or_create_subfolder(d, os.environ["GDRIVE_FOLDER_ID"], "company_repo")
+        _REG_CACHE["drive"] = (d, get_or_create_subfolder(d, repo, "_index"))
+    return _REG_CACHE["drive"]
+
+
 def pick(profile: str, fallback: list[str], drive=None, index_id: str = "",
          log=print) -> list[str]:
     """THE standard call for every process: the models to use for this kind of work,
@@ -394,13 +407,7 @@ def pick(profile: str, fallback: list[str], drive=None, index_id: str = "",
     """
     try:
         if "reg" not in _REG_CACHE:
-            if drive is None or not index_id:
-                from _extractor_base import get_drive, get_or_create_subfolder
-                drive = drive or get_drive()
-                repo = get_or_create_subfolder(drive, os.environ["GDRIVE_FOLDER_ID"],
-                                               "company_repo")
-                index_id = get_or_create_subfolder(drive, repo, "_index")
-            _REG_CACHE["reg"] = load_registry(drive, index_id)
+            _REG_CACHE["reg"] = load_registry(*_drive_index(drive, index_id))
         reg = _REG_CACHE["reg"]
         if not reg or not is_fresh(reg):
             log(f"  models[{profile}]: registry {'stale' if reg else 'missing'} — "
@@ -417,6 +424,24 @@ def pick(profile: str, fallback: list[str], drive=None, index_id: str = "",
     except Exception as e:
         log(f"  models[{profile}]: registry unavailable ({str(e)[:80]}) — static list")
         return list(fallback)
+
+
+def record_usage(pool, source: str, doc_type: str = "report", drive=None,
+                 index_id: str = "", log=print) -> None:
+    """The other half of the standard: after a run, log the pool's per-(key, model)
+    outcome (ok / busy 503 / per-minute / per-day) to gemini_usage.parquet, the same log
+    the backfill and extractors write. busy_rates() reads it, so BULK's busy demotion
+    sees every model a process actually used (2026-10-03: the deep dive and story did not
+    log, so gemini-3.8-flash's 503s were invisible). Accepts a BucketPool, a GeminiKeyPool
+    or a summary dict. Best-effort: never raises, never stops a run."""
+    try:
+        summ = pool.summary() if hasattr(pool, "summary") else pool
+        if not (summ or {}).get("buckets"):
+            return
+        from _extractor_base import persist_gemini_usage
+        persist_gemini_usage(*_drive_index(drive, index_id), summ, doc_type, source)
+    except Exception as e:
+        log(f"  model usage not recorded ({str(e)[:80]})")
 
 
 def overload_keys(n_keys: int) -> int:
@@ -706,6 +731,19 @@ def _self_test() -> int:
     check("pick: fresh registry -> the ranked list",
           pick("WRITE", ["x"], log=lambda *_: None) == w)
     _REG_CACHE.clear()
+    try:
+        record_usage({"buckets": [{"key_idx": 1, "model": "m", "ok": 1}]}, "selftest",
+                     drive="no-drive-here", index_id="x", log=lambda *_: None)
+        raised = False
+    except Exception:
+        raised = True
+    check("record_usage never raises when Drive is unusable (best-effort)", not raised)
+    touched = []
+    real = globals()["_drive_index"]
+    globals()["_drive_index"] = lambda *a, **k: touched.append(1) or ("d", "i")
+    record_usage({"buckets": []}, "selftest", log=lambda *_: None)
+    globals()["_drive_index"] = real
+    check("record_usage skips an empty pool without touching Drive", not touched)
     check("give-up rule scales with keys, never below 3",
           (overload_keys(2), overload_keys(11), overload_keys(34)) == (3, 3, 11))
 
