@@ -353,11 +353,20 @@ def _tier(m: str) -> tuple:
     return (tier, float(v.group(1)) if v else 0.0, 0 if "preview" in m else 1)
 
 
+def reserved_for_media() -> set[str]:
+    """Models ONLY the MEDIA chain names (management interviews lead with them so no other
+    job shares their daily quota). Text profiles never use them — user 2026-10-03.
+    Today: gemini-3.7-flash, gemini-3.6-flash; follows the MEDIA chain if it changes."""
+    others = {m for name, c in CHAINS.items() if name != "MEDIA" for m in c}
+    return set(CHAINS["MEDIA"]) - others
+
+
 def rank(reg: dict, profile: str) -> list[str]:
     """The live, scored models for a profile, best first. Unscored models are left out
     until the weekly exam has scored them — "rank by quality, then pick"."""
     q = reg.get("quality") or {}
-    skip = set(reg.get("dead") or {}) | set(reg.get("no_free_quota") or {})
+    skip = (set(reg.get("dead") or {}) | set(reg.get("no_free_quota") or {})
+            | reserved_for_media())
     pool = [m for m in (reg.get("live") or []) if m in q and m not in skip
             and m in set(reg.get("discovered") or reg.get("live") or [])]
     ordered = sorted(pool, key=lambda m: (q[m].get("score", 0), *_tier(m)), reverse=True)
@@ -680,6 +689,13 @@ def _self_test() -> int:
     b = rank(r2, "BULK")
     check("BULK: a model busy >25% in 7 days goes to the back",
           b[-1] == "gemini-3.8-flash" and b.index("gemini-3.5-flash-lite") < b.index("gemini-3.8-flash"))
+    check("the interview (MEDIA-only) models are reserved: 3.7-flash, 3.6-flash",
+          reserved_for_media() == {"gemini-3.7-flash", "gemini-3.6-flash"})
+    r3 = dict(r2, live=r2["live"] + ["gemini-3.7-flash"],
+              discovered=r2["discovered"] + ["gemini-3.7-flash"],
+              quality={**r2["quality"], "gemini-3.7-flash": {"score": 100}})
+    check("text profiles never use a model reserved for interviews",
+          "gemini-3.7-flash" not in rank(r3, "WRITE") + rank(r3, "BULK"))
     _REG_CACHE["reg"] = {}
     check("pick: no registry -> the caller's static list",
           pick("WRITE", ["x", "y"], log=lambda *_: None) == ["x", "y"])
