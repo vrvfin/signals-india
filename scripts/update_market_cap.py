@@ -4,7 +4,8 @@ update_market_cap.py — DAILY market cap = weekly share count x latest close.
 Runs at the END of Phase 1 (after compute_features has written
 features/latest.parquet). Reads:
   universe/share_count.csv      (build_share_count.py, weekly)
-  features/latest.parquet       symbol, close, date
+  features/latest.parquet       symbol, close, date (price = newer of this
+                                close and share_count's price_at_fetch)
   universe/market_cap.csv       the existing file (Yahoo values, or yesterday's)
 Writes universe/market_cap.csv with EXACTLY the same columns as before —
 symbol, market_cap_cr, mcap_segment — so no reader changes. A symbol with no
@@ -85,10 +86,21 @@ def main() -> int:
     old["symbol"] = old["symbol"].astype(str)
     old["market_cap_cr"] = pd.to_numeric(old["market_cap_cr"], errors="coerce")
 
-    calc = (sc[["symbol", "shares_cr"]].astype({"symbol": str})
-            .merge(feat.astype({"symbol": str}), on="symbol", how="inner"))
-    calc = calc[calc["close"] > 0]
-    calc["new_cap"] = calc["shares_cr"] * calc["close"]
+    # Price = the NEWER of our last close and the price Screener showed when the
+    # share count was fetched. Our close can be days old (BSE-only prices froze
+    # at 2026-09-23 when BSE blocked its API); Screener's can be up to a week old.
+    cols = ["symbol", "shares_cr", "price_at_fetch", "fetched_at"]
+    calc = (sc[[c for c in cols if c in sc.columns]].astype({"symbol": str})
+            .merge(feat.astype({"symbol": str}), on="symbol", how="left"))
+    calc["price_at_fetch"] = pd.to_numeric(calc.get("price_at_fetch"), errors="coerce")
+    fetch_day = pd.to_datetime(calc.get("fetched_at"), errors="coerce", utc=True)         .dt.tz_localize(None).dt.normalize()
+    bar_day = pd.to_datetime(calc["date"], errors="coerce").dt.normalize()
+    use_screener = calc["close"].isna() | (calc["close"] <= 0) | (bar_day < fetch_day)
+    calc["px"] = calc["close"].where(~use_screener, calc["price_at_fetch"])
+    calc = calc[calc["px"] > 0]
+    calc["new_cap"] = calc["shares_cr"] * calc["px"]
+    log(f"price used: our close {int((~use_screener).sum()):,} | Screener's (newer) "
+        f"{int(use_screener.sum()):,}")
 
     out = old[OUT_COLS].copy() if len(old) else pd.DataFrame(columns=OUT_COLS)
     new_map = dict(zip(calc["symbol"], calc["new_cap"]))
