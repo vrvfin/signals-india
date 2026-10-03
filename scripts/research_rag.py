@@ -615,7 +615,7 @@ def search(q: str, k: int = 10, isin: str = "", sector: str = "", theme: str = "
 
 def answer(q: str, hits: list[dict]) -> tuple[str, str]:
     from gemini_pool import BucketPool
-    from model_registry import resolve
+    from model_registry import pick, overload_keys, CHAINS
     ctx = "\n\n".join(f"<<C{i + 1}>> research_{h['research_n']:04d} | {h['source_raw'] or h['source']} | "
                       f"{h['doc_date'] or 'undated'} | {h['doc_type']}"
                       + (f" | {h['company']}" if h['company'] else "") + f"\n{h['page_content'][:5000]}"
@@ -626,7 +626,11 @@ def answer(q: str, hits: list[dict]) -> tuple[str, str]:
               "extracts do not answer the question, say what is missing. Label broker opinions (ratings, "
               "targets) as the named broker's view. Keep it under 350 words, bullets where helpful.\n\n"
               f"QUESTION: {q}\n\nEXTRACTS:\n{ctx}")
-    pool = BucketPool(_keys(), resolve("QUALITY"), inter_call_s=2.0)
+    # WRITE models from the registry (discover -> probe -> quality exam); the old QUALITY
+    # chain is only the fallback. Give-up rule scales with the keys (2026-10-03).
+    keys = _keys()
+    pool = BucketPool(keys, pick("WRITE", CHAINS["QUALITY"]), inter_call_s=2.0,
+                      model_overload_keys=overload_keys(len(keys)))
     return pool.call_text(prompt, max_output_tokens=8192)   # thinking tokens count against this
 
 

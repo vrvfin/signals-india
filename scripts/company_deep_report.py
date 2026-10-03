@@ -82,6 +82,22 @@ DEEPDIVE_MODELS = [
     "gemini-3.1-flash-lite",
 ]
 
+class _TwoTierPool:
+    """Two BucketPools behind the one `pool` every function here already takes: plain
+    pool.call_text / call_pdf go to BULK (the many summary calls); the final write-up asks
+    for pool.write. Keeps every signature unchanged."""
+    def __init__(self, bulk, write):
+        self.bulk, self.write = bulk, write
+
+    def __getattr__(self, name):
+        return getattr(self.bulk, name)
+
+
+def _writer(pool):
+    """The WRITE-tier pool when there is one (main run), else the pool itself."""
+    return getattr(pool, "write", pool)
+
+
 DRIVE = dict(
     queue        = "company_repo/_index/deep_dive_queue.parquet",
     index        = "company_repo/_index/deep_dive_index.parquet",
@@ -1737,7 +1753,7 @@ def complete_sections(pool, prompt: str, report: str) -> tuple[str, list[str]]:
            "repeat, rewrite or summarise any section that is already present.\n\n"
            "=== REPORT SO FAR ===\n" + report)
     try:
-        extra, _m = pool.call_text(ask)
+        extra, _m = _writer(pool).call_text(ask)
     except Exception as e:                          # quota/fatal: keep the first pass as-is
         print(f"    completion call failed ({type(e).__name__}) — report kept with gaps marked")
         return report, missing
@@ -1931,7 +1947,7 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           drhp=drhp,
                           phase3=p3,
                           community=community)
-    report, model_used = pool.call_text(prompt)
+    report, model_used = _writer(pool).call_text(prompt)
     report = _clean_report_md(report)
     report, still_missing = complete_sections(pool, prompt, report)
     n_req = len(REQUIRED_SECTIONS)
@@ -2162,6 +2178,12 @@ def main():
     if args.dry_run:
         pool = None                     # dry-run never calls Gemini
         deadline_ts = None
+        try:                            # which models a live run WOULD use (Drive read only)
+            from model_registry import pick
+            print(f"[dry-run] models BULK : {pick('BULK', DEEPDIVE_MODELS, log=lambda *_: None)}")
+            print(f"[dry-run] models WRITE: {pick('WRITE', DEEPDIVE_MODELS, log=lambda *_: None)}")
+        except Exception as e:
+            print(f"[dry-run] model registry not readable ({str(e)[:80]})")
     elif BucketPool is None or load_keys is None:
         print("ERROR: google-genai not installed — cannot run the deep dive here. "
               "Install it (pip install google-genai) or run via CI/local with deps.")
@@ -2175,10 +2197,21 @@ def main():
         if not api_keys:
             print(f"ERROR: no Gemini keys found for prefixes '{args.key_prefix}' in .env")
             sys.exit(1)
-        pool = BucketPool(api_keys, DEEPDIVE_MODELS, inter_call_s=INTER_CALL_SLEEP)
-        print(f"Pool: {len(api_keys)} key(s) × {len(DEEPDIVE_MODELS)} model(s) "
-              f"= {len(api_keys) * len(DEEPDIVE_MODELS)} daily buckets "
-              f"[{args.key_prefix}]")
+        # Models come from the registry (discover -> probe -> quality exam), not a typed
+        # list: BULK for the many chunk / document / theme summaries, WRITE for the final
+        # report. DEEPDIVE_MODELS is only the fallback when the registry is unavailable.
+        # Give-up rule scales with the keys (a model is dropped for the run after busy
+        # replies on a third of them, not 3) — user decisions 2026-10-03.
+        from model_registry import pick, overload_keys
+        give_up = overload_keys(len(api_keys))
+        pool = _TwoTierPool(
+            BucketPool(api_keys, pick("BULK", DEEPDIVE_MODELS),
+                       inter_call_s=INTER_CALL_SLEEP, model_overload_keys=give_up),
+            BucketPool(api_keys, pick("WRITE", DEEPDIVE_MODELS),
+                       inter_call_s=INTER_CALL_SLEEP, model_overload_keys=give_up))
+        print(f"Pool: {len(api_keys)} key(s) [{args.key_prefix}] · BULK "
+              f"{len(pool.bulk.models)} model(s) · WRITE {len(pool.write.models)} model(s) · "
+              f"a model is dropped after busy replies on {give_up} keys")
         deadline_ts = (time.monotonic() + args.deadline_min * 60) if args.deadline_min > 0 else None
 
     universe = _load_universe(svc, root)
