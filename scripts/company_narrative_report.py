@@ -352,6 +352,11 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     # Same formatter (and look) as the deep dive. Files a person receives are named
     # company _ report type _ date (FMT.report_basename); Drive keeps md_p.name.
     base = FMT.report_basename(co["name"], "Narrative")
+    # The HTML a person receives (mail fallback, local copy) is the SAME styled page the PDF
+    # is printed from — the render_html page (html_p, kept for the CI artefacts) read
+    # poorly (user 2026-10-03: wide tables cut off, one figure card per line).
+    styled_html = FMT._build_full_html(co["name"], co["symbol"], co["isin"], md,
+                                       title="Narrative")
     pdf_p, pdf_err = None, ""
     if args.mail or args.local_render or args.open:
         try:
@@ -374,7 +379,7 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             try:
                 dest.mkdir(parents=True, exist_ok=True)
                 (dest / f"{base}.md").write_text(md, encoding="utf-8")
-                (dest / f"{base}.html").write_text(html_doc, encoding="utf-8")
+                (dest / f"{base}.html").write_text(styled_html, encoding="utf-8")
                 if pdf_p and env_key == "REPORTS_DIR":
                     (dest / pdf_p.name).write_bytes(pdf_p.read_bytes())
                     pdf_p = dest / pdf_p.name           # open the copy people keep
@@ -405,7 +410,7 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             else:
                 pdf_note = (f"<p style='color:#c33'><b>PDF could not be made</b> "
                             f"({pdf_err}) — the report is attached as .html.</p>")
-                att = (f"{base}.html", html_doc.encode("utf-8"), "octet-stream")
+                att = (f"{base}.html", styled_html.encode("utf-8"), "octet-stream")
             notes = "".join(f"<p style='color:#b45309'><b>Data note:</b> {n}</p>"
                             for n in d.get("data_notes") or [])
             part_b = ("Part B (forensic deep dive) is included."
@@ -433,8 +438,13 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             log(f"  mail FAILED: {str(e)[:160]}")
 
     if args.open:
-        # the PDF (same file the mail carries), as the deep dive does; .html if no PDF
-        webbrowser.open((pdf_p or html_p).resolve().as_uri())
+        # the PDF (same file the mail carries), as the deep dive does; the styled .html
+        # (same page the PDF is printed from) if no PDF could be made
+        target = pdf_p
+        if target is None:
+            target = outdir / f"{base}.html"
+            target.write_text(styled_html, encoding="utf-8")
+        webbrowser.open(target.resolve().as_uri())
     log(f"done in {time.time() - t0:.0f}s")
     return {"company": co, "md": str(md_p), "html": str(html_p),
             "facts": len(d["facts"]), "flagged": flagged,

@@ -145,10 +145,15 @@ def daily_keys() -> list[str]:
     return keys
 
 def build_daily_pool() -> BucketPool:
-    """BucketPool over the dedicated daily keys × DAILY_MODELS (best model first)."""
+    """BucketPool over the dedicated daily keys × the registry's BULK models (discover ->
+    probe -> quality exam; busy models to the back). DAILY_MODELS is only the fallback
+    when the registry is unavailable. Give-up rule scales with the keys (2026-10-03)."""
     if BucketPool is None:
         raise RuntimeError("google-genai not installed — cannot build the Gemini pool here.")
-    return BucketPool(daily_keys(), DAILY_MODELS, inter_call_s=INTER_CALL_SLEEP)
+    from model_registry import pick, overload_keys
+    keys = daily_keys()
+    return BucketPool(keys, pick("BULK", DAILY_MODELS), inter_call_s=INTER_CALL_SLEEP,
+                      model_overload_keys=overload_keys(len(keys)))
 
 # ----------------------------------------------------------------------------
 # DRIVE — minimal helper (swap for _extractor_base if preferred)
@@ -524,8 +529,8 @@ def main():
     svc  = drive_service()
     pool = build_daily_pool()
     root = os.environ.get("GDRIVE_FOLDER_ID", "")
-    nbuckets = len(daily_keys()) * len(DAILY_MODELS)
-    print(f"Pool: {len(daily_keys())} key(s) × {len(DAILY_MODELS)} model(s) = {nbuckets} daily buckets")
+    nbuckets = len(daily_keys()) * len(pool.models)
+    print(f"Pool: {len(daily_keys())} key(s) × {len(pool.models)} model(s) = {nbuckets} daily buckets")
 
     if not check_drive_service(svc):
         sys.exit("Drive service is not accessible; check credentials and network.")
