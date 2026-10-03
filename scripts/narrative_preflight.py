@@ -46,8 +46,10 @@ from narrative_factpack import Store, resolve, IDX, FUND
 
 # ----------------------------------------------------------------- policy -----
 # Max age before a source is considered stale. Chosen against how each is refreshed:
-# statements/summary come from the weekly fundamentals job, company_facts nightly.
-STALE_DAYS = {"statements": 14, "summary": 14, "company_facts": 5}
+# company_facts nightly. statements/summary are NOT judged by age any more but by
+# whether the latest due quarter is stored (quarter_status) — the fundamentals job only
+# refetches a company when its new quarter is due, so their age says nothing.
+STALE_DAYS = {"company_facts": 5}
 
 # Minimum documents a section needs to be worth rendering at all.
 MIN_DOCS = {"concall": 4, "annual_report": 3}
@@ -110,6 +112,64 @@ def _age_days(ts) -> float | None:
         return (datetime.now(timezone.utc) - t.to_pydatetime()).total_seconds() / 86400.0
     except Exception:
         return None
+
+
+def _q_key(label) -> tuple[int, int] | None:
+    """Screener quarter label -> sortable (year, month): 'Jun 2026' -> (2026, 6)."""
+    t = pd.to_datetime(f"1 {str(label).strip()}", format="%d %b %Y", errors="coerce")
+    return None if pd.isna(t) else (t.year, t.month)
+
+
+def quarter_status(store: Store, isin: str, symbol: str, stored_label,
+                   today=None) -> tuple[str, str, bool]:
+    """Is the LATEST DUE quarter stored? -> (PASS/WARN, detail, due_and_missing).
+
+    Financials are judged by quarter, not by days since download: the fundamentals job
+    refetches a company only when its new quarter is due (gap scan), so off-season a
+    correct file is routinely 2-3 months "old". The rule is the one that job already
+    uses — results_coverage: SEBI deadline 45 days after quarter end (60 for Q4), and a
+    board meeting held after the quarter ended means the results are out.
+      expected quarter stored                         -> PASS
+      expected not due yet, previous quarter stored   -> PASS
+      anything else                                   -> WARN, due_and_missing=True
+    WARN, never FAIL: when Screener does not have the quarter yet the report is still
+    built, on the previous quarter, with that said on the report.
+    """
+    import calendar
+    import results_coverage as RC
+    t = today or datetime.now(timezone.utc).date()
+    expected = RC.expected_period_label(t)
+    q_end = RC.quarter_end_date(t)
+    deadline = RC.filing_deadline(t)
+    pm, py = (q_end.month - 3, q_end.year) if q_end.month > 3 else (12, q_end.year - 1)
+    previous = f"{calendar.month_abbr[pm]} {py}"
+
+    # Board meetings for THIS quarter only: one held before the quarter ended was for
+    # an earlier quarter (results_coverage counts any past meeting; that over-fetches).
+    held = scheduled = None
+    cal = store.parquet(IDX, "results_calendar.parquet")
+    if not cal.empty and {"symbol", "meeting_date"} <= set(cal.columns):
+        mine = cal[cal["symbol"].astype(str).str.upper().isin({symbol.upper(), isin.upper()})]
+        md = pd.to_datetime(mine["meeting_date"], errors="coerce").dropna()
+        md = sorted(d.date() for d in md if d.date() > q_end)
+        held = max((d for d in md if d <= t), default=None)
+        scheduled = min((d for d in md if d > t), default=None)
+
+    have = _q_key(stored_label)
+    if have is not None and have >= _q_key(expected):
+        return "PASS", f"{stored_label} stored — the latest quarter", False
+    if held is not None:
+        return ("WARN", f"{expected} results are out (board meeting {held:%d %b %Y}) but "
+                f"not on Screener yet — figures run to {stored_label or 'no stored quarter'}",
+                True)
+    due = t > deadline
+    if not due and have is not None and have >= _q_key(previous):
+        when = (f"board meeting {scheduled:%d %b %Y}" if scheduled
+                else f"SEBI deadline {deadline:%d %b %Y}")
+        return "PASS", f"{stored_label} stored; {expected} not due yet ({when})", False
+    missing = expected if due else previous
+    return ("WARN", f"{missing} results are due (SEBI deadline passed) but not on "
+            f"Screener yet — figures run to {stored_label or 'no stored quarter'}", True)
 
 
 # ------------------------------------------------------------- readiness -----
@@ -291,11 +351,26 @@ def integrity(store: Store, isin: str, symbol: str) -> list[dict]:
     if not cf.empty:
         ages["company_facts"] = _age_days(cf.iloc[0].get("updated_at"))
     s = store.parquet(FUND, "summary.parquet")
+    latest = {}                       # source -> latest stored quarter label
     if not s.empty:
         m = s[s["symbol"].astype(str).str.upper() == symbol.upper()]
         if not m.empty:
             ages["summary"] = _age_days(m.iloc[0].get("fetched_at"))
+            latest["summary"] = m.iloc[0].get("latest_quarter_label")
+    if len(st) and {"statement", "period"} <= set(st.columns):
+        qp = st[st["statement"].astype(str) == "quarterly_pl"]["period"].dropna().astype(str)
+        keyed = [(k, p) for p in qp.unique() if (k := _q_key(p)) is not None]
+        latest["statements"] = max(keyed)[1] if keyed else None
+    # statements + summary: judged by QUARTER (see quarter_status), not download age.
+    # `due` tells the story's fetch pass to pull this company before building.
+    for src in ("statements", "summary"):
+        if src in ages:
+            status, detail, due = quarter_status(store, isin, symbol, latest.get(src))
+            add(f"STALE.{src}", f"{src} latest quarter", status, detail)
+            checks[-1]["due"] = due
     for src, age in ages.items():
+        if src in ("statements", "summary"):
+            continue
         lim = STALE_DAYS.get(src, 14)
         if age is None:
             add(f"STALE.{src}", f"{src} freshness", "WARN", "no timestamp recorded")

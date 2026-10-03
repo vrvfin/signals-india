@@ -39,13 +39,19 @@ on:
         required: false
         type: boolean
         default: true
+      with_deepdive:
+        description: "BOTH reports: run the forensic deep dive first and attach it as Part B (ONE company — use its NSE symbol or ISIN)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   report:
     runs-on: ubuntu-latest
     # Generation is sequential with inter-call sleeps; a stuck provider must not hold
-    # the runner for hours.
-    timeout-minutes: 90
+    # the runner for hours. 210 min when with_deepdive is on: the deep dive alone has
+    # deepdive.yml's 120-min budget, the story ~90.
+    timeout-minutes: ${{ inputs.with_deepdive && 210 || 90 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +68,15 @@ jobs:
           # very first import failed with "cannot import name 'genai' from 'google'".
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
+
+      # The report is mailed as a PDF (weasyprint, already in requirements.txt). weasyprint
+      # needs pango/cairo from the OS — the same lines deepdive.yml uses for its PDF mail.
+      - name: Install system deps for PDF rendering
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \
+            libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
 
       # get_drive() reads GDRIVE_OAUTH_CLIENT_SECRET_PATH — a FILE PATH, not inline JSON.
       # Passing GDRIVE_OAUTH_TOKEN_JSON as a per-step env var (my earlier mistake) left
@@ -82,6 +97,7 @@ jobs:
           GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
           SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+          YOUTUBE_API_KEY:         ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           mkdir -p _sec
           printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
@@ -105,6 +121,7 @@ jobs:
             echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
             echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
             echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+            echo "YOUTUBE_API_KEY=$YOUTUBE_API_KEY"
           } > .env
           echo "wrote .env with $(grep -c = .env) vars (values not shown)"
 
@@ -146,6 +163,38 @@ jobs:
           echo "the run will pull the missing data itself."
           exit 1
 
+      # BOTH reports in one job: the deep dive runs first, then the story attaches it from
+      # Drive as Part B (--part-b-drive started_at: only a deep dive built by THIS run counts)
+      # — the same path run_report.bat takes locally. --open also keeps local copies (.md,
+      # .pdf) for the artefacts; the OS "open" call itself fails harmlessly on Linux.
+      - name: Deep dive first (Part B)
+        id: deepdive
+        if: inputs.with_deepdive && inputs.names != ''
+        # a failed deep dive must not cost the story: it is then built without Part B
+        # (same as run_report.bat locally), and this step shows as failed in the run.
+        continue-on-error: true
+        env:
+          NAMES: ${{ inputs.names }}
+          REPORTS_DIR: ${{ github.workspace }}/_narrative/deepdive_local
+          OBSIDIAN_VAULT: ${{ github.workspace }}/_narrative/obsidian
+        run: |
+          if [ "$(echo "$NAMES" | wc -w)" -ne 1 ]; then
+            echo "::error::with_deepdive takes exactly ONE company (its NSE symbol or ISIN, no spaces): '$NAMES'"
+            exit 1
+          fi
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
+          python scripts/company_deep_report.py --names "$NAMES" --open
+
+      # BOTH = two mails (user 2026-10-02): the deep dive's own PDF as soon as it is built,
+      # then the story (which also carries it as Part B). Same notifier as deepdive.yml;
+      # it mails only reports newer than started_at, so a failed deep dive sends nothing.
+      - name: Email the deep dive (PDF)
+        if: inputs.with_deepdive && inputs.names != '' && inputs.mail
+        continue-on-error: true
+        env:
+          NOTIFY_SINCE: ${{ steps.deepdive.outputs.started_at }}
+        run: python scripts/notify_deepdive.py
+
       - name: Generate narrative report
         # Credentials come from the .env written above (scripts call load_dotenv), so no
         # per-step env block — that duplication is exactly what drifted before.
@@ -165,7 +214,8 @@ jobs:
             ${{ inputs.fetch_missing != 'false' && '--fetch-missing' || '' }} \
             ${{ inputs.sections != '' && format('--sections {0}', inputs.sections) || '' }} \
             ${{ inputs.skip_audit == 'true' && '--skip-audit' || '' }} \
-            ${{ inputs.ignore_preflight == 'true' && '--ignore-preflight' || '' }}
+            ${{ inputs.ignore_preflight == 'true' && '--ignore-preflight' || '' }} \
+            ${{ steps.deepdive.outputs.started_at != '' && format('--part-b-drive "{0}"', steps.deepdive.outputs.started_at) || '' }}
 
       - name: Retention — no raw PDF survives the run
         # CLAUDE.md global rule 1: no raw PDF persists more than 2 days after processing.
@@ -190,5 +240,6 @@ jobs:
             _narrative/factpack_*.json
             _narrative/narrative_*.json
             _narrative/audit_*.json
+            _narrative/deepdive_local/deepdive/*.md
           retention-days: 14
           if-no-files-found: warn

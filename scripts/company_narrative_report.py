@@ -49,6 +49,7 @@ import narrative_generate as GEN
 import narrative_preflight as PRE
 import narrative_sources as SRC
 import render_narrative_deck as RENDER
+import format_deepdive_pdf as FMT     # PDF + file naming shared with the deep dive
 
 INDEX_FILE = "narrative_index.parquet"
 INDEX_COLS = ["isin", "symbol", "company_name", "report_file", "as_of",
@@ -126,17 +127,28 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         # deterministic core. The nightly Screener sweep covers 5,381 companies, but a
         # name outside it had NO on-demand path and simply rendered those sections
         # empty. Pull it here so "any company" really means any company.
+        # Also when the LATEST DUE QUARTER is missing (preflight quarter_status marks the
+        # check `due`) — the same rule the fundamentals job's gap scan uses, applied to
+        # this one company now instead of at the next scan. A company whose latest
+        # quarter is stored is NOT refetched, however long ago it was downloaded.
+        # --symbols is a partial run, so summary.parquet is upserted, not replaced.
         st_now = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
-        if st_now.empty:
+        due = [ch["id"].split(".", 1)[1] for ch in rep["integrity"] if ch.get("due")]
+        refetched = False
+        if st_now.empty or due:
             log(f"[1a] no fundamentals/statements/{co['symbol']}.parquet — "
-                f"fetching financials from Screener")
+                f"fetching financials from Screener" if st_now.empty else
+                f"[1a] latest due quarter missing ({', '.join(due)}) — "
+                f"pulling {co['symbol']} from Screener")
             try:
                 import subprocess
                 subprocess.run([sys.executable,
                                 str(Path(_HERE) / "ingest_fundamentals.py"),
                                 "--symbols", co["symbol"]], check=False, timeout=900)
+                refetched = True
                 store._files.pop((f"{FP.FUND}/statements",
                                   f"{co['symbol']}.parquet"), None)
+                store._files.pop((FP.FUND, "summary.parquet"), None)
                 got = store.parquet(f"{FP.FUND}/statements", f"{co['symbol']}.parquet")
                 log(f"     statements now: {len(got)} row(s)"
                     if not got.empty else
@@ -147,6 +159,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         fetchable = [r for r in rep["readiness"] if r["state"] == "FETCHABLE"]
         if not fetchable:
             log("[1b] auto-fetch: nothing fetchable — Drive already has what it can")
+            if refetched:
+                # The [1b] branch re-runs preflight; this one must too, or the verdict
+                # below still sees the pre-refresh freshness FAIL.
+                rep = PRE.run(store, token) or rep
         else:
             log(f"[1b] auto-fetch: {len(fetchable)} section(s) short of documents "
                 f"— pulling from Screener/BSE/NSE")
@@ -203,6 +219,12 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     if pack is None:
         return None
     d = pack.to_dict()
+    # A due quarter Screener still does not have: build on the previous quarter and SAY
+    # so at the top of the report (statements + summary carry the same sentence).
+    d["data_notes"] = list(dict.fromkeys(ch["detail"] for ch in rep["integrity"]
+                                         if ch.get("due")))
+    for n in d["data_notes"]:
+        log(f"  DATA NOTE on the report: {n}")
     log(f"  {len(d['facts'])} facts · {len(d['tables'])} tables · "
         f"{len(d['coverage_gaps'])} gaps")
     outdir = Path(args.outdir)
@@ -326,6 +348,21 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     else:
         log("  --upload not set; nothing written to Drive")
 
+    # ---- PDF: what the mail carries and what opens locally ------------------
+    # Same formatter (and look) as the deep dive. Files a person receives are named
+    # company _ report type _ date (FMT.report_basename); Drive keeps md_p.name.
+    base = FMT.report_basename(co["name"], "Narrative")
+    pdf_p, pdf_err = None, ""
+    if args.mail or args.local_render or args.open:
+        try:
+            pdf_p = outdir / f"{base}.pdf"
+            pdf_p.write_bytes(FMT.md_to_pdf(md, co["name"], co["symbol"], co["isin"],
+                                            title="Narrative"))
+            log(f"  {pdf_p.name}")
+        except Exception as e:
+            pdf_p, pdf_err = None, str(e)[:120]
+            log(f"  pdf FAILED ({pdf_err}) — mail and open fall back to the .html")
+
     # ---- local copies (same destinations as run_deepdive.bat) --------------
     # CI has no Obsidian vault, so this is opt-in rather than automatic; the mail
     # below is what makes a CI run reach the user.
@@ -336,9 +373,12 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             dest = Path(os.environ.get(env_key, default))
             try:
                 dest.mkdir(parents=True, exist_ok=True)
-                (dest / md_p.name).write_text(md, encoding="utf-8")
-                (dest / html_p.name).write_text(html_doc, encoding="utf-8")
-                log(f"  local copy -> {dest / md_p.name}")
+                (dest / f"{base}.md").write_text(md, encoding="utf-8")
+                (dest / f"{base}.html").write_text(html_doc, encoding="utf-8")
+                if pdf_p and env_key == "REPORTS_DIR":
+                    (dest / pdf_p.name).write_bytes(pdf_p.read_bytes())
+                    pdf_p = dest / pdf_p.name           # open the copy people keep
+                log(f"  local copy -> {dest / base}.md")
             except Exception as e:
                 log(f"  local copy to {dest} failed: {str(e)[:110]}")
 
@@ -355,30 +395,46 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                           f"</b> claims verified · {asum.get('unsupported', 0)} "
                           f"unsupported · {asum.get('contradicted', 0)} contradicted"
                           if audit else "Audit: not run for this copy.")
+            # PDF ONLY, same formatter (and look) as the deep dive mail (user 2026-10-02:
+            # the .md / raw-markdown body arrived unformatted). The .md is on Drive and
+            # the .html (with the chart) stays next to it locally / in the CI artefacts.
+            # If the PDF cannot be made, say so and attach the .html instead.
+            pdf_note = ""
+            if pdf_p:
+                att = (pdf_p.name, pdf_p.read_bytes(), "pdf")
+            else:
+                pdf_note = (f"<p style='color:#c33'><b>PDF could not be made</b> "
+                            f"({pdf_err}) — the report is attached as .html.</p>")
+                att = (f"{base}.html", html_doc.encode("utf-8"), "octet-stream")
+            notes = "".join(f"<p style='color:#b45309'><b>Data note:</b> {n}</p>"
+                            for n in d.get("data_notes") or [])
+            part_b = ("Part B (forensic deep dive) is included."
+                      if nar.get("forensic_report") else "No Part B (deep dive) in this copy.")
             body = (
                 f"<h2>{co['name']} — narrative report</h2>"
                 f"<p>{co['symbol']} · {co['isin']} · data current to "
                 f"{d['as_of_utc'][:10]}</p>"
+                f"{notes}"
                 f"<p>{audit_line}</p>"
                 f"<p>{len(d['facts'])} facts · {len(d['tables'])} tables · "
                 f"{len(nar['sections'])} sections · {flagged} section(s) with "
                 f"unresolved grounding flags</p>"
-                f"<p>Full report attached (.md and .html). Open the .html for the "
-                f"charts and source footers.</p>"
-                f"<hr><pre style='white-space:pre-wrap;font-size:12px'>"
-                f"{md[:4000].replace('<', '&lt;')}…</pre>")
+                f"<p>{part_b}</p>"
+                f"<p>Attachment: <b>{att[0]}</b>. The .md is on Drive "
+                f"(company_repo/{co['isin']}/).</p>"
+                f"{pdf_note}")
             ok = send_email(
                 f"Narrative report — {co['name']} ({co['symbol']})",
                 body,
-                attachments=[(md_p.name, md.encode("utf-8"), "octet-stream"),
-                             (html_p.name, html_doc.encode("utf-8"), "octet-stream")])
+                attachments=[att])
             log("  mailed" if ok else "  mail SKIPPED (GMAIL_USER / "
                                       "GMAIL_APP_PASSWORD not set)")
         except Exception as e:
             log(f"  mail FAILED: {str(e)[:160]}")
 
     if args.open:
-        webbrowser.open(html_p.resolve().as_uri())
+        # the PDF (same file the mail carries), as the deep dive does; .html if no PDF
+        webbrowser.open((pdf_p or html_p).resolve().as_uri())
     log(f"done in {time.time() - t0:.0f}s")
     return {"company": co, "md": str(md_p), "html": str(html_p),
             "facts": len(d["facts"]), "flagged": flagged,
@@ -392,7 +448,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
 # document queue. Dedup-on-write is the correctness guarantee; a token already pending
 # or done is never added twice.
 NQUEUE = "company_repo/_index/narrative_queue.parquet"
-NQUEUE_COLS = ["token", "status", "added_at", "done_at", "error"]
+# with_deepdive (added 2026-10-02, additive): True = BOTH reports were queued; the story
+# waits until the company's deep dive is built (deepdive.yml, 08:00 IST) and attaches it
+# as Part B. Older rows read it as None = story only, exactly as before.
+NQUEUE_COLS = ["token", "status", "added_at", "done_at", "error", "with_deepdive"]
 
 
 def _load_nqueue(store: FP.Store) -> pd.DataFrame:
@@ -418,7 +477,8 @@ def _save_nqueue(store: FP.Store, df: pd.DataFrame):
                  buf.getvalue(), "application/octet-stream", existing_id=fid)
 
 
-def enqueue_narrative(store: FP.Store, tokens: list[str]) -> int:
+def enqueue_narrative(store: FP.Store, tokens: list[str],
+                      with_deepdive: bool = False) -> int:
     """Queue tokens for the next drain. Returns how many are now pending.
 
     Only an ALREADY-PENDING token is skipped. A token whose last run is `done` or
@@ -439,23 +499,34 @@ def enqueue_narrative(store: FP.Store, tokens: list[str]) -> int:
                        if not df.empty else set())
 
     now = datetime.now().isoformat(timespec="seconds")
-    requeued, added = [], []
+    requeued, added, upgraded = [], [], []
     for t in toks:
         if t in already_pending:
+            # Asking for BOTH on a company already queued story-only upgrades the row;
+            # a plain --add never downgrades one that asked for both.
+            if with_deepdive:
+                m = (df["token"].astype(str) == t) & (status == "pending")
+                df.loc[m, "with_deepdive"] = True
+                upgraded.append(t)
             continue
         m = (df["token"].astype(str) == t) if not df.empty else None
         if m is not None and m.any():
             df.loc[m, ["status", "added_at", "done_at", "error"]] = \
                 ["pending", now, None, None]
+            df.loc[m, "with_deepdive"] = bool(with_deepdive)
             requeued.append(t)
         else:
             added.append(t)
     if added:
         df = pd.concat([df, pd.DataFrame([{"token": t, "status": "pending",
-                                           "added_at": now} for t in added])],
+                                           "added_at": now,
+                                           "with_deepdive": bool(with_deepdive)}
+                                          for t in added])],
                        ignore_index=True)
-    if added or requeued:
+    if added or requeued or upgraded:
         _save_nqueue(store, df)
+    if upgraded:
+        log(f"  already queued — now set to BOTH reports: {', '.join(upgraded)}")
     if requeued:
         log(f"  re-queued (previous run finished): {', '.join(requeued)}")
     return len(added) + len(requeued)
@@ -475,6 +546,72 @@ def _mark_nqueue(store: FP.Store, token: str, status: str, error: str = ""):
     _save_nqueue(store, df)
 
 
+def _note_nqueue(store: FP.Store, token: str, note: str):
+    """Record WHY a row is still pending (status unchanged) — visible in the queue file."""
+    df = _load_nqueue(store)
+    m = (df["token"].astype(str) == str(token)) & (df["status"].astype(str) == "pending")
+    if m.any():
+        df.loc[m, "error"] = note[:200]
+        _save_nqueue(store, df)
+
+
+def _queued_part_b(store: FP.Store, token: str, outdir: str) -> tuple[str | None, str]:
+    """For a BOTH row: (path to the deep dive .md to attach, "") once it is built, or
+    (None, why) while the story must keep waiting.
+
+    Linked through deep_dive_queue STATUS, not timestamps: the two queues are stamped by
+    different machines' clocks (IST locally, UTC in CI), so comparing times would mix
+    zones. run_report.bat queues the same token in both queues and re-queues a finished
+    deep dive, so "no pending deep-dive row" means this request's deep dive has run.
+    """
+    dq = store.parquet(FP.IDX, "deep_dive_queue.parquet")
+    if not dq.empty and {"token", "status"} <= set(dq.columns):
+        mine = dq[dq["token"].astype(str).str.strip().str.upper() == token.strip().upper()]
+        if (mine["status"].astype(str) == "pending").any():
+            return None, "deep dive still queued (deepdive.yml drains it at 08:00 IST)"
+        errs = mine[mine["status"].astype(str) == "error"]
+    else:
+        errs = pd.DataFrame()
+    r = FP.resolve(store, token)
+    if r is None:
+        return "", ""                    # unresolvable: run_one reports it as an error
+    p, why = _drive_part_b(store, r[0], outdir)
+    if p is None and not errs.empty:
+        why += f" — deep_dive_queue says error: {str(errs.iloc[-1].get('error'))[:80]}"
+    return p, why
+
+
+def _drive_part_b(store: FP.Store, isin: str, outdir: str,
+                  since: str = "") -> tuple[str | None, str]:
+    """Download the company's latest deep dive from Drive (deep_dive_index ->
+    company_repo/<ISIN>/company_deepdive_*.md) for Part B -> (local path, "") or (None, why).
+
+    since (ISO time, the SAME machine's clock that ran the deep dive — it stamps
+    last_update with datetime.now()): only a deep dive built at/after it counts, so a run
+    whose deep dive just failed never silently attaches an older one. Used by run-now BOTH
+    (local run_report.bat and CI narrative.yml alike) and by the queue drain (no since).
+    """
+    idx = store.parquet(FP.IDX, "deep_dive_index.parquet")
+    row = idx[idx["isin"].astype(str) == isin] if not idx.empty and "isin" in idx else idx
+    if row.empty or not str(row.iloc[-1].get("report_path") or ""):
+        return None, "no deep dive on Drive yet"
+    if since:
+        built = pd.to_datetime(row.iloc[-1].get("last_update"), errors="coerce")
+        if pd.isna(built) or built < pd.to_datetime(since):
+            return None, (f"latest deep dive on Drive is from {str(row.iloc[-1].get('last_update'))[:16]}"
+                          f", older than this run ({since[:16]}) — this run's deep dive "
+                          f"did not finish")
+    name = Path(str(row.iloc[-1]["report_path"])).name
+    fid = find_file(store.drive, store.folder(f"company_repo/{isin}"), name)
+    if not fid:
+        return None, f"deep dive {name} listed in deep_dive_index but not found on Drive"
+    p = Path(outdir) / f"_partb_{isin}_{name}"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(download_bytes(store.drive, fid))
+    log(f"  Part B from Drive: company_repo/{isin}/{name}")
+    return str(p), ""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -484,6 +621,10 @@ def main():
                     help="ISIN / symbol / name fragment. Omit to drain the queue.")
     ap.add_argument("--add", nargs="+", default=None,
                     help="enqueue these tokens for the next scheduled run, then exit")
+    ap.add_argument("--with-deepdive", action="store_true",
+                    help="with --add: BOTH reports — the queued story waits for the "
+                         "company's deep dive (queue it too: company_deep_report.py --add "
+                         "X --requeue) and attaches it from Drive as Part B")
     ap.add_argument("--allow-empty-queue", action="store_true",
                     help="an empty queue exits 0 instead of failing. For the SCHEDULED "
                          "run, where nothing queued is normal; a manual dispatch that "
@@ -493,6 +634,10 @@ def main():
     ap.add_argument("--sections", nargs="*", type=int, default=None)
     ap.add_argument("--forensic-md", default="",
                     help="existing company_deepdive_*.md to attach as Part B")
+    ap.add_argument("--part-b-drive", default="", metavar="SINCE",
+                    help="BOTH run-now: attach the company's deep dive from Drive as Part B, "
+                         "only if it was built at/after SINCE (ISO time, same clock as the "
+                         "deep dive run). Used identically by run_report.bat and narrative.yml")
     ap.add_argument("--dry-run", action="store_true",
                     help="preflight + fact pack + sources only; no LLM, no writes")
     ap.add_argument("--skip-audit", action="store_true")
@@ -509,8 +654,8 @@ def main():
                     help="before building, pull any documents Drive is missing "
                          "(Screener/BSE/NSE via backfill_company_docs) and extract them")
     ap.add_argument("--mail", action="store_true",
-                    help="email the report (HTML inline + .md and .html attached) to "
-                         "NOTIFY_EMAIL — works identically local or in CI")
+                    help="email the report as a PDF (short summary inline; .html if the "
+                         "PDF cannot be made) to NOTIFY_EMAIL — identical local or in CI")
     ap.add_argument("--local-render", action="store_true",
                     help="also write the report to the Obsidian vault and Reports dir, "
                          "the same places run_deepdive.bat puts a deep dive")
@@ -536,9 +681,10 @@ def main():
 
     # --add: enqueue and exit (the scheduled run will pick these up).
     if a.add:
-        n = enqueue_narrative(store, a.add)
+        n = enqueue_narrative(store, a.add, with_deepdive=a.with_deepdive)
         log(f"enqueued {n} token(s) to narrative_queue "
-            f"({len(a.add) - n} already pending/done)")
+            f"({len(a.add) - n} already pending/done)"
+            + (" — BOTH reports: each waits for its deep dive" if a.with_deepdive else ""))
         return 0
 
     # No --names -> DRAIN the queue, same as company_deep_report.py with no args.
@@ -566,13 +712,37 @@ def main():
         log(f"draining narrative_queue: {len(pending)} pending "
             f"({', '.join(pending[:8])}{'...' if len(pending) > 8 else ''})")
         tokens = pending
+        wd = q["with_deepdive"] if "with_deepdive" in q.columns else pd.Series(dtype=object)
+        both = set(q[(q["status"].astype(str) == "pending")
+                     & wd.apply(lambda v: v is True or str(v).lower() == "true")
+                     ]["token"].astype(str))
     else:
         tokens = a.names
+        both = set()
 
-    results, failures = [], 0
+    results, failures, waiting = [], 0, 0
     for token in tokens:
+        a_tok = a
+        if token in both:
+            part_b, why = _queued_part_b(store, token, a.outdir)
+            if part_b is None:
+                log(f"  {token}: BOTH reports queued — waiting: {why}. Stays queued; "
+                    f"the next run builds it once the deep dive exists.")
+                _note_nqueue(store, token, f"waiting for deep dive: {why}")
+                waiting += 1
+                continue
+            if part_b:
+                a_tok = argparse.Namespace(**{**vars(a), "forensic_md": part_b})
+        elif a.part_b_drive and not a.forensic_md:
+            r0 = FP.resolve(store, token)
+            part_b, why = (_drive_part_b(store, r0[0], a.outdir, since=a.part_b_drive)
+                           if r0 else (None, "could not resolve the company"))
+            if part_b:
+                a_tok = argparse.Namespace(**{**vars(a), "forensic_md": part_b})
+            else:
+                log(f"  {token}: built WITHOUT Part B — {why}")
         try:
-            r = run_one(store, token, a)
+            r = run_one(store, token, a_tok)
         except Exception as e:
             log(f"  UNHANDLED for '{token}': {str(e)[:200]}")
             if a.debug:
@@ -597,6 +767,8 @@ def main():
             f"{r['flagged']} gate-flagged section(s), audit "
             f"{au.get('verified', '-')}/{au.get('total', '-')} verified")
         log(f"    {r['md']}")
+    if waiting:
+        log(f"  {waiting} company/companies waiting for their deep dive (still queued)")
     if failures:
         log(f"  {failures} company/companies failed")
     return 1 if failures and not results else 0
