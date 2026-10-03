@@ -152,14 +152,22 @@ def search_mentions(query: str, doc_type: str | None) -> pd.DataFrame:
     return df[mask].copy()
 
 
-def get_summaries(research_ns: list[int]) -> dict[int, dict]:
-    """Return {research_n: row_dict} from local ledger (has summary_md)."""
+def get_summaries(research_ns: list[int],
+                  processed_on: dt.date | None = None) -> dict[int, dict]:
+    """Return {research_n: row_dict} from local ledger (has summary_md).
+
+    processed_on: keep only documents PROCESSED on that date (processed_at, stamped on this
+    PC's clock by daily_research_summary, compared with this PC's date) — the daily run's
+    "today only" view (user 2026-10-03)."""
     if not LEDGER_PATH.exists():
         return {}
     idx = pd.read_parquet(LEDGER_PATH)
     if "summary_md" not in idx.columns:
         return {}
     subset = idx[idx.research_n.isin(research_ns)]
+    if processed_on is not None and "processed_at" in subset.columns:
+        day = pd.to_datetime(subset["processed_at"], errors="coerce").dt.date
+        subset = subset[day == processed_on]
     out = {}
     for _, r in subset.iterrows():
         summary = str(r.get("summary_md", "")).strip()
@@ -230,8 +238,13 @@ def enqueue_deep_dive(svc, root: str, isins: list[str]):
 def run_synthesis(label: str, doc_type: str | None,
                   pool, outdir: Path,
                   upload: bool, queue: bool,
-                  svc=None, root: str = "") -> tuple[list[str], Path | None]:
+                  svc=None, root: str = "",
+                  today_only: bool = False) -> tuple[list[str], Path | None]:
     """Run synthesis for one label. Returns (ISINs synthesised, output file or None).
+
+    today_only (the daily --all-new run, user 2026-10-03): only documents PROCESSED today,
+    so the daily synthesis says what today's research adds — not the company's whole
+    history. A manual run by name keeps the full history.
 
     The early returns give the SAME two-value shape as success: they used to return a
     bare [], and both callers unpack two values, so one company with no documents
@@ -243,10 +256,12 @@ def run_synthesis(label: str, doc_type: str | None,
         return [], None
 
     research_ns = sorted(matches.research_n.dropna().astype(int).unique().tolist())
-    summaries   = get_summaries(research_ns)
+    today = dt.date.today() if today_only else None
+    summaries   = get_summaries(research_ns, processed_on=today)
     if not summaries:
-        print(f"  No summary_md available for {label!r} "
-              "(data predates this feature — re-process PDFs to populate).")
+        print(f"  No summary_md available for {label!r}"
+              + (" from today's documents." if today_only else
+                 " (data predates this feature — re-process PDFs to populate)."))
         return [], None
 
     print(f"  [{label}] {len(summaries)} summaries found. Calling Gemini...")
@@ -258,9 +273,11 @@ def run_synthesis(label: str, doc_type: str | None,
 
     stamp      = dt.datetime.now().strftime("%d%b%Y")
     slug_label = _slug(label)
+    scope = (f"{len(summaries)} document(s) processed today ({today:%d %b %Y}) — today's "
+             f"research only; run `synthesise_company_docs.py {label}` for the full history"
+             if today_only else f"{len(summaries)} document(s)")
     header     = (f"# Research Synthesis — {label}\n\n"
-                  f"*Generated {dt.datetime.now():%d %b %Y %H:%M} IST · "
-                  f"{len(summaries)} document(s)*\n\n---\n\n")
+                  f"*Generated {dt.datetime.now():%d %b %Y %H:%M} IST · {scope}*\n\n---\n\n")
 
     # Local save
     outdir.mkdir(parents=True, exist_ok=True)
@@ -339,7 +356,9 @@ def main():
         print(f"--all-new: processing {len(new_isins)} ISIN(s): {new_isins}")
         created = []
         for isin in new_isins:
-            _, outpath = run_synthesis(isin, None, pool, outdir, args.upload, args.queue, svc, root)
+            # daily run = today's research only (user 2026-10-03)
+            _, outpath = run_synthesis(isin, None, pool, outdir, args.upload, args.queue, svc, root,
+                                       today_only=True)
             if outpath and outpath.exists():
                 created.append(outpath)
         # open each synthesis file in Obsidian (same as other bat outputs)
