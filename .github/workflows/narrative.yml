@@ -155,8 +155,8 @@ jobs:
       - name: Stop if preflight found a data-integrity FAIL
         if: >
           steps.preflight.outputs.rc == '2' &&
-          inputs.fetch_missing == 'false' &&
-          inputs.ignore_preflight != 'true'
+          !inputs.fetch_missing &&
+          !inputs.ignore_preflight
         run: |
           echo "::error::Preflight reported a data-integrity FAIL for ${{ inputs.names }}."
           echo "Re-dispatch with ignore_preflight=true, or leave fetch_missing on and"
@@ -201,8 +201,11 @@ jobs:
         run: |
           # On a SCHEDULE event `inputs.*` are all empty, so:
           #  - `--names` (empty) -> the script drains narrative_queue.parquet
-          #  - `!= 'false'` keeps mail + fetch ON for scheduled runs while still letting
-          #    a manual dispatch turn them off (mail=false).
+          #  - mail + fetch are ON for scheduled runs (event_name == 'schedule'); a manual
+          #    dispatch uses its switches. The switches are BOOLEANS: the old
+          #    `inputs.mail != 'false'` compared a boolean with TEXT, which GitHub never
+          #    treats as equal, so mail=false still mailed (5 TCS stories, 2026-10-03) and
+          #    skip_audit / ignore_preflight could never switch on.
           # A scheduled run with an empty queue is normal (exit 0). A MANUAL dispatch
           # that builds nothing must fail, or it goes green having produced no report.
           python scripts/company_narrative_report.py \
@@ -210,11 +213,11 @@ jobs:
             ${{ inputs.names != '' && format('--names {0}', inputs.names) || '' }} \
             --outdir ./_narrative \
             --upload \
-            ${{ inputs.mail != 'false' && '--mail' || '' }} \
-            ${{ inputs.fetch_missing != 'false' && '--fetch-missing' || '' }} \
+            ${{ (github.event_name == 'schedule' || inputs.mail) && '--mail' || '' }} \
+            ${{ (github.event_name == 'schedule' || inputs.fetch_missing) && '--fetch-missing' || '' }} \
             ${{ inputs.sections != '' && format('--sections {0}', inputs.sections) || '' }} \
-            ${{ inputs.skip_audit == 'true' && '--skip-audit' || '' }} \
-            ${{ inputs.ignore_preflight == 'true' && '--ignore-preflight' || '' }} \
+            ${{ inputs.skip_audit && '--skip-audit' || '' }} \
+            ${{ inputs.ignore_preflight && '--ignore-preflight' || '' }} \
             ${{ steps.deepdive.outputs.started_at != '' && format('--part-b-drive "{0}"', steps.deepdive.outputs.started_at) || '' }}
 
       - name: Retention — no raw PDF survives the run
