@@ -90,7 +90,11 @@ def update_index(store: FP.Store, rec: dict) -> str:
     merged = merged.drop_duplicates(subset=["isin", "report_file"], keep="last")
     buf = io.BytesIO()
     merged.to_parquet(buf, index=False)
-    upload_bytes(drive, folder, INDEX_FILE, buf.getvalue(), fid)
+    # (drive, folder, name, data, MIMETYPE, existing_id): fid used to sit in the mimetype
+    # slot — None for a first write -> "'NoneType' object has no attribute 'split'", so
+    # narrative_index.parquet was never created (checked on Drive 2026-10-03: absent).
+    upload_bytes(drive, folder, INDEX_FILE, buf.getvalue(), "application/octet-stream",
+                 existing_id=fid)
     return f"{INDEX_FILE}: {len(merged)} rows"
 
 
@@ -295,6 +299,9 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             # computed figure comes back UNSUPPORTED, because those numbers live in
             # Screener statements rather than in any filing in the document bundle.
             audit = audit_report(adj, secs, chosen, factpack=d)
+            if getattr(adj, "_gem", None) is not None:    # Gemini audit: log its models
+                from model_registry import record_usage
+                record_usage(adj._gem, "narrative_audit", "narrative", log=log)
             s = audit["summary"]
             if not audit.get("ran"):
                 log(f"  AUDIT DID NOT RUN — every section failed adjudication: "
@@ -326,6 +333,7 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
 
     # ---- Drive ------------------------------------------------------------
     if args.upload:
+        store.refresh()      # fresh connection: the first one is stale after the LLM phases
         try:
             folder = store.folder(f"company_repo/{co['isin']}")
             fid = find_file(store.drive, folder, md_p.name)
@@ -546,6 +554,7 @@ def enqueue_narrative(store: FP.Store, tokens: list[str],
 
 
 def _mark_nqueue(store: FP.Store, token: str, status: str, error: str = ""):
+    store.refresh()          # runs after a long report build: fresh Drive connection
     df = _load_nqueue(store)
     if df.empty:
         return

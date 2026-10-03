@@ -2247,6 +2247,7 @@ def main():
                     open_report_local(r["_report_md"], r["_slug"],
                                       r.get("name",""), r.get("symbol",""), r.get("isin",""))
             update_index(svc, root, [_strip_internal(r) for r in recs])
+        _record_usage(pool)
         return
 
     queue = _dedup_queue(_read_parquet(svc, DRIVE["queue"], root))
@@ -2318,6 +2319,18 @@ def main():
             _mark(token, added, "error", error=_safe_err(e))
 
     print(f"Done. {len(recs)} report(s) generated.")
+    _record_usage(pool)
+
+
+def _record_usage(pool):
+    """Log both pools' per-(key, model) outcome to gemini_usage.parquet (the registry's
+    standard), so the busy demotion sees the models the deep dive used. Best-effort."""
+    if pool is None:
+        return
+    from model_registry import record_usage
+    record_usage(getattr(pool, "bulk", pool), "deepdive_bulk", "deepdive")
+    if getattr(pool, "write", None) is not None:
+        record_usage(pool.write, "deepdive_write", "deepdive")
 
 
 if __name__ == "__main__":

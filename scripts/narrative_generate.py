@@ -300,6 +300,8 @@ def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> d
         if i < len(todo) - 1:
             time.sleep(INTER_CALL_SLEEP)
     flagged = sum(1 for s in out if s.get("gate_failed"))
+    from model_registry import record_usage          # busy demotion sees these models
+    record_usage(pool, "narrative_writer", "narrative", log=log)
     return {"company": pack["company"], "sections": out,
             "generator_model": models[0],
             "sections_with_unresolved_gate_failures": flagged}

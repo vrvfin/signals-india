@@ -66,14 +66,18 @@ FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash"
 
 
 def _models(drive=None, index_id: str = "") -> list[str]:
-    """The NARRATIVE chain with anything the daily probe found dead removed.
+    """Registry WRITE models (discover -> probe -> quality exam), FLASH TIER ONLY.
 
-    Imported under an alias: `resolve` in this module is narrative_factpack's token
-    resolver, which is a different thing entirely.
+    Every record is kept only if its evidence span is found VERBATIM in the source, and
+    lite / gemma models paraphrase, which costs records outright — the reason the old
+    NARRATIVE chain never named one. FALLBACK_MODELS when the registry is unavailable or
+    has no flash model ranked.
     """
     try:
-        from model_registry import resolve as resolve_models
-        return resolve_models("NARRATIVE", drive, index_id) or FALLBACK_MODELS
+        from model_registry import pick
+        flash = [m for m in pick("WRITE", FALLBACK_MODELS, drive, index_id)
+                 if "lite" not in m and not m.startswith("gemma-")]
+        return flash or FALLBACK_MODELS
     except Exception:
         return FALLBACK_MODELS
 # Thinking models spend this budget on reasoning too — see narrative_generate for the
@@ -179,7 +183,8 @@ def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save(store: Store, rows: pd.DataFrame, dry_run: bool) -> str:
-    drive, root = store.drive, store.root
+    store.refresh()          # after minutes of model calls the first connection is stale
+    drive, root = store.drive, store.root          # (ssl.SSLEOFError lost every row, 2026-10-03)
     fid_folder = store.folder(IDX)
     existing = pd.DataFrame(columns=STRUCT_COLS)
     fid = find_file(drive, fid_folder, STRUCT_FILE)
@@ -293,6 +298,9 @@ def main():
             return 1
         from _extractor_base import GeminiKeyPool
         pool = GeminiKeyPool(keys, _models(store.drive, store.folder(IDX)))
+        # give up on a busy model after a third of the keys, not 3 (this pool only)
+        from model_registry import overload_keys
+        pool._pool.model_overload_keys = overload_keys(len(keys))
 
     frames = []
     for token in a.names:
@@ -304,6 +312,9 @@ def main():
         print("no records extracted — nothing written")
         return 0
     print(save(store, allrows, a.dry_run))
+    if not a.dry_run:                       # busy demotion sees these models
+        from model_registry import record_usage
+        record_usage(pool, "extract_structure", "narrative")
     return 0
 
 

@@ -77,6 +77,13 @@ class Store:
         self._folders: dict[str, str] = {}
         self._files: dict[tuple[str, str], pd.DataFrame] = {}
 
+    def refresh(self) -> None:
+        """A NEW Drive connection, for writes after long Gemini work. The first one goes
+        stale while the run spends 10-30 min on model calls, and the next Drive request
+        fails with ssl.SSLEOFError — every story upload in CI on 2026-10-03 was lost that
+        way. Folder ids and cached frames stay valid."""
+        self.drive = get_drive()
+
     def folder(self, path: str) -> str:
         if path not in self._folders:
             fid = self.root
