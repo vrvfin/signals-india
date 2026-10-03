@@ -294,6 +294,15 @@ jobs:
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:        ${{ secrets.NOTIFY_EMAIL }}
 
+      # Market cap = weekly share count (share_count.yml) x today's close from
+      # features/latest.parquet. Rewrites universe/market_cap.csv with the same
+      # 3 columns; names without a share count keep their existing value.
+      # compute_features picks it up at the start of the next run.
+      - name: Update market cap (share count x close)
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/update_market_cap.py
+        continue-on-error: true
+
       # ---- Truth gate: the ONLY step allowed to fail the run ----
       - name: Health check (truth gate)
         if: steps.fresh.outputs.skip != 'true'

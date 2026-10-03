@@ -1914,6 +1914,22 @@ def main():
                 base_pat[s] = float(pd.Series(r.get("q_netprofit_last_4q")).astype(float).sum())
             except Exception:
                 pass
+    # Daily market cap (weekly share count x latest close, update_market_cap.py)
+    # replaces the summary snapshot, which Screener refreshes ~once a quarter.
+    # Only for names WITH a share count: the rest of market_cap.csv still holds
+    # old Yahoo values that must not override Screener's.
+    uni = _folder(drive, "universe")
+    sc, mc_daily = _read_csv(drive, uni, "share_count.csv"), _read_csv(drive, uni, "market_cap.csv")
+    if not sc.empty and not mc_daily.empty and "symbol" in sc.columns \
+            and {"symbol", "market_cap_cr"} <= set(mc_daily.columns):
+        have = set(sc["symbol"].astype(str).str.upper())
+        n = 0
+        for s, v in zip(mc_daily["symbol"].astype(str).str.upper(),
+                        pd.to_numeric(mc_daily["market_cap_cr"], errors="coerce")):
+            if s in have and pd.notna(v) and v > 0:
+                mcap_map[s] = float(v)
+                n += 1
+        log(f"  market cap: {n:,} names from the daily share-count x close file")
 
     title, annot, prelude = "📊 Signals gallery", {}, ""
     out_default = "gallery.html"
