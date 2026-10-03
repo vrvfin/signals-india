@@ -439,12 +439,21 @@ def render_entry(n, tags, meta, summary_md, run_hhmm) -> str:
             f"**Type:** {meta.get('doc_type','other')} · **Companies:** {comp}\n"
             f"**Tags:** {tagline}\n\n{body}\n\n---\n")
 
+def _drop_n(df, n):
+    """df without the rows of research number n (a retry replaces them, gap 3)."""
+    if df is None or df.empty or "research_n" not in df.columns:
+        return df
+    return df[df["research_n"].astype(str) != str(n)]
+
+
 def append_company_page(svc, isin, n, meta, summary_md, root):
     path = f"{DRIVE['company_page_dir']}/{isin}/company_page.md"
     cur = drive_download(svc, path, root)
     cur = cur.decode("utf-8") if cur else f"# Company Page — {isin}\n"
     if "## Research Notes" not in cur:
         cur += "\n## Research Notes\n"
+    if f"### research_{n:04d} " in cur:          # a retry: already appended once
+        return
     block = (f"\n### research_{n:04d} · {meta.get('doc_date','NA')} · {meta.get('source','NA')} "
              f"· {meta.get('doc_type','other')}\n"
              + re.sub(r"```json.*?```", "", summary_md, flags=re.DOTALL).strip() + "\n")
@@ -507,6 +516,11 @@ def main():
     seen_hash = set(blocking.doc_hash); seen_fp = set(blocking.fuzzy_fp)
     seen_ck = set(blocking.get("content_key", pd.Series(dtype=str)))
     prior_status = dict(zip(ledger.doc_hash, ledger.status)) if len(ledger) else {}
+    # research number of each doc whose last attempt failed to UPLOAD: its retry reuses it,
+    # so whatever that attempt already saved (digest entry, index row) is replaced below,
+    # not duplicated under a second number (gap 3, 2026-10-03).
+    prior_n = ({h: int(n) for h, n, st in zip(ledger.doc_hash, ledger.research_n, ledger.status)
+                if st == "upload_error" and pd.notna(n) and int(n) > 0} if len(ledger) else {})
     counter = int(ledger.research_n.max()) if len(ledger) else 0
 
     def add_ledger(**row):
@@ -654,12 +668,17 @@ def main():
         isins   = resolve_isins(meta.get("companies", []), universe)
         tags    = [meta["doc_type"]] + sectors + themes
 
-        counter += 1
-        md_ref = f"{dpath}#research_{counter:04d}"
-        entry  = render_entry(counter, tags, meta, summary, run_hhmm)
+        n = prior_n.get(h)
+        if n:
+            print(f"   retry of research_{n:04d} (its upload failed last run) — same number")
+        else:
+            counter += 1
+            n = counter
+        md_ref = f"{dpath}#research_{n:04d}"
+        entry  = render_entry(n, tags, meta, summary, run_hhmm)
         clean  = re.sub(r"```json.*?```", "", summary, flags=re.DOTALL).strip()
         index_row = dict(
-            research_n=counter, doc_hash=h, fuzzy_fp=fp, content_key=ck,
+            research_n=n, doc_hash=h, fuzzy_fp=fp, content_key=ck,
             file_name=pdf.name, source=meta["source"], doc_date=meta["doc_date"],
             doc_type=meta["doc_type"], companies=json.dumps(meta.get("companies", [])),
             isins=json.dumps(isins), sectors=json.dumps(sectors), subsectors=json.dumps(subs),
@@ -677,39 +696,41 @@ def main():
             tok = str(c.get("ticker_or_isin", "")).strip().upper()
             isin_for_c = tok if tok.startswith("INE") and tok in isins else (isins[0] if isins else "")
             ment_rows.append(dict(
-                research_n=counter, file_name=pdf.name, source=meta["source"],
+                research_n=n, file_name=pdf.name, source=meta["source"],
                 doc_date=meta["doc_date"], doc_type=meta["doc_type"],
                 company_name_raw=raw, company_name_slug=company_slug(raw),
                 isin=isin_for_c, daily_md_ref=md_ref))
 
         # ---- PERSIST THIS DOC (append-each-time: Drive + local) ----
         try:
-            daily_md += entry
+            if f"## research_{n:04d} " not in daily_md:   # a retry may already have it
+                daily_md += entry
             drive_upload_with_retry(svc, dpath, root, daily_md.encode("utf-8"), "text/markdown")
 
-            index_df = pd.concat([index_df, pd.DataFrame([index_row])], ignore_index=True)
+            index_df = pd.concat([_drop_n(index_df, n), pd.DataFrame([index_row])],
+                                 ignore_index=True)
             ibuf = io.BytesIO(); index_df.to_parquet(ibuf, index=False)
             drive_upload_with_retry(svc, DRIVE["index_parquet"], root, ibuf.getvalue(), "application/octet-stream")
             index_df.to_parquet(LOCAL_INDEX_PATH, index=False)
 
             if ment_rows:
-                mentions_df = pd.concat([mentions_df, pd.DataFrame(ment_rows)], ignore_index=True)
+                mentions_df = pd.concat([_drop_n(mentions_df, n), pd.DataFrame(ment_rows)],
+                                        ignore_index=True)
                 mbuf = io.BytesIO(); mentions_df.to_parquet(mbuf, index=False)
                 drive_upload_with_retry(svc, DRIVE["mentions_parquet"], root, mbuf.getvalue(), "application/octet-stream")
                 mentions_df.to_parquet(MENTIONS_PATH, index=False)
 
             for isin in isins:
-                append_company_page(svc, isin, counter, meta, summary, root)
+                append_company_page(svc, isin, n, meta, summary, root)
         except Exception as e:
             print(f"   FATAL (upload): {pdf.name}: {str(e)[:120]}")
-            add_ledger(research_n=counter, doc_hash=h, fuzzy_fp=fp, content_key=ck,
+            print("   the PDF stays in intake: the next run retries it with the same number")
+            add_ledger(research_n=n, doc_hash=h, fuzzy_fp=fp, content_key=ck,
                        file_name=pdf.name, source=source, doc_type=meta["doc_type"],
                        processed_at=dt.datetime.now().isoformat(), status="upload_error")
-            seen_hash.add(h); seen_fp.add(fp); seen_ck.add(ck)
-            _move_processed(pdf)
             raise
 
-        add_ledger(research_n=counter, doc_hash=h, fuzzy_fp=fp, content_key=ck,
+        add_ledger(research_n=n, doc_hash=h, fuzzy_fp=fp, content_key=ck,
                    file_name=pdf.name, source=source, doc_type=meta["doc_type"],
                    processed_at=dt.datetime.now().isoformat(), status="ok")
 
@@ -719,7 +740,7 @@ def main():
         _move_processed(pdf)
         seen_hash.add(h); seen_fp.add(fp); seen_ck.add(ck)
         counts["processed"] += 1
-        print(f"   persisted research_{counter:04d}  ({len(isins)} ISIN, {len(ment_rows)} mention)")
+        print(f"   persisted research_{n:04d}  ({len(isins)} ISIN, {len(ment_rows)} mention)")
 
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
