@@ -127,6 +127,21 @@ def _build_email(name: str, symbol: str, isin: str,
     return msg
 
 
+def _both_pending(svc, root) -> set[str]:
+    """Upper-cased tokens of narrative_queue rows still PENDING for BOTH reports
+    (with_deepdive) — their deep dive is emailed with the story. Empty on any error, so a
+    queue read problem can only mean an extra email, never a lost one."""
+    try:
+        q = _read_parquet(svc, "company_repo/_index/narrative_queue.parquet", root)
+        if q.empty or "with_deepdive" not in q.columns:
+            return set()
+        wd = q["with_deepdive"].map(lambda v: v is True or str(v).lower() == "true")
+        p = q[(q["status"].astype(str) == "pending") & wd]
+        return {str(t).strip().upper() for t in p["token"]}
+    except Exception:
+        return set()
+
+
 def send_notifications(report_isins: list[str] | None = None):
     if not GMAIL_USER or not GMAIL_PASS:
         print("notify_deepdive: GMAIL_USER / GMAIL_APP_PASSWORD not set — skipping email."); return
@@ -148,6 +163,20 @@ def send_notifications(report_isins: list[str] | None = None):
     else:
         today = dt.date.today().isoformat()
         rows = idx[idx["last_update"].astype(str).str.startswith(today)]
+
+    # ONE email per company for BOTH (user 2026-10-04): a company still waiting in
+    # narrative_queue for BOTH reports gets its deep dive inside the STORY email (both
+    # PDFs) — skip it here. An explicit report_isins list (the story-failed fallback) is
+    # never skipped.
+    if not report_isins:
+        both = _both_pending(svc, root)
+        if both:
+            keys = rows.apply(lambda r: {str(r.get(c, "")).strip().upper()
+                                         for c in ("isin", "symbol", "name")}, axis=1)
+            skip = keys.map(lambda k: bool(k & both))
+            for _, r in rows[skip].iterrows():
+                print(f"  held for the story email (BOTH queued): {r.get('name', r.get('isin'))}")
+            rows = rows[~skip]
 
     if rows.empty:
         print("notify_deepdive: no reports to notify."); return

@@ -422,6 +422,17 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                 pdf_note = (f"<p style='color:#c33'><b>PDF could not be made</b> "
                             f"({pdf_err}) — the report is attached as .html.</p>")
                 att = (f"{base}.html", styled_html.encode("utf-8"), "octet-stream")
+            # ONE email per company for BOTH (user 2026-10-04): when the deep dive is
+            # attached as Part B, its own PDF rides along — no separate deep dive email.
+            atts, dd_name = [att], ""
+            if nar.get("forensic_report"):
+                dd_name = f"{FMT.report_basename(co['name'], 'DeepDive')}.pdf"
+                try:
+                    atts.append((dd_name, FMT.md_to_pdf(nar["forensic_report"], co["name"],
+                                                         co["symbol"], co["isin"]), "pdf"))
+                except Exception as e:
+                    log(f"  deep dive pdf FAILED ({str(e)[:100]}) — it is still inside as Part B")
+                    dd_name = ""
             notes = "".join(f"<p style='color:#b45309'><b>Data note:</b> {n}</p>"
                             for n in d.get("data_notes") or [])
             part_b = ("Part B (forensic deep dive) is included."
@@ -436,13 +447,15 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                 f"{len(nar['sections'])} sections · {flagged} section(s) with "
                 f"unresolved grounding flags</p>"
                 f"<p>{part_b}</p>"
-                f"<p>Attachment: <b>{att[0]}</b>. The .md is on Drive "
-                f"(company_repo/{co['isin']}/).</p>"
+                f"<p>Attachment{'s' if dd_name else ''}: <b>{att[0]}</b>"
+                + (f" and <b>{dd_name}</b>" if dd_name else "")
+                + f". The .md is on Drive (company_repo/{co['isin']}/).</p>"
                 f"{pdf_note}")
             ok = send_email(
-                f"Narrative report — {co['name']} ({co['symbol']})",
+                (f"Deep dive + story — {co['name']} ({co['symbol']})" if dd_name else
+                 f"Narrative report — {co['name']} ({co['symbol']})"),
                 body,
-                attachments=[att])
+                attachments=atts)
             log("  mailed" if ok else "  mail SKIPPED (GMAIL_USER / "
                                       "GMAIL_APP_PASSWORD not set)")
         except Exception as e:
@@ -777,6 +790,18 @@ def main():
             failures += 1
             if draining:
                 _mark_nqueue(store, token, "error", "run_one returned None or raised")
+            # BOTH (queue, or run-now via --part-b-drive): the deep dive is emailed only
+            # inside the story email (one email per company) — the story failed, so send
+            # the deep dive on its own; it must never be lost.
+            if a.mail and a_tok is not a:
+                try:
+                    from notify_deepdive import send_notifications
+                    r0 = FP.resolve(store, token)
+                    if r0:
+                        log(f"  {token}: story failed — emailing its deep dive on its own")
+                        send_notifications([r0[0]])
+                except Exception as e:
+                    log(f"  deep dive fallback email failed: {str(e)[:120]}")
         else:
             results.append(r)
             if draining:
