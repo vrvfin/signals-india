@@ -1544,8 +1544,10 @@ def phase3_block(svc, root, isin, symbol) -> str:
             if v is None or (isinstance(v, float) and v != v):
                 return "?"
             return round(v, 1) if isinstance(v, float) else v
+        _asof = str(r.get("mcap_as_of") or "").strip()          # added 2026-10-05
+        _asof = f" (as of {_asof})" if _asof and _asof.lower() != "nan" else ""
         parts.append(
-            f"MARKET & FINANCIALS (latest): mcap={_g('mcap_cr')} cr | "
+            f"MARKET & FINANCIALS (latest): mcap={_g('mcap_cr')} cr{_asof} | "
             f"P/E={_g('pe')} | P/B={_g('pb')} | price ret 3m/6m/12m="
             f"{_g('ret_3m_pct')}/{_g('ret_6m_pct')}/{_g('ret_12m_pct')}% | "
             f"latest {_g('latest_q')}: rev={_g('rev_q')} (YoY {_g('rev_q_yoy')}%, "

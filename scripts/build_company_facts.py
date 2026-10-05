@@ -16,11 +16,12 @@ Columns (FACT_COLS): identity + classification + the metrics the user asked for
   rev_q, rev_q_yoy, rev_q_qoq, pat_q, pat_q_yoy, pat_q_qoq,
   eps_q, eps_q_yoy, eps_q_qoq,
   rev_ttm, pat_ttm, eps_ttm,
-  latest_q, source, updated_at
+  latest_q, source, updated_at, mcap_as_of, mcap_source
 
 Sources: summary.parquet (mcap/pe/book + q arrays), features/latest (price moves
 + volume), results.parquet (explicit Q value + YoY + QoQ — authoritative),
-classification.csv (segment/peer_group/sector/subsector), universe (isin map).
+classification.csv (segment/peer_group/sector/subsector), universe (isin map),
+universe/share_count.csv + market_cap.csv (DAILY mcap; P/E repriced to it).
 
 Usage:
     python scripts/build_company_facts.py --dry-run     # coverage + sample
@@ -55,7 +56,12 @@ FACT_COLS = [
     "rev_q", "rev_q_yoy", "rev_q_qoq", "pat_q", "pat_q_yoy", "pat_q_qoq",
     "eps_q", "eps_q_yoy", "eps_q_qoq", "rev_ttm", "pat_ttm", "eps_ttm",
     "latest_q", "source", "updated_at",
+    # ADDITIVE 2026-10-05: when mcap_cr / pe were valued, and from what.
+    "mcap_as_of", "mcap_source",
 ]
+# mcap_source values
+MCAP_DAILY = "daily (share count x close)"
+MCAP_SNAPSHOT = "screener snapshot"
 GROUP_LEVELS = ["peer_group", "subsector", "sector", "segment"]
 NUM_METRICS = ["mcap_cr", "pe", "pb", "ret_3m_pct", "ret_6m_pct", "ret_12m_pct",
                "rev_q_yoy", "rev_q_qoq", "pat_q_yoy", "pat_q_qoq",
@@ -106,6 +112,34 @@ def _q_last(arr):
         return round(a[-1], 2) if a else None
     except Exception:
         return None
+
+
+def _day(v) -> str:
+    """YYYY-MM-DD of a date/timestamp value, or '' (UTC as stored)."""
+    t = pd.to_datetime(v, errors="coerce", utc=True)
+    return "" if pd.isna(t) else t.strftime("%Y-%m-%d")
+
+
+def _daily_mcap(sc: pd.DataFrame | None, mc: pd.DataFrame | None) -> dict[str, dict]:
+    """isin -> {mcap, shares, fetched} for every company with a weekly share count AND a
+    daily value in universe/market_cap.csv (update_market_cap.py, end of Phase 1).
+
+    WHY (user 2026-10-05, "morepen mcap seems dated"): mcap_cr / pe here came only from
+    summary.parquet — a Screener snapshot (MOREPENLAB Rs 4,036 cr fetched 2026-08-12)
+    while the daily figure was Rs 7,398 cr. market_cap.csv also keeps Yahoo values for
+    names WITHOUT a share count, which do not refresh, so only share-count names count
+    as daily here; the rest keep the snapshot, as before."""
+    if sc is None or sc.empty or mc is None or mc.empty:
+        return {}
+    cap = dict(zip(mc["symbol"].astype(str), pd.to_numeric(mc["market_cap_cr"],
+                                                           errors="coerce")))
+    out: dict[str, dict] = {}
+    for _, r in sc.iterrows():
+        isin, sym = str(r.get("isin", "")).strip(), str(r.get("symbol", "")).strip()
+        shares, m = _num(r.get("shares_cr")), _num(cap.get(sym))
+        if isin and shares and shares > 0 and m and m > 0:
+            out[isin] = {"mcap": m, "shares": shares, "fetched": _day(r.get("fetched_at"))}
+    return out
 
 
 def _pivot_results(res: pd.DataFrame) -> dict[str, dict]:
@@ -167,6 +201,10 @@ def main() -> None:
     cls = _read(drive, root, ["company_repo", "_index", "company_classification.csv"])
     cls_by_isin = ({str(r["isin"]): r for _, r in cls.fillna("").iterrows()}
                    if cls is not None else {})
+    daily = _daily_mcap(_read(drive, root, ["universe", "share_count.csv"]),
+                        _read(drive, root, ["universe", "market_cap.csv"]))
+    log(f"daily market cap available for {len(daily):,} companies "
+        f"(universe/share_count.csv x market_cap.csv)")
 
     rows = []
     n_alt = 0
@@ -193,6 +231,26 @@ def main() -> None:
 
         price = _num(sg(f, "close"))
         bv = _num(sg(s, "book_value"))
+        # Market cap + P/E: the DAILY value where the company has a share count, else
+        # the Screener snapshot (unchanged behaviour). P/E keeps SCREENER'S EARNINGS
+        # and updates only the market value: snapshot P/E x today's mcap / snapshot
+        # mcap (= today's mcap / Screener's implied earnings). Measured 2026-10-05:
+        # neither mcap / TTM net profit nor price / TTM EPS reproduces Screener's P/E
+        # (>25% off for ~850 of 4,348 companies; Screener uses its own earnings basis),
+        # so the basis is taken from Screener, not rebuilt. Blank P/E (loss-makers)
+        # stays blank. The earnings side refreshes when summary.parquet does.
+        snap_mcap, snap_pe = _num(sg(s, "market_cap_cr")), _num(sg(s, "pe"))
+        dm = daily.get(isin)
+        if dm:
+            mcap = round(dm["mcap"], 2)
+            pe = (round(snap_pe * dm["mcap"] / snap_mcap, 2)
+                  if (snap_pe is not None and snap_mcap and snap_mcap > 0) else None)
+            mcap_as_of = max(_day(sg(f, "date")), dm["fetched"])
+            mcap_src = MCAP_DAILY
+        else:
+            mcap, pe = snap_mcap, snap_pe
+            mcap_as_of = _day(sg(s, "fetched_at")) if snap_mcap is not None else ""
+            mcap_src = MCAP_SNAPSHOT if snap_mcap is not None else ""
         src = "+".join(x for x, ok in
                        (("summary", sym in summ_by_sym),
                         ("features", sym in feat_by_sym),
@@ -204,8 +262,8 @@ def main() -> None:
             "sector": str(c.get("sector", "")) if c is not None else "",
             "subsector": str(c.get("subsector", "")) if c is not None else "",
             "peer_group": str(c.get("peer_group", "")) if c is not None else "",
-            "mcap_cr": _num(sg(s, "market_cap_cr")),
-            "pe": _num(sg(s, "pe")),
+            "mcap_cr": mcap,
+            "pe": pe,
             "pb": round(price / bv, 2) if (price and bv) else None,
             "ret_3m_pct": _num(sg(f, "return_3m_pct")),
             "ret_6m_pct": _num(sg(f, "return_6m_pct")),
@@ -237,14 +295,25 @@ def main() -> None:
             # from a BSE-only one without re-deriving it from the universe.
             "source": (src + "|bse") if listing == "bse" else src,
             "updated_at": today,
+            "mcap_as_of": mcap_as_of,
+            "mcap_source": mcap_src,
+            # dry-run comparison only (dropped before writing)
+            "_snap_mcap": snap_mcap, "_snap_pe": snap_pe,
         })
 
+    cmp = pd.DataFrame(rows)
     df = pd.DataFrame(rows, columns=FACT_COLS)
     cov = {c: int(df[c].notna().sum()) for c in
            ["mcap_cr", "pe", "ret_12m_pct", "rev_q_yoy", "pat_q_yoy", "rev_ttm"]}
     log(f"company_facts: {len(df)} rows "
         f"({len(df) - n_alt} keyed on {sym_col}, {n_alt} on {alt_sym_col or 'n/a'}). "
         f"coverage {cov}")
+    log(f"market cap source: {df['mcap_source'].replace('', 'none').value_counts().to_dict()}")
+    d_ = cmp[(cmp["mcap_source"] == MCAP_DAILY) & cmp["_snap_mcap"].gt(0)]
+    if len(d_):
+        chg = (d_["mcap_cr"] / d_["_snap_mcap"] - 1) * 100
+        log(f"daily vs snapshot mcap: median |change| {chg.abs().median():.1f}% | "
+            f">25% off {int((chg.abs() > 25).sum()):,} of {len(d_):,}")
 
     # ---- peer/segment median aggregates ----
     agg_rows = []
@@ -268,6 +337,10 @@ def main() -> None:
         print(sample[cols].to_string(index=False))
         log("peer-aggregate sample:")
         print(agg[agg["level"] == "peer_group"].head(6).to_string(index=False))
+        log("market cap / P/E — snapshot -> written:")
+        show = cmp[cmp["symbol"].isin(["MOREPENLAB", "LAURUSLABS", "TCS", "RELIANCE"])]
+        print(show[["symbol", "_snap_mcap", "mcap_cr", "_snap_pe", "pe", "mcap_as_of",
+                    "mcap_source"]].to_string(index=False))
         return
 
     for name, frame in (("company_facts", df), ("peer_aggregates", agg)):
