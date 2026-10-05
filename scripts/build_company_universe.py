@@ -38,6 +38,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+from bse_http import bse_session
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # NSE equity CSVs — (url, board label). Mainboard is reliable; SME is best-effort.
@@ -169,7 +171,8 @@ def fetch_bse() -> pd.DataFrame:
     headers = {"User-Agent": UA, "Accept": "application/json",
                "Referer": "https://www.bseindia.com/"}
     try:
-        r = requests.get(BSE_SCRIP_API, headers=headers, timeout=30)
+        # Browser-fingerprint session: BSE 403s python-requests since ~2026-09-24.
+        r = bse_session(headers).get(BSE_SCRIP_API, timeout=30)
         if r.status_code != 200:
             log(f"  BSE: HTTP {r.status_code} — skipping.")
             return pd.DataFrame(columns=cols)

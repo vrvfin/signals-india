@@ -42,6 +42,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
+from bse_http import bse_session
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, upload_bytes, log)
 
@@ -63,11 +64,12 @@ TRD_URL = "https://api.bseindia.com/BseIndiaAPI/api/StockTrading/w?flag=&scripco
 _tl = threading.local()
 
 
-def _session() -> requests.Session:
+def _session():
+    # Browser-fingerprint session (bse_http): since ~2026-09-24 BSE 403s
+    # python-requests on every api.bseindia.com call.
     s = getattr(_tl, "s", None)
     if s is None:
-        s = requests.Session()
-        s.headers.update(API_HDR)
+        s = bse_session(API_HDR)
         _tl.s = s
     return s
 
@@ -249,6 +251,26 @@ def corp_action_factor(code: str, around: date) -> tuple[float, date] | None:
                 a, b = float(m.group(1)), float(m.group(2))
                 if b > 0 and a > b:
                     return a / b, exd
+    # Stock SPLITS are not in Table1: BSE lists them in Table2 as
+    # {purpose_code 'SS', Ex_date '25 Sep 2026', purpose 'Stock  Split From
+    # Rs.10/- to Rs.5/-'} (NAPL, REMAGNET, verified 2026-10-04). Reading only
+    # Table1 meant no split was ever confirmed and history kept a fake cliff.
+    for row in (j.get("Table2") or []):
+        purpose = " ".join(str(row.get("purpose", "")).lower().split())
+        try:
+            exd = datetime.strptime(str(row.get("Ex_date", "")).strip(), "%d %b %Y").date()
+        except ValueError:
+            continue
+        if abs((exd - around).days) > EXDATE_SLACK_DAYS:
+            continue
+        if "split" in purpose or "sub-division" in purpose or "sub division" in purpose:
+            fv = [float(x) for x in re.findall(r"rs\.?\s*(\d+(?:\.\d+)?)", purpose)]
+            if len(fv) >= 2 and fv[1] > 0 and fv[0] > fv[1]:
+                return fv[0] / fv[1], exd
+        elif "bonus" in purpose:
+            m = re.search(r"(\d+)\s*:\s*(\d+)", purpose)
+            if m and int(m.group(2)) > 0:
+                return (int(m.group(1)) + int(m.group(2))) / int(m.group(2)), exd
     return None
 
 
@@ -311,6 +333,219 @@ def _merge_append(drive, folder_id, key, bar: dict, existing_id, bse_code: str =
     return len(merged)
 
 
+# ---------- Official bhavcopy (default source from 2026-10) --------------------
+# Since ~2026-09-24 BSE blocks bursts: ~5,000 per-scrip API calls a day got this
+# pipeline 403'd (and once got a whole IP blocked). BSE's official daily file —
+# ONE request, every BSE equity's OHLC + volume — replaces them. It is published
+# ~11:00 UTC (Last-Modified 30 Sep 10:59, 1 Oct 11:04), a little after Phase 1's
+# BSE step, so the step waits for it (--wait-min) and only then falls back to
+# Yahoo `<bse_symbol>.BO`. A later official file always REPLACES a Yahoo bar for
+# the same date; Yahoo bars only ever fill dates the official file has not.
+
+BHAV_URL = ("https://www.bseindia.com/download/BhavCopy/Equity/"
+            "BhavCopy_BSE_CM_0_0_0_{d}_F_0000.CSV")
+WAIT_POLL_SEC = 120
+
+
+def _today_ist() -> date:
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
+
+
+def fetch_bhavcopy(day: date):
+    """(frame, status). status: ok | none (BSE serves its web page: weekend,
+    holiday, or not published yet) | blocked (403, network error)."""
+    try:
+        r = _session().get(BHAV_URL.format(d=day.strftime("%Y%m%d")), timeout=40)
+    except Exception:
+        return None, "blocked"
+    if r.status_code != 200 or b"Access Denied" in r.content[:400]:
+        return None, "blocked"
+    if not r.content.startswith(b"TradDt"):
+        return None, "none"
+    df = pd.read_csv(io.BytesIO(r.content), dtype=str)
+    return df[df["FinInstrmTp"].astype(str).str.strip() == "STK"], "ok"
+
+
+def bhav_bars(df: pd.DataFrame, code_to_key: dict) -> dict:
+    """key -> bar dict, for the BSE-only names present in one bhavcopy."""
+    out = {}
+    for r in df.to_dict("records"):
+        key = code_to_key.get(str(r.get("FinInstrmId", "")).strip())
+        if not key:
+            continue
+        o, h, l, c = (_num(r.get(k)) for k in ("OpnPric", "HghPric", "LwPric", "ClsPric"))
+        if not c or c <= 0:
+            continue
+        out[key] = {"date": pd.Timestamp(r["TradDt"]).normalize(), "open": o or c,
+                    "high": h or c, "low": l or c, "close": c,
+                    "volume": float(_num(r.get("TtlTradgVol")) or 0)}
+    return out
+
+
+def yahoo_bars(rows: list, days: set) -> dict:
+    """Fallback: key -> [bars] for `days`, from Yahoo `<bse_symbol>.BO` raw
+    (unadjusted) prices. Yahoo no longer answers the numeric `<code>.BO` form."""
+    import yfinance as yf
+    tk = {}
+    for r in rows:
+        sym = str(r.get("bse_symbol", "")).strip()
+        if sym and sym.lower() != "nan":
+            tk[f"{sym.upper()}.BO"] = _storage_key(r)
+    out, names = {}, list(tk)
+    for i in range(0, len(names), 40):
+        batch = names[i:i + 40]
+        try:
+            df = yf.download(batch, period="1mo", group_by="ticker", progress=False,
+                             auto_adjust=False, threads=True)
+        except Exception as e:
+            log(f"  yahoo batch failed: {str(e)[:80]}")
+            continue
+        if df is None or df.empty:
+            continue
+        for t in batch:
+            try:
+                sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+            except KeyError:
+                continue
+            sub = sub.dropna(subset=["Close"])
+            for d_, r in sub.iterrows():
+                d0 = pd.Timestamp(d_).tz_localize(None).normalize()
+                if d0.date() in days and r["Close"] > 0:
+                    out.setdefault(tk[t], []).append(
+                        {"date": d0, "open": float(r["Open"]), "high": float(r["High"]),
+                         "low": float(r["Low"]), "close": float(r["Close"]),
+                         "volume": float(r.get("Volume", 0) or 0)})
+        time.sleep(0.5)
+    return out
+
+
+def _merge_bars(drive, folder_id, key, official: list, yahoo: list,
+                existing_id, bse_code: str = "", write: bool = True) -> dict:
+    """Official bars REPLACE stored bars of the same date; Yahoo bars only fill
+    dates not stored and not official. Then the existing split/bonus guard runs
+    on every new bar: a > JUMP_TOL move vs the previous close is rescaled ONLY on
+    an official BSE corporate-action record (never price-implied); otherwise the
+    history is left alone and the jump is reported."""
+    old = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    if existing_id:
+        old = pd.read_parquet(io.BytesIO(download_bytes(drive, existing_id)))
+        old["date"] = pd.to_datetime(old["date"]).dt.normalize()
+    off = pd.DataFrame(official)
+    off_dates = set(off["date"]) if len(off) else set()
+    yh = pd.DataFrame(yahoo)
+    if len(yh):
+        yh = yh[~yh["date"].isin(set(old["date"]) | off_dates)]
+    replaced = int(old["date"].isin(off_dates).sum())
+    new_dates = sorted(off_dates | (set(yh["date"]) if len(yh) else set()))
+    parts = [x for x in (old[~old["date"].isin(off_dates)], off, yh) if len(x)]
+    if not parts:
+        return {"key": key, "added": 0, "replaced": 0, "events": [], "new_dates": []}
+    merged = pd.concat(parts, ignore_index=True)
+    merged = (merged.drop_duplicates(subset=["date"], keep="last")
+              .sort_values("date").reset_index(drop=True))
+    events = []
+    for d0 in new_dates:
+        prior = merged[merged["date"] < d0]
+        if not len(prior):
+            continue
+        last = float(prior["close"].iloc[-1])
+        now = float(merged.loc[merged["date"] == d0, "close"].iloc[0])
+        if last > 0 and abs(now / last - 1.0) > JUMP_TOL:
+            hit = corp_action_factor(bse_code, d0.date()) if bse_code else None
+            if hit:
+                factor, exd = hit
+                fixed = rescale_history(merged, exd, factor)
+                if junction_ok(fixed, exd):
+                    merged = fixed
+                    events.append(f"rescaled /{factor:g} (official {exd})")
+                    continue
+            events.append(f"jump {100*(now/last-1):+.0f}% on {d0.date()} - no official "
+                          f"record, history untouched")
+    if write and new_dates:
+        upload_bytes(drive, folder_id, f"{key}.parquet", merged.to_parquet(index=False),
+                     "application/octet-stream", existing_id=existing_id)
+    return {"key": key, "added": len(new_dates) - replaced, "replaced": replaced,
+            "events": events, "new_dates": [str(d.date()) for d in new_dates]}
+
+
+def main_bhavcopy(args, drive, bse: pd.DataFrame) -> None:
+    rows = bse.to_dict("records")
+    code_to_key = {str(r["bse_code"]).strip(): _storage_key(r) for r in rows}
+    key_to_code = {v: k for k, v in code_to_key.items()}
+    today = _today_ist()
+    if args.from_date:
+        start = date.fromisoformat(args.from_date)
+        days = [start + timedelta(n) for n in range((today - start).days + 1)]
+    else:
+        # today + a catch-up window: any session missed in the last two weeks
+        # (BSE refused, Yahoo used, run skipped) is re-taken from the official file
+        days = [today - timedelta(n) for n in range(max(1, args.catchup_days))]
+    days = sorted(d for d in days if d.weekday() < 5)
+    log(f"BSE-only EOD via official bhavcopy: {len(rows)} names | sessions "
+        f"{days[0]}..{days[-1]} | mode={'DRY-RUN' if args.dry_run else 'LIVE'}")
+
+    official, yahoo_days, per_day = {}, set(), []
+    for d in days:
+        df, st = fetch_bhavcopy(d)
+        if st == "none" and d == today and args.wait_min > 0:
+            deadline = time.time() + args.wait_min * 60
+            while st == "none" and time.time() < deadline:
+                log(f"  {d}: official file not published yet - waiting")
+                time.sleep(WAIT_POLL_SEC)
+                df, st = fetch_bhavcopy(d)
+        if st == "ok":
+            bars = bhav_bars(df, code_to_key)
+            for k, b in bars.items():
+                official.setdefault(k, []).append(b)
+            per_day.append(f"{d} official {len(bars)}")
+        elif st == "blocked" or (st == "none" and d == today):
+            yahoo_days.add(d)
+            per_day.append(f"{d} {st} -> Yahoo")
+        else:
+            per_day.append(f"{d} no file (weekend/holiday)")
+        time.sleep(1)
+    log("  sessions: " + " | ".join(per_day))
+
+    yahoo = {}
+    if yahoo_days and not args.no_yahoo:
+        yahoo = yahoo_bars(rows, yahoo_days)
+        log(f"  Yahoo fallback for {sorted(str(d) for d in yahoo_days)}: "
+            f"{sum(len(v) for v in yahoo.values())} bars, {len(yahoo)} names")
+
+    keys = sorted(set(official) | set(yahoo))
+    if args.limit:
+        keys = keys[:args.limit]
+    live_fid = _folder(drive, OHLCV_LIVE)
+    live_index = _list_folder(drive, live_fid)
+
+    def _one(k):
+        try:
+            return _merge_bars(_thread_drive(), live_fid, k, official.get(k, []),
+                               yahoo.get(k, []), live_index.get(f"{k}.parquet"),
+                               bse_code=key_to_code.get(k, ""), write=not args.dry_run)
+        except Exception as e:
+            return {"key": k, "added": 0, "replaced": 0, "events": [f"error {str(e)[:80]}"],
+                    "new_dates": []}
+
+    t0, res = time.time(), []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        for f in as_completed([pool.submit(_one, k) for k in keys]):
+            res.append(f.result())
+    added = sum(r["added"] for r in res)
+    replaced = sum(r["replaced"] for r in res)
+    ev = [(r["key"], e) for r in res for e in r["events"]]
+    log("-" * 60)
+    log(f"bhavcopy: {len(res)} names | bars added {added} | official replaced {replaced} "
+        f"| split/bonus events {len(ev)} | "
+        f"{'DRY-RUN - no Drive writes' if args.dry_run else 'written'} | {time.time()-t0:.0f}s")
+    for k, e in sorted(ev)[:25]:
+        log(f"    {k:<12} {e}")
+    if len(ev) > 25:
+        log(f"    ... {len(ev) - 25} more")
+    for r in res[:4]:
+        log(f"    sample {r['key']:<12} new dates {r['new_dates']}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="Pilot: first N names.")
@@ -321,12 +556,26 @@ def main() -> None:
                          "(suspended/delisted return ancient dates).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Fetch + report coverage (incl. volume); NO Drive writes.")
+    ap.add_argument("--source", choices=["bhavcopy", "api"], default="bhavcopy",
+                    help="bhavcopy (default): BSE's official daily file, one request; "
+                         "api: the old per-scrip API (~5,000 calls, now 403-prone).")
+    ap.add_argument("--from", dest="from_date", default="",
+                    help="bhavcopy: fill every session from this date (YYYY-MM-DD).")
+    ap.add_argument("--wait-min", type=float, default=30,
+                    help="bhavcopy: minutes to wait for today's file before Yahoo.")
+    ap.add_argument("--no-yahoo", action="store_true",
+                    help="bhavcopy: never fall back to Yahoo.")
+    ap.add_argument("--catchup-days", type=int, default=14,
+                    help="bhavcopy: calendar days back to re-take from official files.")
     args = ap.parse_args()
 
     drive = get_drive()
     bse = _bse_only(drive)
     if bse.empty:
         log("No BSE-only names in universe — nothing to do.")
+        return
+    if args.source == "bhavcopy":
+        main_bhavcopy(args, drive, bse)
         return
     if args.limit:
         bse = bse.head(args.limit)
