@@ -193,6 +193,15 @@ def _src_parquet(table: str, note: str = "") -> dict:
     return {"kind": "parquet", "table": table, "note": note}
 
 
+def _mcap_note(r) -> str:
+    """'; market cap <source> as of <date>' from a company_facts row (columns added
+    2026-10-05), or '' for an older table without them."""
+    as_of = str(r.get("mcap_as_of") or "").strip()
+    if not as_of or as_of.lower() == "nan":
+        return ""
+    return f"; market cap {r.get('mcap_source') or ''} as of {as_of}".replace("  ", " ")
+
+
 def _src_stmt(symbol: str, line_items, period, fetched_at=None) -> dict:
     return {"kind": "statements",
             "table": f"fundamentals/statements/{symbol}.parquet",
@@ -238,10 +247,12 @@ def sec2_one_pager(pack: Pack, store: Store):
         return
     r = f.iloc[0]
     src = _src_parquet(f"{IDX}/company_facts.parquet",
-                       f"updated_at={r.get('updated_at')}")
+                       f"updated_at={r.get('updated_at')}{_mcap_note(r)}")
+    daily = str(r.get("mcap_source") or "").startswith("daily")
     for col, label, unit in (
             ("mcap_cr", "Market capitalisation", "Rs Cr"),
-            ("pe", "P/E (reported)", "x"),
+            ("pe", "P/E (today's market cap / Screener earnings)" if daily
+             else "P/E (reported)", "x"),
             ("pb", "P/B", "x"),
             ("rev_ttm", "Revenue (TTM)", "Rs Cr"),
             ("pat_ttm", "PAT (TTM)", "Rs Cr"),
@@ -516,14 +527,18 @@ def sec22_sensitivity_grid(pack: Pack, store: Store, st: pd.DataFrame, lev: dict
     rows = [{"revenue": r, **{f"m{m}": (None if v is None else round(v, 1))
                               for m, v in zip(m_levels, pe_row)}}
             for r, pe_row in zip(rev_levels, g["implied_pe"])]
-    pack.table("tbl.sensitivity_pe", f"Implied P/E at market cap Rs {mcap:,.0f} Cr", 22,
+    as_of = str(f.iloc[0].get("mcap_as_of") or "").strip()
+    as_of = "" if as_of.lower() == "nan" else as_of
+    pack.table("tbl.sensitivity_pe", f"Implied P/E at market cap Rs {mcap:,.0f} Cr"
+               + (f" (as of {as_of})" if as_of else ""), 22,
                ["revenue"] + [f"m{m}" for m in m_levels], rows,
                _src_computed(f"revenue x margin - fixed block {lev['fixed_block']:.1f}, "
                              f"taxed at {tax:.1f}%, over mcap {mcap:,.0f}"),
                note=g["note"])
     pack.add("grid.mcap_cr", "Market capitalisation used in the grid", float(mcap),
              "Rs Cr", "reported", 22,
-             _src_parquet(f"{IDX}/company_facts.parquet"))
+             _src_parquet(f"{IDX}/company_facts.parquet",
+                          _mcap_note(f.iloc[0]).lstrip("; ")))
 
 
 def sec21_peers(pack: Pack, store: Store):
