@@ -185,16 +185,9 @@ jobs:
           echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
           python scripts/company_deep_report.py --names "$NAMES" --open
 
-      # BOTH = two mails (user 2026-10-02): the deep dive's own PDF as soon as it is built,
-      # then the story (which also carries it as Part B). Same notifier as deepdive.yml;
-      # it mails only reports newer than started_at, so a failed deep dive sends nothing.
-      - name: Email the deep dive (PDF)
-        if: inputs.with_deepdive && inputs.names != '' && inputs.mail
-        continue-on-error: true
-        env:
-          NOTIFY_SINCE: ${{ steps.deepdive.outputs.started_at }}
-        run: python scripts/notify_deepdive.py
-
+      # BOTH = ONE email per company (user 2026-10-04): the story email carries the story
+      # PDF + the deep dive PDF. No separate deep dive email here; if the story fails, the
+      # story script emails the deep dive on its own (company_narrative_report main()).
       - name: Generate narrative report
         # Credentials come from the .env written above (scripts call load_dotenv), so no
         # per-step env block — that duplication is exactly what drifted before.
