@@ -111,6 +111,7 @@ jobs:
         run: |
           python scripts/deck_summary.py --self-test
           python scripts/pf_coverage.py --self-test
+          python scripts/requeue_documents.py --self-test
           python scripts/pf_company_mails.py --self-test
           python scripts/pf_season_status.py --self-test
       # THESE TWO ARE NOT MAIL. model_registry and gemini_pool decide WHICH MODEL an
@@ -176,6 +177,28 @@ jobs:
           python scripts/pf_docs_sweep.py --enqueue --nse --bse --one-per-quarter
           --days 30 --concall-days 2
           --types presentation,rating,results,annual_report,concall
+        continue-on-error: true
+
+      # A DOCUMENT THAT FAILED ONCE USED TO SIT IN 'error' FOR EVER. Nothing re-queued
+      # it, so a model that echoed the prompt back — or a 503 on a busy afternoon —
+      # cost that document permanently; 13 PF annual reports were in that state on
+      # 2026-09-13 and had to be re-queued by hand.
+      #
+      # THREE GUARDS KEEP THIS FROM BECOMING A QUOTA FIRE, and all three matter because
+      # this step runs five times a day:
+      #   --max-attempts 3   mark_queue_error increments attempts on every failure, so
+      #                      a document that simply cannot be read stops costing calls.
+      #   --cooldown-hours   a row retried this morning is not retried again tonight.
+      #   PF book + --limit  the queue holds 426 failures; this touches the handful
+      #                      that belong to holdings, a few at a time.
+      # A failure whose reason was never RECORDED is never retried: an unknown cause is
+      # not a transient one. Measured on dispatch: 426 failed rows, 9 worth another read.
+      # It runs BEFORE the hydrate below, so anything it re-queues is fetched in the
+      # same run and extracted by the step after that.
+      - name: Retry the failures worth another read
+        run: >
+          python scripts/requeue_documents.py --retry-errors
+          --max-attempts 3 --cooldown-hours 12 --limit 10 --live
         continue-on-error: true
 
       - name: Fetch what the sweep found
