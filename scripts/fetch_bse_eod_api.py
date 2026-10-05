@@ -477,7 +477,9 @@ def main_bhavcopy(args, drive, bse: pd.DataFrame) -> None:
         start = date.fromisoformat(args.from_date)
         days = [start + timedelta(n) for n in range((today - start).days + 1)]
     else:
-        days = [today - timedelta(n) for n in range(5)]      # today + catch-up window
+        # today + a catch-up window: any session missed in the last two weeks
+        # (BSE refused, Yahoo used, run skipped) is re-taken from the official file
+        days = [today - timedelta(n) for n in range(max(1, args.catchup_days))]
     days = sorted(d for d in days if d.weekday() < 5)
     log(f"BSE-only EOD via official bhavcopy: {len(rows)} names | sessions "
         f"{days[0]}..{days[-1]} | mode={'DRY-RUN' if args.dry_run else 'LIVE'}")
@@ -563,6 +565,8 @@ def main() -> None:
                     help="bhavcopy: minutes to wait for today's file before Yahoo.")
     ap.add_argument("--no-yahoo", action="store_true",
                     help="bhavcopy: never fall back to Yahoo.")
+    ap.add_argument("--catchup-days", type=int, default=14,
+                    help="bhavcopy: calendar days back to re-take from official files.")
     args = ap.parse_args()
 
     drive = get_drive()
