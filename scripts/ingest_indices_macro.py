@@ -38,7 +38,7 @@ INDIAN_INDICES = {
     "NIFTY_BANK":        "^NSEBANK",
     "INDIA_VIX":         "^INDIAVIX",
     "NIFTY_500":         "^CRSLDX",
-    "NIFTY_MIDCAP_100":  "^CNXMIDCAP",
+    "NIFTY_MIDCAP_100":  "NIFTY_MIDCAP_100.NS",   # ^CNXMIDCAP: Yahoo 404 since >=2026-09-30
     "NIFTY_SMALLCAP_100":"^CNXSC",
     "NIFTY_IT":          "^CNXIT",
     "NIFTY_AUTO":        "^CNXAUTO",

@@ -170,13 +170,21 @@ def download_csv(drive, file_id: str) -> pd.DataFrame:
     return pd.read_csv(fh)
 
 
+# Google's own retry (exponential backoff with jitter) for 429, 5xx and 403
+# rateLimitExceeded. Without it one refused read dropped the stock for the day:
+# 2026-10-05 Drive returned "Quota exceeded for quota metric 'Total Query Cost'
+# and limit 'Units per minute per user'" (reason rateLimitExceeded) for ~70 s
+# and 536 stocks fell out of features. 6 retries back off for up to ~2 minutes.
+DRIVE_READ_RETRIES = 6
+
+
 def download_parquet(drive, file_id: str) -> pd.DataFrame:
     request = drive.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = downloader.next_chunk(num_retries=DRIVE_READ_RETRIES)
     fh.seek(0)
     return pd.read_parquet(fh)
 
@@ -531,7 +539,7 @@ def main() -> None:
             df = download_parquet(d, ohlcv_files[f"{sym}.parquet"])
             return sym, compute_features_one(sym, df), None
         except Exception as e:
-            return sym, None, str(e)[:60]
+            return sym, None, str(e)
 
     rows: list[dict] = []
     errors: list[tuple[str, str]] = []      # (symbol, error text)
@@ -543,7 +551,7 @@ def main() -> None:
         nonlocal done
         sym, r, err = res
         if err is not None:
-            missing.append(f"{sym}({err})")
+            missing.append(f"{sym}({err[:60]})")
             errors.append((sym, err))
         elif r is None:
             # <60 bars — a real, countable outcome, not an invisible drop.
@@ -579,6 +587,7 @@ def main() -> None:
         for kind, n in kinds.most_common(10):
             log(f"    {n:>5}  {kind}")
         log(f"  first 10 failing symbols: {[sym for sym, _ in errors[:10]]}")
+        log(f"  first error in full: {errors[0][1][:600]}")
     if too_short:
         log(f"  first 10 too-short symbols: {too_short[:10]}")
 
