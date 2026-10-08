@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import math
 import os
 import re
 import sys
@@ -419,6 +420,44 @@ def yahoo_bars(rows: list, days: set) -> dict:
     return out
 
 
+def _apply_split(merged: pd.DataFrame, fresh_dates: set, exd, factor: float):
+    """Put a confirmed split/bonus on ONE scale without ever dividing twice.
+
+    The daily run re-takes the last 14 days from BSE's raw files. For a split
+    inside that window the re-taken bars dated before the ex-date are on the OLD
+    scale again, while the older stored history may already have been rescaled
+    by an earlier run. Rescaling everything again divided that older history a
+    second time (NAPL/METSL /4, REMAGNET /100 on 2026-10-07).
+
+    Two candidates: (a) adjust only the re-taken bars before the ex-date (right
+    when history was already adjusted), (b) rescale everything before the
+    ex-date (right the first time the split is seen). Keep the one whose join
+    between untouched history and the first re-taken bar is smoother — the wrong
+    one leaves a jump the size of the split ratio there."""
+    exd = pd.Timestamp(exd)
+    full = rescale_history(merged, exd, factor)
+    first = min(fresh_dates)
+    if not (merged["date"] < first).any():
+        return full, "rescaled"                    # nothing older to protect
+    part = merged.copy()
+    mask = part["date"].isin(fresh_dates) & (part["date"] < exd)
+    for c in ("open", "high", "low", "close"):
+        if c in part.columns:
+            part.loc[mask, c] = part.loc[mask, c] / factor
+    if "volume" in part.columns:
+        part.loc[mask, "volume"] = (part.loc[mask, "volume"] * factor).round()
+
+    def join_move(df):
+        s = df.sort_values("date").reset_index(drop=True)
+        i = int(s.index[s["date"] >= first][0])
+        a, b = float(s.loc[i - 1, "close"]), float(s.loc[i, "close"])
+        return abs(math.log(b / a)) if a > 0 and b > 0 else float("inf")
+
+    if join_move(part) <= join_move(full):
+        return part, "split already applied, re-taken bars adjusted"
+    return full, "rescaled"
+
+
 def _merge_bars(drive, folder_id, key, official: list, yahoo: list,
                 existing_id, bse_code: str = "", write: bool = True) -> dict:
     """Official bars REPLACE stored bars of the same date; Yahoo bars only fill
@@ -454,10 +493,10 @@ def _merge_bars(drive, folder_id, key, official: list, yahoo: list,
             hit = corp_action_factor(bse_code, d0.date()) if bse_code else None
             if hit:
                 factor, exd = hit
-                fixed = rescale_history(merged, exd, factor)
+                fixed, how = _apply_split(merged, set(new_dates), exd, factor)
                 if junction_ok(fixed, exd):
                     merged = fixed
-                    events.append(f"rescaled /{factor:g} (official {exd})")
+                    events.append(f"{how} /{factor:g} (official {exd})")
                     continue
             events.append(f"jump {100*(now/last-1):+.0f}% on {d0.date()} - no official "
                           f"record, history untouched")
