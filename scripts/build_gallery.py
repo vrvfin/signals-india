@@ -1324,16 +1324,20 @@ def _select_ipos(drive, args, exch):
             rec = pd.DataFrame({"symbol": wider["symbol"], "_ld": wider["_ld2"]})
         ltype = dict(zip(lt["symbol"], lt["listing_type"].fillna("")))
         before = len(rec)
+        # IPO ONLY (user 2026-10-07): a name is shown only with positive proof —
+        # a SEBI prospectus or NSE's own public-issue list (build_listing_dates
+        # --classify). Migrations, ETFs, demergers/re-listings and anything
+        # unproven are left out.
         bad = rec["symbol"].astype(str).map(
-            lambda x: str(ltype.get(x, "")).lower() in ("migration", "etf"))
+            lambda x: str(ltype.get(x, "")).lower() != "ipo")
         dropped = rec[bad]
         rec = rec[~bad]
         if len(dropped):
-            kinds = (dropped["symbol"].astype(str).map(lambda x: ltype.get(x, ""))
+            kinds = (dropped["symbol"].astype(str)
+                     .map(lambda x: ltype.get(x, "") or "(no type)")
                      .value_counts().to_dict())
-            log(f"  listing_type gate: {before} -> {len(rec)} "
-                f"({len(dropped)} dropped: {kinds}) — re-listings and funds are "
-                f"not IPOs")
+            log(f"  IPO-only gate: {before} -> {len(rec)} "
+                f"({len(dropped)} dropped: {kinds})")
     else:
         log("  listing_dates.parquet has no listing_type — showing every recent "
             "DATE, which includes re-listings and ETFs. Run "
@@ -1847,8 +1851,8 @@ def main():
                          "drops=fell off the select list in last 7d; "
                          "ipo=names listed in the last --ipo-days, ranked on "
                          "pure returns (no strategy-count gate).")
-    ap.add_argument("--ipo-days", type=int, default=365,
-                    help="IPO view: listing-date lookback window (default 365)")
+    ap.add_argument("--ipo-days", type=int, default=548,
+                    help="IPO view: listing-date lookback window (default 548 = 18 months)")
     ap.add_argument("--min-strats", type=int, default=2)
     ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
     ap.add_argument("--timeframe-days", type=int, default=252)
@@ -2052,7 +2056,7 @@ def main():
             ranked["_exch"] = ranked["symbol"].map(exch).fillna("NSE")
             log(f"  {len(ranked)} names dropped from the select list in last 7d")
         elif args.view == "ipo":
-            title = f"🚀 Recent listings ({args.ipo_days}d) — ranked by return"
+            title = f"🚀 Recent IPOs ({args.ipo_days}d) — ranked by return"
             out_default = "gallery_ipo.html"
             ranked = _select_ipos(drive, args, exch)
             if ranked.empty:
