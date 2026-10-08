@@ -298,8 +298,43 @@ def _find_cliffs(first_bars: dict) -> set:
 
 
 # -------------------------------------------------------------- classify ----
+# NSE's own list of past public issues: the authoritative IPO record for NSE
+# main board + SME. Measured 2026-10-07 on the last 18 months: it confirmed 330
+# of our 760 recent listings (329/331 with the same listing date), including 226
+# we could not prove before, and contradicted none of the 171 migrations.
+NSE_PAST_ISSUES_URL = "https://www.nseindia.com/api/public-past-issues"
+NSE_IPO_TYPES = {"EQ", "BE", "SME"}      # equity; excludes DEBT, IV (InvIT), RR (REIT), N0
+
+
+def _nse_ipo_symbols(days: int) -> dict:
+    """{SYMBOL: listing date text} for NSE equity public issues listed within
+    `days`. One request. {} on any failure, so classification then works
+    exactly as before."""
+    to = date.today()
+    fr = date.fromordinal(to.toordinal() - days)
+    try:
+        r = requests.get(NSE_PAST_ISSUES_URL,
+                         params={"from_date": fr.strftime("%d-%m-%Y"),
+                                 "to_date": to.strftime("%d-%m-%Y")},
+                         headers={"User-Agent": UA, "Accept": "application/json",
+                                  "Referer": "https://www.nseindia.com/"},
+                         timeout=30)
+        rows = r.json() if r.ok else []
+    except Exception as e:
+        log(f"  NSE public-issue list unavailable ({type(e).__name__}) - skipped.")
+        return {}
+    out = {}
+    for x in rows if isinstance(rows, list) else []:
+        listed = str(x.get("listingDate", "") or "").strip()
+        if (str(x.get("securityType", "")).strip() in NSE_IPO_TYPES
+                and listed not in ("", "-")):
+            out[str(x.get("symbol", "")).strip().upper()] = listed
+    return out
+
+
 def _classify_rows(rows: pd.DataFrame, first_bars: dict, sebi_syms: set,
-                   sebi_isins: set, has_financials: dict) -> pd.DataFrame:
+                   sebi_isins: set, has_financials: dict,
+                   nse_ipo: dict | None = None) -> pd.DataFrame:
     """Assign listing_type from POSITIVE proof only.
 
     Two heuristics were tested against known cases on 2026-08-28 and REJECTED —
@@ -340,13 +375,17 @@ def _classify_rows(rows: pd.DataFrame, first_bars: dict, sebi_syms: set,
         if typ == UNCLASSIFIED and (sym in sebi_syms or (isin and isin in sebi_isins)):
             typ, ev = IPO, "SEBI public-issue prospectus on file"
 
+        # After migration/ETF: a re-listing is never called an IPO.
+        if typ == UNCLASSIFIED and nse_ipo and sym in nse_ipo:
+            typ, ev = IPO, f"NSE public-issue list (listed {nse_ipo[sym]})"
+
         if typ == UNCLASSIFIED:
             bits = []
             if fb is None:
                 bits.append("no price history to test against")
             else:
                 bits.append("no trading before the listing date")
-            bits.append("no SEBI prospectus in our sample")
+            bits.append("no SEBI prospectus in our sample, not on NSE's public-issue list")
             ev = "; ".join(bits) + " — cannot prove either way"
         out_type.append(typ)
         out_ev.append(ev)
@@ -742,7 +781,11 @@ def _run_classify(args) -> None:
     sebi_isins = set(seeds["isin"].astype(str)) if "isin" in seeds else set()
     log(f"  SEBI prospectus index: {len(sebi_isins)} securities")
 
-    done = _classify_rows(target, first_bars, sebi_syms, sebi_isins, has_fin)
+    nse_ipo = _nse_ipo_symbols(args.classify_days)
+    log(f"  NSE public-issue list: {len(nse_ipo)} equity IPOs in {args.classify_days}d")
+
+    done = _classify_rows(target, first_bars, sebi_syms, sebi_isins, has_fin,
+                          nse_ipo=nse_ipo)
     now = datetime.now().isoformat(timespec="seconds")
     done["classified_at"] = now
 
