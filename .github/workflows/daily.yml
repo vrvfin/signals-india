@@ -120,14 +120,19 @@ jobs:
           python scripts/build_listing_dates.py --classify
         continue-on-error: true
 
-      - name: Ingest indices + macro
-        if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/ingest_indices_macro.py
-        continue-on-error: true
-
+      # NSE first, Yahoo second. NSE's official index file appears only in the
+      # evening (~23:20 IST), so it can fill every missed session up to YESTERDAY;
+      # Yahoo (NIFTY_MIDCAP_100.NS / ^CNXSC) returns only the LATEST bar, so it adds
+      # today. In the old order Yahoo wrote today first and the NSE step (which
+      # fetches only after the last stored date) could never fill a missed day.
       - name: Fix indices (NSE midcap/smallcap)
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/fix_indices_nse.py
+        continue-on-error: true
+
+      - name: Ingest indices + macro
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/ingest_indices_macro.py
         continue-on-error: true
 
       - name: Ingest FII/DII
