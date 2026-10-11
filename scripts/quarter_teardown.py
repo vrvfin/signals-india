@@ -46,6 +46,7 @@ import ar_scorecard as ARS
 import deck_teardown as DT
 import filing_results as FR
 import season_summary as SS
+import results_day_guidance as RDG
 from provenance import (Fact, MISSING, SCREENER, ANNUAL, QUARTERLY, write_audit, audit)
 
 MAIL_KEY = "quarter_teardown"
@@ -1192,6 +1193,22 @@ def block_d(d: dict) -> str:
     return "".join(out)
 
 
+def block_progress(d: dict) -> str:
+    """D2 - each OPEN P&L promise measured including the quarter just reported.
+
+    Block D can only judge a horizon once it has closed (guidance_vs_actual is annual),
+    so on a Q1-Q3 results day it is silent about the quarter itself. This is the same
+    pace measurement as the weekly guidance-progress mail, run at mail time
+    (results_day_guidance). `d["progress"]` is filled by main(); absent -> no block.
+    """
+    pr = d.get("progress")
+    if pr is None:
+        return ""
+    return RDG.render_block(pr, filing_quarter=d.get("progress_filing_q"),
+                            tbl=_tbl, heading=_h,
+                            max_rows=d.get("progress_rows", RDG.MAX_ROWS))
+
+
 # --------------------------------------------------------------------------- #
 # page assembly
 # --------------------------------------------------------------------------- #
@@ -1392,7 +1409,8 @@ def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
             f"{datetime.now().strftime('%d %b %Y')}</div>")
     body = (block_a(d) + block_b(d) + block_ladder(d, stmts) + block_h1(d, rich)
             + block_financials(d)
-            + block_h2(d) + block_deck(d) + block_d(d) + block_season(d))
+            + block_h2(d) + block_deck(d) + block_d(d) + block_progress(d)
+            + block_season(d))
     foot = (
         f"<div style='margin-top:22px;padding-top:12px;border-top:1px solid #ddd;"
         f"font-size:11.5px;color:{MUTED};line-height:1.6'>"
@@ -2110,6 +2128,21 @@ def _self_test() -> int:
     # It must NOT imply a teardown was done.
     check("filing card withholds the bridge", "Adjusted PAT" not in fh)
 
+    # ---- D2: guidance progress (results_day_guidance) ----------------------------
+    check("D2 absent when main() did not measure", block_progress({}) == "")
+    _pr = pd.DataFrame([{"metric": "pat", "guided_text": "Rs 60 crore",
+                         "target_period": "FY27", "kind": "level",
+                         "actual_to_date": 18.0, "periods_elapsed": 2,
+                         "periods_total": 4, "pct_of_target": 30.0, "time_pct": 50.0,
+                         "status": "BEHIND"}])
+    d2 = block_progress({"progress": _pr, "progress_filing_q": "Q1 FY27"})
+    check("D2 renders a measured promise", "BEHIND" in d2 and "Rs 60 crore" in d2)
+    check("D2 says the quarter came from the filing", "exchange filing" in d2)
+    check("D2 explains an empty measurement",
+          "No open" in block_progress({"progress": pd.DataFrame()}))
+    check("D2 sits after D on the full page",
+          "block_d(d) + block_progress(d)" in open(__file__, encoding="utf-8").read())
+
     # ---- the send path itself ----------------------------------------------------
     # THE REGRESSION THAT SHIPPED: the per-company branch called
     #     send_email(subject, body, attachments=attachments or None)
@@ -2274,6 +2307,9 @@ def main() -> None:
     reported = {}
     pf_all = list(targets)
     windowed = args.since_hours is not None or args.season_all
+    # Bound for the non-windowed paths too (--pf / --symbols without a window): the
+    # per-company loop reads it unconditionally and crashed with UnboundLocalError.
+    prev_keys: dict = {}
     if windowed:
         pf_n = len(targets)
         recent = recent_reporters(drive, idx, targets, season, args.since_hours, log)
@@ -2365,6 +2401,35 @@ def main() -> None:
                    "announcements": tables_ann},
     }
 
+    # Open guidance for block D2, parsed once for the whole run and only for the
+    # companies in it. Read-only; a failure drops the block, never the mail.
+    try:
+        commits_by_isin = RDG.prepare_commitments(
+            _read(drive, idx, "guidance_tracker.parquet"),
+            _read(drive, idx, "ppt_guidance.parquet"),
+            _read(drive, idx, "ar_guidance.parquet"),
+            _read(drive, idx, "mgmt_credibility.parquet"),
+            isins={t[0] for t in targets})
+        log(f"  open P&L guidance: {sum(map(len, commits_by_isin.values()))} "
+            f"promises across {len(commits_by_isin)} company(ies)")
+    except Exception as e:
+        commits_by_isin = None
+        log(f"  WARNING: guidance progress unavailable ({str(e)[:70]})")
+
+    def _progress(d, stmts, filing=None):
+        """Fill d['progress'] for block D2. Silent on failure - the block is extra."""
+        if commits_by_isin is None:
+            return
+        try:
+            ser = RDG.series_from_statements(stmts, d["isin"])
+            if filing and RDG.add_filing_quarter(ser, d["isin"], filing):
+                d["progress_filing_q"] = filing.get("quarter")
+            d["progress"] = RDG.company_progress(
+                commits_by_isin.get(d["isin"], []), ser, season)
+            d["progress_summary"] = RDG.summary(d["progress"])
+        except Exception as e:
+            log(f"  {d.get('symbol')}: guidance progress skipped ({str(e)[:60]})")
+
     # The filing fallback. Screener is a lagging mirror of the exchange filing, and a
     # holding that filed is not "not reported" — it is reported and unpublished.
     try:
@@ -2380,7 +2445,7 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     pages, filing_pages = [], []
-    def _try_filing(isin, symbol, name, why, stmts=None) -> bool:
+    def _try_filing(isin, symbol, name, why, stmts=None, gva=None) -> bool:
         """Render the filing card when the statements cannot carry a teardown."""
         fil = filings.get(isin)
         if not fil:
@@ -2398,9 +2463,14 @@ def main() -> None:
         # it needs no quarterly ladder.
         d["season_summary"] = SS.build_summary(
             isin, season, filing=fil, deck=tables["deck"], **tables["season"])
-        html = render_filing(d) + block_season(d)
-        if not html:
+        card = render_filing(d)
+        if not card:
             return False
+        # Said-vs-delivered and the pace of open promises need no quarterly ladder:
+        # D reads guidance_vs_actual, D2 measures with the filing's own quarter.
+        d["gva"] = gva if gva is not None else pd.DataFrame()
+        _progress(d, stmts, filing=fil)
+        html = card + block_d(d) + block_progress(d) + block_season(d)
         filing_pages.append((symbol, d, html))
         log(f"  {symbol}: {why} — rendered from the filing "
             f"({fil['quarter']}, filed {fil.get('filed_on') or '?'})")
@@ -2410,7 +2480,7 @@ def main() -> None:
         stmts, register, arsc, gva, deck = load_company(
             drive, idx, stmt_fid, repo_id, isin, symbol, name, tables)
         if stmts is None or stmts.empty:
-            if not _try_filing(isin, symbol, name, "no statements parquet"):
+            if not _try_filing(isin, symbol, name, "no statements parquet", gva=gva):
                 log(f"  {symbol}: no statements parquet — skipped")
             continue
         # NO QUARTER MIXING. A filing can be dated before the numbers land, so the
@@ -2425,7 +2495,8 @@ def main() -> None:
                 # company still reported, so fall back to the filing's own numbers
                 # rather than dropping it out of the mail entirely.
                 if not _try_filing(isin, symbol, name,
-                                   f"statements still at {lbl or 'n/a'}", stmts=stmts):
+                                   f"statements still at {lbl or 'n/a'}", stmts=stmts,
+                                   gva=gva):
                     log(f"  {symbol}: filing dated {season} but statements still at "
                         f"{lbl or 'n/a'} — skipped until the numbers land")
                 continue
@@ -2447,7 +2518,13 @@ def main() -> None:
                 continue
             log(f"  {symbol}: numbers RESTATED since the last mail "
                 f"({_prev} -> {_cur}) — re-sending")
+        _progress(d, stmts)
         html = render(d, stmts, rich=args.html)
+        if len(html.encode("utf-8")) > MAX_HTML_BYTES and d.get("progress") is not None:
+            # D2 is the newest block; it gives way first rather than tipping the
+            # page over Gmail's clip — worst three promises only.
+            d["progress_rows"] = 3
+            html = render(d, stmts, rich=args.html)
         pages.append((symbol, d, html))
         log(f"  {symbol}: {d['quarter']} · {len(d['facts'])} facts · "
             f"{len(register)} register rows · {len(html):,} bytes")
