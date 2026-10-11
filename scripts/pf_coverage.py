@@ -320,6 +320,9 @@ def _season_rows(ledger: pd.DataFrame, season: str | None) -> pd.DataFrame:
     return ledger[ledger["season"].astype(str) == str(season)]
 
 
+TYPED_KEY_FAMILIES = {"deck", "concall", "annual_report"}
+
+
 def keys_differ(prev: str, cur: str) -> bool:
     """Do two content keys disagree on a field they BOTH carry?
 
@@ -337,12 +340,25 @@ def keys_differ(prev: str, cur: str) -> bool:
         return False                 # unknown on either side is never a change
     a = str(prev).split("|")
     b = str(cur).split("|")
+    # A DIFFERENT KEY FAMILY is not a change in content - it means the two keys
+    # describe different document types. KANOHAR (Oct 2026): one doc_id sat in the queue
+    # as both concall and presentation, the keys were stored per doc_id, so the concall
+    # row recorded "deck|111" and every run read "concall|..." vs "deck|..." as a
+    # correction and re-sent both mails. Only the typed families are guarded: a rating
+    # key starts with the agency, and an agency fix is a real correction.
+    fams = {a[0], b[0]} & TYPED_KEY_FAMILIES
+    if fams and a[0] != b[0]:
+        return False
     n = min(len(a), len(b))
     return a[:n] != b[:n]
 
 
 def mailed_content_keys(ledger: pd.DataFrame, season: str | None) -> dict:
-    """{doc_id: content_key} for ledger rows that recorded one.
+    """{(doc_id, doc_type): content_key} for ledger rows that recorded one, plus a plain
+    {doc_id: content_key} entry for callers/rows that carry no doc_type.
+
+    doc_id is NOT unique across types (the same filing can be queued as a concall and as
+    a presentation), so lookups must try (doc_id, doc_type) first - see mail_due.
 
     A row written before `content_key` existed returns nothing, which is what keeps the
     change check from firing on the entire back catalogue the first time it runs.
@@ -358,6 +374,9 @@ def mailed_content_keys(ledger: pd.DataFrame, season: str | None) -> dict:
         k = str(r.get("content_key") or "").strip()
         if d and k and k.lower() not in ("none", "nan"):
             out[d] = k
+            t = str(r.get("doc_type") or "").strip()
+            if t:
+                out[(d, t)] = k
     return out
 
 
@@ -604,8 +623,11 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
             #
             # Both keys must be present to fire: a blank stored key means the row predates
             # this field, and treating unknown as changed would re-send the back catalogue.
-            prev = prev_keys.get(doc_id, "")
-            cur = (content_keys or {}).get(doc_id, "")
+            # per (doc_id, doc_type) first: one doc_id can carry two types
+            _dt = r["doc_type"]
+            prev = prev_keys.get((doc_id, _dt), prev_keys.get(doc_id, ""))
+            _ck = content_keys or {}
+            cur = _ck.get((doc_id, _dt), _ck.get(doc_id, ""))
             if not (prev and cur and keys_differ(prev, cur)):
                 continue
             resend = True
@@ -966,8 +988,37 @@ def _self_test() -> int:
     check("no current key means no re-send either",
           not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
                        on=date(2026, 8, 14), content_keys={}))
-    check("mailed_content_keys reads what was stored",
-          mailed_content_keys(led_corr, "Q1FY27") == {"tatva1": "CRISIL|D|STABLE|REAFFIRMED"})
+    check("mailed_content_keys reads what was stored (plain + per type)",
+          mailed_content_keys(led_corr, "Q1FY27")
+          == {"tatva1": "CRISIL|D|STABLE|REAFFIRMED",
+              ("tatva1", "rating"): "CRISIL|D|STABLE|REAFFIRMED"})
+    # ---- KANOHAR (Oct 2026): one doc_id queued as concall AND presentation ----------
+    check("different key family is not a change",
+          not keys_differ("deck|111", "concall|Q1FY27|1|4"))
+    check("same family still detects a change",
+          keys_differ("concall|Q1FY27|0", "concall|Q1FY27|1"))
+    check("rating agency correction still detected",
+          keys_differ("CRISIL|D|STABLE|REAFFIRMED", "ICRA|D|STABLE|REAFFIRMED"))
+    led_kan = pd.DataFrame([
+        {"season": "Q2FY27", "isin": "INE1", "doc_type": "presentation", "doc_id": "kan1",
+         "content_key": "deck|111"},
+        {"season": "Q2FY27", "isin": "INE1", "doc_type": "concall", "doc_id": "kan1",
+         "content_key": "concall|Q1FY27|1|4"}])
+    mk = mailed_content_keys(led_kan, None)
+    check("per-type keys survive a shared doc_id",
+          mk[("kan1", "presentation")] == "deck|111"
+          and mk[("kan1", "concall")] == "concall|Q1FY27|1|4")
+    # the corrections path itself, with per-type keys: unchanged -> not due
+    check("per-type content key, unchanged -> not re-sent",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={("tatva1", "rating"): "CRISIL|D|STABLE|REAFFIRMED",
+                                     ("tatva1", "presentation"): "deck|111"}))
+    check("per-type content key, changed -> re-sent",
+          len(mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={("tatva1", "rating"):
+                                     "CRISIL|BBB+|STABLE|DOWNGRADE"})) == 1)
     check("mailed_content_keys ignores other seasons",
           mailed_content_keys(led_corr, "Q2FY27") == {})
     check("mailed_content_keys tolerates a missing column",
