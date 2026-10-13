@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(_HERE), ".env"))
 import pandas as pd
 from ingest_company_docs import get_drive, get_or_create_subfolder, find_file, download_bytes
-from _extractor_base import load_parquet, load_portfolio_isins
+from _extractor_base import load_parquet, load_portfolio_isins, save_parquet
 from mailer import send_email
 
 try:                                                       # deep-dive news feed (C) —
@@ -111,6 +111,66 @@ def rbi_html(rbi, fin_syms):
         p.append(f"<li>{_esc(x.get('date'))} — [{_esc(x.get('kind'))}] {title_html}</li>")
     p.append("</ul>")
     return "\n".join(p)
+
+
+# ---- "new since the last brief" (user 2026-10-13) --------------------------------
+# The look-back windows (research 30d, news 21d, FDA 60d, RBI 7d) stay, because research
+# and FDA items are often processed days after their date - but each item now reaches
+# the reader ONCE. Identity per item lives in this ledger; it advances only after a
+# confirmed send. Shared by daily.yml and weekend_announcements.yml (same script).
+SEEN_NAME = "daily_brief_seen.parquet"
+SEEN_COLS = ["item_id", "kind", "symbol", "first_mailed"]
+SEEN_KEEP_DAYS = 120          # > the longest look-back (60d), so nothing re-qualifies
+
+
+def item_id(kind: str, x) -> str:
+    """Stable identity of one brief item. News lines are matched on their text."""
+    import hashlib
+    if kind == "ann":
+        key = x.get("newsid") or f"{x.get('ann_date')}|{x.get('headline')}"
+    elif kind == "res":
+        key = x.get("file_name") or f"{x.get('doc_date')}|{x.get('source')}"
+    elif kind == "fda":
+        key = (x.get("recall_number") or x.get("event_id")
+               or f"{x.get('date')}|{x.get('product')}")
+    elif kind == "rbi":
+        key = x.get("link") or f"{x.get('date')}|{x.get('title')}"
+    else:                                              # news: one text line
+        key = " ".join(str(x).lstrip("- ").lower().split())
+    return kind + ":" + hashlib.sha1(str(key).encode("utf-8")).hexdigest()[:16]
+
+
+def only_new(kind: str, items: list, seen: set, out_ids: list, symbol: str = "") -> list:
+    """Items whose id is not in `seen`; their ids are queued in `out_ids`."""
+    keep = []
+    for x in items or []:
+        i = item_id(kind, x)
+        if i in seen:
+            continue
+        keep.append(x)
+        out_ids.append((i, kind, symbol))
+    return keep
+
+
+def new_news_lines(news_txt: str, seen: set, out_ids: list, symbol: str) -> str:
+    lines = [ln for ln in (news_txt or "").splitlines() if ln.strip()]
+    return "\n".join(only_new("news", lines, seen, out_ids, symbol))
+
+
+def load_seen(drive, idx) -> tuple[pd.DataFrame, set]:
+    df = load_parquet(drive, idx, SEEN_NAME, SEEN_COLS)
+    return df, set(df["item_id"].astype(str)) if not df.empty else set()
+
+
+def save_seen(drive, idx, prev: pd.DataFrame, ids: list, now_iso: str) -> int:
+    add = pd.DataFrame([{"item_id": i, "kind": k, "symbol": s, "first_mailed": now_iso}
+                        for i, k, s in ids], columns=SEEN_COLS)
+    out = add if prev is None or prev.empty else pd.concat([prev, add], ignore_index=True)
+    cut = (dt.date.today() - dt.timedelta(days=SEEN_KEEP_DAYS)).isoformat()
+    out = (out[out["first_mailed"].astype(str).str[:10] >= cut]
+           .drop_duplicates("item_id", keep="first"))
+    save_parquet(drive, idx, SEEN_NAME, out)
+    return len(out)
 
 
 def company_announcements(ledger, isin, symbol, days):
@@ -232,17 +292,27 @@ def main():
     print(f"PF companies: {len(pf)} | {now_ist:%d %b %Y %H:%M IST} | ann_days={ann_days} "
           f"research_days={args.research_days} news={not args.no_news} alt={alt_on}")
 
+    try:
+        seen_df, seen = load_seen(drive, idx)
+    except Exception as e:                     # fail-open: a brief with repeats beats none
+        print(f"seen-ledger unavailable ({str(e)[:60]}) - showing the full windows")
+        seen_df, seen = pd.DataFrame(columns=SEEN_COLS), set()
+    new_ids: list = []
+    print(f"seen ledger: {len(seen)} item(s) already mailed")
+
     sections, n_ann, n_res, n_co, n_fda = [], 0, 0, 0, 0
     fin_syms = []
     for isin, sym, name in pf:
-        anns = company_announcements(ledger, isin, sym, ann_days)
-        res = company_research(research, isin, sym, name, args.research_days)
+        anns = only_new("ann", company_announcements(ledger, isin, sym, ann_days),
+                        seen, new_ids, sym)
+        res = only_new("res", company_research(research, isin, sym, name,
+                                               args.research_days), seen, new_ids, sym)
         news_txt = ""
         if not args.no_news and news_block:
             try:
                 nt = news_block(name, sym, days=args.news_days, limit=8)
                 if nt and "No recent news" not in nt and not nt.startswith("DATA_MISSING"):
-                    news_txt = nt
+                    news_txt = new_news_lines(nt, seen, new_ids, sym)
             except Exception:
                 news_txt = ""
             time.sleep(0.4)                                # be gentle with Google News
@@ -251,7 +321,8 @@ def main():
             crow = _cls_row(cls_df, isin, sym, name)
             if is_pharma(crow) and fda_recalls:
                 try:
-                    fda = fda_recalls(name, days=args.fda_days)
+                    fda = only_new("fda", fda_recalls(name, days=args.fda_days),
+                                   seen, new_ids, sym)
                 except Exception:
                     fda = []
             if is_finance(crow):
@@ -268,7 +339,7 @@ def main():
     rbi = []
     if alt_on and rbi_circulars and fin_syms:
         try:
-            rbi = rbi_circulars(days=args.rbi_days)
+            rbi = only_new("rbi", rbi_circulars(days=args.rbi_days), seen, new_ids)
         except Exception:
             rbi = []
     rbi_sec = rbi_html(rbi, sorted(set(fin_syms)))
@@ -281,9 +352,9 @@ def main():
     subject = (f"📋 PF Daily Brief — {today} — {n_co} cos · {n_ann} announcements · "
                f"{n_res} research" + (f" · {alt_bits}" if alt_bits else ""))
     if sections:
-        intro = (f"{n_co} companies with updates · {n_ann} exchange announcements "
-                 f"(last {ann_days}d) · {n_res} research items (last {args.research_days}d) · "
-                 f"news from reputable sources")
+        intro = (f"<b>Only what is new since the last brief</b> — {n_co} companies · "
+                 f"{n_ann} exchange announcements · {n_res} research items · news from "
+                 f"reputable sources. Anything already mailed is left out")
         if alt_bits:
             intro += f" · {n_fda} US-FDA recalls (pharma) · {len(rbi)} RBI circulars (finance)"
         body = (f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222'>"
@@ -292,7 +363,8 @@ def main():
                 f"<p style='color:#555;margin:0 0 8px'>{intro}.</p><hr>"
                 + "<hr>".join(sections) + "</div>")
     else:
-        body = f"<p>No new PF announcements/research in the window (as of {stamp}).</p>"
+        body = (f"<p>Nothing new for your holdings since the last brief "
+                f"(as of {stamp}).</p>")
     print(f"brief: {n_co} companies with updates, {n_ann} announcements, {n_res} research items, "
           f"{n_fda} FDA recalls, {len(rbi)} RBI circulars")
 
@@ -304,8 +376,54 @@ def main():
         _safe = subject.encode("ascii", "replace").decode()   # Windows console is cp1252
         print(f"DRY-RUN - wrote {outp} (no mail). Subject: {_safe}")
         return
-    send_email(subject, body)
+    if not sections:
+        # nothing new: no mail, and nothing to add to the ledger
+        print("nothing new since the last brief - no mail")
+        return
+    if send_email(subject, body) and new_ids:
+        # the ledger advances ONLY after a confirmed send
+        n = save_seen(drive, idx, seen_df, new_ids,
+                      dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+        print(f"seen ledger: +{len(new_ids)} -> {SEEN_NAME} ({n} rows)")
+
+
+def _self_test() -> int:
+    """Offline: identities, the new-only filter, news lines. No Drive, no mail."""
+    fails = 0
+
+    def check(name, ok):
+        nonlocal fails
+        print(("  ok   " if ok else "  FAIL ") + name)
+        fails += 0 if ok else 1
+
+    a1 = {"newsid": "N1", "headline": "Order win"}
+    a2 = {"newsid": "N2", "headline": "Board meeting"}
+    check("same item -> same id", item_id("ann", a1) == item_id("ann", dict(a1)))
+    check("kinds never collide", item_id("ann", {"newsid": "X"}) != item_id("rbi", {"link": "X"}))
+    ids: list = []
+    seen = {item_id("ann", a1)}
+    got = only_new("ann", [a1, a2], seen, ids, "SYM")
+    check("already-mailed item dropped", got == [a2])
+    check("new item queued for the ledger", [i[0] for i in ids] == [item_id("ann", a2)])
+    r1 = {"file_name": "broker_note.pdf", "doc_date": "2026-09-20"}
+    check("research keyed on file name",
+          item_id("res", r1) == item_id("res", {"file_name": "broker_note.pdf"}))
+    news = "- 2026-10-12 · ET: X wins order\n- 2026-10-11 · BS: X results"
+    seen2 = {item_id("news", "- 2026-10-11 · BS: X results")}
+    ids2: list = []
+    out = new_news_lines(news, seen2, ids2, "X")
+    check("news: only unseen lines kept", out == "- 2026-10-12 · ET: X wins order")
+    check("news: case/space-insensitive", item_id("news", "-  2026-10-11 · bs: x RESULTS")
+          == item_id("news", "- 2026-10-11 · BS: X results"))
+    check("fda prefers recall_number",
+          item_id("fda", {"recall_number": "D-1", "date": "a"})
+          == item_id("fda", {"recall_number": "D-1", "date": "b"}))
+    check("empty input -> empty", only_new("rbi", [], set(), []) == [])
+    print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
+    return 1 if fails else 0
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
     main()

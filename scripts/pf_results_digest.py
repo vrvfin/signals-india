@@ -59,7 +59,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, load_parquet,
 from build_gallery import _bulk_parquet, _folder
 from daily_brief import load_pf
 from mailer import send_email, load_mail_settings, esc
-from seasons import is_peak_season
+from seasons import in_results_mail_window
 import quarterly_table as QT
 import filing_results as FR
 import results_day_guidance as RDG
@@ -625,7 +625,7 @@ def main():
 
     season = QT.season_quarter()
     today = datetime.now().strftime("%Y-%m-%d")
-    in_window = is_peak_season(datetime.now())
+    in_window = in_results_mail_window(datetime.now())
     log(f"season quarter={season} · peak-season={in_window} · today={today}")
 
     if not in_window and not args.force and not args.dry_run:
