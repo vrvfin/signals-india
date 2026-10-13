@@ -189,17 +189,64 @@ def download_parquet(drive, file_id: str) -> pd.DataFrame:
     return pd.read_parquet(fh)
 
 
+# Writes get the same patience as reads. 2026-10-12: every stock's features were
+# computed, then the dated-snapshot create got ONE "502 Bad Gateway" from Drive and
+# the step died; continue-on-error let all strategies run on Friday's file.
+DRIVE_WRITE_RETRIES = 6
+
+
+def _transient(e: Exception) -> bool:
+    """A failure worth retrying: Drive 5xx / 429 / rate-limit 403, or a dropped
+    connection. Anything else (404, auth, a bad request) is raised at once."""
+    from googleapiclient.errors import HttpError
+    if isinstance(e, HttpError):
+        st = int(getattr(e.resp, "status", 0) or 0)
+        # the 403 reason lives in the response BODY, not in str(e)
+        detail = ((getattr(e, "content", b"") or b"").decode("utf-8", "ignore")
+                  + " " + str(getattr(e, "reason", "") or "")).lower()
+        return st >= 500 or st == 429 or (st == 403 and "ratelimitexceeded" in detail)
+    return isinstance(e, (ConnectionError, TimeoutError, OSError))
+
+
 def upload_parquet(drive, folder_id: str, filename: str, df: pd.DataFrame,
-                   existing_id: str | None) -> str:
+                   existing_id: str | None, _sleep=None) -> str:
+    import time as _t
+    sleep = _sleep or _t.sleep
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
-    buf.seek(0)
-    media = MediaIoBaseUpload(buf, mimetype="application/octet-stream", resumable=False)
+    data = buf.getvalue()
+
+    def _media():
+        # a fresh stream per attempt: a failed attempt may have consumed the last one
+        return MediaIoBaseUpload(io.BytesIO(data), mimetype="application/octet-stream",
+                                 resumable=False)
+
     if existing_id:
-        drive.files().update(fileId=existing_id, media_body=media).execute()
+        # Updating the same file id is idempotent, so Google's own retry is safe here.
+        drive.files().update(fileId=existing_id, media_body=_media()).execute(
+            num_retries=DRIVE_WRITE_RETRIES)
         return existing_id
+    # CREATE IS NOT IDEMPOTENT. A 502 can arrive after Drive already made the file, and
+    # a blind retry would leave two files of the same name. So after a transient
+    # failure, look again: update what landed, or create if nothing did.
     meta = {"name": filename, "parents": [folder_id]}
-    return drive.files().create(body=meta, media_body=media, fields="id").execute()["id"]
+    for i in range(DRIVE_WRITE_RETRIES + 1):
+        try:
+            landed = find_file(drive, folder_id, filename) if i else None
+            if landed:
+                log(f"  {filename}: the failed create had landed — updating {landed}")
+                drive.files().update(fileId=landed, media_body=_media()).execute(
+                    num_retries=DRIVE_WRITE_RETRIES)
+                return landed
+            return drive.files().create(body=meta, media_body=_media(),
+                                        fields="id").execute()["id"]
+        except Exception as e:
+            if i == DRIVE_WRITE_RETRIES or not _transient(e):
+                raise
+            wait = min(2 ** i, 30)
+            log(f"  upload {filename} failed ({type(e).__name__}: {str(e)[:70]}) — "
+                f"retry {i + 1}/{DRIVE_WRITE_RETRIES} in {wait}s")
+            sleep(wait)
 
 
 # ---------- Indicator math ----------
