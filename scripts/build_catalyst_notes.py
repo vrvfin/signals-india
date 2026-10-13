@@ -51,6 +51,9 @@ CATALYST_COLS = [
     "note_text",              # 2026-06-17: note body inline, so the app can diff
                               # today's note vs the prior as_of without fetching md
     "md_path", "n_sources", "computed_at",
+    # 2026-10-12 (ADDITIVE; old rows read None): 12-char fingerprint of the evidence
+    # the note was written from. Same evidence next time -> no Gemini call, no note.
+    "evidence_hash",
 ]
 
 CATALYST_TYPES = {"order_win", "mgmt_change", "policy", "sector",
@@ -215,31 +218,101 @@ def _recent_filings(bse_code, days: int) -> list[str]:
     return out[:12]
 
 
-def _catalyst_mail_html(new_rows: list[dict], n_eligible: int, n_pf: int,
-                        n_selected: int, skipped_quiet: int) -> str:
-    parts = [f"<p><b>Catalyst notes — nightly digest.</b><br>"
-             f"Eligible (≥{MIN_STRATEGIES} strategies): {n_eligible} · "
-             f"PF daily: {n_pf} · scanned: {n_selected} · "
-             f"quiet (no trusted news): {skipped_quiet} · "
-             f"notes written: <b>{len(new_rows)}</b></p>"]
-    if new_rows:
-        rows = "".join(
-            f"<tr><td><b>{_esc(r['symbol'])}</b></td><td>{_esc(r['catalyst_type'])}</td>"
-            f"<td>{_esc(r['headline'], 160)}"
-            + (f"<br><i style='color:#777'>👁 {_esc(r.get('what_to_track', ''), 200)}"
-               f"</i>" if r.get("what_to_track") else "")
-            + f"</td><td>{_esc(r['tags'], 60)}</td>"
-            f"<td align=center>{r['n_sources']}</td></tr>" for r in new_rows)
-        parts.append("<table border=1 cellpadding=4 cellspacing=0>"
-                     "<tr><th>Symbol</th><th>Type</th><th>Headline</th>"
-                     "<th>Tags</th><th>Src</th></tr>" + rows + "</table>")
-    else:
-        parts.append("<p>No catalysts found tonight — every scanned name was quiet.</p>")
-    parts.append("<p style='font-size:11px;color:#999'>Full notes live on the Stock "
-                 "Detail / Scorecard pages. Quiet = no trusted-source news in "
-                 f"{NEWS_DAYS} days (no Gemini call spent). "
-                 "Toggle this mail in the app sidebar (📧 Email toggles).</p>")
-    return "".join(parts)
+def evidence_hash(items, filings, research, community) -> str:
+    """Order-independent fingerprint of everything a note is written FROM. Headlines
+    are matched on their title text only (the RSS link and timestamp change between
+    fetches of the same story)."""
+    import hashlib
+    lines = sorted({str(i.get("title", "")).strip().lower() for i in items or []}
+                   | {str(x).strip().lower() for x in (filings or [])}
+                   | {str(x).strip().lower() for x in (research or [])}
+                   | {str(x).strip().lower() for x in (community or [])})
+    lines = [x for x in lines if x]
+    return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()[:12] if lines else ""
+
+
+def _norm_headline(h) -> str:
+    return " ".join(str(h or "").lower().split())
+
+
+# SAME STORY (user-approved 2026-10-12). The model rewords the same event every night:
+# WELCORP's one US$412.5 mn order was re-mailed on 3, 9, 10 and 11 Oct as four
+# different headlines. Two notes are the same story when they share the catalyst type
+# AND an AMOUNT - a number tied to a currency or a unit (Rs 2,026 Cr, US$412.5 mn,
+# 24%, 122,662 tons). Bare numbers (dates, "FY27") are ignored: matching on them
+# dropped a genuinely new plant commissioning in the replay.
+SAME_STORY_DAYS = 14
+_CUR = r"(?:rs\.?|inr|₹|\$|us\$|usd|sar|eur)"
+_UNIT = r"(?:cr|crs?|crore|crores|mn|million|bn|billion|lakh|%|tons?|tonnes?|mw|gw)"
+# (?![a-z]) not \b: "24%" followed by a space has no word boundary after the "%"
+_AMOUNT = re.compile(rf"{_CUR}\s*(\d[\d,]*(?:\.\d+)?)|(\d[\d,]*(?:\.\d+)?)\s*{_UNIT}(?![a-z])",
+                     re.I)
+
+
+def amounts(headline) -> set[str]:
+    out = set()
+    for m in _AMOUNT.finditer(str(headline or "")):
+        v = (m.group(1) or m.group(2)).replace(",", "")
+        if v.replace(".", "").strip("0"):
+            out.add(v)
+    return out
+
+
+def same_story(recent: list[tuple], ctype: str, headline: str) -> bool:
+    """recent = [(catalyst_type, headline)] for this symbol's notes in the last
+    SAME_STORY_DAYS days (before today)."""
+    mine = amounts(headline)
+    return bool(mine) and any(t == ctype and (mine & amounts(h)) for t, h in recent)
+
+
+def note_changed(prev: dict | None, ctype: str, headline: str) -> bool:
+    """A note is NEWS when there was no earlier note, or its catalyst type or headline
+    differs from the symbol's previous note (user 2026-10-10: 'only where there is a
+    change')."""
+    if not prev:
+        return True
+    return (str(prev.get("catalyst_type") or "") != str(ctype or "")
+            or _norm_headline(prev.get("headline")) != _norm_headline(headline))
+
+
+def actionable(rows: list[dict]) -> list[dict]:
+    """Rows worth a reader's time: a real catalyst (not 'unknown') that is new."""
+    return [r for r in rows
+            if str(r.get("catalyst_type") or "") != "unknown" and r.get("_changed")]
+
+
+def catalyst_mail_html(rows: list[dict], counts: dict) -> str:
+    """Only the notes that changed and name a real catalyst. Everything else is one
+    line of counts, so a quiet night costs the reader one glance (or no mail)."""
+    rows = sorted(rows, key=lambda r: (not r.get("_in_pf"), r["symbol"]))
+    td = "padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top;font-size:13px"
+    body = "".join(
+        f"<tr><td style='{td}'>{'💼 ' if r.get('_in_pf') else ''}<b>"
+        f"{_esc(r['symbol'])}</b><br><span style='color:#888;font-size:11px'>"
+        f"{_esc(r['catalyst_type'])}</span></td>"
+        f"<td style='{td}'><b>{_esc(r['headline'], 200)}</b>"
+        + (f"<br>👁 <i>{_esc(r.get('what_to_track', ''), 260)}</i>"
+           if r.get("what_to_track") else "")
+        + (f"<br><span style='color:#999;font-size:11px'>previous note "
+           f"({_esc(r.get('_prev_as_of'), 10)}): {_esc(r.get('_prev_headline'), 140)}"
+           f"</span>" if r.get("_prev_headline") else
+           "<br><span style='color:#1a7a3a;font-size:11px'>first note for this stock"
+           "</span>")
+        + "</td></tr>" for r in rows)
+    c = counts
+    return (
+        f"<div style='font-family:Arial,sans-serif;max-width:720px'>"
+        f"<p style='font-size:13px'><b>{len(rows)} new catalyst"
+        f"{'' if len(rows) == 1 else 's'}</b> tonight — only notes that name a real "
+        f"catalyst AND differ from that stock's previous note. Holdings first.</p>"
+        f"<table style='border-collapse:collapse;width:100%'>{body}</table>"
+        f"<p style='font-size:11px;color:#999;margin-top:10px'>Also scanned "
+        f"{c.get('selected', 0)} stocks: {c.get('quiet', 0)} had no news at all · "
+        f"{c.get('unchanged', 0)} had the same news as last time (no AI call spent) · "
+        f"{c.get('no_catalyst', 0)} had news but no clear catalyst · "
+        f"{c.get('same_note', 0)} repeated a story already mailed in the last "
+        f"{SAME_STORY_DAYS} days. Full notes: Stock "
+        f"Detail / Scorecard pages. Toggle this mail in the app sidebar.</p></div>")
 
 
 def make_note(pool, company: str, symbol: str, items: list[dict],
@@ -341,9 +414,19 @@ def main():
     # ---- previous index: idempotency + stalest-first rotation ----
     idx = store.read_parquet(["company_repo", "_index", "catalyst_index.parquet"])
     last_note: dict[str, str] = {}
+    prev_row: dict[str, dict] = {}       # newest note BEFORE today, per symbol
     if idx is not None and not idx.empty:
         for _, r in idx.sort_values("as_of").iterrows():
             last_note[str(r["symbol"]).upper()] = str(r["as_of"])
+            if str(r["as_of"]) < as_of:
+                prev_row[str(r["symbol"]).upper()] = r.to_dict()
+    recent: dict[str, list] = {}         # same-story window, per symbol
+    _since = (today - timedelta(days=SAME_STORY_DAYS)).strftime("%Y-%m-%d")
+    if idx is not None and not idx.empty:
+        for _, r in idx.iterrows():
+            if _since <= str(r["as_of"]) < as_of:
+                recent.setdefault(str(r["symbol"]).upper(), []).append(
+                    (str(r.get("catalyst_type") or ""), str(r.get("headline") or "")))
 
     # ---- PF companies: scanned EVERY run on top of the cap (user 2026-06-11) ----
     pf_syms: list[str] = []
@@ -384,7 +467,7 @@ def main():
     if pool is None:
         return
 
-    new_rows, skipped_quiet = [], 0
+    new_rows, skipped_quiet, skipped_unchanged = [], 0, 0
     for sym in selected:
         isin, cname = isin_map.get(sym, ("", ""))
         if not isin:
@@ -415,6 +498,12 @@ def main():
         if not items and not filings and not research and not community:
             skipped_quiet += 1
             continue           # nothing moving anywhere -> save the Gemini call
+        ev = evidence_hash(items[:10], filings, research, community)
+        prev = prev_row.get(sym)
+        if ev and prev and str(prev.get("evidence_hash") or "") == ev:
+            skipped_unchanged += 1
+            log(f"  {sym}: same evidence as the {prev.get('as_of')} note — no call")
+            continue
         brief = store.read_text(["company_repo", isin, "company_page.md"]) or ""
         res = make_note(pool, cname, sym, items[:10], filings, research,
                         community, brief[-6000:])
@@ -445,11 +534,27 @@ def main():
                           + (body or "")).strip(),
             "md_path": md_path, "n_sources": len(items) + len(filings),
             "computed_at": datetime.now().isoformat(timespec="seconds"),
+            "evidence_hash": ev,
+            # mail-only (dropped by CATALYST_COLS before any write)
+            "_changed": (note_changed(prev, ctype, headline)
+                         and not same_story(recent.get(sym, []), ctype, headline)),
+            "_prev_headline": (prev or {}).get("headline"),
+            "_prev_as_of": (prev or {}).get("as_of"),
+            "_in_pf": sym in set(pf_syms),
         })
         log(f"  {sym}: note written ({ctype}) — {headline[:70]}")
 
-    log(f"notes written: {len(new_rows)}; quiet names skipped (no news, no filings): "
-        f"{skipped_quiet}; RSS calls: {news_fetch.calls_made()}")
+    news = actionable(new_rows)
+    counts = {"selected": len(selected), "quiet": skipped_quiet,
+              "unchanged": skipped_unchanged,
+              "no_catalyst": sum(1 for r in new_rows
+                                 if str(r.get("catalyst_type")) == "unknown"),
+              "same_note": sum(1 for r in new_rows
+                               if str(r.get("catalyst_type")) != "unknown"
+                               and not r.get("_changed"))}
+    log(f"notes written: {len(new_rows)} ({len(news)} new catalysts); quiet names "
+        f"skipped (no news, no filings): {skipped_quiet}; same evidence as last note "
+        f"(no call): {skipped_unchanged}; RSS calls: {news_fetch.calls_made()}")
 
     if new_rows:
         # ---- upsert index: replace same (symbol, as_of) rows, append the rest ----
@@ -473,10 +578,74 @@ def main():
         if not load_mail_settings(store.drive, index_id).get("catalyst", True):
             log("catalyst mail toggled OFF — skipped.")
             return
-        send_email(f"💡 Catalyst notes — {len(new_rows)} new — {datetime.now():%d-%b}",
-                   _catalyst_mail_html(new_rows, len(elig_syms), len(pf_syms),
-                                       len(selected), skipped_quiet))
+        if not news:
+            log("no new catalyst tonight — no mail (counts: "
+                + ", ".join(f"{k}={v}" for k, v in counts.items()) + ")")
+            return
+        n_pf = sum(1 for r in news if r.get("_in_pf"))
+        send_email(f"💡 Catalysts — {len(news)} new"
+                   + (f" · 💼 {n_pf} PF" if n_pf else "")
+                   + f" — {datetime.now():%d-%b}",
+                   catalyst_mail_html(news, counts))
+
+
+def _self_test() -> int:
+    """Offline: evidence fingerprint, change detection, mail filtering. No network."""
+    fails = 0
+
+    def check(name, ok):
+        nonlocal fails
+        print(("  ok   " if ok else "  FAIL ") + name)
+        fails += 0 if ok else 1
+
+    a = [{"title": "X wins Rs 500 cr order", "link": "u1"}, {"title": "X Q2 results"}]
+    b = [{"title": "x q2 results", "link": "other"}, {"title": "X wins Rs 500 cr order"}]
+    h = evidence_hash(a, ["- filing 1"], [], [])
+    check("hash ignores order, case and links", h == evidence_hash(b, ["- filing 1"], [], []))
+    check("new filing changes the hash", h != evidence_hash(a, ["- filing 1", "- f2"], [], []))
+    check("no evidence -> empty hash", evidence_hash([], [], [], []) == "")
+    check("12 chars", len(h) == 12)
+    prev = {"catalyst_type": "order_win", "headline": "X wins Rs 500 cr order"}
+    check("first note is news", note_changed(None, "order_win", "anything"))
+    check("same type + same headline (case/space) is not news",
+          not note_changed(prev, "order_win", "x wins  rs 500 cr ORDER"))
+    check("new headline is news", note_changed(prev, "order_win", "X wins Rs 900 cr order"))
+    check("new type is news", note_changed(prev, "results", "X wins Rs 500 cr order"))
+    welcorp = [("order_win", "Welspun Corp secures US$412.5 million order, order book US$4.7 billion")]
+    check("reworded same order = same story", same_story(
+        welcorp, "order_win", "Welspun Corp secured record USD 412.5 mn HFIW pipe order"))
+    check("different amount = new story", not same_story(
+        welcorp, "order_win", "Associate East Pipes wins SAR 771 million Aramco contract"))
+    check("same amount, different type = new story", not same_story(
+        welcorp, "results", "Revenue US$412.5 million"))
+    check("dates and FY labels are not amounts",
+          amounts("Board meets on 29 Sept 2026 for Q2 FY27 results") == set())
+    check("no amount in the new headline = never same story",
+          not same_story(welcorp, "order_win", "Syrma inaugurates new plant in Jodhpur"))
+    check("amount forms", amounts("Rs 2,026 Cr; 24.2% YoY; 122,662 tons; ₹8.83 crore")
+          == {"2026", "24.2", "122662", "8.83"})
+    rows = [{"symbol": "A", "catalyst_type": "unknown", "_changed": True},
+            {"symbol": "B", "catalyst_type": "order_win", "_changed": False},
+            {"symbol": "C", "catalyst_type": "results", "_changed": True, "_in_pf": True,
+             "headline": "C beats", "what_to_track": "margin in Q3"},
+            {"symbol": "D", "catalyst_type": "policy", "_changed": True,
+             "headline": "D gets PLI", "_prev_headline": "D applies", "_prev_as_of": "2026-10-01"}]
+    news = actionable(rows)
+    check("unknown and unchanged notes are dropped", [r["symbol"] for r in news] == ["C", "D"])
+    html = catalyst_mail_html(news, {"selected": 30, "quiet": 12, "unchanged": 9,
+                                     "no_catalyst": 1, "same_note": 1})
+    check("PF first", html.index(">C<") < html.index(">D<"))
+    check("previous note shown", "D applies" in html and "first note" in html)
+    check("counts line", "9 had the same news" in html)
+    check("mail-only keys never persisted",
+          not any(c.startswith("_") for c in CATALYST_COLS)
+          and CATALYST_COLS[-1] == "evidence_hash")
+    print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
+    return 1 if fails else 0
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    if "--self-test" in _sys.argv:
+        raise SystemExit(_self_test())
     main()
