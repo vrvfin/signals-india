@@ -2171,7 +2171,9 @@ def main() -> None:
         if _did:
             _k = content_key(_dt, _i, _pre)
             if _k:
-                _keys[_did] = _k
+                # keyed per TYPE: one doc_id can be queued as both concall and
+                # presentation (KANOHAR, Oct 2026) - per-doc_id keys overwrote each other
+                _keys[(_did, _dt)] = _k
     due = COV.mail_due(pf, queue, calendar, ledger, season, on=today,
                        window_days=args.window_days, doc_types=tuple(want),
                        require_calendar=args.require_calendar, tables=_pre,
@@ -2300,7 +2302,8 @@ def main() -> None:
                       "doc_type": d["doc_type"], "period": season,
                       "doc_id": d.get("doc_id", ""), "mailed_at": _now,
                       "subject": "(seeded - back catalogue, never sent)",
-                      "content_key": _keys.get(str(d.get("doc_id") or ""), "")}
+                      "content_key": _keys.get((str(d.get("doc_id") or ""),
+                                                d["doc_type"]), "")}
                      for d in due]
         out = pd.concat([ledger, pd.DataFrame(seed_rows, columns=LEDGER_COLS)],
                         ignore_index=True) if ledger is not None and not ledger.empty \
@@ -2439,7 +2442,8 @@ def main() -> None:
                               "doc_id": d.get("doc_id", ""),
                               "mailed_at": datetime.now().isoformat(timespec="seconds"),
                               "subject": subject[:200],
-                              "content_key": _keys.get(str(d.get("doc_id") or ""), "")})
+                              "content_key": _keys.get((str(d.get("doc_id") or ""),
+                                                        dt), "")})
 
     # Ledger advances ONLY on confirmed sends — a failed mail must stay due.
     if sent_rows:
