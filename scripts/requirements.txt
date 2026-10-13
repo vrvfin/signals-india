@@ -5,6 +5,7 @@
 numpy>=1.26
 pandas>=2.2
 pyarrow>=15.0          # parquet read/write (results.parquet)
+matplotlib>=3.8        # static PNG price charts embedded in mails (mail_chart.py)
 
 # Market data
 yfinance>=0.2.38
