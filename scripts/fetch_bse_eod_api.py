@@ -459,12 +459,17 @@ def _apply_split(merged: pd.DataFrame, fresh_dates: set, exd, factor: float):
 
 
 def _merge_bars(drive, folder_id, key, official: list, yahoo: list,
-                existing_id, bse_code: str = "", write: bool = True) -> dict:
+                existing_id, bse_code: str = "", write: bool = True,
+                corp_fn=None) -> dict:
     """Official bars REPLACE stored bars of the same date; Yahoo bars only fill
     dates not stored and not official. Then the existing split/bonus guard runs
     on every new bar: a > JUMP_TOL move vs the previous close is rescaled ONLY on
     an official BSE corporate-action record (never price-implied); otherwise the
-    history is left alone and the jump is reported."""
+    history is left alone and the jump is reported.
+
+    `corp_fn(around_date) -> (factor, ex_date) | None` swaps in another OFFICIAL
+    corporate-action source (fetch_nse_sme_eod: NSE's list, for NSE-only SME names
+    that have no BSE code). Omitted -> BSE's record, exactly as before."""
     old = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
     if existing_id:
         old = pd.read_parquet(io.BytesIO(download_bytes(drive, existing_id)))
@@ -490,7 +495,8 @@ def _merge_bars(drive, folder_id, key, official: list, yahoo: list,
         last = float(prior["close"].iloc[-1])
         now = float(merged.loc[merged["date"] == d0, "close"].iloc[0])
         if last > 0 and abs(now / last - 1.0) > JUMP_TOL:
-            hit = corp_action_factor(bse_code, d0.date()) if bse_code else None
+            hit = (corp_fn(d0.date()) if corp_fn is not None else
+                   corp_action_factor(bse_code, d0.date()) if bse_code else None)
             if hit:
                 factor, exd = hit
                 fixed, how = _apply_split(merged, set(new_dates), exd, factor)

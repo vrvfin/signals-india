@@ -104,7 +104,12 @@ def render_png(ohlcv: pd.DataFrame, title: str = "", days: int = 250,
     ax.grid(alpha=0.15)
     # month ticks on the shared axis
     months = d["date"].dt.to_period("M")
-    ticks = [i for i in range(1, len(d)) if months.iloc[i] != months.iloc[i - 1]]
+    ticks = []
+    for i in range(1, len(d)):
+        # thinly traded SME names can have a month of only a few bars: labels that
+        # close collide ("JanFeb") - keep a label only 8+ bars after the last one
+        if months.iloc[i] != months.iloc[i - 1] and (not ticks or i - ticks[-1] >= 8):
+            ticks.append(i)
     axv.set_xticks(ticks)
     axv.set_xticklabels([d["date"].iloc[i].strftime("%b") for i in ticks], fontsize=7)
     ax.set_xlim(-1, len(d))
