@@ -461,7 +461,8 @@ def main() -> None:
               "rating) · medium 2 (other filing, deck/AR, new catalyst, "
               f"results due ≤3 days, guidance pace slipping) · minor 1. A card needs "
               f"{F.FOCUS_MIN}+. Unusual move = ≥{F.PRICE_Z:g}× the stock's own typical "
-              "move vs Nifty. Views are written only from the evidence listed; a view "
+              f"move vs Nifty, or a ≥{F.PRICE_ABS_5D:g}% move vs Nifty over 5 days. "
+              "Views are written only from the evidence listed; a view "
               "marked rule-based is the fallback. Signals only, not advice. Toggle this "
               "mail in the app sidebar.</p></div>")
 

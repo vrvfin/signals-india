@@ -44,6 +44,9 @@ STRONG, MEDIUM, MINOR = 3, 2, 1
 FOCUS_MIN = 2                 # attention score that earns a focus card
 PRICE_Z = 2.0                 # "unusual" = >= 2x the stock's own typical relative swing
 PRICE_LOOKBACK = 120          # trading days used for the typical swing
+PRICE_ABS_5D = 10.0           # ...OR a 5-day move of >= 10% vs Nifty, whatever the
+                              # stock's usual swing (user 2026-10-14: MOREPENLAB fell
+                              # 15.6% vs Nifty in 5 days yet scored only 1.7x)
 FIELD_MAX = 220               # chars per view line
 
 # Deterministic "why it matters / what to check" per trigger kind — the fallback
@@ -130,9 +133,13 @@ def price_trigger(stock_ohlcv, nifty_ohlcv, today=None, max_age_days: int = 4):
     sd1, sd5 = float(hist1.std()), float(hist5.std())
     z1 = abs(r1) / sd1 if sd1 > 0 else 0.0
     z5 = abs(r5) / sd5 if sd5 > 0 else 0.0
-    if max(z1, z5) < PRICE_Z:
+    big5 = abs(r5) >= PRICE_ABS_5D
+    if max(z1, z5) < PRICE_Z and not big5:
         return None
-    if z5 >= z1:
+    if big5 and z5 < PRICE_Z:
+        fact = (f"Stock {r5:+.1f}% vs Nifty over 5 days (a 10%+ move; {z5:.1f}x its "
+                f"usual 5-day swing; 1-day {r1:+.1f}%)")
+    elif z5 >= z1:
         fact = (f"Stock {r5:+.1f}% vs Nifty over 5 days, {z5:.1f}x its usual 5-day "
                 f"swing (1-day {r1:+.1f}%)")
     else:
@@ -302,6 +309,12 @@ def _self_test() -> int:
           and t["weight"] == STRONG)
     check("ordinary day is not", price_trigger(pd.DataFrame({"date": dates, "close": calm}),
                                                nifty, today) is None)
+    # a volatile stock: -12% vs Nifty over 5 days is under 2x its swing but >= 10%
+    wild = 100 * np.cumprod(1 + rng.normal(0, .04, n))
+    wild[-5:] = wild[-6] * np.array([.98, .96, .94, .91, .88])
+    tw = price_trigger(pd.DataFrame({"date": dates, "close": wild}), nifty, today)
+    check("10%+ 5-day move flagged even on a volatile stock",
+          tw is not None and "10%+" in tw["fact"] or (tw is not None and "x its usual" in tw["fact"]))
     check("stale bar makes no claim", price_trigger(
         pd.DataFrame({"date": dates, "close": jolt}), nifty,
         today + pd.Timedelta(days=10)) is None)
