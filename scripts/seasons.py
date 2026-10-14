@@ -24,12 +24,31 @@ PEAK_SEASONS = [
 ]
 
 
-def is_peak_season(ist_now: datetime) -> bool:
-    """True if the given IST datetime falls within any India results season."""
+# The PF RESULTS MAIL opens earlier than the peak (user 2026-10-13): holdings start
+# filing in the first fortnight after quarter-end - 15 PF holdings had filed Q2 FY27
+# by 12 Oct while the peak window kept the mail silent until 15 Oct. Same end dates.
+# PEAK_SEASONS itself is NOT moved: backfill_skip_check and pipeline_skip_check
+# throttle on it, and changing their cadence was not asked for.
+RESULTS_MAIL_SEASONS = [
+    (1, 1, 3, 1),      # Q3: 1 Jan – 1 Mar
+    (4, 1, 6, 14),     # Q4 / annual: 1 Apr – 14 Jun
+    (7, 1, 8, 29),     # Q1: 1 Jul – 29 Aug
+    (10, 1, 11, 29),   # Q2: 1 Oct – 29 Nov
+]
+
+
+def is_peak_season(ist_now: datetime, windows=None) -> bool:
+    """True if the given IST datetime falls within any India results season
+    (PEAK_SEASONS, or the `windows` given)."""
     m, d = ist_now.month, ist_now.day
-    for sm, sd, em, ed in PEAK_SEASONS:
+    for sm, sd, em, ed in (windows or PEAK_SEASONS):
         after_start = (m > sm) or (m == sm and d >= sd)
         before_end = (m < em) or (m == em and d <= ed)
         if after_start and before_end:
             return True
     return False
+
+
+def in_results_mail_window(ist_now: datetime) -> bool:
+    """The PF results mail's window: 1st of the month after quarter-end onwards."""
+    return is_peak_season(ist_now, RESULTS_MAIL_SEASONS)
