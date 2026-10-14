@@ -66,6 +66,14 @@ def _read(drive, root, parts):
         return pd.DataFrame()
 
 
+def _txt(v) -> str:
+    """Cell -> clean text; NaN / None / 'nan' / 'none' -> ''."""
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() in ("nan", "none", "<na>") else s
+
+
 def _by_isin(df, isin, col="isin"):
     if df.empty or col not in df.columns:
         return df.iloc[0:0] if not df.empty else pd.DataFrame()
@@ -371,11 +379,10 @@ def main() -> None:
     for _, r in uni.iterrows():
         isin = str(r.get("isin", "")).strip()
         if isin in pf:
-            sym = (str(r.get("nse_symbol", "") or "").strip()
-                   or str(r.get("bse_symbol", "") or "").strip()
-                   or str(r.get("bse_code", "") or "").strip()).upper()
-            if sym.lower() == "nan":
-                sym = isin
+            # A missing NSE symbol reads as float NaN, which is TRUTHY and str()s to
+            # "nan" - BSE-only LTELEVATOR became "NAN" and lost its chart and name.
+            sym = (_txt(r.get("nse_symbol")) or _txt(r.get("bse_symbol"))
+                   or _txt(r.get("bse_code")).split(".")[0] or isin).upper()
             rows.append((isin, sym, str(r.get("name", "")).strip(),
                          str(r.get("bse_code", "")).strip()))
     log(f"PF companies resolved: {len(rows)} of {len(pf)} ISINs")
