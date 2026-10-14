@@ -60,6 +60,7 @@ NSE_CA = ("https://www.nseindia.com/api/corporates-corporateActions?index=sme"
 SME_SERIES = {"SM", "ST"}
 EXDATE_SLACK_DAYS = 5          # same tolerance as the BSE step
 WAIT_POLL_SEC = 120
+MIN_STALE_HOURS = 6.0           # below this, Yahoo-fresh names would become targets
 
 _sess = None
 
@@ -127,11 +128,43 @@ def action_factor(subject: str) -> float | None:
     return None
 
 
+_RIGHTS = re.compile(r"rights\s+(\d+)\s*:\s*(\d+)\s*@\s*(?:premium|prem)\s*r[se]?\.?\s*"
+                     r"(\d+(?:\.\d+)?)", re.I)
+
+
+def rights_terms(subject: str, face_val) -> tuple | None:
+    """'RIGHTS a:b @ PREMIUM Rs p' + face value -> (a new per b held, issue price)."""
+    m = _RIGHTS.search(str(subject or ""))
+    fv = _f(face_val)
+    if not m or fv is None:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    return (a, b, fv + float(m.group(3))) if a > 0 and b > 0 else None
+
+
+def rights_factor(terms: tuple, cum_close: float) -> float | None:
+    """Price divisor for a rights issue = cum price / theoretical ex-rights price,
+    TERP = (b*P + a*I) / (a+b). Verified on DHARIWAL (1:1 @ Rs 2.50, cum 79.45 ->
+    TERP 40.98, first ex close 41.80) and MPEL (2:1 @ Rs 16, cum 38.70 -> TERP
+    23.57, ex close 24.70 = TERP + its 5% band). A rights issue priced at or above
+    the market changes nothing -> None."""
+    a, b, issue = terms
+    if not cum_close or cum_close <= issue:
+        return None
+    terp = (b * cum_close + a * issue) / (a + b)
+    return cum_close / terp if terp > 0 else None
+
+
 def parse_actions(rows: list) -> dict:
-    """{symbol: [(ex_date, factor)]} from NSE's corporate-actions JSON rows."""
+    """{symbol: [(ex_date, factor | ("rights", terms))]} from NSE's corporate-actions
+    JSON rows. Bonus/split factors are fixed; a rights factor needs the cum price,
+    so it is resolved later against the symbol's own bars (corp_fn_for)."""
     out: dict = {}
     for x in rows or []:
         f = action_factor(x.get("subject"))
+        if not f:
+            t = rights_terms(x.get("subject"), x.get("faceVal"))
+            f = ("rights", t) if t else None
         if not f:
             continue
         try:
@@ -142,16 +175,27 @@ def parse_actions(rows: list) -> dict:
     return out
 
 
-def corp_fn_for(sym: str, actions: dict):
-    """corp_fn for _merge_bars: (factor, ex_date) within the ex-date slack, else None."""
+def corp_fn_for(sym: str, actions: dict, bars: list | None = None):
+    """corp_fn for _merge_bars: (factor, ex_date) within the ex-date slack, else None.
+    `bars`: this symbol's official bars, for a rights issue's cum-rights close."""
     evs = actions.get(sym, [])
+    closes = sorted(((pd.Timestamp(b_["date"]).date(), float(b_["close"]))
+                     for b_ in (bars or [])), key=lambda x: x[0])
+
+    def factor(f, exd):
+        if not isinstance(f, tuple):
+            return f
+        cum = [c for d_, c in closes if d_ < exd]
+        return rights_factor(f[1], cum[-1]) if cum else None
 
     def fn(around: date):
         best = None
         for exd, f in evs:
             gap = abs((exd - around).days)
             if gap <= EXDATE_SLACK_DAYS and (best is None or gap < best[0]):
-                best = (gap, f, exd)
+                val = factor(f, exd)
+                if val:
+                    best = (gap, val, exd)
         return (best[1], best[2]) if best else None
     return fn
 
@@ -246,6 +290,12 @@ def main() -> None:
                     help="minutes to wait for today's file (0: let tomorrow's catch-up)")
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
+    if args.stale_hours < MIN_STALE_HOURS:
+        # 2026-10-14: --stale-hours 0 made every Yahoo-covered SME name a target and
+        # overwrote 282 of their files with raw NSE bars (restored from Drive
+        # revisions). The Yahoo/NSE ownership boundary is not an option to tune away.
+        ap.error(f"--stale-hours must be >= {MIN_STALE_HOURS:g}: lower would take over "
+                 f"names Yahoo keeps fresh")
 
     from _extractor_base import get_drive, find_file, download_bytes
     from fetch_bse_eod_api import _folder, _merge_bars, _thread_drive, _today_ist
@@ -310,7 +360,7 @@ def main() -> None:
     def _one(k):
         try:
             fid = (files.get(f"{k}.parquet") or {}).get("id")
-            kw = dict(corp_fn=corp_fn_for(k, actions))
+            kw = dict(corp_fn=corp_fn_for(k, actions, official.get(k, [])))
             if fid and not args.dry_run:
                 # A file Yahoo wrote before: merge only if NSE's prices JOIN it. An
                 # unexplained jump means the stored history is another company's or
@@ -372,6 +422,23 @@ def _self_test() -> int:
     check("corp_fn finds the ex-date within slack", fn(date(2026, 10, 10)) == (2.0, date(2026, 10, 9)))
     check("corp_fn: nothing far away", fn(date(2026, 9, 1)) is None)
     check("corp_fn: unknown symbol", corp_fn_for("ZZZ", acts)(date(2026, 10, 9)) is None)
+    # rights issues (DHARIWAL / MPEL, real NSE records and closes)
+    t = rights_terms("RIGHTS 1:1 @ PREMIUM RE 0.50/-", "2")
+    check("rights terms parsed", t == (1, 1, 2.5))
+    check("DHARIWAL TERP factor", abs(rights_factor(t, 79.45) - 79.45 / 40.975) < 1e-9)
+    t2 = rights_terms("RIGHTS 2:1 @ PREMIUM RS 6/-", "10")
+    check("MPEL: 2 new per 1 held at Rs 16", t2 == (2, 1, 16.0)
+          and abs(38.70 / rights_factor(t2, 38.70) - 23.5667) < 1e-3)
+    check("rights at/above market -> no adjustment", rights_factor((1, 1, 100.0), 90.0) is None)
+    acts2 = parse_actions([{"symbol": "DHARIWAL", "exDate": "27-Feb-2026", "faceVal": "2",
+                            "subject": "RIGHTS 1:1 @ PREMIUM RE 0.50/-"}])
+    bars_d = [{"date": pd.Timestamp("2026-02-26"), "close": 79.45},
+              {"date": pd.Timestamp("2026-02-27"), "close": 41.80}]
+    got = corp_fn_for("DHARIWAL", acts2, bars_d)(date(2026, 2, 27))
+    check("corp_fn resolves a rights factor from the cum close",
+          got is not None and abs(got[0] - 79.45 / 40.975) < 1e-9 and got[1] == date(2026, 2, 27))
+    check("rights without a cum bar -> no factor",
+          corp_fn_for("DHARIWAL", acts2, [])(date(2026, 2, 27)) is None)
 
     raw = pd.DataFrame([
         {"TradDt": "2026-10-13", "TckrSymb": "ANONDITA", "SctySrs": "SM", "OpnPric": "1049.95",
