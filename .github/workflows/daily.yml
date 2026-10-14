@@ -106,6 +106,16 @@ jobs:
         run: python scripts/fetch_bse_eod_api.py --workers 16
         continue-on-error: true
 
+      # NSE SME names Yahoo has no data for (276 of 593 had no price file,
+      # 2026-10-14): official NSE bhavcopy rows, merged with the BSE step's own
+      # _merge_bars (14-day re-take, split/bonus rescale on NSE's corporate-action
+      # list). Only names today's Yahoo ingest did not refresh. Before listing
+      # dates, which dates new names from their first bar.
+      - name: Ingest OHLCV (NSE SME names Yahoo lacks, NSE bhavcopy)
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/fetch_nse_sme_eod.py --workers 16
+        continue-on-error: true
+
       # Listing dates — must run AFTER both OHLCV steps, since new names are
       # dated from the first bar of data/ohlcv when NSE has no date for them.
       # DAILY mode only touches names with no row yet (typically a handful), so
