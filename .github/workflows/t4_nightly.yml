@@ -230,10 +230,15 @@ jobs:
         run: python scripts/quarter_teardown.py --daily
         continue-on-error: true
 
-      - name: PF daily digest mail (filings/research/flags/community per holding)
+      - name: PF daily focus mail (what changed, why it matters, what to check)
         if: always()
         run: python scripts/run_pf_digest.py
         continue-on-error: true
+        # ONE batched model call for the focus holdings' three-line views (user
+        # 2026-10-13). FREE_POOL is the default pool for new work (CLAUDE.md); scoped
+        # to this step only. Without it the script falls back to rule-based views.
+        env:
+          FREE_POOL: ${{ secrets.FREE_POOL }}
 
       # PF "new documents" digest (user 2026-07-11): collects Phase-2 summaries of
       # newly-arrived AR/concall/presentation/results/rating + announcements per PF
