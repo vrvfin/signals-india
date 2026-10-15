@@ -189,20 +189,39 @@ def corp_fn_for(sym: str, actions: dict, bars: list | None = None):
         return rights_factor(f[1], cum[-1]) if cum else None
 
     def fn(around: date):
+        # A thinly traded SME stock may not trade for days after an ex-date: the
+        # first ex-bar can land past the slack (JAKHARIA bonus 8 Oct 2025, next trade
+        # 15 Oct; ARIHANTACA bonus 1 Oct 2026, next trade 7 Oct). An ex-date inside
+        # the no-trade gap - after the previous bar, on or before this one - is the
+        # action behind this jump; it wins over a mere slack match.
+        prev = [d_ for d_, _ in closes if d_ < around]
+        prev_d = prev[-1] if prev else None
         best = None
         for exd, f in evs:
+            in_gap = prev_d is not None and prev_d < exd <= around
             gap = abs((exd - around).days)
-            if gap <= EXDATE_SLACK_DAYS and (best is None or gap < best[0]):
+            if not (in_gap or gap <= EXDATE_SLACK_DAYS):
+                continue
+            rank = (0 if in_gap else 1, gap)
+            if best is None or rank < best[0]:
                 val = factor(f, exd)
                 if val:
-                    best = (gap, val, exd)
+                    best = (rank, val, exd)
         return (best[1], best[2]) if best else None
     return fn
 
 
-def source_mismatch(merge_result: dict) -> bool:
-    """_merge_bars reported a jump it could not explain with an official record."""
-    return any("no official record" in str(e) for e in merge_result.get("events", []))
+def source_mismatch(merge_result: dict, tol_pct: float = 25.0) -> bool:
+    """_merge_bars reported a jump it could not explain with an official record AND
+    the jump is bigger than an SME circuit can make. SME bands are 5/10/20%: a
+    20% day is a real move, and treating it as a mismatch (2026-10-14) would have
+    stopped a stock updating whenever it hit a circuit inside the 14-day re-take.
+    tol = the BSE step's own JUNCTION_TOL (25%)."""
+    for e in merge_result.get("events", []):
+        m = re.search(r"jump ([+-]?\d+(?:\.\d+)?)%.*no official record", str(e))
+        if m and abs(float(m.group(1))) > tol_pct:
+            return True
+    return False
 
 
 def pick_targets(sme_syms, files: dict, now: datetime, stale_hours: float,
@@ -289,6 +308,9 @@ def main() -> None:
     ap.add_argument("--wait-min", type=float, default=0,
                     help="minutes to wait for today's file (0: let tomorrow's catch-up)")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--rebuild", action="store_true",
+                    help="discard the stored history and rebuild from NSE only. "
+                         "ONLY for ingest_ohlcv.NSE_OWNED names, which --names must list")
     args = ap.parse_args()
     if args.stale_hours < MIN_STALE_HOURS:
         # 2026-10-14: --stale-hours 0 made every Yahoo-covered SME name a target and
@@ -299,7 +321,13 @@ def main() -> None:
 
     from _extractor_base import get_drive, find_file, download_bytes
     from fetch_bse_eod_api import _folder, _merge_bars, _thread_drive, _today_ist
-    from ingest_ohlcv import COLLISION_SKIP
+    from ingest_ohlcv import COLLISION_SKIP, NSE_OWNED
+    from fetch_bse_eod_api import JUNCTION_TOL
+    if args.rebuild:
+        want = {x.strip().upper() for x in args.names.split(",") if x.strip()}
+        if not want or not want <= set(NSE_OWNED):
+            # never a scope wider than the NSE-owned list (2026-10-14 incident)
+            sys.exit(f"--rebuild needs --names, all in NSE_OWNED {sorted(NSE_OWNED)}")
 
     drive = get_drive()
     uf = _folder(drive, "universe")
@@ -313,6 +341,8 @@ def main() -> None:
     files = _files_with_mtime(drive, live_fid)
     now = datetime.now(timezone.utc)
     targets = pick_targets(sme, files, now, args.stale_hours, set(COLLISION_SKIP))
+    # NSE-owned names are updated every run, whatever Yahoo did (it skips them)
+    targets = sorted(set(targets) | (set(NSE_OWNED) & sme))
     if args.names:
         want = {x.strip().upper() for x in args.names.split(",") if x.strip()}
         targets = [t for t in targets if t in want] or sorted(want & sme)
@@ -361,20 +391,31 @@ def main() -> None:
         try:
             fid = (files.get(f"{k}.parquet") or {}).get("id")
             kw = dict(corp_fn=corp_fn_for(k, actions, official.get(k, [])))
-            if fid and not args.dry_run:
+            if args.rebuild and fid and not args.dry_run:
+                # empty the file IN PLACE (same id: no duplicate), then the normal
+                # merge rebuilds it from official bars with every corporate action
+                empty = pd.DataFrame(columns=["date", "open", "high", "low", "close",
+                                              "volume"])
+                from _extractor_base import upload_bytes
+                upload_bytes(_thread_drive(), live_fid, f"{k}.parquet",
+                             empty.to_parquet(index=False), "application/octet-stream",
+                             existing_id=fid)
+            if fid and not args.dry_run and not args.rebuild and k not in NSE_OWNED:
                 # A file Yahoo wrote before: merge only if NSE's prices JOIN it. An
                 # unexplained jump means the stored history is another company's or
                 # on another scale (RAJPUTANA: stored ~30, NSE ~200, +564%) - never
                 # glue the two together; skip and report instead.
                 probe = _merge_bars(_thread_drive(), live_fid, k, official.get(k, []), [],
                                     fid, write=False, **kw)
-                if source_mismatch(probe):
+                if source_mismatch(probe, JUNCTION_TOL * 100):
                     probe["events"] = ["SKIPPED - stored history does not join NSE prices: "
                                        + "; ".join(probe["events"])]
                     probe["added"] = probe["replaced"] = 0
                     return probe
+            # a --rebuild dry run previews the rebuild: as if the file were empty
+            merge_fid = None if (args.rebuild and args.dry_run) else fid
             return _merge_bars(_thread_drive(), live_fid, k, official.get(k, []), [],
-                               fid, write=not args.dry_run, **kw)
+                               merge_fid, write=not args.dry_run, **kw)
         except Exception as e:
             return {"key": k, "added": 0, "replaced": 0,
                     "events": [f"error {str(e)[:80]}"], "new_dates": []}
@@ -437,6 +478,15 @@ def _self_test() -> int:
     got = corp_fn_for("DHARIWAL", acts2, bars_d)(date(2026, 2, 27))
     check("corp_fn resolves a rights factor from the cum close",
           got is not None and abs(got[0] - 79.45 / 40.975) < 1e-9 and got[1] == date(2026, 2, 27))
+    jk = parse_actions([{"symbol": "JAKHARIA", "exDate": "08-Oct-2025", "faceVal": "10",
+                         "subject": "BONUS 2:1"}])
+    bars_j = [{"date": pd.Timestamp("2025-10-07"), "close": 300.0},
+              {"date": pd.Timestamp("2025-10-15"), "close": 105.0}]
+    check("ex-date inside a no-trade gap matches (JAKHARIA, 7 days late)",
+          corp_fn_for("JAKHARIA", jk, bars_j)(date(2025, 10, 15)) == (3.0, date(2025, 10, 8)))
+    check("but not when a bar already traded after the ex-date",
+          corp_fn_for("JAKHARIA", jk, bars_j + [{"date": pd.Timestamp("2025-10-09"),
+                                                  "close": 100.0}])(date(2025, 10, 20)) is None)
     check("rights without a cum bar -> no factor",
           corp_fn_for("DHARIWAL", acts2, [])(date(2026, 2, 27)) is None)
 
@@ -468,6 +518,12 @@ def _self_test() -> int:
     check("targets: missing + stale, never fresh or collision", t == ["NEW", "STALE"])
     check("unexplained jump = source mismatch", source_mismatch(
         {"events": ["jump +564% on 2026-10-01 - no official record, history untouched"]}))
+    check("a 20% circuit day is NOT a mismatch", not source_mismatch(
+        {"events": ["jump +20% on 2026-03-12 - no official record, history untouched"]}))
+    check("a -21% day is within the 25% tolerance", not source_mismatch(
+        {"events": ["jump -21% on 2026-02-02 - no official record, history untouched"]}))
+    check("-65% is a mismatch", source_mismatch(
+        {"events": ["jump -65% on 2025-10-15 - no official record, history untouched"]}))
     check("official rescale is not a mismatch", not source_mismatch(
         {"events": ["rescaled /2 (official 2026-10-09)"]}))
     print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
