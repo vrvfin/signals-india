@@ -932,7 +932,10 @@ def content_key(doc_type: str, isin: str, tables: dict) -> str:
     cur = rt.iloc[-1]
 
     def _v(k):
-        return str(cur.get(k) or "").strip().upper()
+        # NaN is truthy, so `or ""` let it through as "NAN"; None became "". Same
+        # meaning, two keys - see pf_coverage._EMPTY_TOKENS.
+        v = str(cur.get(k) if cur.get(k) is not None else "").strip().upper()
+        return "" if v in ("NAN", "NONE", "<NA>", "NULL", "NAT") else v
 
     return "|".join((_v("agency"), _v("rating"), _v("outlook"), _v("rating_action")))
 

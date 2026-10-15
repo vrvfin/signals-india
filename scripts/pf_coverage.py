@@ -323,6 +323,18 @@ def _season_rows(ledger: pd.DataFrame, season: str | None) -> pd.DataFrame:
 TYPED_KEY_FAMILIES = {"deck", "concall", "annual_report"}
 
 
+# Every spelling of "empty" a key field has ever been written with. A ratings.parquet
+# rewrite turned blank outlooks from NaN into None; the key built "NAN" from one and ""
+# from the other, so RAYMOND (22 Jul 2025), CPPLUS and GRAPHITE were re-sent as
+# "credit rating CORRECTED" on 2026-10-15 with nothing changed. Compare on meaning.
+_EMPTY_TOKENS = {"", "NAN", "NONE", "<NA>", "NULL", "NAT"}
+
+
+def _key_fields(key: str) -> list[str]:
+    return ["" if t.strip().upper() in _EMPTY_TOKENS else t.strip().upper()
+            for t in str(key).split("|")]
+
+
 def keys_differ(prev: str, cur: str) -> bool:
     """Do two content keys disagree on a field they BOTH carry?
 
@@ -338,15 +350,15 @@ def keys_differ(prev: str, cur: str) -> bool:
     """
     if not str(prev or "").strip() or not str(cur or "").strip():
         return False                 # unknown on either side is never a change
-    a = str(prev).split("|")
-    b = str(cur).split("|")
+    a = _key_fields(prev)
+    b = _key_fields(cur)
     # A DIFFERENT KEY FAMILY is not a change in content - it means the two keys
     # describe different document types. KANOHAR (Oct 2026): one doc_id sat in the queue
     # as both concall and presentation, the keys were stored per doc_id, so the concall
     # row recorded "deck|111" and every run read "concall|..." vs "deck|..." as a
     # correction and re-sent both mails. Only the typed families are guarded: a rating
     # key starts with the agency, and an agency fix is a real correction.
-    fams = {a[0], b[0]} & TYPED_KEY_FAMILIES
+    fams = {a[0].lower(), b[0].lower()} & TYPED_KEY_FAMILIES
     if fams and a[0] != b[0]:
         return False
     n = min(len(a), len(b))
@@ -999,6 +1011,15 @@ def _self_test() -> int:
           keys_differ("concall|Q1FY27|0", "concall|Q1FY27|1"))
     check("rating agency correction still detected",
           keys_differ("CRISIL|D|STABLE|REAFFIRMED", "ICRA|D|STABLE|REAFFIRMED"))
+    # 2026-10-15: NaN -> None in ratings.parquet re-sent three old ratings as CORRECTED
+    check("RAYMOND: NAN vs empty outlook is NOT a change",
+          not keys_differ("CARE|DATA_MISSING|NAN|ASSIGNED", "CARE|DATA_MISSING||ASSIGNED"))
+    check("CPPLUS: NAN vs empty is NOT a change",
+          not keys_differ("DATA_MISSING|A|NAN|REAFFIRMED", "DATA_MISSING|A||REAFFIRMED"))
+    check("GRAPHITE: NONE / <NA> spellings are NOT a change",
+          not keys_differ("DATA_MISSING|DATA_MISSING|NONE|", "DATA_MISSING|DATA_MISSING|<NA>|"))
+    check("a real rating change still fires",
+          keys_differ("CARE|A|NAN|REAFFIRMED", "CARE|AA|NAN|UPGRADED"))
     led_kan = pd.DataFrame([
         {"season": "Q2FY27", "isin": "INE1", "doc_type": "presentation", "doc_id": "kan1",
          "content_key": "deck|111"},
