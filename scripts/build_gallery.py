@@ -34,7 +34,7 @@ import json
 import os
 import sys
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPTS_DIR not in sys.path:
@@ -48,38 +48,98 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, log, load_portfolio_isins,
                              find_latest_portfolio_file, isin_symbol_map)
+from drive_io import drive_call, ParquetCache
 import gradation as G
+
+# Tolerance for "how far behind the market may a series be". Mirrors
+# OHLCV_MAX_STALE_DAYS in pipeline_healthcheck.py:52 — 4 calendar days is too
+# tight for India's long holiday weekends. Kept as a local constant rather than
+# an import so this renderer pulls in no pipeline/Drive side effects.
+OHLCV_MAX_STALE_DAYS = 6
 
 _EMPTY = pd.DataFrame()
 
 
 # ─────────────────────────── Drive loaders (plain) ──────────────────────────
+# Every Drive entry point here goes through drive_io.drive_call. On 2026-08-25 a
+# momentary DNS failure (getaddrinfo -> ServerNotFoundError) killed a build one
+# statement AFTER 45 minutes of downloads had finished, and gallery.html silently
+# stayed a day stale. A transient blip now costs a short pause, not the run.
+_DRIVE = None
+_FOLDER_IDS: dict = {}          # path -> folder id, resolved once per process
+
+
+def _drive(existing=None):
+    """The Drive service these helpers actually call.
+
+    `existing` lets an outside caller's service be adopted on first use —
+    pf_results_digest.py and pf_season_status.py import _folder/_bulk_parquet and
+    pass their own — so behaviour for them is unchanged while reconnects still
+    work through the same global.
+    """
+    global _DRIVE
+    if _DRIVE is None:
+        _DRIVE = existing if existing is not None else get_drive()
+    return _DRIVE
+
+
+def _reconnect():
+    """Drop a poisoned httplib2 connection and build a fresh Drive service."""
+    global _DRIVE
+    _DRIVE = get_drive()
+
+
+def _dc(fn, label=""):
+    return drive_call(fn, on_reconnect=_reconnect, label=label)
+
+
 def _folder(drive, parts):
+    """Resolve 'a/b/c' to a folder id. Memoised: main() asks for the same handful
+    of paths up to 11 times and every hop was a live round-trip — so ~25 needless
+    calls, each one its own crash site."""
+    if parts in _FOLDER_IDS:
+        return _FOLDER_IDS[parts]
     fid = os.environ["GDRIVE_FOLDER_ID"]
     for p in parts.split("/"):
-        fid = get_or_create_subfolder(drive, fid, p)
+        fid = _dc(lambda p=p, fid=fid: get_or_create_subfolder(_drive(drive), fid, p),
+                  label=parts)
+    _FOLDER_IDS[parts] = fid
     return fid
 
 
 def _read_parquet(drive, folder, name):
-    fid = find_file(drive, folder, name)
-    return pd.read_parquet(io.BytesIO(download_bytes(drive, fid))) if fid else _EMPTY
+    fid = _dc(lambda: find_file(_drive(drive), folder, name), label=name)
+    if not fid:
+        return _EMPTY
+    raw = _dc(lambda: download_bytes(_drive(drive), fid), label=name)
+    return pd.read_parquet(io.BytesIO(raw))
 
 
 def _read_csv(drive, folder, name):
-    fid = find_file(drive, folder, name)
-    return pd.read_csv(io.BytesIO(download_bytes(drive, fid))) if fid else _EMPTY
+    fid = _dc(lambda: find_file(_drive(drive), folder, name), label=name)
+    if not fid:
+        return _EMPTY
+    raw = _dc(lambda: download_bytes(_drive(drive), fid), label=name)
+    return pd.read_csv(io.BytesIO(raw))
 
 
 def _list_folder(drive, folder_id):
+    """-> {name: {"id", "mtime", "size"}}.
+
+    modifiedTime/size ride along in the SAME request (no extra round-trip) and
+    are what the parquet cache keys on, so a cached copy can never outlive the
+    file it came from. NOTE the value is a dict, not a bare id — the callers in
+    this file (_bulk_parquet, _load_signals) read ["id"].
+    """
     out, tok = {}, None
     while True:
-        resp = drive.files().list(
+        resp = _dc(lambda tok=tok: _drive(drive).files().list(
             q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id,name)", pageSize=1000,
-            pageToken=tok).execute()
+            fields="nextPageToken, files(id,name,modifiedTime,size)",
+            pageSize=1000, pageToken=tok).execute(), label="list")
         for f in resp.get("files", []):
-            out[f["name"]] = f["id"]
+            out[f["name"]] = {"id": f["id"], "mtime": f.get("modifiedTime", ""),
+                              "size": f.get("size")}
         tok = resp.get("nextPageToken")
         if not tok:
             break
@@ -88,16 +148,19 @@ def _list_folder(drive, folder_id):
 
 def _load_signals(drive):
     sig_id = _folder(drive, "signals/per_strategy")
-    subs = drive.files().list(
+    subs = _dc(lambda: _drive(drive).files().list(
         q=f"'{sig_id}' in parents and mimeType='application/vnd.google-apps.folder' "
-          "and trashed=false", fields="files(id,name)").execute().get("files", [])
+          "and trashed=false", fields="files(id,name)").execute().get("files", []),
+        label="signals")
     frames = []
     for s in subs:
         files = _list_folder(drive, s["id"])
-        fid = files.get("latest.csv")
-        if fid:
+        ent = files.get("latest.csv")
+        if ent:
             try:
-                df = pd.read_csv(io.BytesIO(download_bytes(drive, fid)))
+                raw = _dc(lambda e=ent: download_bytes(_drive(drive), e["id"]),
+                          label=s["name"])
+                df = pd.read_csv(io.BytesIO(raw))
             except pd.errors.EmptyDataError:
                 continue  # zero-signal / empty latest.csv — skip, don't crash the gallery
             df["strategy_group"] = s["name"]
@@ -110,10 +173,12 @@ def _load_pf_holdings(drive):
     pf_tracking/ + portfolio/, same source as load_portfolio_isins). Scans every
     cell for an ISIN pattern so it is format-agnostic (Screener / broker exports)."""
     import re as _re
-    tgt = find_latest_portfolio_file(drive, os.environ["GDRIVE_FOLDER_ID"])
+    tgt = _dc(lambda: find_latest_portfolio_file(_drive(drive),
+                                                 os.environ["GDRIVE_FOLDER_ID"]),
+              label="pf-holdings")
     if not tgt:
         return _EMPTY
-    raw = download_bytes(drive, tgt["id"])
+    raw = _dc(lambda: download_bytes(_drive(drive), tgt["id"]), label="pf-holdings")
     try:
         if tgt["name"].lower().endswith(".csv"):
             df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
@@ -138,20 +203,83 @@ def _load_pf_holdings(drive):
     return pd.DataFrame(rows).drop_duplicates("isin")
 
 
-def _bulk_parquet(drive, folder_id, symbols):
-    """{symbol: DataFrame} — list folder once, download only needed files."""
+def _bulk_parquet(drive, folder_id, symbols, cache=None, what="files",
+                  max_missing_pct=None, failed_out=None):
+    """-> {symbol: DataFrame}   (return contract deliberately UNCHANGED)
+
+    pf_results_digest.py and pf_season_status.py both import this, so the new
+    behaviour is strictly opt-in: they keep the plain dict, get retry and better
+    logging for free, and — with max_missing_pct=None — never gain an abort that
+    could silence a live daily mail. build_gallery passes both extras.
+
+    cache            ParquetCache, or None to always download.
+    max_missing_pct  None = never abort (legacy). A number = raise past that
+                     share of failures.
+    failed_out       optional set, populated with symbols that FAILED to download.
+
+    List the folder once, then fetch only what is needed. Two outcomes that used
+    to be indistinguishable are now separated:
+
+      absent  no file for that symbol here at all. Normal and expected — plenty
+              of names legitimately have no statements. Counted, not warned.
+      failed  the file EXISTS on Drive but could not be downloaded. THIS is the
+              real signal, and it used to be swallowed into an empty frame: a
+              network blip mid-loop produced blank charts on a build that still
+              reported success. Now it retries, names the offenders, and refuses
+              to write the page past a floor.
+    """
     all_files = _list_folder(drive, folder_id)
-    out = {}
+    out, absent, failed = {}, [], []
     for sym in symbols:
-        fid = all_files.get(f"{sym}.parquet")
-        if not fid:
+        ent = all_files.get(f"{sym}.parquet")
+        if not ent:
             out[sym] = _EMPTY
+            absent.append(sym)
+            continue
+        df = cache.get(ent["id"], ent["mtime"]) if cache else None
+        if df is not None:
+            out[sym] = df
             continue
         try:
-            out[sym] = pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
-        except Exception:
+            raw = _dc(lambda e=ent: download_bytes(_drive(drive), e["id"]), label=sym)
+            out[sym] = pd.read_parquet(io.BytesIO(raw))
+            if cache:
+                cache.put(ent["id"], ent["mtime"], raw)
+        except Exception as e:
             out[sym] = _EMPTY
+            failed.append((sym, type(e).__name__))
+    present = len(symbols) - len(absent)
+    if failed_out is not None:
+        failed_out.update(s for s, _ in failed)
+    log(f"  {what}: {present - len(failed)}/{len(symbols)} loaded"
+        + (f", {len(absent)} not on Drive" if absent else "")
+        + (f", {len(failed)} FAILED" if failed else "")
+        + (f" [{cache.summary()}]" if cache else ""))
+    if failed:
+        shown = ", ".join(f"{s} ({e})" for s, e in failed[:25])
+        more = f" +{len(failed) - 25} more" if len(failed) > 25 else ""
+        log(f"  !! {what} download failures: {shown}{more}")
+        pct = 100.0 * len(failed) / max(present, 1)
+        if max_missing_pct is not None and pct > max_missing_pct:
+            raise RuntimeError(
+                f"{what}: {len(failed)}/{present} downloads failed ({pct:.1f}% > "
+                f"{max_missing_pct}%). Refusing to write a gallery with silently "
+                f"blank charts. Re-run (the cache makes it quick), or pass "
+                f"--max-missing-pct if this level of loss is expected.")
     return out
+
+
+def _last_bar_date(odf):
+    """Newest date in the RAW frame.
+
+    Must be read BEFORE any resampling: a 'W-FRI' bar is stamped with that week's
+    Friday — a FUTURE date midweek — and 'ME' with month-end, so a resampled
+    label would report a chart as fresher than it actually is.
+    """
+    if odf is None or getattr(odf, "empty", True) or "date" not in odf.columns:
+        return None
+    d = pd.to_datetime(odf["date"], errors="coerce").max()
+    return None if pd.isna(d) else d.date()
 
 
 # ─────────────────────────── card helpers (ported) ──────────────────────────
@@ -206,16 +334,46 @@ def _q_order(qs):
     return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
+def _last_weekday(d):
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+# "Today's" information = dated on/after the last market close. Defaults to the
+# latest weekday (annotations are built before build_html); build_html narrows it
+# to the page's own last-bar date, so a Monday-morning render still flags
+# Friday-evening and weekend filings.
+_NEW_FROM = _last_weekday(date.today())
+
+_TODAY_CHIP = ('<span style="background:#e65100;color:#fff;padding:1px 7px;'
+               'border-radius:6px;font-size:12px;font-weight:800">🆕 TODAY</span> ')
+
+
+def _is_new(date_str):
+    try:
+        return date.fromisoformat(str(date_str)[:10]) >= _NEW_FROM
+    except Exception:
+        return False
+
+
+def _line_attr(date_str, kind, style):
+    """Attributes for one dated item line: new ones get the highlighter class
+    and a data-k tag that build_html counts for the card banner."""
+    if _is_new(date_str):
+        return f'class="today" data-k="{kind}" style="{style}"'
+    return f'style="{style}"'
+
+
 def _fresh_badge(date_str):
-    """🆕 NEW (today) / 🕓 RECENT (last 7d) / grey age chip — same tiers as app.py."""
+    """🆕 TODAY (since last close) / 🕓 RECENT (last 7d) / grey age chip."""
     from datetime import date as _d
     try:
         age = (_d.today() - _d.fromisoformat(str(date_str)[:10])).days
     except Exception:
         return ""
-    if age <= 0:
-        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
-                'border-radius:6px;font-size:10px;font-weight:700">🆕 NEW</span> ')
+    if _is_new(date_str):
+        return _TODAY_CHIP
     if age <= 7:
         return ('<span style="background:#1565c0;color:#fff;padding:1px 6px;'
                 'border-radius:6px;font-size:10px;font-weight:700">🕓 RECENT</span> ')
@@ -481,7 +639,12 @@ class Cards:
                 mt = str(gr.get("metric_type", "") or "").strip()
                 tf = str(gr.get("timeframe", "") or "").strip()
                 tag = " · ".join(t for t in (qv, mt, tf) if t and t.lower() != "nan")
-                lines.append((f'<i style="color:#1565c0">[{tag}]</i> ' if tag else "") + stmt[:200])
+                ln = (f'<i style="color:#1565c0">[{tag}]</i> ' if tag else "") + stmt[:200]
+                pa = str(gr.get("processed_at", "") or "")
+                if _is_new(pa):
+                    ln = (f'<span class="today" data-k="guidance">{_TODAY_CHIP}'
+                          f'{ln}</span>')
+                lines.append(ln)
                 shown += 1
                 if shown >= 3:
                     break
@@ -556,7 +719,7 @@ class Cards:
             mcol = {"high": "#c0392b", "med": "#a66300"}.get(mat, "#7f8c8d")
             s = _highlight_numbers(str(r.get("summary", "")).strip()[:320])
             lines.append(
-                f'<div style="margin:3px 0">{dot} {_fresh_badge(adate)}'
+                f'<div {_line_attr(adate, "filing", "margin:3px 0")}>{dot} {_fresh_badge(adate)}'
                 f'<b style="color:{mcol}">{adate}'
                 f' · {str(r.get("event_type", r.get("category", "")) or "").replace("_", " ")}'
                 f'{" · " + mat.upper() if mat else ""}:</b> {s}'
@@ -604,7 +767,7 @@ class Cards:
             tag = ("" if score >= _NEWS_DIRECT_MIN else
                    ' <span style="background:#b0bec5;color:#fff;padding:0 5px;'
                    'border-radius:4px;font-size:10px">unverified</span>')
-            lines.append(f'<div style="margin:2px 0">{_fresh_badge(dt_s)}'
+            lines.append(f'<div {_line_attr(dt_s, "news", "margin:2px 0")}>{_fresh_badge(dt_s)}'
                          f'<b style="color:#00695c">{dt_s}</b>'
                          f' · {_highlight_numbers(head)}{tag}</div>')
         newest = max((d for _, d, _ in items), default="")
@@ -651,7 +814,7 @@ class Cards:
             ddate = str(r.get("doc_date", ""))[:10]
             tags = " · ".join(x for x in [dtype, theme] if x)
             lines.append(
-                f'<div style="margin:3px 0">{_fresh_badge(ddate)}'
+                f'<div {_line_attr(ddate, "research", "margin:3px 0")}>{_fresh_badge(ddate)}'
                 f'<b style="color:#4a148c">{ddate} · {str(r.get("source", ""))[:40]}</b>'
                 + (f' <span style="background:#ede7f6;color:#4a148c;padding:0 5px;'
                    f'border-radius:4px;font-size:10.5px">{tags}</span>' if tags else "")
@@ -865,8 +1028,19 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
  .row{margin:2px 0}
  .chart{height:440px;margin-top:6px}
  table{border-collapse:collapse;width:100%}
+ .fresh{font-size:12px;margin:-2px 8px 8px;padding:5px 9px;border-radius:5px;display:inline-block}
+ .fresh-ok{background:#e8f5e9;color:#1b5e20;border:1px solid #c3e6c8}
+ .fresh-warn{background:#fff4e0;color:#8a5300;border:1px solid #f2d9a8}
+ .fresh-bad{background:#fdecea;color:#96231a;border:1px solid #f5c6c0}
+ .stale{font-size:10.5px;font-weight:600;color:#8a5300;background:#fff4e0;border:1px solid #f2d9a8;border-radius:4px;padding:1px 5px;margin-left:6px;white-space:nowrap}
+ .stale-bad{font-size:10.5px;font-weight:600;color:#96231a;background:#fdecea;border:1px solid #f5c6c0;border-radius:4px;padding:1px 5px;margin-left:6px;white-space:nowrap}
+ .today{background:#fff3a0;border-left:4px solid #e65100;padding:2px 6px;font-weight:600;border-radius:3px}
+ .card.upd{border:2px solid #e65100;box-shadow:0 0 0 3px rgba(230,81,0,.12)}
+ .updbar{background:#e65100;color:#fff;font-size:13px;font-weight:800;padding:4px 10px;border-radius:5px;margin:3px 0}
+ .dlfail{font-size:11px;color:#96231a;background:#fdecea;border:1px solid #f5c6c0;border-radius:4px;padding:5px 7px;margin:4px 0}
 </style></head><body>
 <h1>__TITLE__ — __N__ charts — __DATE__ (rendered in your browser)</h1>
+__FRESH__
 <div style="font-size:11px;color:#888;margin:-2px 8px 10px">Candlesticks + volume · <b style="color:#2962FF">EMA20</b> · <b style="color:#FF6D00">EMA50</b></div>
 __PRELUDE__<div class="grid">__CARDS__</div>
 <script>
@@ -882,6 +1056,16 @@ function mk(id){
  l50.setData((D[id]||{}).e50||[]);
  const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});
  vs.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}}); vs.setData((D[id]||{}).v||[]);
+ // Optional event marker — only build_sold_gallery.py sends one (the sell date);
+ // every other page has no .mk and this block never runs.
+ const M=(D[id]||{}).mk;
+ if(M){
+  cs.setMarkers([{time:M.t,position:'aboveBar',color:'#c62828',shape:'arrowDown',text:M.x||'SOLD'}]);
+  if(M.p!=null)cs.createPriceLine({price:M.p,color:'#c62828',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'sold'});
+  const vl=ch.addHistogramSeries({priceScaleId:'mk',color:'rgba(198,40,40,.45)',priceLineVisible:false,lastValueVisible:false});
+  vl.priceScale().applyOptions({scaleMargins:{top:0,bottom:0}});
+  vl.setData([{time:M.t,value:1}]);
+ }
  ch.timeScale().fitContent();
 }
 const io=new IntersectionObserver((es)=>{es.forEach(e=>{if(e.isIntersecting)mk(e.target.id.slice(2));});},{rootMargin:'300px'});
@@ -889,14 +1073,120 @@ document.querySelectorAll('.chart').forEach(el=>io.observe(el));
 </script></body></html>"""
 
 
+def _stale_chip(d, mkt_date):
+    """Per-card marker, rendered ONLY when this series is behind the market. Fresh
+    cards get nothing — 700 identical badges would just become wallpaper, so mark
+    the exception, not the rule."""
+    if not d or not mkt_date or d >= mkt_date:
+        return ""
+    n = (mkt_date - d).days
+    cls = "stale-bad" if n > OHLCV_MAX_STALE_DAYS else "stale"
+    return (f'<span class="{cls}">&#9888; data to {d.strftime("%d %b %Y")} '
+            f'({n}d behind)</span>')
+
+
+def _freshness_banner(mkt_date, gen_date, n_behind, n_charts):
+    """Page-level statement of what the page was built from, so a stale gallery
+    announces itself instead of being noticed days later by accident.
+
+    Both dates carry their weekday, because that is what makes the gap readable
+    at a glance: Sat-generated/Fri-data is nothing, Wed-generated/Fri-data is a
+    stalled feed, and the day names say which is which without any arithmetic.
+    """
+    if not mkt_date:
+        return ('<div class="fresh fresh-bad">&#9888; No price data on this page '
+                '&mdash; latest data point unknown.</div>')
+    lag = (gen_date - mkt_date).days
+    when = mkt_date.strftime("%a %d %b %Y")
+    gen = gen_date.strftime("%a %d %b %Y")
+    plural = "day" if lag == 1 else "days"
+    if lag <= 0:
+        cls = "fresh-ok"
+        msg = (f"&#10003; Generated {gen} &middot; latest data point {when} "
+               f"&mdash; up to date.")
+    elif lag > OHLCV_MAX_STALE_DAYS:
+        cls = "fresh-bad"
+        msg = (f"&#9888; Generated {gen} &middot; latest data point {when} "
+               f"&mdash; {lag} {plural} behind. The price feed looks stalled.")
+    else:
+        # Name the ordinary explanations so a normal gap doesn't read as a fault.
+        why = (" (today's close may not be ingested yet)" if lag == 1
+               else " (weekend / holiday gap is normal)" if lag <= 4 else "")
+        cls = "fresh-warn"
+        msg = (f"&#9888; Generated {gen} &middot; latest data point {when} "
+               f"&mdash; {lag} {plural} behind{why}.")
+    tail = (f" &middot; {n_behind} of {n_charts} charts are behind {when}"
+            if n_behind else f" &middot; all {n_charts} charts current to {when}")
+    return f'<div class="fresh {cls}">{msg}{tail}</div>'
+
+
+_UPD_LABEL = (("filing", "filing"), ("news", "news"), ("research", "research note"),
+              ("guidance", "guidance line"))
+
+
+def _updated_banner(meta, annot_html):
+    """If the card holds anything new since the last close, put a strip under
+    its header saying what, and return the extra card class. Cards with nothing
+    new come back unchanged."""
+    bits = []
+    for k, lbl in _UPD_LABEL:
+        n = meta.count(f'data-k="{k}"')
+        if n:
+            bits.append(f"{n} {lbl}{'s' if n > 1 else ''}")
+    # The EVENT chip comes from n_events_at_signal, i.e. the event seen when the
+    # signal FIRST fired (often weeks ago) — it is only today's news when the
+    # signal itself is new today.
+    if "NEW TODAY" in annot_html:
+        bits.append("🆕 NEW signal" + (" + ⚡ EVENT" if "EVENT AT SIGNAL" in annot_html
+                                       else ""))
+    if not bits:
+        return meta, ""
+    bar = f'<div class="updbar">🔔 UPDATED TODAY · {" · ".join(bits)}</div>'
+    i = meta.find("</div>")                  # end of the .hd header line
+    if i < 0:
+        return bar + meta, " upd"
+    i += len("</div>")
+    return meta[:i] + bar + meta[i:], " upd"
+
+
 def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
-               annot=None, resample=None, prelude=""):
+               annot=None, resample=None, prelude="", failed_syms=None, marks=None):
     """`prelude` is optional page furniture rendered ABOVE the card grid (the
     watchlist summary table uses it). It defaults to "" and the placeholder sits
     flush against <div class="grid">, so every existing caller emits a
-    byte-identical page."""
+    byte-identical page.
+
+    `failed_syms` are names whose OHLCV download FAILED this run (as opposed to
+    not existing on Drive) — they render a red note instead of the benign
+    "no feed" one, so a network problem can never masquerade as missing data.
+
+    `marks` is an optional {symbol: {"t": "YYYY-MM-DD", "p": price, "x": label}}
+    drawing ONE event line on that symbol's chart — a full-height vertical rule,
+    a ▼ marker and a dashed price line. build_sold_gallery.py passes the sell
+    date; every other caller passes nothing and the chart JS skips the block."""
     annot = annot or {}
+    failed_syms = failed_syms or set()
+    marks = marks or {}
     card_html, data = [], {}
+
+    # Freshness reference = the MODE of every symbol's last raw bar, i.e. what the
+    # market as a whole last traded. Self-calibrating, so there is no NSE holiday
+    # calendar to maintain and a long holiday weekend simply looks normal.
+    bar_dates = {}
+    for _s in ranked.get("symbol", pd.Series(dtype=object)).tolist():
+        _s = str(_s or "")
+        if _s:
+            _d = _last_bar_date(omap.get(_s))
+            if _d:
+                bar_dates[_s] = _d
+    mkt_date = None
+    if bar_dates:
+        _modes = pd.Series(list(bar_dates.values())).mode()
+        if not _modes.empty:
+            mkt_date = _modes.iloc[0]
+    global _NEW_FROM
+    if mkt_date:
+        _NEW_FROM = mkt_date
     for j, (_, rr) in enumerate(ranked.iterrows()):
         s = str(rr.get("symbol", "") or "")
         pfname = str(rr.get("_pfname", "") or "")          # PF holding name (raw list)
@@ -921,6 +1211,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             f'<div class="hd">{j + 1}. <b>{s}</b>'
             + (f' <span class="nm">{nmj}</span>' if nmj else "")
             + _decision_chip(rr.get("decision"), rr.get("n_buy"), rr.get("n_vote"))
+            + _stale_chip(bar_dates.get(s), mkt_date)
             + "</div>",
             annot.get(s.upper(), ""),
             f'<div class="row">{cards.mcap(s, mcap_map)}{cards.grades_strip(s)}</div>',
@@ -928,28 +1219,52 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             cards.llm_summary(s), cards.news_card(s, nmj),
             cards.research_card(s, nmj),
         ] if x)
+        meta, upd_cls = _updated_banner(meta, annot.get(s.upper(), ""))
         if not c:
             # Fundamentals present but no price series — panels + a small note,
-            # no chart div.
-            card_html.append(
-                f'<div class="card">{meta}'
-                f'<div style="font-size:11px;color:#999;padding:6px 2px">'
-                f'No chart/price data for this name (no OHLCV feed).</div></div>')
+            # no chart div. A DOWNLOAD FAILURE is called out separately: it used
+            # to render as the benign "no feed" note, so a network problem was
+            # indistinguishable from a name that genuinely has no price history.
+            note = (f'<div class="dlfail">&#9888; Price data FAILED to download '
+                    f'this run — this is a fetch problem, not a missing feed. '
+                    f'Re-run to restore this chart.</div>'
+                    if s.upper() in failed_syms or s in failed_syms else
+                    f'<div style="font-size:11px;color:#999;padding:6px 2px">'
+                    f'No chart/price data for this name (no OHLCV feed).</div>')
+            card_html.append(f'<div class="card{upd_cls}">{meta}{note}</div>')
             continue
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
+        # Event marker, when the caller sent one. Snapped BACK to the last bar at
+        # or before the date so a non-trading day — or a weekly/monthly resample —
+        # still lands on a real candle instead of inventing a time point. A date
+        # older than the charted window simply draws nothing.
+        _mk = marks.get(s) or marks.get(s.upper())
+        if _mk and _mk.get("t"):
+            _t = str(_mk["t"])[:10]
+            _bars = [x["time"] for x in c if x["time"] <= _t]
+            if _bars:
+                data[str(j)]["mk"] = {"t": _bars[-1], "x": _mk.get("x", ""),
+                                      "p": _mk.get("p")}
         # Per-chart legend — the page-level note scrolls away on a long gallery,
         # so each chart says what its two lines are.
         legend = ('<div style="font-size:10.5px;color:#777;margin:2px 0 0">'
                   'Candles + volume · <b style="color:#2962FF">━ EMA20</b> '
                   '(short-term trend) · <b style="color:#FF6D00">━ EMA50</b> '
                   '(medium-term trend)</div>')
-        card_html.append(f'<div class="card">{meta}{legend}'
+        card_html.append(f'<div class="card{upd_cls}">{meta}{legend}'
                          f'<div class="chart" id="ch{j}"></div></div>')
+    now = datetime.now()
+    n_behind = sum(1 for d in bar_dates.values() if mkt_date and d < mkt_date)
+    banner = _freshness_banner(mkt_date, now.date(), n_behind, len(bar_dates))
+    if mkt_date:
+        log(f"  data as of {mkt_date} (generated {now.date()}); "
+            f"{n_behind}/{len(bar_dates)} charts behind that date")
     return (_TPL.replace("__PAYLOAD__", json.dumps(data, separators=(",", ":")))
                 .replace("__CARDS__", "".join(card_html))
                 .replace("__N__", str(len(card_html)))
                 .replace("__TITLE__", title)
-                .replace("__DATE__", datetime.now().strftime("%d %b %Y %H:%M"))
+                .replace("__DATE__", now.strftime("%d %b %Y %H:%M"))
+                .replace("__FRESH__", banner)
                 .replace("__PRELUDE__", prelude or ""))
 
 
@@ -1066,7 +1381,16 @@ def _select_ipos(drive, args, exch):
     the card so a name that IS being flagged stands out.
 
     NOTE: listing_date only exists for NSE rows; BSE-only names carry no date and
-    are therefore absent from this view."""
+    are therefore absent from this view.
+
+    A RECENT DATE IS NOT PROOF OF A RECENT LISTING. Measured 2026-09-02: of the
+    577 names dated inside a year, 165 are provable re-listings (the stock has
+    price bars from BEFORE its listing date — you cannot trade a share that has
+    not listed, so prior trading proves the date marks an SME-to-main-board
+    migration, not a debut) and 12 are ETFs. That is 31% of this view that was
+    never an IPO. company_repo/_index/listing_dates.parquet carries the proof in
+    `listing_type`, so it is preferred over master_list when present; the
+    classification travels onto the card rather than being silently applied."""
     uni = _read_csv(drive, _folder(drive, "universe"), "master_list.csv")
     if uni.empty or "listing_date" not in uni.columns:
         log("  master_list has no listing_date — IPO view unavailable")
@@ -1074,7 +1398,64 @@ def _select_ipos(drive, args, exch):
     ld = pd.to_datetime(uni["listing_date"], format="%d-%b-%Y", errors="coerce")
     cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=args.ipo_days)
     rec = uni.assign(_ld=ld)[ld >= cut].copy()
-    log(f"  {len(rec)} names listed in the last {args.ipo_days}d")
+    log(f"  {len(rec)} names listed in the last {args.ipo_days}d (master_list)")
+
+    # ---- prefer the PROVEN classification where it exists --------------------
+    ltype = {}
+    try:
+        lt = _read_parquet(drive, _folder(drive, "company_repo/_index"),
+                           "listing_dates.parquet")
+    except Exception as e:
+        log(f"  listing_dates.parquet unavailable ({type(e).__name__}) — "
+            f"falling back to master_list dates only")
+        lt = pd.DataFrame()
+    if not lt.empty and "listing_type" in lt.columns and "symbol" in lt.columns:
+        lt = lt.copy()
+        lt["symbol"] = lt["symbol"].astype(str)
+        lt["_ld2"] = pd.to_datetime(lt.get("listing_date"), errors="coerce")
+        lt = lt.dropna(subset=["_ld2"])
+        # this table covers BSE and NSE SME too, which master_list does not
+        wider = lt[lt["_ld2"] >= cut]
+        if len(wider) > len(rec):
+            log(f"  listing_dates.parquet covers {len(wider)} in the same window "
+                f"(master_list has {len(rec)}) — using it")
+            rec = pd.DataFrame({"symbol": wider["symbol"], "_ld": wider["_ld2"]})
+        ltype = dict(zip(lt["symbol"], lt["listing_type"].fillna("")))
+        before = len(rec)
+        bad = rec["symbol"].astype(str).map(
+            lambda x: str(ltype.get(x, "")).lower() in ("migration", "etf"))
+        dropped = rec[bad]
+        rec = rec[~bad]
+        if len(dropped):
+            kinds = (dropped["symbol"].astype(str).map(lambda x: ltype.get(x, ""))
+                     .value_counts().to_dict())
+            log(f"  listing_type gate: {before} -> {len(rec)} "
+                f"({len(dropped)} dropped: {kinds}) — re-listings and funds are "
+                f"not IPOs")
+        # A date shared by more names than could plausibly list that day is a bulk
+        # re-registration (ISIN change, series migration, name change) that the
+        # exchange restamps as a listing date. NSE carries 2026-04-20 for 103
+        # names and 2026-08-17 for 151. strategy_ipo_base.py has always gated on
+        # this; this view did not, which is how Timex Group India — listed for
+        # decades — and 3B Blackbio Dx surfaced here as recent IPOs.
+        # Positive proof wins: a name classified `ipo` keeps its place regardless.
+        if "on_date_cliff" in lt.columns:
+            cliffed = set(lt.loc[lt["on_date_cliff"].astype("boolean")
+                                   .fillna(False).astype(bool), "symbol"]
+                            .astype(str))
+            if cliffed:
+                b4 = len(rec)
+                rec = rec[rec["symbol"].astype(str).map(
+                    lambda x: x not in cliffed
+                    or str(ltype.get(x, "")).lower() == "ipo")]
+                if len(rec) < b4:
+                    log(f"  date-cliff gate: {b4} -> {len(rec)} "
+                        f"({b4 - len(rec)} dropped) — a listing date shared by "
+                        f"implausibly many names is a bulk re-registration")
+    else:
+        log("  listing_dates.parquet has no listing_type — showing every recent "
+            "DATE, which includes re-listings and ETFs. Run "
+            "build_listing_dates.py --classify to fix.")
     if rec.empty:
         return pd.DataFrame()
 
@@ -1199,7 +1580,57 @@ def _dh_chip(dh):
             f'border-radius:6px;font-weight:700">▼ {abs(v):.0f}% off high</span>')
 
 
-def _build_meta_annot(ranked, feats, mem) -> dict:
+def _load_open_signals(drive) -> pd.DataFrame:
+    """signals/aggregated/open_signals.csv — the entry and stop FROZEN on the day
+    each (symbol, family) first fired, written by aggregate_signals.
+
+    This is what lets a card say what you would have RISKED and what the idea has
+    done since, rather than only what it looks like today. Absent until the new
+    aggregator has run once; every consumer below degrades to the old card."""
+    try:
+        df = _read_csv(drive, _folder(drive, "signals/aggregated"),
+                       "open_signals.csv")
+    except Exception as e:
+        log(f"  open_signals.csv unavailable ({type(e).__name__}) — cards will "
+            f"omit the risk and engine lines")
+        return pd.DataFrame()
+    if df.empty or "symbol" not in df.columns:
+        return pd.DataFrame()
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    log(f"  open_signals: {len(df):,} rows, {df['symbol'].nunique():,} symbols")
+    return df
+
+
+def _open_map(opens: pd.DataFrame) -> dict:
+    """symbol -> {families, first_date, entry, stop, times_seen, events}.
+
+    One symbol can hold several families; the OLDEST first_date is the one that
+    matters ("when did this idea first appear"), and the entry/stop come from
+    that same first sighting so the risk shown is the risk that was real."""
+    if opens is None or opens.empty:
+        return {}
+    out = {}
+    for sym, g in opens.groupby("symbol"):
+        g = g.copy()
+        g["_fd"] = pd.to_datetime(g.get("first_date"), errors="coerce")
+        g = g.sort_values("_fd")
+        first = g.iloc[0]
+        out[str(sym)] = {
+            "families": sorted({str(x) for x in g.get("family", []) if str(x)}),
+            "first_date": first.get("first_date"),
+            "entry": pd.to_numeric(pd.Series([first.get("entry_at_signal")]),
+                                   errors="coerce").iloc[0],
+            "stop": pd.to_numeric(pd.Series([first.get("stop_at_signal")]),
+                                  errors="coerce").iloc[0],
+            "times_seen": int(pd.to_numeric(g.get("times_seen"),
+                                            errors="coerce").max() or 0),
+            "events": int(pd.to_numeric(g.get("n_events_at_signal"),
+                                        errors="coerce").fillna(0).max() or 0),
+        }
+    return out
+
+
+def _build_meta_annot(ranked, feats, mem, opens=None) -> dict:
     """symbol.upper() -> meta HTML: strategies · price · 1/3/6/12M returns ·
     tenure (came Nx since <date>) + FRESH/NEW/RECENT/DROPPED badge."""
     fcols = ["close", "dist_from_52w_high_pct",
@@ -1210,6 +1641,7 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
         keep = [c for c in fcols if c in feats.columns]
         for _, r in feats[["symbol"] + keep].iterrows():
             fmap[str(r["symbol"]).upper()] = r
+    omap = _open_map(opens)
     mmap = {}
     if mem is not None and not mem.empty and "symbol" in mem.columns:
         mk = [c for c in ["days_present", "window_snapshots", "first_seen",
@@ -1267,6 +1699,42 @@ def _build_meta_annot(ranked, feats, mem) -> dict:
                 if b:
                     bits.append(f'<span style="background:{b[1]};color:#fff;'
                                 f'padding:0 6px;border-radius:6px">{b[0]}</span>')
+        # ---- signal memory: which engines, is it new, and what is at risk ----
+        # Appended AFTER everything that was already on the card; nothing above
+        # is removed or reordered.
+        o = omap.get(u)
+        if o:
+            if o["families"]:
+                bits.append('<span style="color:#555">🔧 '
+                            + ", ".join(o["families"]) + '</span>')
+            if o["times_seen"] == 1:
+                bits.append('<span style="background:#0d7a35;color:#fff;'
+                            'padding:1px 7px;border-radius:6px;font-size:13px;font-weight:800">🆕 NEW TODAY</span>')
+            elif o["times_seen"] > 1:
+                bits.append(f'<span style="color:#666">held {o["times_seen"]}d'
+                            f'</span>')
+            if o["events"] > 0:
+                bits.append('<span style="background:#b8860b;color:#fff;'
+                            'padding:1px 7px;border-radius:6px;font-size:13px;font-weight:800">⚡ EVENT AT SIGNAL'
+                            '</span>')
+            e, st = o["entry"], o["stop"]
+            if pd.notna(e) and pd.notna(st) and float(e) > 0 and float(st) < float(e):
+                risk = (float(e) - float(st)) / float(e) * 100
+                # A list of names becomes a list of TRADES: what you risk, and a
+                # 2R target measured off that risk rather than off a round number.
+                tgt = float(e) + 2 * (float(e) - float(st))
+                bits.append(f'<span style="color:#333">🎯 entry ₹{float(e):,.0f} '
+                            f'· stop ₹{float(st):,.0f} '
+                            f'<b>({risk:.1f}% risk)</b> · 2R ₹{tgt:,.0f}</span>')
+                # "have I missed it?" — answerable only because entry is frozen
+                f2 = fmap.get(u)
+                px_now = f2.get("close") if f2 is not None else None
+                if px_now is not None and pd.notna(px_now) and float(e) > 0:
+                    move = (float(px_now) / float(e) - 1) * 100
+                    c = "#1a7a3a" if move >= 0 else "#c0392b"
+                    since = f' since {o["first_date"]}' if o.get("first_date") else ""
+                    bits.append(f'<span style="color:{c}">{move:+.1f}%{since}</span>')
+
         annot[u] = (f'<div style="font-size:12px;color:#333;margin:2px 0;'
                     f'line-height:1.6">{" · ".join(bits)}</div>')
     return annot
@@ -1490,7 +1958,7 @@ def main():
     ap.add_argument("--min-cagr", type=float, default=0.0,
                     help="watchlist mode: extra CAGR floor on top of whatever "
                          "the table was built with (0 = show everything in it)")
-    ap.add_argument("--view", choices=["full", "additions", "drops", "ipo"],
+    ap.add_argument("--view", choices=["full", "additions", "drops", "ipo", "new"],
                     default="full",
                     help="signals mode: full=all ranked (existing limits); "
                          "additions=first seen last 14d (fresh/new/recent); "
@@ -1521,9 +1989,24 @@ def main():
                     help="skip the Google-News headline pass (network-bound)")
     ap.add_argument("--news-days", type=int, default=30,
                     help="news lookback window in days (default 30)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="bypass the local parquet cache (always download)")
+    ap.add_argument("--purge-cache", action="store_true",
+                    help="wipe the local parquet cache first, then build "
+                         "normally. gallery_all.bat passes this on its FIRST "
+                         "gallery step so one batch shares one warm cache.")
+    ap.add_argument("--max-missing-pct", type=float, default=5.0,
+                    help="abort if more than this %% of the files that DO exist "
+                         "on Drive fail to download (default 5). Guards against "
+                         "writing a gallery full of silently blank charts.")
     args = ap.parse_args()
 
-    drive = get_drive()
+    cache = ParquetCache(enabled=not args.no_cache)
+    if args.purge_cache:
+        cache.purge()
+        log(f"parquet cache purged ({cache.root})")
+
+    drive = _drive()
     idx = _folder(drive, "company_repo/_index")
     fund = _folder(drive, "fundamentals")
     uni = _read_csv(drive, _folder(drive, "universe"), "master_list.csv")
@@ -1549,6 +2032,22 @@ def main():
                 base_pat[s] = float(pd.Series(r.get("q_netprofit_last_4q")).astype(float).sum())
             except Exception:
                 pass
+    # Daily market cap (weekly share count x latest close, update_market_cap.py)
+    # replaces the summary snapshot, which Screener refreshes ~once a quarter.
+    # Only for names WITH a share count: the rest of market_cap.csv still holds
+    # old Yahoo values that must not override Screener's.
+    uni_dir = _folder(drive, "universe")
+    sc, mc_daily = _read_csv(drive, uni_dir, "share_count.csv"), _read_csv(drive, uni_dir, "market_cap.csv")
+    if not sc.empty and not mc_daily.empty and "symbol" in sc.columns \
+            and {"symbol", "market_cap_cr"} <= set(mc_daily.columns):
+        have = set(sc["symbol"].astype(str).str.upper())
+        n = 0
+        for s, v in zip(mc_daily["symbol"].astype(str).str.upper(),
+                        pd.to_numeric(mc_daily["market_cap_cr"], errors="coerce")):
+            if s in have and pd.notna(v) and v > 0:
+                mcap_map[s] = float(v)
+                n += 1
+        log(f"  market cap: {n:,} names from the daily share-count x close file")
 
     title, annot, prelude = "📊 Signals gallery", {}, ""
     out_default = "gallery.html"
@@ -1556,6 +2055,10 @@ def main():
     # Meta-line inputs (52wH, returns+ranks, tenure) — used by signals AND pf modes
     mem = _read_parquet(drive, _folder(drive, "signals/aggregated"),
                         "membership.parquet")
+    # The entry/stop memory. Loaded once so every view and both modes see the
+    # same frame; absent until the new aggregator has run, and every consumer
+    # degrades to the pre-existing card when it is.
+    opens_df = _load_open_signals(drive)
     feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
 
     if args.mode == "pf":
@@ -1594,7 +2097,7 @@ def main():
                     [z.strip() for z in args.zones.split(",")])]
             nmap = sig_pf.groupby("symbol")["strategy_group"].nunique()
             ranked["n_strategies"] = ranked["symbol"].map(nmap)
-        annot = _build_meta_annot(ranked, feats_g, mem)
+        annot = _build_meta_annot(ranked, feats_g, mem, opens_df)
         log(f"  PF holdings: {len(ranked)} total "
             f"({len(resolved)} chartable, {len(unresolved)} name-only/not-in-universe)")
 
@@ -1682,7 +2185,23 @@ def main():
                     ranked = ranked[ranked["symbol"].astype(str).str.upper()
                                     .isin(add)].reset_index(drop=True)
                 log(f"  {len(ranked)} recent additions (fresh/new/recent)")
-        annot = _build_meta_annot(ranked, feats_g, mem)
+            elif args.view == "new":
+                # STRICTLY today's first-timers, from the signal memory rather
+                # than a 14-day window. `additions` answers "what is recent";
+                # this answers "what is new TODAY, and which engine found it".
+                title = "🆕 New ideas today — by engine"
+                out_default = "gallery_new_today.html"
+                om = _open_map(opens_df)
+                fresh = {k for k, v in om.items() if v["times_seen"] == 1}
+                if not fresh:
+                    log("  no first-time signals today — open_signals has no "
+                        "times_seen == 1 rows (the memory may be one run old)")
+                ranked = ranked[ranked["symbol"].astype(str).str.upper()
+                                .isin(fresh)].reset_index(drop=True)
+                ev = sum(1 for k in fresh if om[k]["events"] > 0)
+                log(f"  {len(ranked)} NEW today ({ev} of them with an event "
+                    f"firing, the rest are states that just qualified)")
+        annot = _build_meta_annot(ranked, feats_g, mem, opens_df)
         if args.max > 0:
             ranked = ranked.head(args.max)
 
@@ -1711,9 +2230,14 @@ def main():
     ann = _read_parquet(drive, idx, "announcement_ledger.parquet")
     res_idx = _read_parquet(drive, idx, "research_index.parquet")
     log(f"downloading OHLCV for {len(syms)} names…")
-    omap = _bulk_parquet(drive, _folder(drive, "data/ohlcv"), syms)
+    ohlcv_failed = set()
+    omap = _bulk_parquet(
+        drive, _folder(drive, "data/ohlcv"), syms, cache=cache, what="OHLCV",
+        max_missing_pct=args.max_missing_pct, failed_out=ohlcv_failed)
     log("downloading statements…")
-    stmts = _bulk_parquet(drive, _folder(drive, "fundamentals/statements"), syms)
+    stmts = _bulk_parquet(
+        drive, _folder(drive, "fundamentals/statements"), syms, cache=cache,
+        what="statements", max_missing_pct=args.max_missing_pct)
 
     _name_by = {}
     if not grades.empty and {"symbol", "company_name"} <= set(grades.columns):
@@ -1726,7 +2250,7 @@ def main():
     log("assembling HTML…")
     html = build_html(ranked, omap, cards, mcap_map, args.timeframe_days,
                       title=title, annot=annot, resample=resample,
-                      prelude=prelude)
+                      prelude=prelude, failed_syms=ohlcv_failed)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     log(f"wrote {out_path}  ({len(html) / 1e6:.1f} MB, {len(syms)} charts)")
