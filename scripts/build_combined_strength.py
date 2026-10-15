@@ -460,6 +460,126 @@ def score_math(r: dict) -> str:
 CARD_N = 15            # stocks shown as full cards (chart + reasons); approved cap
 
 
+# ---- what is NEW or CHANGED since the previous list (user 2026-10-15) ------------
+# "I need to know which one to focus on or has come fresh in today's mail; colour
+# coding needs to indicate that - if something new has come up, or information
+# changed, highlight it - similar to the gallery render."
+FRESH_TONE = {"new": ("#1a7a3a", "#e8f5e9", "🆕 NEW TODAY"),
+              "changed": ("#b8860b", "#fff8e1", "✳ CHANGED"),
+              "same": ("#dde3e8", "#ffffff", "")}
+_ORDER = {"new": 0, "changed": 1, "same": 2, None: 2}
+
+
+def annotate_freshness(rows: list[dict], hist: pd.DataFrame, today: str) -> str | None:
+    """Compare each row with the same stock on the PREVIOUS list date in the history.
+    Sets mail-only keys on every row: _fresh ('new'|'changed'|'same'|None),
+    _changes [str], _score_delta, _days_on. Returns the previous date (None on the
+    first ever run, when nothing can be called new). Pure."""
+    for r in rows:
+        r.update(_fresh=None, _changes=[], _chart_notes=[], _score_delta=None,
+                 _days_on=None)
+    if hist is None or hist.empty or "as_of" not in hist.columns:
+        return None
+    h = hist[hist["as_of"].astype(str) < str(today)]
+    if h.empty:
+        return None
+    prev_date = str(h["as_of"].astype(str).max())
+    prev = {str(x["isin"]): x for _, x in h[h["as_of"].astype(str) == prev_date].iterrows()}
+    since = (pd.Timestamp(today) - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    days = (h[h["as_of"].astype(str) >= since].groupby(h["isin"].astype(str))["as_of"]
+            .nunique().to_dict())
+
+    def _s(v):
+        t = str(v if v is not None else "").strip()
+        return "" if t.lower() in ("nan", "none", "<na>") else t
+
+    for r in rows:
+        iso = str(r["isin"])
+        r["_days_on"] = int(days.get(iso, 0)) + 1
+        p0 = prev.get(iso)
+        if p0 is None:
+            r["_fresh"] = "new"
+            continue
+        ch = []
+        if _s(r.get("pat_qtr")) and _s(r.get("pat_qtr")) != _s(p0.get("pat_qtr")):
+            ch.append(f"new results ({_s(r.get('pat_qtr'))})")
+        if _s(r.get("guid_from")) and _s(r.get("guid_from")) != _s(p0.get("guid_from")):
+            ch.append(f"new guidance ({_s(r.get('guid_from'))} concall)")
+        if _s(r.get("surge_class")) != _s(p0.get("surge_class")):
+            ch.append(f"results trend {(_s(p0.get('surge_class')) or 'none').lower()} → "
+                      f"{(_s(r.get('surge_class')) or 'none').lower()}")
+        # Chart-setup churn is NOT highlighted (user 2026-10-15: "all information
+        # gets highlighted, chart need not be") - it is daily strategy noise (15 of
+        # 16 'changes' on 15 Oct). Kept as a quiet note on the card.
+        a, b = set(setups_of(p0.get("strategies"))), set(setups_of(r.get("strategies")))
+        notes = []
+        if b - a:
+            notes.append("new chart setup: " + ", ".join(sorted(b - a)))
+        if a - b:
+            notes.append("setup dropped: " + ", ".join(sorted(a - b)))
+        r["_chart_notes"] = notes
+        try:
+            r["_score_delta"] = round(float(r["rank_score"]) - float(p0["rank_score"]), 1)
+        except (TypeError, ValueError):
+            r["_score_delta"] = None
+        r["_changes"] = ch
+        r["_fresh"] = "changed" if ch else "same"
+    return prev_date
+
+
+def order_rows(rows: list[dict]) -> list[dict]:
+    """Holdings first; within each, new, then changed, then by score."""
+    return sorted(rows, key=lambda r: (not r["in_pf"], _ORDER.get(r.get("_fresh"), 2),
+                                       -r["rank_score"]))
+
+
+def _chart_note(r: dict) -> str:
+    n = r.get("_chart_notes") or []
+    return (f" <span style='color:#888;font-size:11px'>· {esc('; '.join(n), 120)}</span>"
+            if n else "")
+
+
+def fresh_badge(r: dict) -> str:
+    st = r.get("_fresh")
+    if st not in ("new", "changed"):
+        d = r.get("_days_on")
+        return ((f"<span style='color:#888;font-size:11px'>on the list {d} days</span>"
+                 if d else "") + _chart_note(r))
+    edge, _bg, label = FRESH_TONE[st]
+    extra = (": " + esc("; ".join(r.get("_changes") or []), 160)) if st == "changed" else ""
+    return (f"<span style='background:{edge};color:#fff;padding:1px 7px;border-radius:6px;"
+            f"font-size:11px;font-weight:700'>{label}</span>"
+            f"<span style='font-size:12px;color:{edge}'>{extra}</span>" + _chart_note(r))
+
+
+def score_move(r: dict) -> str:
+    d = r.get("_score_delta")
+    if d is None or abs(d) < 0.05:
+        return ""
+    col = "#1a7a3a" if d > 0 else "#c0392b"
+    return f" <span style='color:{col};font-size:12px'>{'▲' if d > 0 else '▼'}{abs(d):.0f}</span>"
+
+
+def fresh_strip(rows: list[dict], prev_date: str | None) -> str:
+    if not prev_date:
+        return ""
+    new = [r for r in rows if r.get("_fresh") == "new"]
+    ch = [r for r in rows if r.get("_fresh") == "changed"]
+    same = len(rows) - len(new) - len(ch)
+
+    def _names(rs):
+        return ", ".join(("💼" if r["in_pf"] else "") + esc(r["symbol"], 14) for r in rs[:20])
+    parts = []
+    if new:
+        parts.append(f"<b style='color:#1a7a3a'>🆕 New today ({len(new)}):</b> {_names(new)}")
+    if ch:
+        parts.append(f"<b style='color:#b8860b'>✳ Changed ({len(ch)}):</b> {_names(ch)}")
+    parts.append(f"<span style='color:#888'>{same} unchanged since {esc(prev_date, 10)}</span>")
+    return ("<div style='background:#f6f8fa;border-left:4px solid #1a7a3a;padding:7px 11px;"
+            "margin:0 0 12px;font:13px Arial,sans-serif;line-height:1.6'>"
+            + "<br>".join(parts) + "</div>")
+
+
 def _card(i: int, r: dict, cid: str | None) -> str:
     sym = esc(r["symbol"], 14)
     pf = "💼 " if r["in_pf"] else ""
@@ -486,11 +606,15 @@ def _card(i: int, r: dict, cid: str | None) -> str:
     chart = mail_chart.img_tag(cid, sym) if cid else (
         "<div style='color:#999;font-size:11px'>(no price history for a chart)</div>")
     return (
-        f"<div style='border:1px solid #dde3e8;border-radius:6px;padding:10px 12px;"
+        f"<div style='border:1px solid #dde3e8;border-left:5px solid "
+        f"{FRESH_TONE.get(r.get('_fresh') or 'same', FRESH_TONE['same'])[0]};"
+        f"background:{FRESH_TONE.get(r.get('_fresh') or 'same', FRESH_TONE['same'])[1]};"
+        f"border-radius:6px;padding:10px 12px;"
         f"margin:0 0 14px;font-family:Arial,sans-serif;font-size:13px'>"
+        f"<div style='margin:0 0 4px'>{fresh_badge(r)}</div>"
         f"<div style='font-size:15px'><b>{i}. {pf}<a href='https://www.screener.in/company/"
         f"{sym}/' style='color:#1a237e'>{sym}</a></b> · {esc(r['company_name'], 50)}"
-        f"<span style='float:right'>{score_math(r)}</span></div>"
+        f"<span style='float:right'>{score_math(r)}{score_move(r)}</span></div>"
         f"<div style='margin:6px 0;color:#222'><b>Why here:</b> {esc(why_line(r), 400)}</div>"
         f"{chart}"
         f"<table style='width:100%;border-collapse:collapse;margin-top:6px;font-size:12px'>"
@@ -531,17 +655,20 @@ def explainer() -> str:
         "</div>")
 
 
-def build_html(rows: list[dict], today: str, cids: dict | None = None) -> str:
+def build_html(rows: list[dict], today: str, cids: dict | None = None,
+               prev_date: str | None = None) -> str:
     """Cards (chart + why + maths + sources) for the top CARD_N, then one line each."""
     cids = cids or {}
     n_pf = sum(1 for r in rows if r["in_pf"])
-    rows = sorted(rows, key=lambda r: (not r["in_pf"], -r["rank_score"]))
+    strip = fresh_strip(rows, prev_date)
+    rows = order_rows(rows)
     n_total = len(rows)
     rows = rows[:MAIL_TOP_N]
     out = [f"<div style='max-width:720px;font-family:Arial,sans-serif'>"
            f"<p style='font-size:13px'><b>{n_total} stock(s)</b> strong on chart + results "
            f"+ guidance today ({today})" + (f" — 💼 {n_pf} in PF" if n_pf else "")
-           + ". Holdings first, then by score.</p>", explainer()]
+           + ". Holdings first; within each, new, then changed, then by score.</p>",
+           strip, explainer()]
     for i, r in enumerate(rows[:CARD_N], 1):
         out.append(_card(i, r, cids.get(r["symbol"])))
     rest = rows[CARD_N:]
@@ -551,8 +678,12 @@ def build_html(rows: list[dict], today: str, cids: dict | None = None) -> str:
                    "(no chart to keep the mail light):</p><table style='width:100%;"
                    "border-collapse:collapse'>")
         for i, r in enumerate(rest, CARD_N + 1):
-            out.append(f"<tr><td style='{td}'>{i}</td><td style='{td}'>"
-                       f"{'💼 ' if r['in_pf'] else ''}<b>{esc(r['symbol'], 14)}</b></td>"
+            _ed = FRESH_TONE.get(r.get("_fresh") or "same", FRESH_TONE["same"])[0]
+            out.append(f"<tr style='border-left:4px solid {_ed}'><td style='{td}'>{i}</td>"
+                       f"<td style='{td}'>"
+                       f"{'💼 ' if r['in_pf'] else ''}<b>{esc(r['symbol'], 14)}</b>"
+                       f"{(' ' + fresh_badge(r)) if r.get('_fresh') in ('new', 'changed') else ''}"
+                       f"</td>"
                        f"<td style='{td}'>{r['rank_score']:.0f}</td>"
                        f"<td style='{td}'>{esc(why_line(r), 220)}</td></tr>")
         out.append("</table>")
@@ -569,7 +700,7 @@ def render_charts(drive, rows: list[dict], log=print) -> tuple[dict, list]:
     """{symbol: cid}, [(cid, png)] for the card stocks. A failure costs the chart,
     never the mail."""
     cids, imgs = {}, []
-    top = sorted(rows, key=lambda r: (not r["in_pf"], -r["rank_score"]))[:CARD_N]
+    top = order_rows(rows)[:CARD_N]
     syms = [r["symbol"] for r in top]
     try:
         from build_gallery import _bulk_parquet, _folder as _gfolder
@@ -706,6 +837,10 @@ def main() -> None:
     # history -> weekly / quarterly roll-ups (latest row per isin in window)
     hist = load_parquet(drive, index_id, HIST_NAME, HIST_COLS)
     hist = hist[hist["as_of"].astype(str) != today]        # idempotent per day
+    prev_date = annotate_freshness(rows, hist, today)
+    log(f"vs previous list {prev_date}: "
+        f"{sum(1 for r in rows if r.get('_fresh') == 'new')} new, "
+        f"{sum(1 for r in rows if r.get('_fresh') == 'changed')} changed")
     if not daily_df.empty:
         hist = daily_df.copy() if hist.empty else pd.concat(
             [hist, daily_df], ignore_index=True)
@@ -731,7 +866,7 @@ def main() -> None:
                     "cred_score", "in_pf"]
             print(daily_df[cols].head(25).to_string(index=False))
         cids, imgs = render_charts(drive, rows, log)
-        html = _preview_with_images(build_html(rows, today, cids), imgs)
+        html = _preview_with_images(build_html(rows, today, cids, prev_date), imgs)
         prev = Path(__file__).resolve().parent.parent / "combined_strength_preview.html"
         prev.write_text(html, encoding="utf-8")
         print(f"\nDRY RUN — preview saved to {prev.name}; no Drive write, no mail.")
@@ -752,10 +887,15 @@ def main() -> None:
         log("combined_strength mail toggled OFF — skipped.")
         return
     n_pf = int(daily_df["in_pf"].sum())
-    subject = (f"🏆 Combined strength — {len(daily_df)} stocks "
-               f"(tech+results+guidance)" + (f" · 💼{n_pf} PF" if n_pf else ""))
+    n_new = sum(1 for r in rows if r.get("_fresh") == "new")
+    n_ch = sum(1 for r in rows if r.get("_fresh") == "changed")
+    subject = (f"🏆 Combined strength — {len(daily_df)} stocks"
+               + (f" · 🆕 {n_new} new" if n_new else "")
+               + (f" · ✳ {n_ch} changed" if n_ch else "")
+               + (f" · 💼{n_pf} PF" if n_pf else ""))
     cids, imgs = render_charts(drive, rows, log)
-    sent = send_email(subject, build_html(rows, today, cids), inline_images=imgs)
+    sent = send_email(subject, build_html(rows, today, cids, prev_date),
+                      inline_images=imgs)
     # ascii-only in log lines — local console is cp1252, emoji crash print()
     log(f"Email {'sent' if sent else 'FAILED'}: "
         f"{subject.encode('ascii', 'ignore').decode().strip()}")
@@ -837,6 +977,43 @@ def _self_test() -> int:
     check("persisted frame unchanged (HIST_COLS only)",
           list(pd.DataFrame(rows, columns=HIST_COLS).columns) == HIST_COLS)
     check("mail html small (<60 KB for 2 cards)", len(html.encode()) < 60_000)
+    # ---- new / changed vs the previous list --------------------------------------
+    hist = pd.DataFrame([
+        {**{c: None for c in HIST_COLS}, "isin": "I1", "symbol": "AAA", "as_of": "2026-10-14",
+         "strategies": "minervini, momentum_3m", "pat_qtr": "Mar 2026", "guid_from": "Q4 FY26",
+         "surge_class": "CONSISTENT", "rank_score": 85.0},
+        {**{c: None for c in HIST_COLS}, "isin": "I1", "symbol": "AAA", "as_of": "2026-10-10",
+         "rank_score": 80.0}])
+    rws = [dict(by["AAA"]), dict(by["BBB"])]
+    pdate = annotate_freshness(rws, hist, "2026-10-15")
+    fa = {r["symbol"]: r for r in rws}
+    check("previous list date found", pdate == "2026-10-14")
+    check("stock absent yesterday is NEW", fa["BBB"]["_fresh"] == "new")
+    check("new results + new guidance flagged as CHANGED",
+          fa["AAA"]["_fresh"] == "changed"
+          and any("new results" in c for c in fa["AAA"]["_changes"])
+          and any("new guidance" in c for c in fa["AAA"]["_changes"]))
+    check("score move tracked", fa["AAA"]["_score_delta"] == 5.0)
+    check("days on list counted", fa["AAA"]["_days_on"] == 3)
+    check("first ever run: nothing called new", annotate_freshness(
+        [dict(by["AAA"])], pd.DataFrame(columns=HIST_COLS), "2026-10-15") is None)
+    o = order_rows([dict(fa["AAA"], in_pf=False), dict(fa["BBB"], in_pf=False)])
+    check("new comes before changed", [r["symbol"] for r in o] == ["BBB", "AAA"])
+    h2 = build_html(rws, "2026-10-15", {}, pdate)
+    check("strip + badges in the mail", "New today (1)" in h2 and "Changed (1)" in h2
+          and "NEW TODAY" in h2 and "#1a7a3a" in h2 and "#b8860b" in h2)
+    same = [dict(by["AAA"])]
+    annotate_freshness(same, pd.DataFrame([{**{c: None for c in HIST_COLS},
+                       **{k: by["AAA"].get(k) for k in HIST_COLS if k in by["AAA"]},
+                       "as_of": "2026-10-14"}]), "2026-10-15")
+    check("identical row is SAME, no badge", same[0]["_fresh"] == "same"
+          and "NEW TODAY" not in fresh_badge(same[0]))
+    chart_only = [dict(by["AAA"], strategies="minervini, darvas")]
+    annotate_freshness(chart_only, pd.DataFrame([{**{c: None for c in HIST_COLS},
+                       **{k: by["AAA"].get(k) for k in HIST_COLS if k in by["AAA"]},
+                       "as_of": "2026-10-14"}]), "2026-10-15")
+    check("chart-setup change alone is NOT highlighted, shown as a note",
+          chart_only[0]["_fresh"] == "same" and "new chart setup: darvas" in fresh_badge(chart_only[0]))
     print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
     return 1 if fails else 0
 
