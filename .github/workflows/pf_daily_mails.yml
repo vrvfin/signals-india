@@ -252,6 +252,18 @@ jobs:
       # --per-company: one mail per reporting company, matching the presentation and
       # rating mails above. The combined body hit 90,957 B on a 42-company catch-up,
       # past Gmail's clip threshold; splitting removes the size ceiling entirely.
+      # Same-day teardown (user 2026-10-16): re-read from Screener ONLY the holdings
+      # that reported recently and still lack their full teardown, so the step below
+      # does not wait for the separate Fundamentals Refresh cron (started ~4 h late on
+      # 15 Oct). Refresh only; the sending stays with the teardown step.
+      - name: Refresh statements for holdings awaiting their teardown
+        env:
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: >
+          python scripts/results_watch.py --once --refresh-only
+          ${{ inputs.dry_run == true && '--dry-run' || '' }}
+        continue-on-error: true
+
       - name: Results teardown mails (per company, last 26h)
         run: >
           python scripts/quarter_teardown.py --per-company --since-hours 26
