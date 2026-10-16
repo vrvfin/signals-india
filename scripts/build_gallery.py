@@ -1120,6 +1120,21 @@ def _freshness_banner(mkt_date, gen_date, n_behind, n_charts):
     return f'<div class="fresh {cls}">{msg}{tail}</div>'
 
 
+def _mcap_floor(df, syms, mcap_map, floor):
+    """Drop rows whose market cap is KNOWN and below `floor` (Rs cr). A missing
+    market cap is kept — absent data must not hide a stock. floor <= 0 = off."""
+    if floor <= 0 or df is None or df.empty:
+        return df
+    keep = [not (mcap_map.get(str(s).upper()) is not None
+                 and pd.notna(mcap_map.get(str(s).upper()))
+                 and float(mcap_map[str(s).upper()]) < floor) for s in syms]
+    out = df[keep].reset_index(drop=True)
+    n_unknown = sum(1 for s in syms if mcap_map.get(str(s).upper()) is None)
+    log(f"  {len(out)}/{len(df)} pass Rs{floor:,.0f}cr market-cap floor "
+        f"({n_unknown} with unknown market cap kept)")
+    return out
+
+
 _UPD_LABEL = (("filing", "filing"), ("news", "news"), ("research", "research note"),
               ("guidance", "guidance line"))
 
@@ -1974,6 +1989,10 @@ def main():
                     help="candle timeframe: D=daily (default), W=weekly, "
                          "M=monthly. EMAs are recomputed on the chosen bars.")
     ap.add_argument("--turnover", type=float, default=1.0, help="min Rs cr/day, 0=off")
+    ap.add_argument("--min-mcap", type=float, default=0.0,
+                    help="signal + watchlist pages: hide names below this market "
+                         "cap in Rs cr (0=off). Unknown market cap is kept; PF "
+                         "mode is never filtered.")
     ap.add_argument("--max", type=int, default=0,
                     help="cap chart count (0=all; guidance mode defaults to 100)")
     ap.add_argument("--out", default="")
@@ -2134,6 +2153,9 @@ def main():
                 == str(q).replace(" ", "")]
         if args.min_cagr > 0 and "cagr_pct" in wl.columns:
             wl = wl[pd.to_numeric(wl["cagr_pct"], errors="coerce") >= args.min_cagr]
+        wl = _mcap_floor(wl, [str(s or t or "") for s, t in
+                              zip(wl.get("symbol", ""), wl.get("nse_symbol", ""))],
+                         mcap_map, args.min_mcap)
         top = args.max if args.max > 0 else 100
         # newest idea on top; CAGR breaks a same-day tie so the order is stable
         wl = wl.sort_values(["date_added", "cagr_pct"], ascending=[False, False],
@@ -2201,6 +2223,8 @@ def main():
                 ev = sum(1 for k in fresh if om[k]["events"] > 0)
                 log(f"  {len(ranked)} NEW today ({ev} of them with an event "
                     f"firing, the rest are states that just qualified)")
+        ranked = _mcap_floor(ranked, ranked["symbol"].tolist(), mcap_map,
+                             args.min_mcap)
         annot = _build_meta_annot(ranked, feats_g, mem, opens_df)
         if args.max > 0:
             ranked = ranked.head(args.max)
