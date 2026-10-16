@@ -259,6 +259,23 @@ def _is_esg(*fields) -> bool:
 _NUM_RE = __import__("re").compile(r"^\s*([+-]?)\s*([\d,]+(?:\.\d+)?)\s*(%|x|bps|Cr|cr)?\s*$")
 
 
+def _unit_txt(unit) -> str:
+    """The deck's unit as a reader sees it ('mn' -> 'Rs mn'); '' for none."""
+    u = DS.display_unit(unit)
+    return "" if u.lower() in ("", "nan", "none", "null") else u
+
+
+def _crore_note(value, unit) -> str:
+    """' (~ Rs 2,814 cr)' beside a figure the deck printed in Rs mn / bn / lakh, so a
+    Rs 28,137 mn order book is never read as 28,137 crore (CYIENTDLM, 2026-10-15)."""
+    cr = DS.crore_equiv(value, unit)
+    if cr is None:
+        return ""
+    txt = f"{cr:,.0f}" if abs(cr) >= 100 else f"{cr:,.1f}" if abs(cr) >= 1 else f"{cr:,.2f}"
+    return (f" <span style='color:{MUTED};font-weight:400;font-size:11px'>"
+            f"(&asymp; &#8377;{txt} cr)</span>")
+
+
 def colour_num(text, good_up: bool = True, bold: bool = True) -> str:
     """Render a number with a colour that carries its MEANING.
 
@@ -379,7 +396,7 @@ def season_rows(df, season, tables):
     return df[df["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
 
 
-def standalone_summary(isin, season, tables) -> str:
+def standalone_summary(isin, season, tables, numbers_only: bool = False) -> str:
     """The deck read as a company note in its own right.
 
     This is the section that matters for a company that never holds a concall: eighteen
@@ -402,7 +419,14 @@ def standalone_summary(isin, season, tables) -> str:
 
     out = [_h("The deck on its own terms",
               f"Everything this presentation discloses, quoted from it. "
-              f"<b>{n_have} of 18</b> sections are covered by this deck.")]
+              f"<b>{n_have} of 18</b> sections are covered by this deck.")
+           if not numbers_only else
+           _h("The numbers, as the deck states them",
+              f"Every figure quoted from the presentation, by section "
+              f"(<b>{n_have} of 18</b> sections covered; the story above has the rest).")]
+    if numbers_only:
+        ds = ds[ds["value"].map(lambda v: v is not None and str(v).strip().lower()
+                                not in ("", "nan", "none"))]
 
     body = []
     for sec, title, colour in _SUMMARY_SECTIONS:
@@ -420,7 +444,8 @@ def standalone_summary(isin, season, tables) -> str:
                 # level is not — a bigger number is not automatically better news.
                 txt = f"{float(val):g}"
                 num = (colour_num(f"{txt}{unit}") if unit == "%"
-                       else f"<b>{_esc(txt, 18)}{(' ' + unit) if unit else ''}</b>")
+                       else f"<b>{_esc(txt, 18)}{(' ' + unit) if unit else ''}</b>"
+                       + _crore_note(val, r.get("unit")))
             per = _esc(r.get("period"), 16)
             det = _esc(r.get("detail"), 210)
             body.append(
@@ -434,6 +459,108 @@ def standalone_summary(isin, season, tables) -> str:
     out.append(f"<table cellpadding='4' cellspacing='0' style='{_TBL}'>"
                + "".join(body) + "</table>")
     return "".join(out)
+
+
+# The deck read as a STORY first (user 2026-10-15: "the presentation mail needs to read like
+# a quick story, not a data set ... what the presentation talks about, then guidance /
+# risk / growth / commentary, and then numbers in a table"). Built from the same quoted
+# deck_summary rows as the table below, so it adds no model call and no new claim.
+_STORY_GROUPS = (
+    ("What the deck says", ("business_overview", "segment_performance", "strategy",
+                            "customers", "products_rd", "industry_market",
+                            "subsidiary_ma"), 8, BLUE, ""),
+    ("Guidance and outlook", ("guidance_outlook",), 6, PURPLE,
+     "The deck gives no forward guidance."),
+    ("Growth drivers", ("capacity_expansion", "capex", "orderbook_pipeline",
+                        "capital_allocation", "geography"), 6, UP, ""),
+    ("Risks the deck admits", ("risks",), 5, DOWN,
+     "The deck names no risks or headwinds — decks rarely volunteer bad news."),
+    ("Management commentary", ("management_commentary",), 4, "#34495e", ""),
+)
+
+
+def _story_line(r) -> str:
+    """One readable sentence from a deck_summary row (escaped HTML)."""
+    det = str(r.get("detail") or "").strip()
+    if det.lower() in ("nan", "none"):
+        det = ""
+    val = r.get("value")
+    has_val = val is not None and str(val).strip().lower() not in ("", "nan", "none")
+    if det and not has_val:
+        return _esc(det, 260)
+    lab = _esc(r.get("label"), 80)
+    num = ""
+    if has_val:
+        try:
+            txt = f"{float(val):,g}"
+        except (TypeError, ValueError):
+            txt = str(val)
+        u = _unit_txt(r.get("unit"))
+        num = f"<b>{_esc(txt, 18)}{'' if u in ('', '%', 'x') else ' '}{_esc(u, 10)}</b>" \
+              + _crore_note(val, r.get("unit"))
+    per = str(r.get("period") or "").strip()
+    per = "" if per.lower() in ("nan", "none") else f" ({_esc(per, 20)})"
+    head = f"{lab}: {num}{per}" if num else lab
+    return head + (f" &mdash; {_esc(det, 200)}" if det else "")
+
+
+def deck_story(isin, season, tables) -> str:
+    """'What the deck says', then guidance / growth / risks / commentary, as short bullet
+    paragraphs. '' when the deck has no deck_summary rows this season."""
+    ds = _slice(tables.get("deck_summary"), isin)
+    if ds.empty:
+        return ""
+    ds = season_rows(ds, season, tables)
+    if ds.empty:
+        return ""
+    sec = ds["section"].astype(str).str.strip()
+    out = []
+    for title, sections, cap, colour, empty_note in _STORY_GROUPS:
+        part = ds[sec.isin(sections)]
+        if title == "What the deck says":
+            # Balanced across sections, sentences before figures: two per section first.
+            order = {s: i for i, s in enumerate(sections)}
+            part = part.assign(
+                _o=part["section"].astype(str).str.strip().map(order),
+                _n=part["value"].map(lambda v: v is not None and str(v).strip().lower()
+                                     not in ("", "nan", "none")),
+            ).sort_values(["_n", "_o"], kind="stable")
+            part = part.groupby("_o", sort=True).head(2).sort_values(["_o"], kind="stable")
+        lines = [_story_line(r) for _, r in part.head(cap).iterrows()]
+        lines = [l for l in lines if l]
+        if not lines and not empty_note:
+            continue
+        body = ("".join(f"<li style='margin:2px 0'>{l}</li>" for l in lines)
+                if lines else f"<li style='color:{MUTED};list-style:none'>{empty_note}</li>")
+        out.append(f"<div style='margin:10px 0 2px;font-weight:700;color:{colour}'>{title}</div>"
+                   f"<ul style='margin:0 0 4px 18px;padding:0;font-size:13px;color:#222'>"
+                   f"{body}</ul>")
+    return "".join(out)
+
+
+def sources_footer(symbol: str, doc_type: str, pdf_url: str = "") -> str:
+    """Links to re-check a mail against the exchange (user 2026-10-15, P4): the filing as
+    fetched (its own queue pdf_url), the company's NSE page, and Screener. Pure.
+
+    A purely numeric symbol is a BSE-only listing: no NSE page exists, so none is shown.
+    """
+    sym = str(symbol or "").strip().upper()
+    url = str(pdf_url or "").strip()
+    links = []
+    if url.lower().startswith("http"):
+        where = ("BSE filing" if "bseindia" in url.lower() else
+                 "NSE filing" if "nseindia" in url.lower() else "Source document")
+        links.append(f"<a href='{_esc(url, 600)}'>{where} ({_esc(_DOC_LABEL.get(doc_type, doc_type), 30)})</a>")
+    if sym and not sym.isdigit():
+        links.append(f"<a href='https://www.nseindia.com/get-quotes/equity?symbol="
+                     f"{_esc(sym, 20)}'>NSE: {_esc(sym, 20)}</a>")
+    if sym:
+        links.append(f"<a href='https://www.screener.in/company/{_esc(sym, 20)}/'>Screener</a>")
+    if not links:
+        return ""
+    return (f"<div style='{_WRAP};border-top:1px solid #e0e6ea;margin-top:12px;"
+            f"padding-top:6px;color:{MUTED};font-size:11.5px'>Verify at source: "
+            + " &middot; ".join(links) + "</div>")
 
 
 def _deck_key(isin: str, tables: dict) -> str:
@@ -971,8 +1098,9 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
     # The standalone summary is computed BEFORE the gate: a company that holds no concall
     # may have a full deck_summary and no ppt_highlights at all, and gating on the old
     # two tables would suppress exactly the mail this section was built for.
-    standalone = standalone_summary(isin, season, tables)
-    if cur_hi.empty and cur_gu.empty and not standalone:
+    story = deck_story(isin, season, tables)
+    standalone = standalone_summary(isin, season, tables, numbers_only=bool(story))
+    if cur_hi.empty and cur_gu.empty and not standalone and not story:
         return ""
 
     out = [f"<div style='{_WRAP}'>",
@@ -983,9 +1111,14 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
            f"</div>"]
 
     def _val(r):
-        v, u = _esc(r.get("value"), 24), _esc(r.get("unit"), 10)
-        return f"<b>{v}{u}</b>" if v else ""
+        v, u = _esc(r.get("value"), 24), _esc(_unit_txt(r.get("unit")), 10)
+        if not v or v.lower() in ("nan", "none"):
+            return ""
+        sep = "" if u in ("", "%", "x") else " "
+        return f"<b>{v}{sep}{u}</b>" + _crore_note(r.get("value"), r.get("unit"))
 
+    # Story first (P2), then the numbers: call-outs, the deck's own figures, the tables.
+    out.append(story)
     out.append(_key_callouts(cur_hi))
     out.append(standalone)
 
@@ -993,7 +1126,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
                for _, r in cur_hi.iterrows()
                if not _is_esg(r.get("statement"), r.get("category"))]
     if hi_rows:
-        out.append(_h("What the deck says", "Highlights as published this quarter.")
+        out.append(_h("Deck highlights", "Highlights as published this quarter.")
                    + _rows_html(hi_rows[:10], ["Area", "Statement", "Value"]))
 
     gu_rows = [[f"<b>{_esc(r.get('metric'), 40)}</b>", _val(r), _esc(r.get("horizon"), 24)]
@@ -1046,12 +1179,14 @@ def _key_callouts(cur_hi) -> str:
         in_key = any(k in (cat + " " + stmt).lower() for k in _KEY_CATEGORIES)
         if not has_num:
             continue
-        scored.append((2 if in_key else 1, stmt, val, unit, cat))
+        scored.append((2 if in_key else 1, stmt, val, unit, cat, _crore_note(val, unit)))
     if not scored:
         return ""
     scored.sort(key=lambda x: -x[0])
     cards = ""
-    for _s, stmt, val, unit, cat in scored[:4]:
+    for _s, stmt, val, unit, cat, cr_note in scored[:4]:
+        unit = _unit_txt(unit)
+        sep = "" if unit in ("", "%", "x") else "&nbsp;"   # _esc strips a plain space
         cards += (
             f"<td style='vertical-align:top;padding:0 8px 0 0;width:25%'>"
             f"<div style='border:1px solid #e0e6ea;border-left:3px solid {UP};"
@@ -1059,7 +1194,7 @@ def _key_callouts(cur_hi) -> str:
             f"<div style='font-size:10.5px;color:{MUTED};text-transform:uppercase;"
             f"letter-spacing:.3px'>{_esc(cat, 22)}</div>"
             f"<div style='font-size:17px;font-weight:700;color:#111;margin:2px 0'>"
-            f"{_esc(val, 18)}{_esc(unit, 8)}</div>"
+            f"{_esc(val, 18)}{sep}{_esc(unit, 10)}{cr_note}</div>"
             f"<div style='font-size:11px;color:#444'>{_esc(stmt, 90)}</div>"
             f"</div></td>")
     return (_h("Key call-outs", "The numbers from this deck worth reading first.")
@@ -1181,8 +1316,9 @@ def _business_view(isin, season, tables) -> str:
                 continue
             items.append((f"{r.get('category','')} {r.get('metric','')}",
                           str(r.get("metric") or ""),
-                          f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}",
-                          str(r.get("slide_ref") or "")))
+                          f"{_esc(r.get('value'), 20)}{_esc(_unit_txt(r.get('unit')), 10)}",
+                          str(r.get("slide_ref") or ""),
+                          _crore_note(r.get("value"), r.get("unit"))))
     if not items and not hi.empty:
         h = season_rows(hi, season, tables)
         for _, r in h.iterrows():
@@ -1190,14 +1326,15 @@ def _business_view(isin, season, tables) -> str:
                 continue
             items.append((f"{r.get('category','')} {r.get('statement','')}",
                           str(r.get("statement") or ""),
-                          f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}", ""))
+                          f"{_esc(r.get('value'), 20)}{_esc(_unit_txt(r.get('unit')), 10)}", "",
+                          _crore_note(r.get("value"), r.get("unit"))))
     if not items:
         return ""
 
     out, used = [], set()
     for title, keys in _BUSINESS_VIEWS:
         rows = []
-        for i, (blob, label, val, ref) in enumerate(items):
+        for i, (blob, label, val, ref, cr_note) in enumerate(items):
             if i in used:
                 continue
             if any(k in blob.lower() for k in keys):
@@ -1205,7 +1342,7 @@ def _business_view(isin, season, tables) -> str:
                 th, tcol = theme_of(label)
                 rows.append([_chip(th, tcol) if th else "",
                              _esc(label, 190),
-                             colour_num(val) if val else "",
+                             (colour_num(val) + cr_note) if val else "",
                              _esc(ref, 14)])
         if rows:
             out.append(_h(title) + _rows_html(rows[:6], ["", "What the deck says",
@@ -2263,7 +2400,7 @@ def main() -> None:
 
     log(f"season={season} pf={len(pf)} due={len(due)} "
         f"({', '.join(sorted({d['doc_type'] for d in due})) or 'nothing'})")
-    if not due:
+    if not due and not args.force:      # --force rebuilds its own list below
         log("nothing due — no mail.")
         return
 
@@ -2353,6 +2490,12 @@ def main() -> None:
     if args.limit:
         due = due[: args.limit]
 
+    # {doc_id: pdf_url} from the one global queue, for the "verify at source" links.
+    try:
+        _pdf_urls = dict(zip(queue["doc_id"].astype(str), queue["pdf_url"].fillna("").astype(str)))
+    except Exception:
+        _pdf_urls = {}
+
     sent_rows = []
     for d in due:
         isin, sym, name, dt = d["isin"], d["symbol"], d["name"], d["doc_type"]
@@ -2425,6 +2568,8 @@ def main() -> None:
         if len(body.encode()) > MAX_HTML_BYTES:
             log(f"  {sym:<12} {dt}: {len(body.encode()):,} B over budget — trimmed")
             body = body[:MAX_HTML_BYTES]
+        # P4: exchange links last, after the trim, so they always survive it.
+        body += sources_footer(sym, dt, _pdf_urls.get(str(d.get("doc_id") or ""), ""))
 
         if args.dry_run:
             p = os.path.join(args.out_dir, f"mail_{sym}_{dt}.html")
@@ -2691,8 +2836,21 @@ def _self_test() -> int:
     check("other quarters excluded", "Old capex" not in ss and "Capex" not in ss)
     check("no deck_summary renders nothing", standalone_summary("INE1", "Q1FY27", T) == "")
     check("other company renders nothing", standalone_summary("INE9", "Q1FY27", T_ds) == "")
-    check("summary reaches the mail body",
-          "The deck on its own terms" in presentation_body("INE1", "AAA", "A", "Q1FY27", T_ds))
+    _pb = presentation_body("INE1", "AAA", "A", "Q1FY27", T_ds)
+    check("summary reaches the mail body", "The numbers, as the deck states them" in _pb)
+    # P2 (2026-10-15): the story comes first, the numbers after it.
+    check("story leads the deck mail",
+          "What the deck says" in _pb
+          and _pb.index("What the deck says") < _pb.index("The numbers, as the deck states them"))
+    check("story carries the narrative line", "Top-5 customers are 46%" in deck_story("INE1", "Q1FY27", T_ds))
+    check("story says when the deck gives no guidance",
+          "no forward guidance" in deck_story("INE1", "Q1FY27", T_ds)
+          or "Guidance and outlook" in deck_story("INE1", "Q1FY27", T_ds))
+    check("numbers table drops sentence-only rows under a story",
+          "Top-5 customers are 46%" not in standalone_summary("INE1", "Q1FY27", T_ds, numbers_only=True))
+    check("Rs mn figure shows its crore equivalent",
+          "2,814 cr" in _story_line({"label": "Order book", "value": 28137, "unit": "mn",
+                                     "period": "Q2FY27", "detail": ""}))
     check("18 sections mapped, matching the extractor",
           {s for s, _, _ in _SUMMARY_SECTIONS} == set(DS.SECTIONS))
 
@@ -2701,11 +2859,18 @@ def _self_test() -> int:
     only_ds = {k: pd.DataFrame() for k in T}
     only_ds["deck_summary"] = _ds
     check("deck-only company still gets a mail",
-          "The deck on its own terms" in presentation_body("INE1", "AAA", "A", "Q1FY27", only_ds))
+          "What the deck says" in presentation_body("INE1", "AAA", "A", "Q1FY27", only_ds))
 
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")
     check("no ratings renders nothing", rating_body("INE_NONE", "X", "X", T) == "")
+    # P4 (2026-10-15): verify-at-source links at the foot of every document mail.
+    _f = sources_footer("CYIENTDLM", "presentation",
+                        "https://www.bseindia.com/xml-data/corpfiling/AttachLive/x.pdf")
+    check("footer: BSE filing link from the queue pdf_url", "BSE filing" in _f and "x.pdf" in _f)
+    check("footer: NSE + Screener links", "symbol=CYIENTDLM" in _f and "screener.in/company/CYIENTDLM/" in _f)
+    check("footer: BSE-only numeric code has no NSE link", "nseindia" not in sources_footer("543210", "rating"))
+    check("footer: no url still links the company", "Screener" in sources_footer("ABC", "concall", "nan"))
 
     # ---- content_key: the fingerprint that makes a correction detectable
     rt_d = pd.DataFrame([{"isin": "INE1", "agency": "CRISIL", "rating": "D",
