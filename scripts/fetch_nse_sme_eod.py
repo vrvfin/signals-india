@@ -21,8 +21,11 @@ why the official corporate-action list is required.
 
 WHICH NAMES. master_list SME rows whose price file is MISSING, or was not updated by
 today's Yahoo ingest (modifiedTime older than --stale-hours). Names Yahoo keeps fresh
-are never touched. The six Yahoo-collision symbols (ingest_ohlcv.COLLISION_SKIP) are
-left out: their files have held another company's prices before.
+are never touched. The Yahoo-collision symbols (ingest_ohlcv.COLLISION_SKIP) ARE
+included (2026-10-16): Yahoo maps them to another company, so NSE is their only correct
+feed. Their stored closes were checked against NSE's bhavcopy (GSTL, MAL, SEL exact on
+four dates; ZEAL exact recently) and the junction check below still refuses a merge onto
+another company's history.
 
 Phase 1 step: after the Yahoo + BSE ingests, before compute_features. A history
 backfill for names that have none: --from YYYY-MM-DD (one-off, outside 10:30-11:45 UTC).
@@ -321,7 +324,7 @@ def main() -> None:
 
     from _extractor_base import get_drive, find_file, download_bytes
     from fetch_bse_eod_api import _folder, _merge_bars, _thread_drive, _today_ist
-    from ingest_ohlcv import COLLISION_SKIP, NSE_OWNED
+    from ingest_ohlcv import NSE_OWNED
     from fetch_bse_eod_api import JUNCTION_TOL
     if args.rebuild:
         want = {x.strip().upper() for x in args.names.split(",") if x.strip()}
@@ -340,7 +343,9 @@ def main() -> None:
     live_fid = _folder(drive, "data/ohlcv")
     files = _files_with_mtime(drive, live_fid)
     now = datetime.now(timezone.utc)
-    targets = pick_targets(sme, files, now, args.stale_hours, set(COLLISION_SKIP))
+    # COLLISION_SKIP names are NOT skipped here: Yahoo is the wrong feed for them, NSE
+    # the right one (they had no updates from 1 Oct, 2026-10-16). Junction-checked.
+    targets = pick_targets(sme, files, now, args.stale_hours, set())
     # NSE-owned names are updated every run, whatever Yahoo did (it skips them)
     targets = sorted(set(targets) | (set(NSE_OWNED) & sme))
     if args.names:

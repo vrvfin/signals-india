@@ -171,6 +171,25 @@ def _fmt_date(s) -> str:
         return str(s or "")[:10]
 
 
+# A GF1 line tagged IMMEDIATE with none of these words is a result already reported,
+# not guidance. Measured 2026-10-16: 56 of 1,219 picked quotes were IMMEDIATE; this keeps
+# the forward ones among them (WIPRO "we are projecting ...", NAVINFLUOR "will be
+# commissioned") and drops the past ones (SYRMA, AEROFLEX, IRISDOREME, LTTS).
+_FORWARD_WORDS = re.compile(
+    r"(?i)\b(expect\w*|guid\w*|target\w*|will|would|going forward|next|coming|aim\w*|"
+    r"plan\w*|outlook|on track|should|anticipat\w*|envisag\w*|project\w*|forecast\w*|"
+    r"estimat\w*|confident|fy\s?'?(2[7-9]|3\d)|fy\s?20(2[7-9]|3\d))\b")
+
+
+def is_past_result(statement, timeframe) -> bool:
+    """True for a GF1 line that is a reported result, not guidance — or is empty. Pure."""
+    s = str(statement or "").strip().strip('"').strip()
+    if s.lower() in ("", "na", "n/a", "none", "nan"):
+        return True
+    return (str(timeframe or "").strip().upper() == "IMMEDIATE"
+            and not _FORWARD_WORDS.search(s))
+
+
 def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
                      cur_key: int, doc_by: dict | None = None) -> dict | None:
     """Most-RECENT quantified growth guidance (revenue/EBITDA/PAT) for one company.
@@ -206,6 +225,12 @@ def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
     stmt = tf = ""
     if gf1_iso is not None and not gf1_iso.empty:
         f = gf1_iso[gf1_iso["quarter"].map(_qkey) == latest_qk]
+        # Never quote a REPORTED RESULT as guidance (SYRMA, 2026-10: "revenue for the
+        # quarter stood at Rs 1,604 crores, registering 67% YoY" beat the call's own
+        # "30% to 35% growth for FY27-28"). No line at all beats a past one.
+        if not f.empty:
+            f = f[[not is_past_result(s, t) for s, t in
+                   zip(f["exact_statement"], f["timeframe"])]]
         if not f.empty:
             fm = f[f["metric_type"].astype(str).str.lower().str.contains(metric, na=False)]
             pick = fm if not fm.empty else f
@@ -1014,6 +1039,36 @@ def _self_test() -> int:
                        "as_of": "2026-10-14"}]), "2026-10-15")
     check("chart-setup change alone is NOT highlighted, shown as a note",
           chart_only[0]["_fresh"] == "same" and "new chart setup: darvas" in fresh_badge(chart_only[0]))
+    # O4 (2026-10-16): a reported result is never quoted as guidance — real GF1 lines.
+    check("past result (IMMEDIATE, no forward word) is dropped", is_past_result(
+        "our consolidated total revenue for the quarter stood at Rs. 1,604 crores, "
+        "registering a 67% year-on-year growth.", "IMMEDIATE"))
+    check("forward line tagged IMMEDIATE is kept", not is_past_result(
+        "In Quarter 3, we are projecting sequential IT services revenue growth of "
+        "minus 0.5% to plus 1.5%", "IMMEDIATE"))
+    check("'will be commissioned' is kept", not is_past_result(
+        "R32 capex of INR80 crores in Surat will be commissioned as per schedule", "IMMEDIATE"))
+    check("long-term line kept whatever its wording", not is_past_result(
+        "for FY27-28, FY28-29, and maybe thereafter, we are on track to achieve 30% to "
+        "35% growth rate.", "LONG_TERM"))
+    check("'NA' is never a quote", is_past_result("NA", "LONG_TERM"))
+    _gt = pd.DataFrame([{"isin": "S1", "symbol": "SYRMA", "quarter": "Q1 FY27",
+                         "metric": "revenue", "cagr_pct": 32.5, "source_doc_id": "d1"}])
+    _gf = pd.DataFrame([
+        {"isin": "S1", "quarter": "Q1 FY27", "metric_type": "Revenue", "timeframe": "IMMEDIATE",
+         "quantifiable": "Yes", "source_doc_id": "d1",
+         "exact_statement": "our consolidated total revenue for the quarter stood at Rs. "
+                            "1,604 crores, registering a 67% year-on-year growth."},
+        {"isin": "S1", "quarter": "Q1 FY27", "metric_type": "Revenue", "timeframe": "LONG_TERM",
+         "quantifiable": "Yes", "source_doc_id": "d1",
+         "exact_statement": "for FY27-28, FY28-29 we are on track to achieve 30% to 35% growth rate."}])
+    _lg = _latest_guidance(_gt, _gf, _qkey("Q2 FY27"), {})
+    check("SYRMA: the forward line wins over the reported result",
+          _lg is not None and "on track to achieve 30% to 35%" in _lg["statement"])
+    _lg2 = _latest_guidance(_gt, _gf.iloc[:1], _qkey("Q2 FY27"), {})
+    check("only a past line -> no quote, cagr kept",
+          _lg2 is not None and _lg2["statement"] == "" and _lg2["cagr"] == 32.5)
+
     print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
     return 1 if fails else 0
 
