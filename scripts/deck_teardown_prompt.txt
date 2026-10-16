@@ -23,7 +23,7 @@ are a valid answer.
       "category": "capacity|utilisation|orderbook|volume|realisation|segment_mix|geo_mix",
       "metric":   "<short name as the deck labels it, e.g. 'Installed capacity'>",
       "value":    <number exactly as printed, or null>,
-      "unit":     "<MT|MW|units|cr|%|x|null>",
+      "unit":     "<MT|MW|units|cr|mn|bn|lakh|usd_mn|usd_bn|%|x|null>",  (money: the scale the slide prints — never assume cr)
       "period":   "<the period this figure belongs to, as printed, e.g. 'Q1FY27'|'FY28'>",
       "slide_ref":"<slide number or slide title>",
       "evidence": "<VERBATIM text containing the number>"

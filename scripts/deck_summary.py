@@ -191,13 +191,113 @@ _UNIT_MAP = {
     "rs. cr": "Rs cr", "rs cr": "Rs cr", "inr cr": "Rs cr", "cr": "Rs cr",
     "crore": "Rs cr", "crores": "Rs cr", "rs. crore": "Rs cr",
     "bn": "Rs bn", "rs. bn": "Rs bn", "inr bn": "Rs bn", "billion": "Rs bn",
+    "usd_mn": "US$ mn", "usd mn": "US$ mn", "us$ mn": "US$ mn",
+    "usd_bn": "US$ bn", "usd bn": "US$ bn", "us$ bn": "US$ bn",
 }
+
+# Crore per one printed unit, for the reader-side "~ Rs X cr" alongside a figure the
+# deck printed in another rupee scale (CYIENTDLM 2026-10-15: a Rs 28,137 mn order book
+# shown as 28,137 cr, ten times too big). Stored values stay as printed.
+_CRORE_PER = {"Rs cr": 1.0, "Rs mn": 0.1, "Rs bn": 100.0, "Rs lakh": 0.01}
 
 
 def display_unit(unit: str) -> str:
     """The unit as a reader should see it. Never rescales, never infers a missing one."""
     u = _s(unit, 16)
     return _UNIT_MAP.get(u.lower().strip(), u)
+
+
+def crore_equiv(value, unit) -> float | None:
+    """`value` in crore when `unit` is a non-crore rupee scale, else None. Pure."""
+    per = _CRORE_PER.get(display_unit(unit))
+    if not per or per == 1.0:
+        return None
+    try:
+        v = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return None if v != v else v * per
+
+
+_SCALE_WORDS = (("mn", "mn"), ("million", "mn"), ("mln", "mn"), ("bn", "bn"),
+                ("billion", "bn"), ("lakhs", "lakh"), ("lakh", "lakh"), ("lacs", "lakh"),
+                ("lac", "lakh"), ("crores", "cr"), ("crore", "cr"), ("cr", "cr"))
+_CR_UNITS = {"cr", "rs cr", "rs. cr", "inr cr", "crore", "crores", "rs. crore", "rs crore"}
+
+
+def _num_variants(value) -> list:
+    try:
+        v = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return []
+    if v != v:
+        return []
+    out = {f"{v:g}", f"{v:,.2f}", f"{v:.2f}", f"{v:,.1f}", f"{v:.1f}"}
+    if v == int(v):
+        out |= {f"{int(v):,}", str(int(v)), _indian(int(v))}
+    return sorted(out, key=len, reverse=True)
+
+
+def _indian(n: int) -> str:
+    s = str(abs(n))
+    if len(s) <= 3:
+        return s
+    head, tail = s[:-3], s[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:]); head = head[:-2]
+    return ",".join(([head] if head else []) + parts + [tail])
+
+
+def scale_from_evidence(value, evidence) -> str | None:
+    """The rupee scale the deck prints RIGHT AFTER this number ('mn'|'bn'|'lakh'|'cr'),
+    or None when the quote does not say. Pure.
+
+    Only the word directly after the figure counts: "US$ 32.85 million (~ Rs 281 Cr)" is
+    281 crore, not 281 million. A bare figure under a column header is left alone.
+    """
+    ev = str(evidence or "")
+    low = ev.lower()
+    for txt in _num_variants(value):
+        start = 0
+        while True:
+            i = low.find(txt.lower(), start)
+            if i < 0:
+                break
+            j = i + len(txt)
+            if not (j < len(low) and low[j].isdigit()) and not (i and (low[i - 1].isdigit()
+                                                                     or low[i - 1] in ",.")):
+                rest = low[j:j + 12].lstrip(" \u00a0")
+                # The currency printed just BEFORE the figure: "US$100 bn" (DEEPINDS,
+                # India's E&P target) is dollars, and must never get a rupee label.
+                pre = low[max(0, i - 6):i].rstrip(" \u00a0")
+                fx = ("usd" if pre.endswith(("$", "usd", "us$")) else
+                      "other" if pre.endswith(("\u20ac", "eur", "\u00a3", "gbp")) else "")
+                for word, unit in _SCALE_WORDS:
+                    if rest.startswith(word) and not rest[len(word):len(word) + 1].isalpha():
+                        if fx == "usd":
+                            return "usd_" + unit if unit in ("mn", "bn") else None
+                        return None if fx else unit
+            start = i + 1
+    return None
+
+
+_RUPEE_SCALES = {"Rs cr", "Rs mn", "Rs bn", "Rs lakh"}
+
+
+def corrected_unit(unit, value, evidence) -> str | None:
+    """The unit this figure's own quote prints, when its label says otherwise. Pure.
+
+    A crore label over a printed mn / bn / lakh -> that scale (CYIENTDLM, NETWEB).
+    Any rupee label over a printed US$ mn / bn -> usd_mn / usd_bn (DEEPINDS).
+    None when nothing needs to change."""
+    u = str(unit or "").strip().lower()
+    sc = scale_from_evidence(value, evidence)
+    if sc in ("usd_mn", "usd_bn"):
+        return sc if display_unit(u) in _RUPEE_SCALES else None
+    if u not in _CR_UNITS:
+        return None
+    return sc if sc in ("mn", "bn", "lakh") else None
 
 
 def parse_summary(payload, row, quarter: str, now_str: str) -> dict:
@@ -299,8 +399,10 @@ def parse_summary(payload, row, quarter: str, now_str: str) -> dict:
             drop("duplicate"); continue
         seen.add(k)
 
+        _u = _s(o.get("unit"), 16)
+        _u = corrected_unit(_u, val, ev) or _u      # "cr" over a printed "Rs 1,890 Mn"
         rows.append({**base, "section": sec, "label": label, "value": val,
-                     "unit": _s(o.get("unit"), 16), "period": _s(o.get("period"), 20),
+                     "unit": _u, "period": _s(o.get("period"), 20),
                      "detail": detail, "slide_ref": _s(o.get("slide_ref"), 60),
                      "evidence": ev})
 
@@ -663,6 +765,37 @@ def _self_test() -> int:
     # --- a DataFrame built from the rows keeps the declared column order
     df = pd.DataFrame(P({"summary": [dup]})["rows"], columns=DECK_SUMMARY_COLS)
     check("dataframe round-trip", list(df.columns) == DECK_SUMMARY_COLS and len(df) == 1)
+
+    # ---- units: the scale printed right after the number wins over a "cr" label
+    # (real stored rows, 2026-10-16: NETWEB / AIMTRON / UNIVASTU / APLAPOLLO / DEEPINDS)
+    CU = corrected_unit
+    check("units: Rs million labelled cr -> mn",
+          CU("cr", 25069.35, "order book stood at ₹25,069.35 million as of 30th June") == "mn")
+    check("units: header-less 'Rs 1,890 Mn' -> mn",
+          CU("cr", 1890.0, "Order Book\nas on 31st March 2025\nRs 1,890 Mn") == "mn")
+    check("units: lakhs -> lakh", CU("cr", 102098.0, "Ongoing Projects 102,098 Lakhs") == "lakh")
+    check("units: Rs 55.1Bn -> bn", CU("cr", 55.1, "₹55.1Bn\nRevenue") == "bn")
+    check("units: US$ million beside Rs Cr stays cr",
+          CU("Cr", 281.0, "US$ 32.85 million (~ ₹ 281 Cr)") is None)
+    check("units: cut-off quote, no scale -> unchanged",
+          CU("cr", 4639.0, "INR 1,350 Mn (H1FY25) → INR 4,639") is None)
+    check("units: only a crore label is ever corrected", CU("%", 26.5, "26.5 mn") is None)
+    check("units: US$100 bn labelled bn -> usd_bn (DEEPINDS)",
+          CU("bn", 100.0, "E&P Investment Target (2030)\nUS$100 bn") == "usd_bn")
+    check("units: US$ 32.85 million labelled cr -> usd_mn",
+          CU("cr", 32.85, "contract value is US$ 32.85 million") == "usd_mn")
+    check("units: EUR figure is left alone", CU("cr", 40.0, "EUR 40 mn order") is None)
+    check("units: no crore equivalent for dollars", crore_equiv(100, "usd_bn") is None)
+    check("units: crore_equiv mn", abs(crore_equiv(28137, "mn") - 2813.7) < 1e-6)
+    check("units: crore_equiv bn", crore_equiv(55.1, "bn") == 5510.0)
+    check("units: crore_equiv cr / junk -> None",
+          crore_equiv(5, "cr") is None and crore_equiv("x", "mn") is None)
+    r = parse_summary({"summary": [{"section": "orderbook_pipeline", "label": "Order book",
+                                    "value": 28137, "unit": "cr", "period": "Q2FY27",
+                                    "evidence": "Order book of INR 28,137 Mn"}]},
+                      {"isin": "INE1", "symbol": "X", "doc_id": "d"}, "Q2FY27", "t")
+    check("units: parse_summary relabels a cr row its quote prints in Mn",
+          bool(r["rows"]) and r["rows"][0]["unit"] == "mn")
 
     print(f"deck_summary self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

@@ -8,6 +8,10 @@ OUTPUT RULES (critical):
 - NEVER repeat an entry. Every item must be DISTINCT.
 - HARD CAPS: at most 12 guidance, at most 12 highlights. Stop after the cap — do not loop.
 - Use null for an unknown scalar and [] for an empty list. Keep enum values EXACTLY as listed.
+- UNITS: copy the scale the analysis text states for that figure — ₹ Mn / million -> mn,
+  ₹ Bn / billion -> bn, ₹ Lakh -> lakh, ₹ Cr / crore -> cr, US$ Mn -> usd_mn,
+  US$ Bn -> usd_bn. Keep "value"
+  exactly as written. NEVER convert and NEVER assume cr: if the scale is not stated, use null.
 
 SCHEMA:
 {
@@ -18,7 +22,7 @@ SCHEMA:
       "guidance_type": "growth|margin|capacity|orderbook|capex|other",
       "horizon": "<FYxx / H2FY26 / medium-term / null>",
       "value": <number-or-null>,
-      "unit": "%|cr|units|null",
+      "unit": "%|cr|mn|bn|lakh|usd_mn|usd_bn|x|units|null",
       "notes": "<short note>"
     }
   ],
@@ -27,7 +31,7 @@ SCHEMA:
       "category": "demand|capacity|orderbook|cost|new_product|margin|expansion|other",
       "statement": "<the operational/strategic highlight management emphasises>",
       "value": <number-or-null>,
-      "unit": "%|cr|units|null"
+      "unit": "%|cr|mn|bn|lakh|usd_mn|usd_bn|x|units|null"
     }
   ]
 }

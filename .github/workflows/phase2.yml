@@ -162,9 +162,13 @@ jobs:
       # runs. It MUST run here at ingest: source PDFs are deleted 2 days after processing
       # (retention rule 1), so a deck cannot be re-read afterwards. Every row it stores
       # must quote the deck verbatim or it is dropped at parse time.
-      - name: Extract investor presentations (+ PF deck teardown)
+      # --deck-summary (user 2026-10-15, P3): the 18-section deck story for PF + watchlist
+      # decks. Without it the story only ran when pf_daily_mails reached a deck first;
+      # Phase 2 usually does, so decks like CYIENTDLM Q2 FY27 mailed with no story.
+      # One extra model call per PF/watchlist deck; concall path untouched.
+      - name: Extract investor presentations (+ PF deck teardown + deck story)
         if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/extract_presentation.py --teardown
+        run: python scripts/extract_presentation.py --teardown --deck-summary
         continue-on-error: true
 
       - name: Extract annual reports
