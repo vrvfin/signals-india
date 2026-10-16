@@ -1756,6 +1756,25 @@ LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on
                "mail_mode"]
 
 
+def owed_full_teardown(ledger: pd.DataFrame, season: str, mode: str) -> set:
+    """ISINs mailed ONLY as a filing card this season in this mail mode: the full
+    Screener teardown has not followed yet. Pure."""
+    if ledger is None or ledger.empty:
+        return set()
+    l = ledger[ledger["season_quarter"].astype(str) == season].copy()
+    if l.empty:
+        return set()
+    m = (l["mail_mode"].astype(str).replace({"None": "combined", "nan": "combined",
+                                              "": "combined"})
+         if "mail_mode" in l.columns else pd.Series("combined", index=l.index))
+    l = l[m == mode]
+    src = l["data_source"].fillna("screener").astype(str).replace(
+        {"None": "screener", "nan": "screener", "": "screener"})
+    fil = set(l[src == "filing"]["isin"].astype(str))
+    full = set(l[src == "screener"]["isin"].astype(str))
+    return fil - full
+
+
 def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tuple]:
     """PF holdings whose results for THIS season landed inside the window.
 
@@ -2163,6 +2182,19 @@ def _self_test() -> int:
 
     # ---- D2: guidance progress (results_day_guidance) ----------------------------
     check("D2 absent when main() did not measure", block_progress({}) == "")
+    # ---- P5: the full teardown follows a filing card ----------------------------
+    _led = pd.DataFrame([
+        {"season_quarter": "Q2FY27", "isin": "F1", "data_source": "filing", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F2", "data_source": "filing", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F2", "data_source": "screener", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F3", "data_source": "filing", "mail_mode": "combined"},
+        {"season_quarter": "Q1FY27", "isin": "F4", "data_source": "filing", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F5", "data_source": None, "mail_mode": None}])
+    check("owed: filing card only, this season, this mode",
+          owed_full_teardown(_led, "Q2FY27", "per_company") == {"F1"})
+    check("owed: combined mode is its own ledger",
+          owed_full_teardown(_led, "Q2FY27", "combined") == {"F3"})
+    check("owed: empty ledger", owed_full_teardown(pd.DataFrame(), "Q2FY27", "combined") == set())
     # ---- step 6: documents block + the 'new today' strip ----------------------------
     _t = MF.today_ist().isoformat()
     _dd = {"docs": {"concall": {"date": _t, "doc_id": "c", "title": "", "period": ""}},
@@ -2355,6 +2387,10 @@ def main() -> None:
     # Bound for the non-windowed paths too (--pf / --symbols without a window): the
     # per-company loop reads it unconditionally and crashed with UnboundLocalError.
     prev_keys: dict = {}
+    # {isin: content_key} of FILING cards already mailed in this mode this season, so a
+    # card is not re-sent on every run while Screener lags (harmless at 3-hourly, a
+    # mail every 20 min under results_watch). A changed filing still re-sends.
+    prev_filing: dict = {}
     if windowed:
         pf_n = len(targets)
         recent = recent_reporters(drive, idx, targets, season, args.since_hours, log)
@@ -2370,6 +2406,22 @@ def main() -> None:
             targets = [(i, s, n) for i, s, n, _w, _src in recent]
             log(f"  {len(targets)} of {pf_n} PF holding(s) have a {season} report date "
                 f"in the last {args.since_hours:g}h")
+            # P5 (2026-10-15): a holding mailed ONLY as a filing card this season is
+            # still owed the full teardown, however long Screener took. The report-date
+            # window used to drop it for good (Q1 FY27: OBSCP, VMARCIND never got theirs).
+            try:
+                from _extractor_base import load_parquet as _lp
+                _led = _lp(drive, idx, LEDGER_NAME, LEDGER_COLS)
+                owed = owed_full_teardown(_led, season,
+                                          "per_company" if args.per_company else "combined")
+                have = {t[0] for t in targets}
+                extra = [t for t in pf_all if t[0] in owed and t[0] not in have]
+                if extra:
+                    targets += extra
+                    log(f"  + {len(extra)} holding(s) owed the full teardown after a "
+                        f"filing card: {', '.join(t[1] for t in extra)}")
+            except Exception as e:
+                log(f"  WARNING: filing-card follow-up check failed ({str(e)[:60]})")
 
         # {isin: content_key} for holdings already mailed WITH a key recorded. Populated
         # below; declared here because --force skips that block and the post-load check
@@ -2395,6 +2447,9 @@ def main() -> None:
                     # teardown (bridge, divergence rails, register) still owes it a
                     # mail once Screener publishes the ladder.
                     if str(r.get("data_source") or "screener").strip() == "filing":
+                        _fk = str(r.get("content_key") or "").strip()
+                        if _fk and _fk.lower() not in ("none", "nan"):
+                            prev_filing[str(r["isin"]).strip()] = _fk
                         continue
                     # A ROW CARRYING A content_key IS NOT DECIDED HERE. Its numbers may
                     # have been restated since, and the only way to know is to build the
@@ -2527,6 +2582,11 @@ def main() -> None:
                 FR.apply_unit_check({isin: fil}, {isin: ref}, log)
         d = {"isin": isin, "symbol": symbol, "name": name,
              "quarter": fil["quarter"], "filing": fil, "data_source": "filing"}
+        _fk = results_content_key(d)
+        if _fk and prev_filing.get(isin) == _fk:
+            log(f"  {symbol}: filing card already mailed, same numbers — waiting for "
+                f"Screener's statements for the full teardown")
+            return True
         # A holding Screener has not caught up with still published a deck, a concall
         # and its other filings — that is exactly what the season summary carries, and
         # it needs no quarterly ladder.
