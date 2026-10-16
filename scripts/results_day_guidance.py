@@ -189,7 +189,7 @@ def company_progress(commits: list[dict], series: dict, season: str | None = Non
 # consolidated OPM produced ten false AT_RISK rows for RAYMOND (live dry-run
 # 2026-10-10). Precision over recall: an unqualified "margin" is dropped too.
 _CO_MARGIN = re.compile(r"ebitda|operating|\bopm\b|consolidated|overall|company", re.I)
-_NOT_CO = re.compile(r"\bro(c)?e\b|segment|division|business|subsidiar", re.I)
+_NOT_CO = re.compile(r"\bro(?:c)?e\b|segment|division|business|subsidiar", re.I)
 RATE_MAX_QUARTERS_AHEAD = 4     # a rate target ending > 1 year out is not judgeable now
 # A parenthetical naming a business line marks a SEGMENT target: RAYMOND's
 # "INR 3,500-4,000 cr (Real Estate)" read BEHIND against total company revenue. Words

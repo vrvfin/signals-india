@@ -77,6 +77,8 @@ NARRATIVE_LIMIT = 2600
 # an annual report to the FINANCIAL YEAR. Applies to these two and to nothing else, so
 # the established presentation/rating/results mails keep their behaviour exactly.
 SCOPED_TYPES = ("concall", "annual_report")
+_DOC_LABEL = {"presentation": "investor presentation", "rating": "credit rating",
+              "concall": "concall transcript", "annual_report": "annual report"}
 
 
 def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None,
@@ -2410,6 +2412,16 @@ def main() -> None:
         if not body:
             log(f"  {sym:<12} {dt}: nothing renderable — skipped")
             continue
+        # How fresh THIS document is, gallery-style (user 2026-10-14). An AR's
+        # doc_date is its FY-END, so it is dated by when it reached us instead.
+        try:
+            import mail_freshness as MF
+            _filed = (d.get("discovered_at") or d.get("processed_at")
+                      if dt == "annual_report" else d.get("doc_date"))
+            body = MF.doc_strip(_DOC_LABEL.get(dt, dt), _filed,
+                                d.get("processed_at")) + body
+        except Exception as e:
+            log(f"  {sym:<12} {dt}: freshness line skipped ({str(e)[:50]})")
         if len(body.encode()) > MAX_HTML_BYTES:
             log(f"  {sym:<12} {dt}: {len(body.encode()):,} B over budget — trimmed")
             body = body[:MAX_HTML_BYTES]

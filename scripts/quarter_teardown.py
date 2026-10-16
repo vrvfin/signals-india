@@ -47,6 +47,8 @@ import deck_teardown as DT
 import filing_results as FR
 import season_summary as SS
 import results_day_guidance as RDG
+import mail_freshness as MF
+import teardown_docs as TD
 from provenance import (Fact, MISSING, SCREENER, ANNUAL, QUARTERLY, write_audit, audit)
 
 MAIL_KEY = "quarter_teardown"
@@ -1397,6 +1399,36 @@ def block_season(d: dict) -> str:
               "mail — this page is the financial view.") + inner
 
 
+def block_docs(d: dict) -> str:
+    """Step 6: this quarter's concall + results release and this FY's annual report,
+    condensed, each with its NEW / RECENT badge (teardown_docs). Filled by main()."""
+    docs = d.get("docs") or {}
+    if not docs:
+        return ""
+    from pf_company_mails import md_to_html
+    compact = bool(d.get("docs_compact"))
+    texts = {} if compact else (d.get("doc_texts") or {})
+    return TD.render(docs, texts, MF.today_ist(), _h, MF.badge, md_to_html, compact=compact)
+
+
+def block_today(d: dict) -> str:
+    """The 'what is new today' strip at the top of the page (mail_freshness)."""
+    ents = []
+    for kind, label in TD.KINDS:
+        row = (d.get("docs") or {}).get(kind)
+        if row:
+            ents.append({"date": row["date"], "label": label.split(" ", 1)[-1].lower()})
+    fil = d.get("filing") or {}
+    if fil.get("filed_on"):
+        ents.append({"date": fil["filed_on"], "label": "results filing"})
+    if d.get("reported_on"):
+        ents.append({"date": d["reported_on"], "label": "quarterly numbers"})
+    for f in ((d.get("season_summary") or {}).get("filings") or [])[:8]:
+        ents.append({"date": f.get("date"), "label": "filing: "
+                     + str(f.get("headline") or "")[:70]})
+    return MF.today_strip(ents)
+
+
 def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
     if not d.get("quarter"):
         return ""
@@ -1407,10 +1439,11 @@ def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
             f"&middot; <b>{d['quarter']}</b> ({d['period']}) &middot; ISIN "
             f"{esc(d['isin'], 16)} &middot; generated "
             f"{datetime.now().strftime('%d %b %Y')}</div>")
+    head += block_today(d)
     body = (block_a(d) + block_b(d) + block_ladder(d, stmts) + block_h1(d, rich)
             + block_financials(d)
             + block_h2(d) + block_deck(d) + block_d(d) + block_progress(d)
-            + block_season(d))
+            + block_docs(d) + block_season(d))
     foot = (
         f"<div style='margin-top:22px;padding-top:12px;border-top:1px solid #ddd;"
         f"font-size:11.5px;color:{MUTED};line-height:1.6'>"
@@ -2130,6 +2163,18 @@ def _self_test() -> int:
 
     # ---- D2: guidance progress (results_day_guidance) ----------------------------
     check("D2 absent when main() did not measure", block_progress({}) == "")
+    # ---- step 6: documents block + the 'new today' strip ----------------------------
+    _t = MF.today_ist().isoformat()
+    _dd = {"docs": {"concall": {"date": _t, "doc_id": "c", "title": "", "period": ""}},
+           "doc_texts": {"concall": "Guided **20%** growth"}}
+    check("docs block renders with a NEW badge", "What the documents say" in block_docs(_dd)
+          and "NEW" in block_docs(_dd))
+    check("compact docs block keeps the header, drops the text",
+          "Guided" not in block_docs(dict(_dd, docs_compact=True))
+          and "Concall" in block_docs(dict(_dd, docs_compact=True)))
+    check("today strip names today's concall", "New today" in block_today(_dd)
+          and "concall" in block_today(_dd))
+    check("no docs -> no block, no strip", block_docs({}) == "" and block_today({}) == "")
     _pr = pd.DataFrame([{"metric": "pat", "guided_text": "Rs 60 crore",
                          "target_period": "FY27", "kind": "level",
                          "actual_to_date": 18.0, "periods_elapsed": 2,
@@ -2437,6 +2482,30 @@ def main() -> None:
         _queue_all = _lq0(drive, idx)
     except Exception:
         _queue_all = pd.DataFrame()
+
+    # Step 6 (user 2026-10-14): what the company's own documents say, condensed.
+    _page_cache: dict = {}
+    _today_ist = MF.today_ist()
+    try:
+        from pf_company_mails import current_ar_fy, ar_fy_year
+        _ar_fy = current_ar_fy(_today_ist)
+        _win = SS.season_window(season, _today_ist)
+    except Exception as e:
+        _ar_fy, _win = None, None
+        log(f"  WARNING: document summaries unavailable ({str(e)[:70]})")
+
+    def _docs(d):
+        """Fill d['docs'] / d['doc_texts']. Silent on failure - the block is extra."""
+        if _ar_fy is None or _queue_all is None or _queue_all.empty:
+            return
+        try:
+            d["docs"] = TD.pick_docs(_queue_all, d["isin"], season, _today_ist, _win,
+                                     _ar_fy, ar_fy_year)
+            d["doc_texts"] = {k: TD.doc_text(drive, repo_id, idx, d["isin"], k, row,
+                                             _page_cache)
+                              for k, row in d["docs"].items()}
+        except Exception as e:
+            log(f"  {d.get('symbol')}: document summaries skipped ({str(e)[:60]})")
     try:
         filings = FR.load_filing_results(drive, idx, season, queue=_queue_all, log=log)
     except Exception as e:
@@ -2470,7 +2539,9 @@ def main() -> None:
         # D reads guidance_vs_actual, D2 measures with the filing's own quarter.
         d["gva"] = gva if gva is not None else pd.DataFrame()
         _progress(d, stmts, filing=fil)
-        html = card + block_d(d) + block_progress(d) + block_season(d)
+        _docs(d)
+        html = (block_today(d) + card + block_d(d) + block_progress(d) + block_docs(d)
+                + block_season(d))
         filing_pages.append((symbol, d, html))
         log(f"  {symbol}: {why} — rendered from the filing "
             f"({fil['quarter']}, filed {fil.get('filed_on') or '?'})")
@@ -2519,11 +2590,17 @@ def main() -> None:
             log(f"  {symbol}: numbers RESTATED since the last mail "
                 f"({_prev} -> {_cur}) — re-sending")
         _progress(d, stmts)
+        _docs(d)
         html = render(d, stmts, rich=args.html)
         if len(html.encode("utf-8")) > MAX_HTML_BYTES and d.get("progress") is not None:
             # D2 is the newest block; it gives way first rather than tipping the
             # page over Gmail's clip — worst three promises only.
             d["progress_rows"] = 3
+            html = render(d, stmts, rich=args.html)
+        if len(html.encode("utf-8")) > MAX_HTML_BYTES and d.get("docs"):
+            # then the document summaries shrink to their headers and badges; the
+            # full reports come in the per-company concall / annual-report mails
+            d["docs_compact"] = True
             html = render(d, stmts, rich=args.html)
         pages.append((symbol, d, html))
         log(f"  {symbol}: {d['quarter']} · {len(d['facts'])} facts · "
