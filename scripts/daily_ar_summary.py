@@ -147,6 +147,258 @@ def _ar_section(page_md: str, cap: int = PER_AR_CAP) -> str:
     return page_md[max(0, head):start + cap][:cap]
 
 
+_VERDICT_RE = re.compile(r"\s*(FOCUS|DEFOCUS)\s*\|\s*([A-Z0-9._&-]+)\s*\|\s*(.+)", re.I)
+JUDGE_MAX_TOKENS = 3000     # ~1 line per company; a looping lite model is cut off here
+
+
+def parse_verdicts(text: str, allowed: set) -> list[dict]:
+    """Judge reply -> one verdict per company. Pure.
+
+    16 Oct 2026: the lite judge LOOPED and printed DEFOCUS lines thousands of times;
+    every line was counted ("🎯14 / 🚫4023 of 20"). Only companies that were IN the
+    batch count, and only their FIRST verdict (a loop repeats, it does not correct)."""
+    out, seen = [], set()
+    for line in str(text or "").strip().splitlines():
+        m = _VERDICT_RE.match(line.strip())
+        if not m:
+            continue
+        sym = m.group(2).upper()
+        if sym not in allowed or sym in seen:
+            continue
+        seen.add(sym)
+        out.append({"list": m.group(1).upper(), "symbol": sym,
+                    "reasons": m.group(3).strip()[:300]})
+    return out
+
+
+# ---- one line each: growth guidance / risk / balance sheet (user 2026-10-17) ----------
+_GROWTH_WORDS = ("revenue", "sales", "top line", "topline", "ebitda", "pat", "profit",
+                 "growth", "volume", "earnings")
+_SEV_RANK = {"high": 0, "critical": 0, "medium": 1, "moderate": 1, "low": 2}
+
+
+def _blank(v) -> bool:
+    return v is None or str(v).strip().lower() in ("", "nan", "none", "null", "na")
+
+
+def horizon_end_fy(h) -> int | None:
+    """'FY21' -> 2021, 'FY2025' -> 2025, 'FY26-27' / 'H1 2026-27' -> 2027. Pure."""
+    txt = str(h or "")
+    yrs = [int(y) for y in re.findall(r"(?<!\d)(20\d{2})(?!\d)", txt)]
+    yrs += [2000 + int(y) for y in re.findall(r"(?i)fy\s?'?(\d{2})(?!\d)", txt)]
+    tail = re.search(r"(20\d{2}|\d{2})\s*[-/]\s*(\d{2})(?!\d)", txt)
+    if tail:
+        yrs.append(2000 + int(tail.group(2)))
+    return max(yrs) if yrs else None
+
+
+def current_fy(today=None) -> int:
+    """Indian FY ending year: Oct 2026 -> 2027. Pure."""
+    t = today or datetime.now()
+    return t.year + 1 if t.month >= 4 else t.year
+
+
+def guidance_line(g: pd.DataFrame, now_fy: int | None = None) -> str:
+    """The AR's growth guidance in one line, from ar_guidance rows. Pure.
+
+    Guidance whose target year has PASSED is dropped: a backfilled FY2019-20 AR's
+    "capex by FY21" is history, not guidance (seen 17 Oct 2026)."""
+    if g is None or g.empty:
+        return "not stated in the AR"
+    now_fy = now_fy or current_fy()
+    hz_col = g["horizon_fy"] if "horizon_fy" in g.columns else pd.Series([None] * len(g), index=g.index)
+    keep = []
+    for h in hz_col:
+        end = horizon_end_fy(h)
+        keep.append(not (end is not None and end < now_fy))
+    g = g[keep]
+    if g.empty:
+        return "only past-dated guidance in this AR"
+    def score(r):
+        txt = f"{r.get('metric', '')} {r.get('guidance_type', '')}".lower()
+        return (0 if any(w in txt for w in _GROWTH_WORDS) else 1,
+                0 if not _blank(r.get("cagr_pct")) or not _blank(r.get("value")) else 1)
+    rows = sorted((r for _, r in g.iterrows()), key=score)
+    bits = []
+    for r in rows[:2]:
+        val = (f"{float(r['cagr_pct']):g}% CAGR" if not _blank(r.get("cagr_pct"))
+               else f"{r.get('value')}{'' if _blank(r.get('unit')) else ' ' + str(r.get('unit'))}"
+               if not _blank(r.get("value")) else "")
+        hz = "" if _blank(r.get("horizon_fy")) else f" by {r.get('horizon_fy')}"
+        note = "" if _blank(r.get("notes")) else f" ({str(r.get('notes'))[:90]})"
+        body = " ".join(x for x in (val, hz.strip(), note.strip()) if x)
+        bits.append(f"{str(r.get('metric') or '').strip()}: {body}" if body
+                    else str(r.get("metric") or "").strip())
+    return "; ".join(b for b in bits if b) or "not stated in the AR"
+
+
+def risk_line(f: pd.DataFrame) -> str:
+    """The AR's most severe red flag in one line, from ar_red_flags rows. Pure."""
+    if f is None or f.empty:
+        return "no red flag found in the AR"
+    rows = sorted((r for _, r in f.iterrows()),
+                  key=lambda r: _SEV_RANK.get(str(r.get("severity") or "").strip().lower(), 3))
+    r = rows[0]
+    sev = "" if _blank(r.get("severity")) else f"[{str(r.get('severity')).upper()}] "
+    cat = str(r.get("flag_type") or r.get("category") or "").strip()
+    ev = "" if _blank(r.get("evidence")) else str(r.get("evidence")).strip()[:160]
+    pg = "" if _blank(r.get("page_ref")) else f" (p. {r.get('page_ref')})"
+    more = f" · +{len(rows) - 1} more" if len(rows) > 1 else ""
+    return f"{sev}{cat}{': ' if cat and ev else ''}{ev}{pg}{more}".strip() or \
+        "no red flag found in the AR"
+
+
+def _fy_key(p) -> int:
+    m = re.search(r"(\d{4})", str(p))
+    return int(m.group(1)) if m else -1
+
+
+def bs_line(stmts: pd.DataFrame) -> str:
+    """Balance sheet in one line from Screener statements: latest FY vs prior FY —
+    borrowings, net worth (equity + reserves), debt/equity, investments. Pure."""
+    if stmts is None or stmts.empty or "statement" not in stmts.columns:
+        return "no balance sheet on file"
+    b = stmts[stmts["statement"].astype(str) == "balance_sheet"]
+    if b.empty:
+        return "no balance sheet on file"
+    def item(name):
+        s = b[b["line_item"].astype(str).str.strip() == name]
+        return {str(p): pd.to_numeric(v, errors="coerce") for p, v in zip(s["period"], s["value"])}
+    borr, eq, res, inv = item("Borrowings"), item("Equity Capital"), item("Reserves"), item("Investments")
+    periods = sorted(set(eq) | set(res) | set(borr), key=_fy_key)
+    if not periods:
+        return "no balance sheet on file"
+    cur = periods[-1]
+    prv = periods[-2] if len(periods) > 1 else None
+    def nw(p):
+        e, r = eq.get(p), res.get(p)
+        return None if e is None or r is None or pd.isna(e) or pd.isna(r) else float(e + r)
+    def cr(v):
+        return "–" if v is None or pd.isna(v) else f"₹{v:,.0f} cr"
+    def de(p):
+        n, d = nw(p), borr.get(p)
+        return None if not n or d is None or pd.isna(d) or n <= 0 else float(d) / n
+    def vs(cur_v, prv_v, fmt):
+        return "" if prv is None or prv_v is None or pd.isna(prv_v) else f" (vs {fmt(prv_v)})"
+    d_c, d_p = de(cur), de(prv) if prv else None
+    parts = [f"{cur}: debt {cr(borr.get(cur))}{vs(None, borr.get(prv) if prv else None, cr)}",
+             f"net worth {cr(nw(cur))}{vs(None, nw(prv) if prv else None, cr)}",
+             "D/E " + ("–" if d_c is None else f"{d_c:.2f}")
+             + ("" if d_p is None else f" (vs {d_p:.2f})")]
+    if inv.get(cur) is not None and not pd.isna(inv.get(cur)) and inv.get(cur) > 0:
+        parts.append(f"investments {cr(inv.get(cur))}")
+    return " · ".join(parts)
+
+
+def _order(blocks, focus, defocus) -> list:
+    """FOCUS first, then DEFOCUS, then every other AR of the day. Pure."""
+    f = [v["symbol"] for v in focus]
+    d = [v["symbol"] for v in defocus if v["symbol"] not in f]
+    rest = [s for s, _ in blocks if s not in f and s not in d]
+    return f + d + rest
+
+
+def company_cards(order, names, lines, focus, defocus) -> str:
+    """One card per AR: verdict + why, then growth guidance / risk / balance sheet. Pure."""
+    why = {v["symbol"]: (v["list"], v["reasons"]) for v in focus + defocus}
+    out = []
+    for sym in order:
+        g, rk, bs, pf, fy = _line(lines, sym)
+        lst, rs = why.get(sym, ("", ""))
+        tag, col = (("🎯 FOCUS", "#1a7a3a") if lst == "FOCUS" else
+                    ("🚫 DEFOCUS", "#c0392b") if lst == "DEFOCUS" else ("", "#8a97a0"))
+        pf_chip = (" <span style='background:#1f4d6b;color:#fff;border-radius:3px;"
+                   "padding:0 5px;font-size:11px'>PF</span>" if pf else "")
+        out.append(
+            f"<div style='border:1px solid #e0e6ea;border-left:4px solid {col};"
+            f"padding:6px 10px;margin:8px 0;font-family:Arial,sans-serif;font-size:13px'>"
+            f"<div><b>{esc(sym)}</b> · {esc(names.get(sym, ''), 50)}{pf_chip}"
+            + (f" <span style='color:#8a97a0;font-size:11.5px'>· {esc(fy, 20)}</span>" if fy else "")
+            + (f" <span style='color:{col};font-weight:700'>{tag}</span>" if tag else "")
+            + "</div>"
+            + (f"<div style='color:#444;margin:2px 0'><i>why:</i> {esc(rs, 300)}</div>" if rs else "")
+            + "<table cellpadding='2' style='font-size:12.5px;border-collapse:collapse'>"
+            f"<tr><td style='color:#6b4d8f;width:120px;vertical-align:top'><b>Growth guidance</b></td>"
+            f"<td>{esc(g, 300)}</td></tr>"
+            f"<tr><td style='color:#c0392b;vertical-align:top'><b>Risk</b></td><td>{esc(rk, 300)}</td></tr>"
+            f"<tr><td style='color:#1f4d6b;vertical-align:top'><b>Balance sheet</b></td>"
+            f"<td>{esc(bs, 300)}</td></tr></table></div>")
+    return "".join(out)
+
+
+_AR_GUIDANCE_COLS = ["isin", "symbol", "fy_year", "metric", "guidance_type", "horizon_fy",
+                     "value", "unit", "cagr_pct", "notes", "source_doc_id"]
+_AR_REDFLAG_COLS = ["isin", "symbol", "fy_year", "category", "flag_type", "severity",
+                    "evidence", "page_ref", "source_doc_id"]
+
+
+def _rows_for(df: pd.DataFrame, isin: str, doc_id: str) -> pd.DataFrame:
+    """This AR's rows: by its own document id, else the company's latest FY."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if doc_id and "source_doc_id" in df.columns:
+        x = df[df["source_doc_id"].astype(str) == doc_id]
+        if not x.empty:
+            return x
+    x = df[df["isin"].astype(str) == isin]
+    if x.empty or "fy_year" not in x.columns:
+        return x
+    fy = pd.to_numeric(x["fy_year"], errors="coerce")
+    return x[fy == fy.max()] if fy.notna().any() else x
+
+
+def ar_label(*frames) -> str:
+    """'FY2019-20 AR' from the rows' fy_year, so a backfilled old report is obvious. Pure."""
+    for x in frames:
+        if x is not None and not x.empty and "fy_year" in x.columns:
+            ys = [y for y in (horizon_end_fy(v) for v in x["fy_year"]) if y]   # "FY25" -> 2025
+            if ys:
+                y = max(ys)
+                return f"FY{y - 1}-{str(y)[2:]} AR"
+    return ""
+
+
+def _line(lines: dict, sym: str) -> tuple:
+    """(growth, risk, balance sheet, is_pf, AR label) with blanks for a missing entry."""
+    t = tuple(lines.get(sym, ()))
+    return t + ("–", "–", "–", False, "")[len(t):]
+
+
+def _one_liners(drive, root, index_id, done_ar, syms) -> dict:
+    """{symbol: (growth guidance, risk, balance sheet, is_pf)} — read only."""
+    out = {}
+    try:
+        gd = load_parquet(drive, index_id, "ar_guidance.parquet", _AR_GUIDANCE_COLS)
+        rf = load_parquet(drive, index_id, "ar_red_flags.parquet", _AR_REDFLAG_COLS)
+    except Exception as e:
+        log(f"  AR guidance/red-flag tables unavailable ({str(e)[:60]})")
+        gd = rf = pd.DataFrame()
+    try:
+        from daily_brief import load_pf
+        pf_isins = {str(i) for i, _s, _n in load_pf(drive, root, index_id)}
+    except Exception:
+        pf_isins = set()
+    fund = get_or_create_subfolder(drive, root, "fundamentals")
+    st_id = get_or_create_subfolder(drive, fund, "statements")
+    want = set(syms)
+    for _, r in done_ar.iterrows():
+        sym = str(r.get("symbol", "")).upper()
+        if sym not in want:
+            continue
+        isin, doc = str(r.get("isin", "")), str(r.get("doc_id", "") or "")
+        stmts = pd.DataFrame()
+        try:
+            fid = find_file(drive, st_id, f"{sym}.parquet")
+            if fid:
+                stmts = pd.read_parquet(io.BytesIO(download_bytes(drive, fid)))
+        except Exception:
+            pass
+        g_rows, f_rows = _rows_for(gd, isin, doc), _rows_for(rf, isin, doc)
+        out[sym] = (guidance_line(g_rows), risk_line(f_rows), bs_line(stmts),
+                    isin in pf_isins, ar_label(g_rows, f_rows))
+    return out
+
+
 def _judge(pool, blocks: list[tuple[str, str]]) -> list[dict]:
     """blocks = [(symbol, section_text)] -> [{symbol, list, reasons}]."""
     out: list[dict] = []
@@ -161,19 +413,22 @@ def _judge(pool, blocks: list[tuple[str, str]]) -> list[dict]:
         size += len(t)
     if batch:
         batches.append(batch)
+    done = set()
     for b in batches:
+        allowed = {t.split("===")[1].strip().upper() for t in b}
         try:
-            text, _ = pool.call_text(JUDGE_PROMPT.format(summaries="".join(b)))
+            text, _ = pool.call_text(JUDGE_PROMPT.format(summaries="".join(b)),
+                                     max_output_tokens=JUDGE_MAX_TOKENS)
         except Exception as e:
             log(f"  judge call failed ({str(e)[:80]}) — batch skipped")
             continue
-        for line in text.strip().splitlines():
-            m = re.match(r"\s*(FOCUS|DEFOCUS)\s*\|\s*([A-Z0-9._&-]+)\s*\|\s*(.+)",
-                         line.strip(), re.I)
-            if m:
-                out.append({"list": m.group(1).upper(),
-                            "symbol": m.group(2).upper(),
-                            "reasons": m.group(3).strip()[:300]})
+        got = [v for v in parse_verdicts(text, allowed - done)]
+        n_lines = sum(1 for ln in str(text).splitlines() if _VERDICT_RE.match(ln.strip()))
+        if n_lines > len(got):
+            log(f"  judge: {n_lines} verdict lines for {len(allowed)} companies — "
+                f"kept {len(got)} (one per company in the batch)")
+        done |= {v["symbol"] for v in got}
+        out += got
     return out
 
 
@@ -275,9 +530,12 @@ def main() -> None:
             names[sym] = str(r.get("company_name", ""))
 
     log(f"AR sections pulled: {len(blocks)}")
+    lines = _one_liners(drive, root, index_id, done_ar, [s for s, _ in blocks])
     if args.dry_run:
         for sym, sec in blocks:
-            log(f"  {sym:<14} {len(sec)} chars")
+            g, rk, bs, pf, fy = _line(lines, sym)
+            log(f"  {sym:<14} {fy:<13} {len(sec)} chars{'  [PF]' if pf else ''}\n"
+                f"      growth guidance: {g}\n      risk: {rk}\n      balance sheet: {bs}")
         return
     if not blocks:
         return
@@ -298,6 +556,12 @@ def main() -> None:
     md += ["\n## 🚫 DEFOCUS list"]
     md += [f"- **{v['symbol']}** ({names.get(v['symbol'], '')}): {v['reasons']}"
            for v in defocus] or ["- (none today)"]
+    md += ["\n## In one line each — growth guidance · risk · balance sheet"]
+    for sym in _order(blocks, focus, defocus):
+        g, rk, bs, pf, fy = _line(lines, sym)
+        md += [f"\n**{sym}** ({names.get(sym, '')}){' · PF' if pf else ''}"
+               f"{' · ' + fy if fy else ''}",
+               f"- Growth guidance: {g}", f"- Risk: {rk}", f"- Balance sheet: {bs}"]
     md += ["\n---\n## Per-company AR sections\n"]
     md += [f"\n### {sym} — {names.get(sym, '')}\n\n{sec}\n" for sym, sec in blocks]
     daily_id = get_or_create_subfolder(drive, repo_id, "_daily")
@@ -346,21 +610,10 @@ def main() -> None:
         return
     if not verdicts and len(blocks) == 0:
         return
-    focus_html = "".join(
-        f"<p style='margin:6px 0'>🎯 <b>{esc(v['symbol'])}</b> · "
-        f"{esc(names.get(v['symbol'], ''), 40)}<br>"
-        f"<i>why focus:</i> {esc(v['reasons'], 320)}</p>"
-        for v in focus) or "<p>(no FOCUS name today)</p>"
-    defocus_html = "".join(
-        f"<tr><td>🚫 <b>{esc(v['symbol'])}</b></td>"
-        f"<td>{esc(names.get(v['symbol'], ''), 30)}</td>"
-        f"<td>{esc(v['reasons'], 240)}</td></tr>" for v in defocus)
     body = (f"<p><b>{len(blocks)} Annual Report(s)</b> summarised in the last "
             f"{args.hours:.0f}h → 🎯 {len(focus)} FOCUS · 🚫 {len(defocus)} "
-            f"DEFOCUS.</p><h3>🎯 Focus — why</h3>{focus_html}"
-            + (f"<h3>🚫 Defocus</h3><table border=1 cellpadding=4 cellspacing=0>"
-               f"<tr><th></th><th>Company</th><th>Red flag</th></tr>{defocus_html}"
-               f"</table>" if defocus_html else "")
+            f"DEFOCUS.</p>"
+            + company_cards(_order(blocks, focus, defocus), names, lines, focus, defocus)
             + f"<p style='font-size:11px;color:#999'>Full per-company digest "
               f"attached as PDF (also at _daily/{fname}). FOCUS names are "
               f"auto-queued for deep dives. Toggle this mail in the app sidebar."
@@ -373,5 +626,73 @@ def main() -> None:
                f"{len(blocks)} — {as_of}", body, attachments=atts)
 
 
+def _self_test() -> int:
+    fails = 0
+
+    def check(name, ok):
+        nonlocal fails
+        print(("  ok   " if ok else "  FAIL ") + name)
+        fails += 0 if ok else 1
+
+    loop = "FOCUS|AAA|capex + tailwinds\n" + "DEFOCUS|BBB|auditor EoM\n" * 4000 + \
+           "DEFOCUS|ZZZ|not in this batch\nFOCUS|BBB|contradiction later\nnoise line"
+    v = parse_verdicts(loop, {"AAA", "BBB", "CCC"})
+    check("looping judge -> one verdict per company (16 Oct: 4,023 of 20)", len(v) == 2)
+    check("first verdict wins", [x["list"] for x in v] == ["FOCUS", "DEFOCUS"])
+    check("company outside the batch ignored", all(x["symbol"] != "ZZZ" for x in v))
+
+    g = pd.DataFrame([
+        {"metric": "Dividend", "guidance_type": "other", "value": "2", "unit": "Rs",
+         "cagr_pct": None, "horizon_fy": None, "notes": None},
+        {"metric": "Revenue", "guidance_type": "growth", "value": None, "unit": None,
+         "cagr_pct": 18, "horizon_fy": "FY28", "notes": "led by exports"}])
+    gl = guidance_line(g)
+    check("growth guidance first: metric, CAGR, horizon, note",
+          gl.startswith("Revenue: 18% CAGR by FY28 (led by exports)"))
+    check("no guidance rows -> says so", guidance_line(pd.DataFrame()) == "not stated in the AR")
+    check("horizon parse", (horizon_end_fy("FY21"), horizon_end_fy("FY2025"),
+                            horizon_end_fy("FY26-27"), horizon_end_fy("H1 2026-27"),
+                            horizon_end_fy("medium term")) == (2021, 2025, 2027, 2027, None))
+    old = pd.DataFrame([{"metric": "capex", "guidance_type": "capex", "value": None, "unit": None,
+                         "cagr_pct": None, "horizon_fy": "FY21", "notes": "refurbish"}])
+    check("past-dated guidance dropped", guidance_line(old, 2027) == "only past-dated guidance in this AR")
+    check("current FY: Oct 2026 -> 2027", current_fy(datetime(2026, 10, 17)) == 2027)
+    check("AR label from fy_year", ar_label(pd.DataFrame([{"fy_year": "FY20"}])) == "FY2019-20 AR")
+
+    f = pd.DataFrame([
+        {"category": "governance", "flag_type": "RPT", "severity": "low", "evidence": "x", "page_ref": 4},
+        {"category": "audit", "flag_type": "Emphasis of Matter", "severity": "high",
+         "evidence": "auditor flagged going concern", "page_ref": 112}])
+    rl = risk_line(f)
+    check("most severe flag first, with evidence + page + count",
+          rl.startswith("[HIGH] Emphasis of Matter: auditor flagged going concern (p. 112)")
+          and "+1 more" in rl)
+    check("no flags -> says so", risk_line(None) == "no red flag found in the AR")
+
+    st = pd.DataFrame([
+        {"statement": "balance_sheet", "line_item": it, "period": p, "value": v}
+        for it, vals in {"Equity Capital": (10, 10), "Reserves": (990, 1190),
+                         "Borrowings": (500, 400), "Investments": (0, 120)}.items()
+        for p, v in zip(("Mar 2025", "Mar 2026"), vals)])
+    bl = bs_line(st)
+    check("balance sheet: latest FY vs prior, debt / net worth / D/E / investments",
+          bl == "Mar 2026: debt ₹400 cr (vs ₹500 cr) · net worth ₹1,200 cr (vs ₹1,000 cr) · "
+                "D/E 0.33 (vs 0.50) · investments ₹120 cr")
+    check("no statements -> says so", bs_line(pd.DataFrame()) == "no balance sheet on file")
+
+    order = _order([("AAA", ""), ("BBB", ""), ("CCC", "")],
+                   [{"symbol": "CCC"}], [{"symbol": "AAA"}])
+    check("order: FOCUS, DEFOCUS, rest", order == ["CCC", "AAA", "BBB"])
+    cards = company_cards(["AAA"], {"AAA": "A Ltd"}, {"AAA": ("g1", "r1", "b1", True, "FY2025-26 AR")},
+                          [], [{"symbol": "AAA", "list": "DEFOCUS", "reasons": "EoM"}])
+    check("card carries PF chip, verdict, why and the three lines",
+          all(s in cards for s in ("PF", "DEFOCUS", "EoM", "Growth guidance", "g1", "FY2025-26 AR",
+                                   "Risk", "r1", "Balance sheet", "b1")))
+    print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
+    return 1 if fails else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
     main()
