@@ -1922,8 +1922,8 @@ def main():
     # replaces the summary snapshot, which Screener refreshes ~once a quarter.
     # Only for names WITH a share count: the rest of market_cap.csv still holds
     # old Yahoo values that must not override Screener's.
-    uni = _folder(drive, "universe")
-    sc, mc_daily = _read_csv(drive, uni, "share_count.csv"), _read_csv(drive, uni, "market_cap.csv")
+    uni_dir = _folder(drive, "universe")
+    sc, mc_daily = _read_csv(drive, uni_dir, "share_count.csv"), _read_csv(drive, uni_dir, "market_cap.csv")
     if not sc.empty and not mc_daily.empty and "symbol" in sc.columns \
             and {"symbol", "market_cap_cr"} <= set(mc_daily.columns):
         have = set(sc["symbol"].astype(str).str.upper())
