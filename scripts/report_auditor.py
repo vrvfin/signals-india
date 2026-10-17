@@ -65,6 +65,7 @@ MAX_TOTAL_SOURCE_CHARS = 70_000
 MAX_SOURCE_CHARS = 45_000        # ceiling for any single document within that total
 # On a 429 the payload is halved and retried once — a smaller audit beats no audit.
 RETRY_SHRINK = 0.5
+GEMINI_AUDIT_TOKENS = 12000     # thinking + answer; see Adjudicator.call
 VERDICTS = ("VERIFIED", "PARTIAL", "UNSUPPORTED", "CONTRADICTED", "NOT_IN_SOURCE")
 # Documents most likely to carry the evidence for a management claim, cheapest first.
 # Annual reports are 400k chars and would consume the whole budget alone.
@@ -199,7 +200,12 @@ class Adjudicator:
         if self._alt:
             pool, model = self._alt
             return pool.call_text(prompt, model, max_output_tokens=max_tokens)
-        return self._gem.call_text(prompt, "audit", max_output_tokens=max_tokens)
+        # Gemini 2.5+/3.x are THINKING models: the budget covers reasoning as well as the
+        # answer. At 4,000 the reasoning used it up and no JSON came back ("Wait, let's
+        # complete the JSON." — Ather 2026-10-04: 4 sections AUDIT_FAILED). Same trap and
+        # same floor as narrative_generate.MAX_OUTPUT_TOKENS.
+        return self._gem.call_text(prompt, "audit",
+                                   max_output_tokens=max(max_tokens, GEMINI_AUDIT_TOKENS))
 
 
 # ----------------------------------------------------------------- auditing ---
@@ -281,6 +287,15 @@ def audit_section(adj: Adjudicator, section_id, section_title: str,
                      "reason": f"adjudicator call failed: {last_err}",
                      "source_quote": ""}]
     data = _salvage_json(raw)
+    if not data or "claims" not in data:
+        # ONE retry when the answer was not readable (a thinking model can spend its
+        # budget before writing the JSON): same section, told to return only the JSON.
+        try:
+            raw = adj.call(prompt + "\n\nReturn ONLY the JSON object described above — no "
+                                    "reasoning, no prose, no markdown fence.")
+            data = _salvage_json(raw)
+        except Exception as e:
+            raw = f"retry failed: {str(e)[:150]}"
     if not data or "claims" not in data:
         return [{"claim": f"(section {section_id} audit returned unparseable output)",
                  "verdict": "AUDIT_FAILED", "section": section_id,

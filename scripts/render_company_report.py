@@ -56,9 +56,40 @@ CHAPTERS: list[tuple[str, list[int], list[str]]] = [
     ("Valuation check", [22], []),
     ("Risks — and what could prove this reading wrong", [23, 24], ["0.7"]),
 ]
+# What each chapter covers (the user's list, 2026-10-05). Given to the chapter writer.
+CHAPTER_BRIEFS: list[str] = [
+    "What the company does and how it makes money: products, customers, markets, plants, "
+    "and what drives volume, price and mix.",
+    "How the business has evolved over the years: its eras, how scale, mix and margins "
+    "changed, and why.",
+    "What is changing now: capacity and capex, new products or markets, mix shift, "
+    "management's stated plans, and recent filings or news.",
+    "What the income statement, balance sheet and cash flow look like over the years: "
+    "growth, margins, returns, debt, working capital and cash from operations.",
+    "Whether growth can be funded internally: tie the three statements together - does cash "
+    "from operations cover capex, working capital and dividends, or does it need debt or "
+    "new equity?",
+    "Fraud scan: red flags from the fraud tracker, exchange surveillance, auditors and "
+    "governance. If nothing is flagged, say so plainly.",
+    "Promoter quality: holding and pledges, remuneration, related-party dealings, capital "
+    "allocation, and whether management did what it said.",
+    "Financial shenanigans check: cash from operations versus profit, receivable and "
+    "inventory days, other income, capitalised costs, one-offs and accounting changes.",
+    "What research, global learnings and management interactions add: broker views, lessons "
+    "from global peers, and what management said on calls versus what followed.",
+    "The industry scenario: demand, pricing, policy, competition and where this company "
+    "stands among its peers.",
+    "Valuation check: today's multiples against the company's own history and its peers, "
+    "and what growth the current price assumes. No target price.",
+    "Risks, and what could prove this reading wrong.",
+]
 # Tables printed INSIDE the flow (they are the chapter's argument); every other table goes
 # to Appendix B so a chapter never turns into a stack of tables.
 EXHIBITS = {"tbl.financials", "tbl.sensitivity_pe", "tbl.said_vs_delivered"}
+# Deep-dive parts whose TABLES are shown as exhibits in the chaptered report: CFO vs PAT
+# (1.4), the weighted forensic score (1.6), earnings quality (1.8). Labelled as model-
+# extracted, because the deep dive's numbers are not mechanically checked.
+DD_TABLES = {"1.4", "1.6", "1.8"}
 # Deep-dive tokens that are signifiers, not sources.
 _SIGNS = {"WARNING": "Risk:", "COMFORT": "Positive:", "INFO": "Note:"}
 _NOT_SOURCES = set(_SIGNS) | {"DATA_MISSING", "DATA_NOT_DISCLOSED",
@@ -131,6 +162,11 @@ def _clean(text: str) -> str:
     """Model text made safe for the page: no code fences, no stray markdown headings."""
     lines = [ln for ln in str(text or "").splitlines() if not _FENCE.match(ln)]
     return "\n".join(lines).strip()
+
+
+def _no_codes(text: str) -> str:
+    """Model text with fact ids "(one.mcap_cr)" and document ids removed (front page)."""
+    return _DOC_REF.sub("", _FACT_REF.sub("", _clean(text))).strip()
 
 
 def _paras(text: str) -> list[str]:
@@ -233,6 +269,48 @@ def _forensic_text(text: str, refs: Refs) -> str:
     return re.sub(r"\n{3,}", "\n\n", txt)
 
 
+# ------------------------------------------------------------------ chapters --
+def _plain_notes(text: str) -> str:
+    """Deep-dive text for a WRITER: tags and signifiers removed, numbers kept as context."""
+    t = _clean(text)
+    t = _TAG.sub(lambda m: (_SIGNS.get(m.group(1).strip(), "") if m.group(1).strip()
+                            in _NOT_SOURCES else ""), t)
+    t = re.sub(r"\bDATA_(?:MISSING|NOT_DISCLOSED)\b", "not disclosed", t)
+    return re.sub(r"[ \t]+\n", "\n", t).strip()
+
+
+def chapter_inputs(pack: dict, forensic_md: str = "", notes_chars: int = 6000) -> list[dict]:
+    """Per chapter: its facts, tables, gaps and deep-dive notes. A chapter with no facts,
+    no tables and no notes is left out HERE, before any model call (empty-chapter rule)."""
+    dd = parse_forensic(forensic_md or "")
+    out = []
+    for n, ((title, secs, ddkeys), brief) in enumerate(zip(CHAPTERS, CHAPTER_BRIEFS), 1):
+        facts = [f for f in pack.get("facts", []) if f.get("section") in secs]
+        tables = [t for t in pack.get("tables", []) if t.get("section") in secs]
+        notes = "\n\n".join(_plain_notes(dd[k]) for k in ddkeys if dd.get(k))[:notes_chars]
+        gaps = ([g["reason"] for g in pack.get("coverage_gaps", []) if g["section"] in secs]
+                + [u["reason"] for u in pack.get("uncovered_sections", [])
+                   if u["section"] in secs])
+        if not (facts or tables or notes.strip()):
+            continue
+        out.append({"n": n, "id": f"ch{n}", "title": title, "brief": brief,
+                    "sections": secs, "facts": facts, "tables": tables,
+                    "gaps": gaps, "notes": notes})
+    return out
+
+
+def chapter_pack(pack: dict) -> dict:
+    """The fact pack with every fact / table re-keyed from its story section to its chapter
+    id ('ch4'), so a section-scoped check (grounding gate, auditor) sees the whole chapter."""
+    sec_to_ch = {s: f"ch{n}" for n, (_, secs, _) in enumerate(CHAPTERS, 1) for s in secs}
+    p = dict(pack)
+    p["facts"] = [dict(f, section=sec_to_ch.get(f.get("section"), f.get("section")))
+                  for f in pack.get("facts", [])]
+    p["tables"] = [dict(t, section=sec_to_ch.get(t.get("section"), t.get("section")))
+                   for t in pack.get("tables", [])]
+    return p
+
+
 # ------------------------------------------------------------------ story --
 def section_map(pack: dict, narrative: dict | None) -> dict[int, dict]:
     """section number -> narrative section. The model sometimes REWRITES the id it was given
@@ -240,8 +318,8 @@ def section_map(pack: dict, narrative: dict | None) -> dict[int, dict]:
     generated in ascending order of the sections that have facts or tables, so a list whose
     ids are not all numeric is mapped back by that order."""
     secs = list((narrative or {}).get("sections") or [])
-    if not secs:
-        return {}
+    if not secs or (narrative or {}).get("layout") == "chapters":
+        return {}                     # chapters are keyed by chapter, never by position
     if all(str(s.get("id", "")).isdigit() for s in secs):
         return {int(s["id"]): s for s in secs}
     have = sorted({f["section"] for f in pack.get("facts", [])}
@@ -251,8 +329,10 @@ def section_map(pack: dict, narrative: dict | None) -> dict[int, dict]:
     return {int(s["id"]): s for s in secs if str(s.get("id", "")).isdigit()}
 
 
-def _story_block(num: int, sec: dict, pack: dict, links: dict, refs: Refs) -> list[str]:
-    """Takeaway + body of one story section, with its citations as reference numbers."""
+def _story_block(num, sec: dict, pack: dict, links: dict, refs: Refs) -> list[str]:
+    """Takeaway + body of one story section (num = its number) or one chapter (num = the
+    list of story sections it covers), with its citations as reference numbers."""
+    nums = set(num) if isinstance(num, (list, tuple, set)) else {num}
     paras = _paras(sec.get("body", ""))
     take = _clean(sec.get("takeaway", ""))
     if not paras and not take:
@@ -275,8 +355,8 @@ def _story_block(num: int, sec: dict, pack: dict, links: dict, refs: Refs) -> li
             marks.setdefault(_attach(paras, c.get("text", "")), []).append(
                 refs.n(f"doc:{did}", _doc_text(did, links)))
     # 3. the section's data sources -> once, on its first paragraph
-    srcs = {_src_ref(f.get("source")) for f in pack.get("facts", []) if f.get("section") == num}
-    srcs |= {_src_ref(t.get("source")) for t in pack.get("tables", []) if t.get("section") == num}
+    srcs = {_src_ref(f.get("source")) for f in pack.get("facts", []) if f.get("section") in nums}
+    srcs |= {_src_ref(t.get("source")) for t in pack.get("tables", []) if t.get("section") in nums}
     if paras:
         marks.setdefault(0, []).extend(refs.n(k, t) for k, t in sorted(srcs) if t)
     out = [f"**{take}**"] if take else []
@@ -317,7 +397,22 @@ def render(pack: dict, narrative: dict | None = None, audit: dict | None = None,
 
     # ---- the story on one page -------------------------------------------
     front = []
-    if dd.get("onepager"):
+    story = (narrative or {}).get("storyline") or {}
+    if story.get("one_page"):
+        # Written by the storyline pass (numbers gated against the whole fact pack).
+        front.append(_no_codes(story["one_page"]))
+        for key, label in (("business_dynamics", "Business dynamics"),
+                           ("financial_dynamics", "Financial dynamics"),
+                           ("watch", "What would change this reading")):
+            items = [_no_codes(x) for x in story.get(key) or [] if _no_codes(x)]
+            if items:
+                front.append(f"**{label}**\n\n" + "\n".join(f"- {x}" for x in items))
+        m = re.search(r"###\s*Forensic Risk View\s*\n(.*?)(?=\n###|\Z)",
+                      dd.get("onepager", ""), re.S | re.I)
+        if m and m.group(1).strip():
+            front.append("**Forensic risk view (deep dive)**\n\n"
+                         + _forensic_text(m.group(1), refs))
+    elif dd.get("onepager"):
         front.append(_forensic_text(dd["onepager"], refs))
     elif dd.get("1.7"):
         front.append(_forensic_text(dd["1.7"], refs))
@@ -340,7 +435,42 @@ def render(pack: dict, narrative: dict | None = None, audit: dict | None = None,
     # ---- chapters -----------------------------------------------------------
     used, num = set(), 0
     counters: list[str] = []
-    for title, secs, ddkeys in CHAPTERS:
+    if (narrative or {}).get("layout") == "chapters":
+        # Written chapter by chapter (narrative_generate.generate_report): the deep dive
+        # was the writer's analyst notes, so its text is NOT appended again — only its
+        # forensic tables (numbers model-extracted, labelled as such).
+        bych = {int(s.get("chapter", 0)): s for s in narrative.get("sections") or []}
+        for n, (title, secs, ddkeys) in enumerate(CHAPTERS, 1):
+            ch = bych.get(n) or {}
+            body = _story_block(secs, ch, pack, links, refs) if ch else []
+            body = [b for b in body if not re.fullmatch(r"\*\*\s*\*\*", b)]
+            for s in secs:
+                for tid, t in tables.items():
+                    if t.get("section") == s and tid in EXHIBITS and t.get("rows"):
+                        body.append("\n".join(_table_md(t)))
+            for k in ddkeys:
+                if k in DD_TABLES and dd.get(k):
+                    rows = [ln for ln in dd[k].splitlines() if ln.lstrip().startswith("|")]
+                    if len(rows) > 2:
+                        body.append("*From the forensic deep dive (model-extracted figures, "
+                                    "not mechanically checked):*\n\n"
+                                    + _forensic_text("\n".join(rows), refs))
+            v = _clean(ch.get("counter_argument"))
+            if v:
+                counters.append(v)
+            if title.startswith("Risks"):
+                body += [f"- {c}" for c in dict.fromkeys(counters)][:12]
+            prose = [ln for b in body for ln in b.splitlines()
+                     if ln.strip() and not ln.lstrip().startswith(("|", "*From the"))]
+            if not prose:
+                continue                           # nothing to say -> not printed at all
+            num += 1
+            L += [f"## {num}. {title}", ""] + sum(([b, ""] for b in body if b.strip()), [])
+        smap = {}                                  # appendix: chapters carry not_disclosed
+        for s in narrative.get("sections") or []:
+            smap[f"ch{s.get('chapter')}"] = s
+    for title, secs, ddkeys in ([] if (narrative or {}).get("layout") == "chapters"
+                                else CHAPTERS):
         body: list[str] = []
         for s in secs:
             if s in smap:

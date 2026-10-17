@@ -256,23 +256,31 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
 
     # ---- Layer B ----------------------------------------------------------
     log("[4/6] narrative generation (Gemini)")
+    # The deep dive is read BEFORE writing (user 2026-10-17, one merged report): the chapter
+    # writer uses it as analyst notes, chapter by chapter, instead of appending it as Part B.
+    forensic = ""
+    if args.forensic_md:
+        p = Path(args.forensic_md)
+        if p.exists():
+            forensic = p.read_text(encoding="utf-8")
+            log(f"  forensic deep dive: {p.name} ({len(forensic):,} chars)")
+        else:
+            log(f"  WARNING: --forensic-md {p} not found; written without the deep dive")
     try:
-        nar = GEN.generate(d, chosen, args.sections, log=log)
+        if args.sections:          # old per-section writer, kept for targeted reruns
+            nar = GEN.generate(d, chosen, args.sections, log=log)
+        else:
+            nar = GEN.generate_report(d, chosen, forensic, log=log)
     except Exception as e:
         log(f"  generation FAILED: {str(e)[:200]}")
         if args.debug:
             traceback.print_exc()
         return None
     flagged = nar.get("sections_with_unresolved_gate_failures", 0)
-    log(f"  {len(nar['sections'])} section(s); {flagged} with unresolved gate failures")
-    if args.forensic_md:
-        p = Path(args.forensic_md)
-        if p.exists():
-            nar["forensic_report"] = p.read_text(encoding="utf-8")
-            log(f"  attached forensic report: {p.name} "
-                f"({len(nar['forensic_report']):,} chars)")
-        else:
-            log(f"  WARNING: --forensic-md {p} not found; Part B will be empty")
+    log(f"  {len(nar['sections'])} {'chapter' if nar.get('layout') == 'chapters' else 'section'}"
+        f"(s); {flagged} with unresolved gate failures")
+    if forensic:
+        nar["forensic_report"] = forensic
     (outdir / f"narrative_{co['symbol']}.json").write_text(
         json.dumps(nar, indent=2), encoding="utf-8")
 
@@ -298,7 +306,11 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             # The fact pack goes to the auditor as an evidence table. Without it every
             # computed figure comes back UNSUPPORTED, because those numbers live in
             # Screener statements rather than in any filing in the document bundle.
-            audit = audit_report(adj, secs, chosen, factpack=d)
+            # A chapter is checked against ITS chapter's figures: the fact pack is re-keyed
+            # from story sections to chapter ids, or the auditor would see an empty table.
+            audit = audit_report(adj, secs, chosen,
+                                 factpack=(REPORT.chapter_pack(d)
+                                           if nar.get("layout") == "chapters" else d))
             if getattr(adj, "_gem", None) is not None:    # Gemini audit: log its models
                 from model_registry import record_usage
                 record_usage(adj._gem, "narrative_audit", "narrative", log=log)

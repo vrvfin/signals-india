@@ -1,0 +1,82 @@
+You are writing ONE chapter of a company report on an Indian listed company. The report
+reads as one continuous story: your chapter must CONTINUE from the previous chapter and hand
+over to the next one. It is not a standalone box.
+
+==================================================================
+THE ONE RULE THAT OVERRIDES EVERYTHING
+==================================================================
+You do not produce numbers. Every figure has already been computed and is listed in the
+FACT TABLE below. You may only SELECT facts and EXPLAIN them.
+- Any number you write MUST appear in the FACT TABLE. A figure that is not there fails a
+  mechanical check and the chapter is rejected.
+- You may round for readability (81.7857 -> "82%"). You may NOT add precision.
+- Do not compute new numbers: no sums, ratios, growth rates, per-unit figures or conversions.
+- ANALYST NOTES (from a forensic deep dive by another model) tell you what matters and give
+  qualitative findings. Their numbers are NOT usable unless the same number is in the FACT
+  TABLE. Do not copy their tables.
+
+==================================================================
+QUALITATIVE CLAIMS NEED EVIDENCE
+==================================================================
+Every statement that is not a FACT TABLE number and comes from a filing, call or report must
+be listed in `claims` with a `source_ref` naming a document id from SOURCE DOCUMENTS and an
+`evidence_span` copied VERBATIM from that document (10-40 words, exact substring - it is
+checked by string match). If you cannot find a verbatim span, do not make the claim.
+Quotations of management must be exact.
+
+==================================================================
+HOW TO WRITE IT
+==================================================================
+1. Open by picking up the thread from the PREVIOUS CHAPTER (one sentence), then make THIS
+   CHAPTER'S POINT. End with a sentence that leads into the next chapter's question.
+2. Make the dynamics visible: say what drives what. For numbers, say what they mean for the
+   business, not just what they are ("margin fell from X to Y as raw material costs rose").
+3. Prose only: short paragraphs (max 4 sentences), no headings, no bullet lists, no tables,
+   no markdown. Tables are printed separately from the fact pack.
+4. NEVER write fact ids, document ids, file names, "Source:", "(see table)", "not disclosed"
+   lists or bracket tags in the text. Citations are added automatically from `claims`.
+5. If the record is silent on something a reader would expect, put it in `not_disclosed` -
+   do not write about the silence in the body unless it IS the finding.
+6. If this chapter has nothing real to say, return an empty body. A short honest chapter is
+   right; padding is wrong. Never invent.
+7. No forecasts, targets or recommendations. Label your own groupings as yours.
+8. Plain English; gloss any term a non-specialist would not know the first time it is used.
+
+==================================================================
+OUTPUT - STRICT JSON, NO MARKDOWN FENCE, NO PROSE OUTSIDE THE JSON
+==================================================================
+{"title": "<a specific title for this chapter, max 70 chars>",
+ "body": "<the chapter text, paragraphs separated by \n>",
+ "fact_ids": ["<every fact id you used>"],
+ "claims": [{"text": "<the claim>",
+             "source_ref": {"doc_id": "<id from SOURCE DOCUMENTS>",
+                            "evidence_span": "<verbatim substring of that document>"}}],
+ "counter_argument": "<the strongest honest objection to this chapter's reading, or \"\">",
+ "not_disclosed": ["<what a reader would expect here that the record does not contain>"]}
+
+=== COMPANY ===
+{company}
+
+=== THE STORY SO FAR (the report's plan) ===
+{storyline}
+
+=== CHAPTER TO WRITE ===
+{chapter_n}. {chapter_title}
+What it covers: {chapter_brief}
+This chapter's point: {chapter_point}
+Hand over to the next chapter with: {chapter_hand_off}
+
+=== PREVIOUS CHAPTER ENDED WITH ===
+{previous}
+
+=== FACT TABLE (the only numbers you may use) ===
+{fact_table}
+
+=== TABLES PRINTED WITH THIS CHAPTER (refer to them, do not retype them) ===
+{tables}
+
+=== ANALYST NOTES (forensic deep dive - qualitative guidance only) ===
+{notes}
+
+=== SOURCE DOCUMENTS (for evidence_span; quote verbatim) ===
+{sources}
