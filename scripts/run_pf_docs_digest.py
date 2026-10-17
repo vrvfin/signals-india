@@ -46,6 +46,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, load_parquet, save_parquet,
                              load_portfolio_isins, log)
 from mailer import send_email, load_mail_settings, esc
+import quarterly_table as QT
 
 # narrative doc types drained from the global queue (rating comes from ratings.parquet)
 TYPED = ("concall", "annual_report", "presentation", "results")
@@ -399,6 +400,223 @@ def _lift_summary(region: list, limit: int = SUMMARY_LIMIT) -> str:
 
 
 # ------------------------------------------------------------------ #
+#  readable layout (user 2026-10-17): In short -> table -> by theme   #
+# ------------------------------------------------------------------ #
+# The old body flattened everything into one paragraph; a results table written without
+# a leading "|" ("Metric | Q2 FY27 | Q2 FY26 | YoY%") ran straight into the prose.
+_NA = {"", "na", "n/a", "nan", "none", "-", "–", "null", "data_missing"}
+_TAG_RE = re.compile(r"^\[([A-Za-z ]+)\]\s*(.*)$")
+_SKIP_SEC = ("raw guidance", "gf1", "extraction", "methodology", "footnote", "metadata",
+             "statement id")
+_THEMES = (
+    ("Financial performance", ("revenue", "sales", "ebitda", "pat", "profit", "margin",
+                               "eps", "income", "turnover", "pbt")),
+    ("Growth & guidance", ("expect", "guid", "target", "outlook", "plan", "capex",
+                           "capacity", "order book", "orderbook", "pipeline", "will ",
+                           "going forward", "next year", "fy2")),
+    ("Corporate actions", ("joint venture", " jv", "acqui", "subsidiar", "merger",
+                           "amalgamat", "fund rais", "qip", "dividend", "buyback",
+                           "allot", "stake")),
+    ("Risks & watch-outs", ("decline", "fell", "lower", "pressure", "delay", "litigation",
+                            "risk", "loss", "weak", "headwind", "contingent", "penalty")),
+)
+
+
+def _is_na(v) -> bool:
+    return str(v if v is not None else "").strip().lower() in _NA
+
+
+def _cells(line: str) -> list:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def structure_doc(text: str) -> dict:
+    """A company_page section -> {'tags', 'tables', 'points', 'sections'}. Pure.
+
+    tables   : [[header, row, ...]] — pipe tables with OR without a leading '|'
+    points   : bullets / prose lines outside any ### sub-heading
+    sections : [(heading, [points])] for ### / #### sub-headings (concall, AR, deck)
+    """
+    text = re.sub(r"<!--.*?-->", " ", str(text or ""), flags=re.S)
+    out = {"tags": {}, "tables": [], "points": [], "sections": []}
+    cur_sec, table = None, None
+    skip = False
+
+    def _flush():
+        nonlocal table
+        if table and len(table) >= 2:
+            out["tables"].append(table)
+        table = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.count("|") >= 2:
+            cells = _cells(line)
+            if all(re.fullmatch(r":?-{2,}:?", c) or not c for c in cells):
+                continue                               # separator row
+            if skip:
+                continue
+            table = (table or []) + [cells]
+            continue
+        _flush()
+        if not line:
+            continue
+        h = re.match(r"^(#{2,4})\s+(.*)", line)
+        if h:
+            title = re.sub(r"^(section\s*[\w-]*\)?\s*[—:-]?\s*)", "", h.group(2),
+                           flags=re.I).strip(" *#")
+            skip = any(k in title.lower() for k in _SKIP_SEC)
+            cur_sec = None
+            if not skip and len(h.group(1)) >= 3:
+                cur_sec = (title, [])
+                out["sections"].append(cur_sec)
+            continue
+        if skip or _META_RE.match(line.lstrip("*_ ")):
+            continue
+        t = _TAG_RE.match(line)
+        if t:
+            out["tags"][t.group(1).strip()] = t.group(2).strip()
+            continue
+        p = line.lstrip("-*•· ").strip()
+        p = re.sub(r"^\d+[.)]\s+", "", p).strip("* ")
+        if not p or p.endswith(":") and len(p) < 40 or not (set(p) - set("-:|*# ")):
+            continue                                   # "Key Highlights:" labels
+        if (len(p.split()) <= 5 and not re.search(r"\d", p)
+                and not re.search(r"[.!?]$", p)):
+            continue                                   # "Financial Summary Table" labels
+        if any(k in p.lower() for k in _SKIP_SEC):
+            continue
+        (cur_sec[1] if cur_sec else out["points"]).append(p)
+    _flush()
+    return out
+
+
+def skip_document(doc_type: str, title: str) -> bool:
+    """Not a document to report (2026-10-17). A notice of a future call / board meeting
+    (ATHERENERG, CGPOWER), or a 'results' row whose title says it is a credit-rating
+    release (WELCORP: one CARE PDF queued as both results AND rating). Pure."""
+    if QT.is_meeting_notice(title, doc_type):
+        return True
+    return doc_type == "results" and bool(re.search(r"(?i)credit\s*rating", str(title or "")))
+
+
+def compact_table(table: list, max_cols: int = 6, max_rows: int = 12) -> list:
+    """Drop columns that are constant or empty everywhere and rows that are NA in every
+    data column; cap the size. First row is the header. Pure."""
+    if not table or len(table) < 2:
+        return []
+    width = max(len(r) for r in table)
+    rows = [r + [""] * (width - len(r)) for r in table]
+    head, body = rows[0], rows[1:]
+    keep = []
+    for j in range(width):
+        col = [r[j] for r in body]
+        if all(_is_na(c) for c in col):
+            continue
+        if len(body) > 1 and len({c.strip().lower() for c in col}) == 1:
+            continue                    # company name, quarter, "Explicit" - same on every row
+        keep.append(j)
+    keep = keep[:max_cols]
+    body = [r for r in body if not all(_is_na(r[j]) for j in keep[1:])]
+    if not body or len(keep) < 2:
+        return []
+    return [[head[j] for j in keep]] + [[r[j] for j in keep] for r in body[:max_rows]]
+
+
+def _num(s):
+    try:
+        return float(str(s).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def theme_of_point(p: str) -> str:
+    low = f" {p.lower()}"
+    for name, keys in _THEMES:
+        if any(k in low for k in keys):
+            return name
+    return "Other"
+
+
+def in_short(struct: dict, fallback: str = "") -> str:
+    """1-2 lines: Revenue and PAT from the results table (+YoY), then the first point
+    that is not about the numbers. Plain text. Pure."""
+    bits = []
+    for t in struct.get("tables", []):
+        head = [h.lower() for h in t[0]]
+        yoy = next((j for j, h in enumerate(head) if "yoy" in h), None)
+        for r in t[1:]:
+            lab = r[0].lower()
+            for key, name in (("revenue", "Revenue"), ("pat", "PAT")):
+                if lab.startswith(key) and name not in " ".join(bits):
+                    v = _num(r[1]) if len(r) > 1 else None
+                    if v is None:
+                        continue
+                    unit = " cr" if "cr" in lab else ""
+                    g = _num(r[yoy]) if yoy is not None and yoy < len(r) else None
+                    bits.append(f"{name} ₹{v:,.2f}{unit}"
+                                + (f" ({g:+.0f}% YoY)" if g is not None else ""))
+        if bits:
+            break
+    other = next((p for p in struct.get("points", [])
+                  if theme_of_point(p) != "Financial performance"), "")
+    if bits:
+        return " · ".join(bits) + (f"; {other[:160]}" if other else "")
+    return (fallback or "")[:320]
+
+
+def render_doc(struct: dict, fallback: str = "") -> str:
+    """In short -> financial table(s) -> points by theme. HTML. Pure."""
+    parts = []
+    short = in_short(struct, fallback)
+    if short:
+        parts.append(f"<div style='margin:3px 0 6px;font-size:13px'><b>In short:</b> "
+                     f"{esc(short, 420)}</div>")
+    for t in struct.get("tables", [])[:2]:
+        ct = compact_table(t)
+        if not ct:
+            continue
+        head = ct[0]
+        yoy = {j for j, h in enumerate(head) if re.search(r"(?i)yoy|qoq|growth|chg|%", h)}
+        th = "".join(f"<th style='text-align:{'left' if j == 0 else 'right'};"
+                     f"padding:3px 8px;border-bottom:1px solid #ccc;font-size:12px'>"
+                     f"{esc(h, 40)}</th>" for j, h in enumerate(head))
+        trs = []
+        for r in ct[1:]:
+            tds = []
+            for j, c in enumerate(r):
+                col = "#222"
+                if j in yoy and j and _num(c) is not None:
+                    col = "#1a7a3a" if _num(c) > 0 else "#c0392b" if _num(c) < 0 else "#777"
+                tds.append(f"<td style='text-align:{'left' if j == 0 else 'right'};"
+                           f"padding:2px 8px;border-bottom:1px solid #f0f0f0;color:{col};"
+                           f"font-size:12px'>{esc(c, 60)}</td>")
+            trs.append("<tr>" + "".join(tds) + "</tr>")
+        parts.append("<table cellspacing='0' style='border-collapse:collapse;margin:2px 0 6px'>"
+                     f"<tr>{th}</tr>{''.join(trs)}</table>")
+    groups: dict = {}
+    for p in struct.get("points", []):
+        groups.setdefault(theme_of_point(p), []).append(p)
+    order = [n for n, _ in _THEMES] + ["Other"]
+    themed = [(n, groups[n]) for n in order if n in groups]
+    themed += [(h, ps) for h, ps in struct.get("sections", []) if ps]
+    for name, ps in themed[:6]:
+        lis = "".join(f"<li style='margin:1px 0'>{esc(p, 260)}</li>" for p in ps[:4])
+        more = (f"<li style='color:#999;list-style:none'>+{len(ps) - 4} more</li>"
+                if len(ps) > 4 else "")
+        parts.append(f"<div style='margin:4px 0 0;font-weight:700;font-size:12px;"
+                     f"color:#1f4d6b'>{esc(name, 70)}</div>"
+                     f"<ul style='margin:1px 0 4px 18px;padding:0;font-size:12.5px;"
+                     f"color:#333'>{lis}{more}</ul>")
+    return "".join(parts)
+
+
+# ------------------------------------------------------------------ #
 #  collection                                                         #
 # ------------------------------------------------------------------ #
 
@@ -524,10 +742,28 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
             for _, r in grp.iterrows():
                 period = str(r.get("period") or "").strip()
                 doc_id = str(r["doc_id"])
-                summary = _lift_summary(_find_region(
-                    _company_page(drive, repo_id, isin, cache), period, dt, doc_id) or "")
+                title = str(r.get("title") or "")
+                if skip_document(dt, title):
+                    log(f"  {str(r.get('symbol') or ''):<12} {dt}: skipped — "
+                        f"{'meeting notice' if QT.is_meeting_notice(title, dt) else 'a credit-rating release, not results'}"
+                        f" ({title[:60]})")
+                    continue
+                region = _find_region(
+                    _company_page(drive, repo_id, isin, cache), period, dt, doc_id) or []
+                summary = _lift_summary(region)
                 if not summary:   # narrative missing -> structured guidance rows
                     summary = _structured_fallback(dt, doc_id, isin, tables)
+                if region:
+                    # Loose points come only from the document's OWN first section; the
+                    # region can run on into an unrelated press release (Augmont award,
+                    # 17 Oct). Sub-sections (###) still come from the whole block.
+                    st = structure_doc("\n".join(f"{h}\n{b}" for h, b in region))
+                    st["points"] = structure_doc(f"{region[0][0]}\n{region[0][1]}")["points"]
+                    rich = render_doc(st, fallback=summary)
+                    if rich:
+                        out.setdefault(isin, {"symbol": str(r.get("symbol") or ""),
+                                              "name": str(r.get("company_name") or ""),
+                                              "items": []}).setdefault("rich", {})[doc_id] = rich
                 # unambiguous doc name: ARs get FY2024-25-style labels
                 label = (_ar_display(r.get("announcement_date"))
                          if dt == "annual_report" else period)
@@ -595,9 +831,12 @@ def build_html(blocks: dict, since_date: str, days: float) -> str:
         parts.append(f"<h3 style='margin:16px 0 4px'>"
                      f"<a href='{link}' style='color:#1a237e;text-decoration:none'>"
                      f"{sym}</a> · {esc(v['name'], 40)}</h3>")
+        rich = v.get("rich", {})
         for dt, header, summary, _id, arr in items:
             icon = DOC_ICON.get(dt, "📄")
-            body = (f"<div style='margin:2px 0 8px 6px;font-size:12.5px;color:#333;"
+            body = (f"<div style='margin:2px 0 8px 6px;color:#333;border-left:3px solid "
+                    f"#ccc;padding-left:8px'>{rich[_id]}</div>" if rich.get(_id) else
+                    f"<div style='margin:2px 0 8px 6px;font-size:12.5px;color:#333;"
                     f"border-left:3px solid #ccc;padding-left:8px'>{esc(summary, SUMMARY_LIMIT)}</div>"
                     if summary else "<div style='margin:2px 0 8px 6px;font-size:12px;"
                     "color:#999'>(summary pending — the nightly backfill will extract "
@@ -742,6 +981,48 @@ def _self_test() -> int:
     check("ledger row carries the item id",
           saved and list(saved[0]["item_id"]) == ["id1"])
     check("exactly one mail sent", len(sent) == 1)
+    # ---- readable layout (2026-10-17) — the real RPEL results section ----
+    rpel = ("## Q2 FY27 Results — Board Meeting Outcome\n*Processed: 2026-10-16*\n\n"
+            "[QuarterYear] Q2 FY27\n[PriorYearQuarter] Q2 FY26\n\n"
+            "Metric | Q2 FY27 | Q2 FY26 | YoY%\n"
+            "Revenue (Cr) | 93.92 | 64.21 | 46.26\nEBITDA (Cr) | NA | NA | NA\n"
+            "PAT (Cr) | 21.63 | 13.84 | 56.29\nEPS (Rs) | 4.71 | 3.02 | 55.96\n\n"
+            "Key Highlights:\n- Revenue from operations for the quarter was Rs 93.92 Crores.\n"
+            "- The company has entered into a joint venture arrangement with TRL Krosaki "
+            "Refractories Limited.\n")
+    st = structure_doc(rpel)
+    check("table read WITHOUT a leading '|'", st["tables"] and st["tables"][0][0][0] == "Metric")
+    ct = compact_table(st["tables"][0])
+    check("all-NA row (EBITDA) dropped, others kept",
+          [r[0] for r in ct[1:]] == ["Revenue (Cr)", "PAT (Cr)", "EPS (Rs)"])
+    check("tags read, not printed as text", st["tags"].get("QuarterYear") == "Q2 FY27"
+          and not any("[QuarterYear]" in p for p in st["points"]))
+    check("'Key Highlights:' label is not a point",
+          all(not p.startswith("Key Highlights") for p in st["points"]))
+    s = in_short(st)
+    check("in short: revenue + PAT with YoY, then the JV",
+          s.startswith("Revenue ₹93.92 cr (+46% YoY) · PAT ₹21.63 cr (+56% YoY)") and "TRL Krosaki" in s)
+    check("themes: JV is a corporate action", theme_of_point(
+        "The company has entered into a joint venture arrangement with TRL Krosaki") == "Corporate actions")
+    html = render_doc(st)
+    check("render: in short, table, themed list", all(x in html for x in (
+        "In short", "<table", "Corporate actions", "#1a7a3a")))
+    # SYRMA-style wide extraction table: constant + empty columns go
+    wide = [["company", "Current Qtr", "metric", "Guidance type", "current growth", "next qtr", "1yr fwd"],
+            ["SYRMA", "Q1 FY27", "Revenue", "Explicit", "67%", "NA", "35-40%"],
+            ["SYRMA", "Q1 FY27", "PAT", "Explicit", "112%", "NA", "NA"]]
+    check("wide table: constant/empty columns dropped, incl. a constant first column",
+          compact_table(wide)[0] == ["metric", "current growth", "1yr fwd"])
+    check("short heading-like label is not a point", structure_doc(
+        "## X\nFinancial Summary Table\n- Revenue grew 30%.")["points"] == ["Revenue grew 30%."])
+    check("raw-guidance (GF1) section skipped", structure_doc(
+        "### Section GF1 — Raw Guidance Extraction\n| a | b |\n| 1 | 2 |\n- x")["tables"] == [])
+    check("skip: investor-meet intimation", skip_document(
+        "concall", "Announcement under Regulation 30 (LODR)-Analyst / Investor Meet - Intimation"))
+    check("skip: credit-rating release filed as results (WELCORP)", skip_document(
+        "results", "Announcement under Regulation 30 (LODR)-Credit Rating 16 Oct - Press Release"))
+    check("keep: a real results outcome", not skip_document(
+        "results", "Board Meeting Outcome for Outcome Of Board Meeting Held On 16 October"))
     print(f"\nrun_pf_docs_digest self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 
