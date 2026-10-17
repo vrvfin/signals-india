@@ -101,7 +101,9 @@ for label, today, stored, rows, exp_st, exp_due, text in cases:
     check(label, status == exp_st and due == exp_due and text in detail,
           f"got {status} due={due}: {detail}")
 
-# integrity(): statements + summary checks carry `due`, never FAIL on age alone
+# integrity(): statements + summary checks carry `due`, never FAIL on age alone.
+# Pinned to 2 Oct (Jun stored, 8 Oct meeting still ahead): on the real date the fake
+# calendar's meeting eventually passes and the expectation flips to "Sep out".
 print("   integrity() wiring")
 stmts = pd.DataFrame([{"symbol": "TCS", "statement": "quarterly_pl", "line_item": "Sales",
                        "period": p, "value": 1.0, "fetched_at": "2026-08-03T10:00:00"}
@@ -110,7 +112,7 @@ summ = pd.DataFrame([{"symbol": "TCS", "latest_quarter_label": "Jun 2026",
                       "fetched_at": "2026-08-03T10:00:00"}])
 st = FakeStore({"TCS.parquet": stmts, "summary.parquet": summ,
                 "results_calendar.parquet": cal(("TCS", "2026-10-08"))})
-checks = {c["id"]: c for c in PRE.integrity(st, "INE467B01029", "TCS")}
+checks = {c["id"]: c for c in PRE.integrity(st, "INE467B01029", "TCS", today=OCT2)}
 for src in ("STALE.statements", "STALE.summary"):
     c = checks.get(src, {})
     check(f"{src}: 60-day-old download but latest quarter stored -> PASS, not due",
