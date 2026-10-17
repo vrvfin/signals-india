@@ -116,6 +116,33 @@ def norm_q(qs) -> str:
 _BLANK_PERIOD = {"", "none", "nan", "nat", "<na>", "null"}
 
 
+# A filing that only ANNOUNCES a future call / board meeting (2026-10-17). It was
+# queued as concall / results: ATHERENERG "Analyst / Investor Meet - Intimation ... to
+# host Q2FY27 earnings call on October 26" mailed as a "concall transcript", and CGPOWER
+# "Board Meeting Intimation ... board meeting on 23 October" became a results REPORT
+# DATE, so results_watch waited on a holding that had not reported. Measured in the
+# queue: 12 concall + 16 results rows, none mentioning a transcript/recording/outcome.
+# Narrow on purpose: "Intimation of Credit Ratings" IS the rating and is not matched.
+_MEET_NOTICE_RE = re.compile(r"(?i)investor\s*meet\s*-?\s*intimation")
+_BOARD_NOTICE_RE = re.compile(r"(?i)board\s*meeting\s*intimation|intimation\s+of\s+board\s+meeting")
+_ARTEFACT_RE = re.compile(r"(?i)transcript|recording|audio|outcome|presentation")
+
+
+def is_meeting_notice(title, doc_type: str = "") -> bool:
+    """True when a concall/results queue row is only a notice of a future meeting. Pure."""
+    t = str(title or "")
+    dt = str(doc_type or "").strip().lower()
+    if _ARTEFACT_RE.search(t):
+        return False
+    if dt in ("concall", ""):
+        if _MEET_NOTICE_RE.search(t):
+            return True
+    if dt in ("results", ""):
+        if _BOARD_NOTICE_RE.search(t):
+            return True
+    return False
+
+
 def queue_report_dates(queue, season: str) -> dict:
     """{isin: 'YYYY-MM-DD'} — results filings for `season` from the global queue.
 
@@ -137,6 +164,8 @@ def queue_report_dates(queue, season: str) -> dict:
     if "doc_type" not in queue.columns or "announcement_date" not in queue.columns:
         return {}
     q = queue[queue["doc_type"].astype(str) == "results"].copy()
+    if "title" in q.columns:          # a board-meeting NOTICE is not a report date
+        q = q[[not is_meeting_notice(t, "results") for t in q["title"]]]
     if q.empty:
         return {}
     q["_d"] = q["announcement_date"].astype(str).str.slice(0, 10)

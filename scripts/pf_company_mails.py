@@ -2499,6 +2499,12 @@ def main() -> None:
     sent_rows = []
     for d in due:
         isin, sym, name, dt = d["isin"], d["symbol"], d["name"], d["doc_type"]
+        # A notice of a FUTURE call / board meeting is not a transcript or a result
+        # (ATHERENERG, CGPOWER 16 Oct: mailed as "concall transcript, Q2FY27").
+        if QT.is_meeting_notice(d.get("doc_title"), dt):
+            log(f"  {sym:<12} {dt}: meeting notice, not the document — skipped "
+                f"({str(d.get('doc_title') or '')[:70]})")
+            continue
         _attach = None
         if dt == "presentation":
             body = presentation_body(isin, sym, name, season, tables)

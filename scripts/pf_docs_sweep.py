@@ -917,6 +917,14 @@ def main() -> None:
             miss = [d for d in miss if d not in _audio]
             log(f"  - {sym:<14} dropped {len(_audio)} audio link(s) "
                 f"(recordings are not extractable documents)")
+        # ...nor a NOTICE of a future call / board meeting (ATHERENERG, CGPOWER 16 Oct:
+        # mailed as a "concall transcript" and counted as a results report date).
+        import quarterly_table as _QT
+        _notice = [d for d in miss if _QT.is_meeting_notice(d.get("title"), d.get("doc_type"))]
+        if _notice:
+            miss = [d for d in miss if d not in _notice]
+            log(f"  - {sym:<14} dropped {len(_notice)} meeting notice(s) "
+                f"(an intimation of a future call / board meeting is not the document)")
         if miss:
             per_company[sym] = miss
             for d in miss:
@@ -1083,6 +1091,31 @@ def _self_test() -> int:
           classify("Allotment of equity shares") == "")
     check("'Segment' does not trip the egm rule",
           classify("Segment wise Financial Results") == "results")
+    # 2026-10-17: notices of a future call / board meeting are not documents (real titles)
+    import quarterly_table as _QT
+    N = _QT.is_meeting_notice
+    check("investor-meet INTIMATION is a notice (ATHERENERG)", N(
+        "Announcement under Regulation 30 (LODR)-Analyst / Investor Meet - Intimation 16 Oct - "
+        "Ather Energy to host Q2FY27 earnings conference call on October 26, 2026", "concall"))
+    check("board meeting intimation is a notice (CGPOWER)", N(
+        "Board Meeting Intimation for Consideration And Approval Of The Unaudited Financial "
+        "Results For The Half Year And Quarter Ended 30Th September, 2026", "results"))
+    check("'Intimation of Board Meeting To Be Held' is a notice",
+          N("Board Meeting Intimation for Intimation Of Board Meeting To Be Held On Monday", "results"))
+    check("investor-meet OUTCOME / transcript is NOT a notice", not N(
+        "Analyst / Investor Meet - Outcome 3 Aug - Transcript of the earnings call", "concall"))
+    check("credit-rating intimation IS the rating, not a notice", not N(
+        "Announcement under Regulation 30 (LODR)-Credit Rating 29 Sep - Intimation of Credit "
+        "Ratings from India Ratings", "rating"))
+    check("outcome of board meeting is NOT a notice",
+          not N("Outcome of Board Meeting - Financial Results Q2 FY27", "results"))
+    _q = pd.DataFrame([
+        {"doc_type": "results", "announcement_date": "2026-10-14", "period": "",
+         "isin": "CG", "title": "Board Meeting Intimation for Consideration of Results"},
+        {"doc_type": "results", "announcement_date": "2026-10-16", "period": "",
+         "isin": "RP", "title": "Financial Results for the quarter ended September 30, 2026"}])
+    check("report dates ignore board-meeting notices",
+          set(_QT.queue_report_dates(_q, "Q2FY27")) == {"RP"})
     check("bare REC is an audio link", is_audio_link("REC", "http://x/rec"))
     check("REC enriched with its parent row is still audio",
           is_audio_link("REC — Aug 2026 Transcript PPT REC", "http://x/r"))
