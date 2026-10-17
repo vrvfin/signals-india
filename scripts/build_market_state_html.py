@@ -557,37 +557,100 @@ MACRO_CHARTS = [
 ]
 
 
-def _macro_block(drive):
+def _flows_chart(fd, cal):
+    """Running total of FII and DII net cash-market buying, as (card, chart) or
+    (None, None).
+
+    Two facts shape it. The source starts 2026-05-15: NSE's endpoint serves only
+    the latest day, so ingest_fii_dii.py has tracked from its first run and the
+    history grows one day per CI run. And a running total silently UNDER-counts
+    any day the ingest missed, so missing trading days are found against the
+    Nifty calendar and named on the card rather than hidden in the line."""
+    if fd is None or fd.empty or not {"date", "category", "net"} <= set(fd.columns):
+        return None, None
+    f = fd.copy()
+    f["date"] = pd.to_datetime(f["date"], errors="coerce").dt.normalize()
+    f["net"] = pd.to_numeric(f["net"], errors="coerce")
+    f = f.dropna(subset=["date", "net"])
+    cat = f["category"].astype(str)
+    fii = f[cat.str.contains("FII")].groupby("date")["net"].sum()
+    dii = f[cat.str.contains("DII")].groupby("date")["net"].sum()
+    idx = fii.index.union(dii.index).sort_values()
+    if idx.empty:
+        return None, None
+    fc = fii.reindex(idx).fillna(0).cumsum()
+    dc = dii.reindex(idx).fillna(0).cumsum()
+    gap = ""
+    if cal is not None:
+        c = pd.DatetimeIndex(pd.to_datetime(pd.Series(cal), errors="coerce").dropna()).normalize()
+        missing = sorted(set(c[(c >= idx[0]) & (c <= idx[-1])]) - set(idx))
+        if missing:
+            days = ", ".join(d.strftime("%d %b %Y") for d in missing[:6])
+            more = f" and {len(missing) - 6} more" if len(missing) > 6 else ""
+            gap = (f" <b>Missing from the source:</b> {days}{more} — NSE traded "
+                   f"but no FII/DII row was captured, so the running totals omit "
+                   f"{'that day' if len(missing) == 1 else 'those days'}.")
+    since = idx[0].strftime("%d %b %Y")
+    note = (f"Running total of net cash-market buying (+) or selling (−) since "
+            f"tracking began on {since}, from NSE's daily provisional figures. "
+            f"Lines moving apart = domestic institutions absorbing foreign "
+            f"selling, or the reverse. NSE publishes no history, so this grows "
+            f"one day at a time.{gap}")
+    chart = {"d": [d.strftime("%Y-%m-%d") for d in idx],
+             "s": [_ser("FII/FPI cumulative", "#1a3d6e", _vals(fc, 0), f="int"),
+                   _ser("DII cumulative", "#e67e22", _vals(dc, 0), f="int")],
+             "r": [[0, 0]]}
+    card = _card("mc_flows",
+                 f"FII vs DII net flow — cumulative since {since} (₹ crore)", note)
+    return card, chart
+
+
+def _macro_block(drive, fd=None, cal=None):
     """Returns (section_html, payload). Each chart carries its own dates: crude
-    and the S&P do not trade on NSE's calendar. A 200-day average rides along,
-    because above or below it is the quickest honest read of the trend."""
+    and the S&P do not trade on NSE's calendar. A 200-day average rides along
+    the price series, because above or below it is the quickest honest read of
+    the trend. The FII/DII flow chart sits right after the rupee — the two tend
+    to move together."""
     charts, cards, spans = {}, [], []
+    fcard, fchart = _flows_chart(fd, cal)
+
+    def _add_flows():
+        charts["mc_flows"] = fchart
+        cards.append(fcard)
+        spans.append(f"FII_DII {fchart['d'][0]}-{fchart['d'][-1]}")
+
     for cid, human, name, folder, color, fmt, note in MACRO_CHARTS:
         try:
             s = _close_series(drive, _folder(drive, folder), name)
         except Exception as e:
             log(f"macro: {name} unavailable ({str(e)[:60]})")
             s = None
-        if s is None or s.dropna().empty:
-            continue
-        s = s.dropna()
-        charts[cid] = {
-            "d": [d.strftime("%Y-%m-%d") for d in s.index],
-            "s": [_ser(human.split(" (")[0], color, _vals(s, 2), f=fmt),
-                  _ser("200-day average", _C["grey"],
-                       _vals(s.rolling(200, min_periods=150).mean(), 2), f=fmt, w=1)],
-        }
-        cards.append(_card(cid, human, note, cls="chart bchart"))
-        spans.append(f"{name} {s.index[0].year}-{s.index[-1].date()}")
+        if s is not None and not s.dropna().empty:
+            s = s.dropna()
+            charts[cid] = {
+                "d": [d.strftime("%Y-%m-%d") for d in s.index],
+                "s": [_ser(human.split(" (")[0], color, _vals(s, 2), f=fmt),
+                      _ser("200-day average", _C["grey"],
+                           _vals(s.rolling(200, min_periods=150).mean(), 2),
+                           f=fmt, w=1)],
+            }
+            cards.append(_card(cid, human, note, cls="chart bchart"))
+            spans.append(f"{name} {s.index[0].year}-{s.index[-1].date()}")
+        if cid == "mc_usdinr" and fchart:
+            _add_flows()
+            fchart = None
+    if fchart:                       # no rupee chart: flows still render, last
+        _add_flows()
     if not charts:
         return "", {}
     log("macro: " + " | ".join(spans))
     return (
-        '<h2 id="sec-macro">Macro drivers — crude, the rupee, gold, global risk</h2>'
-        '<div style="font-size:11px;color:#888;margin:0 6px 6px">Drive\'s daily '
-        'series (from 2016) joined to the local deep history (to 2001-2007); the '
-        'two agree to a median 0.000% where they overlap. Grey line = 200-day '
-        'average.</div>'
+        '<h2 id="sec-macro">Macro drivers — crude, the rupee, FII flows, gold, '
+        'global risk</h2>'
+        '<div style="font-size:11px;color:#888;margin:0 6px 6px">Price series: '
+        'Drive\'s daily data (from 2016) joined to the local deep history (to '
+        '2001-2007); the two agree to a median 0.000% where they overlap. Grey '
+        'line = 200-day average.</div>'
         f'<div class="charts">{"".join(cards)}</div>',
         {"charts": charts},
     )
@@ -731,8 +794,12 @@ function _applyWin(c){ try{
  const ts=c.ch.timeScale(); let lt=null;
  c.made.forEach(function(m){ if(m.lastT&&(!lt||m.lastT>lt)) lt=m.lastT; });
  if(!_win||!lt){ ts.fitContent(); return; }
- const q=_ymd(lt);
- ts.setVisibleRange({from:(q.y-_win)+'-'+_p2(q.m)+'-'+_p2(q.d),to:lt});
+ let ft=null; c.made.forEach(function(m){ if(m.firstT&&(!ft||m.firstT<ft)) ft=m.firstT; });
+ const q=_ymd(lt), from=(q.y-_win)+'-'+_p2(q.m)+'-'+_p2(q.d);
+ /* window wider than the data (the 4-month FII series at 3y): show it all,
+    not a chart that is mostly empty on the left */
+ if(ft&&from<=ft){ ts.fitContent(); return; }
+ ts.setVisibleRange({from:from,to:lt});
 }catch(e){} }
 function _mk(el,series,refs,D0){
  const left=(series||[]).some(function(s){return s.ax==='left';});
@@ -755,7 +822,8 @@ function _mk(el,series,refs,D0){
            : ch.addLineSeries(Object.assign({lineWidth:s.w||2},o));
    ser.setData(data);
    made.push({ser:ser,s:s,last:data.length?data[data.length-1].value:null,
-              lastT:data.length?data[data.length-1].time:null});
+              lastT:data.length?data[data.length-1].time:null,
+              firstT:data.length?data[0].time:null});
  });
  /* dashed guides (50%, 0, the 0.40 / 0.615 thrust levels): value on the axis
     only, no title, so nothing is drawn across the plot */
@@ -784,7 +852,7 @@ function bdraw(){
 function mdraw(){
  Object.keys((MP&&MP.charts)||{}).forEach(function(cid){
    const el=document.getElementById(cid); if(!el) return;
-   const c=MP.charts[cid]; _mch.push(_mk(el,c.s,null,c.d));
+   const c=MP.charts[cid]; _mch.push(_mk(el,c.s,c.r||null,c.d));
  });
 }
 function _bmark(cls,attr,val){
@@ -976,7 +1044,8 @@ def main():
         log(f"breadth: {bd['date'].nunique():,} days x "
             f"{bd['universe'].nunique()} universes, "
             f"{bd['date'].min().date()} -> {bd['date'].max().date()}")
-    macro_html, mpayload = _macro_block(drive)
+    macro_html, mpayload = _macro_block(
+        drive, fd, n50["date"] if "date" in n50.columns else None)
 
     if args.dry_run:
         log(f"DRY-RUN — {len(chart_ids)} trend charts, "
