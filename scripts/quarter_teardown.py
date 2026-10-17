@@ -2461,6 +2461,19 @@ def main() -> None:
                         prev_keys[str(r["isin"]).strip()] = _k
                         continue
                     done.add(str(r["isin"]).strip())
+                # The COMBINED (t4_nightly --daily) mail leaves out holdings that already
+                # had their own per-company mail this season (2026-10-17: RPEL got both,
+                # 14:26 per-company + 14:37 combined). Per-company + results_watch now
+                # cover every reporter; the combined mail keeps only what they missed.
+                if not args.per_company and "mail_mode" in led.columns:
+                    _pc = led[(led["season_quarter"].astype(str) == season)
+                              & (led["mail_mode"].astype(str) == "per_company")]
+                    _pc_isins = set(_pc["isin"].astype(str).str.strip())
+                    if _pc_isins:
+                        done |= _pc_isins
+                        for _i in _pc_isins:
+                            prev_keys.pop(_i, None)
+                            prev_filing.pop(_i, None)
             before = len(targets)
             targets = [t for t in targets if t[0] not in done]
             if before != len(targets):
