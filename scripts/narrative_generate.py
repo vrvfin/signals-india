@@ -221,6 +221,11 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
                     "takeaway": "", "body": "", "claims": [],
                     "not_disclosed": gaps, "error": str(e)[:200]}
         out = _parse(raw)
+        if out is not None:
+            # The model sometimes REWRITES the id it was given ("scale-history" for 5); the
+            # renderer matches prose by id, so those sections printed no prose at all
+            # (Morepen 2026-10-04: 5 and 19). The section number is ours, not the model's.
+            out["id"] = str(sec)
         if out is None:
             log(f"    section {sec}: unparseable JSON on attempt {attempt}")
             findings = [VG.Finding("parse", "fail", str(sec),

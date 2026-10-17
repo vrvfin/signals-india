@@ -171,10 +171,14 @@ pre {
     background: #f4f4f8;
     padding: 3mm;
     font-size: 7.5pt;
-    overflow-x: auto;
+    /* WRAP, never scroll: paper cannot scroll, so overflow-x:auto cut every long line off
+       at the right margin (Ather 2026-10-04: 16 of 22 pages). */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     margin: 2mm 0;
     page-break-inside: avoid;
 }
+sup { font-size: 6.5pt; line-height: 0; color: #556; }
 
 /* ── Blockquote / highlights ─────────────────────────────────────────── */
 blockquote {
