@@ -199,6 +199,16 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
 
     prompt = build_prompt(tpl, company, sec, facts, tables, gaps, sources)
     subpack = {"facts": facts, "tables": tables}
+    return _write_and_gate(pool, prompt, subpack, sources, str(sec),
+                           SECTION_BRIEFS.get(sec, ("", ""))[0], gaps, log)
+
+
+def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
+                    uid: str, title: str, gaps: list, log=print,
+                    label: str = "section") -> dict:
+    """Write one unit (a story section, or a chapter of the merged report), run
+    Gates 1 and 2 on it and regenerate ONCE with the failures fed back. Shared so
+    the chapter writer gets exactly the grounding the section writer has."""
     attempt, findings, out = 0, [], None
     # Keep the BEST attempt, not the last. A retry that returns unparseable output is
     # strictly worse than a first attempt that parsed with gate failures — overwriting
@@ -213,17 +223,22 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
     while attempt < 2:
         attempt += 1
         try:
-            raw = pool.call_text(prompt, f"narrative_s{sec}",
+            raw = pool.call_text(prompt, f"narrative_s{uid}",
                                  max_output_tokens=MAX_OUTPUT_TOKENS)
         except Exception as e:
-            log(f"    section {sec}: generation failed — {str(e)[:140]}")
-            return {"id": str(sec), "title": SECTION_BRIEFS.get(sec, ("", ""))[0],
+            log(f"    {label} {uid}: generation failed — {str(e)[:140]}")
+            return {"id": uid, "title": title,
                     "takeaway": "", "body": "", "claims": [],
                     "not_disclosed": gaps, "error": str(e)[:200]}
         out = _parse(raw)
+        if out is not None:
+            # The model sometimes REWRITES the id it was given ("scale-history" for 5); the
+            # renderer matches prose by id, so those sections printed no prose at all
+            # (Morepen 2026-10-04: 5 and 19). The section number is ours, not the model's.
+            out["id"] = uid
         if out is None:
-            log(f"    section {sec}: unparseable JSON on attempt {attempt}")
-            findings = [VG.Finding("parse", "fail", str(sec),
+            log(f"    {label} {uid}: unparseable JSON on attempt {attempt}")
+            findings = [VG.Finding("parse", "fail", uid,
                                    "response was not valid JSON")]
             prompt += ("\n\nYour previous response was not valid JSON. Return ONLY the "
                        "JSON object, with no prose and no markdown fence.")
@@ -236,8 +251,8 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
         # that filing, which is exactly what verify_spans establishes.
         claims = out.get("claims") or []
         span_findings, verified_spans = VG.verify_spans_detailed(
-            claims, sources, str(sec))
-        findings = (VG.verify_numbers(prose, subpack, str(sec),
+            claims, sources, uid)
+        findings = (VG.verify_numbers(prose, subpack, uid,
                                       licensed_text=" ".join(verified_spans))
                     + span_findings)
         hard = [f for f in findings if f.severity == "fail"]
@@ -247,13 +262,13 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
             out["gate_findings"] = [f.__dict__ for f in findings]
             out["attempts"] = attempt
             return out
-        log(f"    section {sec}: {len(hard)} gate failure(s) on attempt {attempt}")
+        log(f"    {label} {uid}: {len(hard)} gate failure(s) on attempt {attempt}")
         if attempt >= 2:
             break
         # Feed the failures back as constraints rather than a vague "try again".
         detail = "\n".join(f"- {f.detail} (near: {f.excerpt[:110]})" for f in hard)
         prompt += (f"\n\nYour previous answer FAILED these mechanical checks:\n{detail}\n"
-                   f"Rewrite the section. Use ONLY numbers present in the FACT TABLE, at "
+                   f"Rewrite the {label}. Use ONLY numbers present in the FACT TABLE, at "
                    f"the precision shown, and make every evidence_span an exact "
                    f"substring of a SOURCE DOCUMENT. Drop any claim you cannot ground.")
 
@@ -261,18 +276,19 @@ def generate_section(pool, tpl, pack, sec: int, sources: dict[str, str],
         attempt_used, out, findings = best
     else:
         attempt_used = attempt
-        out = {"id": str(sec), "title": SECTION_BRIEFS.get(sec, ("", ""))[0],
+        out = {"id": uid, "title": title,
                "takeaway": "", "body": "", "claims": []}
     out["gate_findings"] = [f.__dict__ for f in findings]
     out["gate_failed"] = True
     out["attempts"] = attempt_used
-    log(f"    section {sec}: KEPT WITH FLAGS (best of {attempt} attempts was #"
+    log(f"    {label} {uid}: KEPT WITH FLAGS (best of {attempt} attempts was #"
         f"{attempt_used}, {len([f for f in findings if f.severity == 'fail'])} "
         f"unresolved failure(s))")
     return out
 
 
-def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> dict:
+def _writer_pool(log=print):
+    """(pool, models) for the writer: FREE_POOL keys, models from the registry."""
     keys = load_keys(os.environ, prefix="FREE_POOL") or \
         load_keys(os.environ, prefix="GEMINI_API_KEY")
     if not keys:
@@ -287,6 +303,11 @@ def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> d
     pool._pool.model_overload_keys = overload_keys(len(keys))
     log(f"  writer pool: {len(keys)} key(s) · {len(models)} model(s) · a model is dropped "
         f"after busy replies on {pool._pool.model_overload_keys} keys")
+    return pool, models
+
+
+def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> dict:
+    pool, models = _writer_pool(log)
     tpl = (Path(_HERE) / PROMPT_FILE).read_text(encoding="utf-8")
 
     have = sorted({f["section"] for f in pack["facts"]}
@@ -303,6 +324,125 @@ def generate(pack: dict, sources: dict[str, str], sections=None, log=print) -> d
     from model_registry import record_usage          # busy demotion sees these models
     record_usage(pool, "narrative_writer", "narrative", log=log)
     return {"company": pack["company"], "sections": out,
+            "generator_model": models[0],
+            "sections_with_unresolved_gate_failures": flagged}
+
+
+# ---------------------------------------------------------- merged company report --
+# User 2026-10-17: ONE report in one flow. A storyline pass plans the whole company
+# (business dynamics + financial dynamics, one point per chapter); each chapter is then
+# written CONTINUING the previous one, with the deep dive's text as analyst notes. The
+# number gate and span check are the section writer's (_write_and_gate), unchanged.
+STORY_PROMPT_FILE = "narrative_storyline_prompt.txt"
+CHAPTER_PROMPT_FILE = "narrative_chapter_prompt.txt"
+STORY_NOTES_CHARS = 9000
+
+
+def _storyline(pool, pack: dict, chapters: list[dict], forensic_md: str, log=print) -> dict:
+    """One call: the report's plan. Its numbers go through the same number gate (whole
+    fact pack); a plan that still fails after one retry is kept and flagged."""
+    import render_company_report as RCR
+    dd = RCR.parse_forensic(forensic_md or "")
+    notes = "\n\n".join(RCR._plain_notes(dd[k]) for k in ("onepager", "1.7", "0.5", "1.6", "0.6")
+                        if dd.get(k))[:STORY_NOTES_CHARS]
+    co = pack["company"]
+    tpl = (Path(_HERE) / STORY_PROMPT_FILE).read_text(encoding="utf-8")
+    prompt = (tpl
+              .replace("{company}", f"{co['name']} ({co['symbol']} / {co['isin']}) — all "
+                                    f"figures in Indian rupees (Rs crore).")
+              .replace("{chapters}", "\n".join(f"{c['n']}. {c['title']} — {c['brief']}"
+                                               for c in chapters))
+              .replace("{fact_table}", _fact_table(pack["facts"]))
+              .replace("{notes}", notes or "(no deep dive for this copy)"))
+    best = None
+    for attempt in (1, 2):
+        try:
+            raw = pool.call_text(prompt, "narrative_storyline",
+                                 max_output_tokens=MAX_OUTPUT_TOKENS)
+        except Exception as e:
+            log(f"    storyline: generation failed — {str(e)[:140]}")
+            break
+        out = _parse(raw)
+        if out is None:
+            log(f"    storyline: unparseable JSON on attempt {attempt}")
+            prompt += ("\n\nYour previous response was not valid JSON. Return ONLY the "
+                       "JSON object, with no prose and no markdown fence.")
+            continue
+        prose = " ".join([str(out.get("one_page", ""))]
+                         + [str(x) for k in ("business_dynamics", "financial_dynamics",
+                                             "watch") for x in (out.get(k) or [])])
+        hard = [f for f in VG.verify_numbers(prose, pack, "story") if f.severity == "fail"]
+        if best is None or len(hard) < best[1]:
+            best = (out, len(hard))
+        if not hard:
+            break
+        log(f"    storyline: {len(hard)} gate failure(s) on attempt {attempt}")
+        prompt += ("\n\nYour previous answer used numbers that are NOT in the FACT TABLE:\n"
+                   + "\n".join(f"- {f.detail} (near: {f.excerpt[:110]})" for f in hard)
+                   + "\nRewrite it with ONLY numbers from the FACT TABLE, or none.")
+    if best is None:
+        return {"one_page": "", "business_dynamics": [], "financial_dynamics": [],
+                "watch": [], "chapters": [], "failed": True}
+    out, n_hard = best
+    out["gate_failed"] = bool(n_hard)
+    return out
+
+
+def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
+                    log=print) -> dict:
+    """The merged report's text: storyline + one gated chapter at a time. Chapters with
+    nothing to write about are not called at all (render_company_report.chapter_inputs)."""
+    import render_company_report as RCR
+    pool, models = _writer_pool(log)
+    chapters = RCR.chapter_inputs(pack, forensic_md)
+    cpack = RCR.chapter_pack(pack)
+    log(f"  writing {len(chapters)} chapter(s): {[c['n'] for c in chapters]}"
+        + (" — with the deep dive as analyst notes" if forensic_md else " — no deep dive"))
+    log("  [storyline]")
+    story = _storyline(pool, pack, chapters, forensic_md, log)
+    plan = {int(c.get("n", 0)): c for c in story.get("chapters") or []
+            if str(c.get("n", "")).isdigit()}
+    story_txt = "\n".join(
+        [str(story.get("one_page", ""))]
+        + [f"- {x}" for x in story.get("business_dynamics") or []]
+        + [f"- {x}" for x in story.get("financial_dynamics") or []]) or "(no plan)"
+    tpl = (Path(_HERE) / CHAPTER_PROMPT_FILE).read_text(encoding="utf-8")
+    co = pack["company"]
+    out, prev = [], "(this is the first chapter)"
+    for i, ch in enumerate(chapters):
+        p = plan.get(ch["n"], {})
+        log(f"  [{i + 1}/{len(chapters)}] chapter {ch['n']}: {ch['title']}")
+        prompt = (tpl
+                  .replace("{company}", f"{co['name']} ({co['symbol']} / {co['isin']}) — "
+                                        f"an Indian listed company; all figures in Indian "
+                                        f"rupees (Rs crore).")
+                  .replace("{storyline}", story_txt)
+                  .replace("{chapter_n}", str(ch["n"]))
+                  .replace("{chapter_title}", ch["title"])
+                  .replace("{chapter_brief}", ch["brief"])
+                  .replace("{chapter_point}", str(p.get("point") or "(use your judgement)"))
+                  .replace("{chapter_hand_off}", str(p.get("hand_off") or "(none)"))
+                  .replace("{previous}", prev)
+                  .replace("{fact_table}", _fact_table(ch["facts"]) if ch["facts"]
+                           else "(no computed figures for this chapter — write no numbers)")
+                  .replace("{tables}", _tables_blob(ch["tables"]))
+                  .replace("{notes}", ch["notes"] or "(none)")
+                  .replace("{sources}", _sources_blob(sources)))
+        subpack = {"facts": [f for f in cpack["facts"] if f.get("section") == ch["id"]],
+                   "tables": [t for t in cpack["tables"] if t.get("section") == ch["id"]]}
+        res = _write_and_gate(pool, prompt, subpack, sources, ch["id"], ch["title"],
+                              ch["gaps"], log, label="chapter")
+        res.update({"id": ch["id"], "chapter": ch["n"], "sections": ch["sections"]})
+        out.append(res)
+        paras = [x for x in str(res.get("body") or "").split("\n") if x.strip()]
+        if paras:
+            prev = paras[-1]
+        if i < len(chapters) - 1:
+            time.sleep(INTER_CALL_SLEEP)
+    flagged = sum(1 for s in out if s.get("gate_failed"))
+    from model_registry import record_usage          # busy demotion sees these models
+    record_usage(pool, "narrative_writer", "narrative", log=log)
+    return {"company": co, "layout": "chapters", "storyline": story, "sections": out,
             "generator_model": models[0],
             "sections_with_unresolved_gate_failures": flagged}
 

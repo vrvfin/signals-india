@@ -142,8 +142,11 @@ thead th {
     text-align: left;
     font-weight: 700;
     border: 1px solid #1a2a6c;
-    white-space: nowrap;
+    /* headers WRAP: nowrap forced a 7-column table wider than the page and cut its last
+       column off (scenario table, 2026-10-18). Paper cannot scroll. */
+    white-space: normal;
 }
+tbody td { overflow-wrap: anywhere; }
 tbody tr:nth-child(even) {
     background-color: #f0f3ff;
 }
@@ -171,10 +174,14 @@ pre {
     background: #f4f4f8;
     padding: 3mm;
     font-size: 7.5pt;
-    overflow-x: auto;
+    /* WRAP, never scroll: paper cannot scroll, so overflow-x:auto cut every long line off
+       at the right margin (Ather 2026-10-04: 16 of 22 pages). */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     margin: 2mm 0;
     page-break-inside: avoid;
 }
+sup { font-size: 6.5pt; line-height: 0; color: #556; }
 
 /* ── Blockquote / highlights ─────────────────────────────────────────── */
 blockquote {

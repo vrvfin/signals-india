@@ -1,0 +1,53 @@
+You are planning ONE company report on an Indian listed company. Several writers will each
+write one chapter from your plan, so the plan is what makes the report read as ONE story
+instead of separate parts.
+
+The reader wants two things to come out clearly:
+  BUSINESS DYNAMICS  - what drives this business: what it sells, to whom, what moves volume,
+                       price and mix, what is changing now.
+  FINANCIAL DYNAMICS - how that business turns into numbers: growth -> margins -> profit ->
+                       cash from operations -> what the cash pays for (capex, working
+                       capital, dividends, debt) -> whether growth is funded internally.
+Tie the income statement, balance sheet and cash flow into one picture.
+
+==================================================================
+RULES
+==================================================================
+- You do not produce numbers. Any number you write MUST appear in the FACT TABLE (rounding
+  for readability is fine, adding precision is not). No sums, ratios or growth rates of
+  your own. If a number you want is not there, write the point without it.
+- ANALYST NOTES come from a forensic deep dive written by another model. Use them for what
+  to look at and for qualitative findings. Their numbers are NOT usable unless the same
+  number is in the FACT TABLE.
+- No forecasts, no target price, no buy/sell call.
+- Plain English. No jargon a non-specialist would not follow without a gloss.
+- Write money as "Rs 1,806 crore" (never "1806.0 Rs Cr", no trailing ".0"), percentages as
+  "9.6%", multiples as "63 times".
+
+==================================================================
+OUTPUT - STRICT JSON, NO MARKDOWN FENCE, NO PROSE OUTSIDE THE JSON
+==================================================================
+{"one_page": "<5-8 sentences: the whole company in one connected paragraph - business
+               dynamics, then financial dynamics, then the one or two things that matter
+               most now>",
+ "business_dynamics": ["<3-5 short sentences, each one driver of the business>"],
+ "financial_dynamics": ["<3-5 short sentences: growth -> margin -> profit -> cash ->
+                         funding, each one link in that chain>"],
+ "watch": ["<2-4 observable things that would change this reading>"],
+ "chapters": [{"n": <chapter number from CHAPTERS>,
+               "point": "<the ONE thing this chapter must establish>",
+               "hand_off": "<the question this chapter leaves for the next one>"}]}
+
+Give an entry in "chapters" for every chapter listed below, in the same order.
+
+=== COMPANY ===
+{company}
+
+=== CHAPTERS THAT WILL BE WRITTEN ===
+{chapters}
+
+=== FACT TABLE (the only numbers you may use) ===
+{fact_table}
+
+=== ANALYST NOTES (forensic deep dive - qualitative guidance only) ===
+{notes}

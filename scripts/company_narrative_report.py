@@ -9,7 +9,7 @@ markdown and an HTML deck.
     Layer B     narrative_generate    Gemini writes prose; Gates 1-2 enforce grounding
     Part B      (existing deep dive)  attached via --forensic-md
     Layer C     report_auditor        Cerebras re-validates against source
-    Layer D     render_narrative_deck md + html, audit-annotated
+    Layer D     render_company_report: ONE merged file (story + deep dive), refs in appendix
 
 Part B is ATTACHED rather than invoked: `company_deep_report.py` writes to Drive and has
 its own queue lifecycle, so calling it from here would duplicate side effects. Run it
@@ -48,7 +48,7 @@ import narrative_factpack as FP
 import narrative_generate as GEN
 import narrative_preflight as PRE
 import narrative_sources as SRC
-import render_narrative_deck as RENDER
+import render_company_report as REPORT  # ONE merged file: story + deep dive (2026-10-17)
 import format_deepdive_pdf as FMT     # PDF + file naming shared with the deep dive
 
 INDEX_FILE = "narrative_index.parquet"
@@ -225,8 +225,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     d = pack.to_dict()
     # A due quarter Screener still does not have: build on the previous quarter and SAY
     # so at the top of the report (statements + summary carry the same sentence).
-    d["data_notes"] = list(dict.fromkeys(ch["detail"] for ch in rep["integrity"]
-                                         if ch.get("due")))
+    # ...and keep the fact pack's own notes (e.g. history pulled live from Screener).
+    d["data_notes"] = list(dict.fromkeys(list(d.get("data_notes") or [])
+                                         + [ch["detail"] for ch in rep["integrity"]
+                                            if ch.get("due")]))
     for n in d["data_notes"]:
         log(f"  DATA NOTE on the report: {n}")
     log(f"  {len(d['facts'])} facts · {len(d['tables'])} tables · "
@@ -256,23 +258,31 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
 
     # ---- Layer B ----------------------------------------------------------
     log("[4/6] narrative generation (Gemini)")
+    # The deep dive is read BEFORE writing (user 2026-10-17, one merged report): the chapter
+    # writer uses it as analyst notes, chapter by chapter, instead of appending it as Part B.
+    forensic = ""
+    if args.forensic_md:
+        p = Path(args.forensic_md)
+        if p.exists():
+            forensic = p.read_text(encoding="utf-8")
+            log(f"  forensic deep dive: {p.name} ({len(forensic):,} chars)")
+        else:
+            log(f"  WARNING: --forensic-md {p} not found; written without the deep dive")
     try:
-        nar = GEN.generate(d, chosen, args.sections, log=log)
+        if args.sections:          # old per-section writer, kept for targeted reruns
+            nar = GEN.generate(d, chosen, args.sections, log=log)
+        else:
+            nar = GEN.generate_report(d, chosen, forensic, log=log)
     except Exception as e:
         log(f"  generation FAILED: {str(e)[:200]}")
         if args.debug:
             traceback.print_exc()
         return None
     flagged = nar.get("sections_with_unresolved_gate_failures", 0)
-    log(f"  {len(nar['sections'])} section(s); {flagged} with unresolved gate failures")
-    if args.forensic_md:
-        p = Path(args.forensic_md)
-        if p.exists():
-            nar["forensic_report"] = p.read_text(encoding="utf-8")
-            log(f"  attached forensic report: {p.name} "
-                f"({len(nar['forensic_report']):,} chars)")
-        else:
-            log(f"  WARNING: --forensic-md {p} not found; Part B will be empty")
+    log(f"  {len(nar['sections'])} {'chapter' if nar.get('layout') == 'chapters' else 'section'}"
+        f"(s); {flagged} with unresolved gate failures")
+    if forensic:
+        nar["forensic_report"] = forensic
     (outdir / f"narrative_{co['symbol']}.json").write_text(
         json.dumps(nar, indent=2), encoding="utf-8")
 
@@ -298,7 +308,11 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             # The fact pack goes to the auditor as an evidence table. Without it every
             # computed figure comes back UNSUPPORTED, because those numbers live in
             # Screener statements rather than in any filing in the document bundle.
-            audit = audit_report(adj, secs, chosen, factpack=d)
+            # A chapter is checked against ITS chapter's figures: the fact pack is re-keyed
+            # from story sections to chapter ids, or the auditor would see an empty table.
+            audit = audit_report(adj, secs, chosen,
+                                 factpack=(REPORT.chapter_pack(d)
+                                           if nar.get("layout") == "chapters" else d))
             if getattr(adj, "_gem", None) is not None:    # Gemini audit: log its models
                 from model_registry import record_usage
                 record_usage(adj._gem, "narrative_audit", "narrative", log=log)
@@ -324,9 +338,14 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     stamp = datetime.now().strftime("%d%b%y")
     md_p = outdir / f"company_narrative_{co['symbol']}_{stamp}.md"
     html_p = outdir / f"company_narrative_{co['symbol']}_{stamp}.html"
-    md = RENDER.render_markdown(d, nar, audit)
+    # ONE merged company report (user 2026-10-17): story + deep dive in one flow, chapters
+    # with nothing to say left out, sources as numbered references in the appendix. The
+    # Drive file keeps its company_narrative_* name, so narrative_index readers are unchanged.
+    links = {m["doc_id"]: m for m in (manifest or []) if m.get("doc_id")}
+    md = REPORT.render(d, nar, audit, nar.get("forensic_report") or "", links)
     md_p.write_text(md, encoding="utf-8")
-    html_doc = RENDER.render_html(d, nar, audit)
+    html_doc = FMT._build_full_html(co["name"], co["symbol"], co["isin"], md,
+                                    title="Company")
     html_p.write_text(html_doc, encoding="utf-8")
     log(f"  {md_p.name} ({len(md):,} chars)")
     log(f"  {html_p.name}")
@@ -362,18 +381,16 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     # ---- PDF: what the mail carries and what opens locally ------------------
     # Same formatter (and look) as the deep dive. Files a person receives are named
     # company _ report type _ date (FMT.report_basename); Drive keeps md_p.name.
-    base = FMT.report_basename(co["name"], "Narrative")
+    base = FMT.report_basename(co["name"], "CompanyReport")
     # The HTML a person receives (mail fallback, local copy) is the SAME styled page the PDF
-    # is printed from — the render_html page (html_p, kept for the CI artefacts) read
-    # poorly (user 2026-10-03: wide tables cut off, one figure card per line).
-    styled_html = FMT._build_full_html(co["name"], co["symbol"], co["isin"], md,
-                                       title="Narrative")
+    # is printed from (user 2026-10-03: wide tables cut off, one figure card per line).
+    styled_html = html_doc
     pdf_p, pdf_err = None, ""
     if args.mail or args.local_render or args.open:
         try:
             pdf_p = outdir / f"{base}.pdf"
             pdf_p.write_bytes(FMT.md_to_pdf(md, co["name"], co["symbol"], co["isin"],
-                                            title="Narrative"))
+                                            title="Company"))
             log(f"  {pdf_p.name}")
         except Exception as e:
             pdf_p, pdf_err = None, str(e)[:120]
@@ -422,40 +439,25 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                 pdf_note = (f"<p style='color:#c33'><b>PDF could not be made</b> "
                             f"({pdf_err}) — the report is attached as .html.</p>")
                 att = (f"{base}.html", styled_html.encode("utf-8"), "octet-stream")
-            # ONE email per company for BOTH (user 2026-10-04): when the deep dive is
-            # attached as Part B, its own PDF rides along — no separate deep dive email.
-            atts, dd_name = [att], ""
-            if nar.get("forensic_report"):
-                dd_name = f"{FMT.report_basename(co['name'], 'DeepDive')}.pdf"
-                try:
-                    atts.append((dd_name, FMT.md_to_pdf(nar["forensic_report"], co["name"],
-                                                         co["symbol"], co["isin"]), "pdf"))
-                except Exception as e:
-                    log(f"  deep dive pdf FAILED ({str(e)[:100]}) — it is still inside as Part B")
-                    dd_name = ""
+            # ONE file, ONE attachment (user 2026-10-17): the deep dive is merged INTO the
+            # report chapter by chapter, so it is no longer attached as a second PDF.
             notes = "".join(f"<p style='color:#b45309'><b>Data note:</b> {n}</p>"
                             for n in d.get("data_notes") or [])
-            part_b = ("Part B (forensic deep dive) is included."
-                      if nar.get("forensic_report") else "No Part B (deep dive) in this copy.")
+            merged = ("The story and the forensic deep dive are merged into this one report."
+                      if nar.get("forensic_report") else
+                      "Built without the deep dive (story only): chapters 6-8 are thinner.")
             body = (
-                f"<h2>{co['name']} — narrative report</h2>"
+                f"<h2>{co['name']} — company report</h2>"
                 f"<p>{co['symbol']} · {co['isin']} · data current to "
                 f"{d['as_of_utc'][:10]}</p>"
                 f"{notes}"
                 f"<p>{audit_line}</p>"
-                f"<p>{len(d['facts'])} facts · {len(d['tables'])} tables · "
-                f"{len(nar['sections'])} sections · {flagged} section(s) with "
-                f"unresolved grounding flags</p>"
-                f"<p>{part_b}</p>"
-                f"<p>Attachment{'s' if dd_name else ''}: <b>{att[0]}</b>"
-                + (f" and <b>{dd_name}</b>" if dd_name else "")
-                + f". The .md is on Drive (company_repo/{co['isin']}/).</p>"
+                f"<p>{merged}</p>"
+                f"<p>Attachment: <b>{att[0]}</b>. The .md is on Drive "
+                f"(company_repo/{co['isin']}/).</p>"
                 f"{pdf_note}")
-            ok = send_email(
-                (f"Deep dive + story — {co['name']} ({co['symbol']})" if dd_name else
-                 f"Narrative report — {co['name']} ({co['symbol']})"),
-                body,
-                attachments=atts)
+            ok = send_email(f"Company report — {co['name']} ({co['symbol']})", body,
+                            attachments=[att])
             log("  mailed" if ok else "  mail SKIPPED (GMAIL_USER / "
                                       "GMAIL_APP_PASSWORD not set)")
         except Exception as e:
