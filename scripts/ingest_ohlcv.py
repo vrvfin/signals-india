@@ -48,6 +48,15 @@ BACKFILL_PERIOD = "10y"
 # and belong in the accepted no-price gap. NOT FOCUS (that one matches Yahoo).
 COLLISION_SKIP = {"KEL", "KALYANI", "MAL", "SEL", "ZEAL", "GSTL"}
 
+# NSE SME names whose prices are OWNED by fetch_nse_sme_eod.py (NSE's official
+# bhavcopy + corporate-action list), not Yahoo. Their Yahoo history disagreed with
+# NSE's own prices — another company or another scale (RAJPUTANA ~30 vs ~200), or
+# bonus adjustments Yahoo applied differently (AISL, AILIMITED, ARIHANTACA, CHAVDA,
+# ORIANA, RCDL, JAKHARIA). Rebuilt from NSE only on 2026-10-15 (user). Yahoo must not
+# append to them again, or the two scales mix.
+NSE_OWNED = {"RAJPUTANA", "ORIANA", "ARIHANTACA", "AILIMITED", "AISL", "CHAVDA",
+             "RCDL", "JAKHARIA"}
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -385,6 +394,11 @@ def main():
     if len(symbols) != _before_col:
         log(f"Collision skip: dropped {_before_col - len(symbols)} symbol(s) "
             f"{sorted(COLLISION_SKIP)} — no correct Yahoo feed")
+    _before_own = len(symbols)
+    symbols = [s for s in symbols if s.upper() not in NSE_OWNED]
+    if len(symbols) != _before_own:
+        log(f"NSE-owned skip: {_before_own - len(symbols)} SME symbol(s) priced by "
+            f"fetch_nse_sme_eod.py, not Yahoo")
     if args.pilot:
         symbols = symbols[:args.limit]
         log(f"PILOT MODE: {len(symbols)} symbols")

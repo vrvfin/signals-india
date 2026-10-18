@@ -207,6 +207,9 @@ def render_markdown(pack: dict, narrative: dict | None = None,
     L.append(f"**{co['symbol']} · {co['isin']}** · data current to "
              f"{pack.get('as_of_utc', '')[:10]} · this report will become stale.")
     L.append("")
+    for n in pack.get("data_notes") or []:
+        L.append(f"> **Data note:** {n}")
+        L.append("")
 
     if audit and not audit.get("ran", True):
         # An audit that errored on every section must never render as a clean one.
@@ -487,6 +490,8 @@ def render_html(pack: dict, narrative: dict | None = None,
     B.append(f"<div class='sub'>{e(co['symbol'])} · {e(co['isin'])} · data current to "
              f"{e(pack.get('as_of_utc', '')[:10])} — this report will become stale</div>")
     B.append("</header>")
+    for n in pack.get("data_notes") or []:
+        B.append(f"<div class='flag'><b>Data note:</b> {e(str(n))}</div>")
 
     if audit and not audit.get("ran", True):
         B.append("<div class='flag'><b>AUDIT DID NOT RUN.</b> Every section failed "

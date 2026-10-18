@@ -59,9 +59,10 @@ from _extractor_base import (get_drive, get_or_create_subfolder, load_parquet,
 from build_gallery import _bulk_parquet, _folder
 from daily_brief import load_pf
 from mailer import send_email, load_mail_settings, esc
-from seasons import is_peak_season
+from seasons import in_results_mail_window
 import quarterly_table as QT
 import filing_results as FR
+import results_day_guidance as RDG
 
 LEDGER_NAME = "pf_results_digest.parquet"
 # `data_source` added 2026-08-14 (ADDITIVE — old rows read NaN and are treated as
@@ -360,9 +361,195 @@ def _compact_rows(rows) -> str:
         return ""
     return (f"<table cellpadding='4' cellspacing='0' style='{QT._TBL}'>{head}{body}</table>")
 
+# ── PF scoreboard (user 2026-10-09) ──────────────────────────────────────────
+# The holdings side by side: one row each, ranked by PAT YoY, under a strip of PF
+# totals. AGGREGATES USE SCREENER ROWS ONLY — a filing-sourced row has no ladder and
+# is not comparable line-for-line (the same no-mixing rule as the tables below); it is
+# listed, marked, and kept out of every total. Totals are UNWEIGHTED (user choice):
+# like-for-like sums over the companies that have both this quarter and a year ago.
+
+def _yoy_pair(stmts, label: str):
+    """(this quarter, same quarter last year) for one quarterly_rows line."""
+    periods, data = QT.quarterly_rows(stmts, quarters=6)
+    if len(periods) < 5:
+        return None, None
+    d = data.get(label, {})
+
+    def _v(p):
+        v = d.get(p)
+        return None if v is None or pd.isna(v) else float(v)
+    return _v(periods[-1]), _v(periods[-5])
+
+
+def scoreboard_rows(covered, guidance: dict | None = None) -> list[dict]:
+    """One dict per reported holding, ranked by PAT YoY (None last)."""
+    guidance = guidance or {}
+    out = []
+    for r in covered:
+        g = RDG.summary_label(guidance.get(r["isin"]) or {})
+        row = {"symbol": r["symbol"], "isin": r["isin"], "reported_on": r["reported_on"],
+               "filing": r.get("data_source") == "filing", "guidance": g,
+               "rev_yoy": None, "rev_qoq": None, "pat_yoy": None, "pat_qoq": None,
+               "opm_dpp": None, "rev": (None, None), "pat": (None, None)}
+        if row["filing"]:
+            f = r.get("filing") or {}
+            row["rev_yoy"], row["pat_yoy"] = f.get("revenue_yoy_pct"), f.get("pat_yoy_pct")
+        else:
+            h = QT.headline(r.get("stmts"))
+            if h:
+                row["rev_yoy"], row["rev_qoq"] = h["revenue"]["yoy"], h["revenue"]["qoq"]
+                row["pat_yoy"], row["pat_qoq"] = h["pat"]["yoy"], h["pat"]["qoq"]
+                row["opm_dpp"] = h["opm"]["yoy"]
+            row["rev"] = _yoy_pair(r.get("stmts"), "Revenue")
+            row["pat"] = _yoy_pair(r.get("stmts"), "Net Profit")
+        out.append(row)
+    out.sort(key=lambda x: (x["pat_yoy"] is None, -(x["pat_yoy"] or 0), x["symbol"]))
+    return out
+
+
+def scoreboard_totals(rows: list[dict]) -> dict:
+    """PF-level numbers off the Screener rows only (see the block comment)."""
+    scr = [r for r in rows if not r["filing"]]
+
+    def _g(pairs):
+        cur, prev = sum(c for _, c, _ in pairs), sum(p for _, _, p in pairs)
+        return (cur - prev) / abs(prev) * 100 if prev else None
+
+    def _lfl(key):
+        """(growth, n, dominant symbol, growth without it). One company can own a sum:
+        RAYMOND's year-ago PAT of Rs 5,328 cr (a demerger one-off) turned a book whose
+        median PAT grew +78% into "PF PAT -39%" (live dry-run 2026-10-11). When one
+        holding is more than half of the gross change, it is named and the total is
+        also shown without it."""
+        pairs = [(r["symbol"], *r[key]) for r in scr if None not in r[key]]
+        g = _g(pairs)
+        gross = sum(abs(c - p) for _, c, p in pairs)
+        top = max(pairs, key=lambda x: abs(x[1] - x[2]), default=None)
+        if top and gross and abs(top[1] - top[2]) > 0.5 * gross and len(pairs) > 1:
+            return g, len(pairs), top[0], _g([x for x in pairs if x is not top])
+        return g, len(pairs), None, None
+
+    def _med(key):
+        v = [r[key] for r in scr if r[key] is not None]
+        return (float(pd.Series(v).median()) if v else None), len(v)
+
+    rev_g, rev_n, rev_dom, rev_ex = _lfl("rev")
+    pat_g, pat_n, pat_dom, pat_ex = _lfl("pat")
+    gl = [r["guidance"] for r in rows if r["guidance"]]
+    return {
+        "n_screener": len(scr), "n_filing": len(rows) - len(scr),
+        "rev_lfl": rev_g, "rev_lfl_n": rev_n, "pat_lfl": pat_g, "pat_lfl_n": pat_n,
+        "rev_dom": rev_dom, "rev_ex": rev_ex, "pat_dom": pat_dom, "pat_ex": pat_ex,
+        "rev_med": _med("rev_yoy")[0], "pat_med": _med("pat_yoy")[0],
+        "rev_up": sum(1 for r in scr if (r["rev_yoy"] or 0) > 0),
+        "pat_up": sum(1 for r in scr if (r["pat_yoy"] or 0) > 0),
+        "opm_up": sum(1 for r in scr if (r["opm_dpp"] or 0) > 0),
+        "opm_n": sum(1 for r in scr if r["opm_dpp"] is not None),
+        "rev_n": sum(1 for r in scr if r["rev_yoy"] is not None),
+        "pat_n": sum(1 for r in scr if r["pat_yoy"] is not None),
+        "g_ahead": gl.count("AHEAD"), "g_on": gl.count("ON_TRACK"),
+        "g_mixed": gl.count("MIXED"), "g_behind": gl.count("BEHIND"),
+    }
+
+
+def _pct_td(v, pp: bool = False) -> str:
+    if v is None:
+        return "<td style='color:#bbb'>—</td>"
+    col = QT.UP if v >= 0 else QT.DOWN
+    return (f"<td style='font-weight:700;color:{col}'>{v:+.1f}"
+            f"{' pp' if pp else '%'}</td>")
+
+
+def _pct_txt(v) -> str:
+    return "—" if v is None else f"{v:+.1f}%"
+
+
+def _dom_txt(sym, ex) -> str:
+    if not sym:
+        return ""
+    return (f" <span style='color:#b8860b'>— mostly {esc(sym, 20)}; "
+            f"without it <b>{_pct_txt(ex)}</b></span>")
+
+
+def build_scoreboard(covered, pf_n: int, guidance: dict | None = None) -> str:
+    rows = scoreboard_rows(covered, guidance)
+    if not rows:
+        return ""
+    t = scoreboard_totals(rows)
+    gchips = {"AHEAD": "AHEAD", "ON_TRACK": "ON_TRACK", "BEHIND": "BEHIND",
+              "MIXED": "BEHIND"}
+    strip = (
+        f"<div style='background:#f6f8fa;border:1px solid #e0e6ea;border-radius:6px;"
+        f"padding:8px 11px;margin:0 0 8px;font-size:12px;line-height:1.7'>"
+        f"<b>{len(rows)} of {pf_n}</b> reported &middot; "
+        f"PF revenue <b>{_pct_txt(t['rev_lfl'])}</b> YoY "
+        f"({t['rev_lfl_n']} cos){_dom_txt(t['rev_dom'], t['rev_ex'])} &middot; "
+        f"PF PAT <b>{_pct_txt(t['pat_lfl'])}</b> YoY "
+        f"({t['pat_lfl_n']} cos){_dom_txt(t['pat_dom'], t['pat_ex'])}<br>"
+        f"Median revenue {_pct_txt(t['rev_med'])} &middot; median PAT "
+        f"{_pct_txt(t['pat_med'])} &middot; revenue up {t['rev_up']}/{t['rev_n']} "
+        f"&middot; PAT up {t['pat_up']}/{t['pat_n']} &middot; OPM expanding "
+        f"{t['opm_up']}/{t['opm_n']}<br>"
+        f"Guidance pace: {t['g_ahead']} ahead &middot; {t['g_on']} on track &middot; "
+        f"{t['g_mixed']} mixed &middot; {t['g_behind']} behind</div>")
+    head = ("<tr style='color:#666'>"
+            + "".join(f"<td style='{QT._HD};{a}'>{h}</td>" for h, a in
+                      (("#", ""), ("Company", "text-align:left"), ("PAT YoY", ""),
+                       ("PAT QoQ", ""), ("Rev YoY", ""), ("Rev QoQ", ""),
+                       ("OPM Δ YoY", ""), ("Guidance", ""), ("Reported", "")))
+            + "</tr>")
+    body = ""
+    for i, r in enumerate(rows, 1):
+        g = r["guidance"]
+        gcell = (RDG.chip(gchips[g]).replace(gchips[g].replace("_", " "),
+                                             g.replace("_", " "))
+                 if g else "<span style='color:#bbb'>—</span>")
+        body += (f"<tr><td style='color:#999'>{i}</td>"
+                 f"<td style='text-align:left'><b>{esc(r['symbol'], 24)}</b>"
+                 + ("<span style='color:#b8860b'> (filing)</span>" if r["filing"] else "")
+                 + "</td>"
+                 + _pct_td(r["pat_yoy"]) + _pct_td(r["pat_qoq"])
+                 + _pct_td(r["rev_yoy"]) + _pct_td(r["rev_qoq"])
+                 + _pct_td(r["opm_dpp"], pp=True)
+                 + f"<td>{gcell}</td><td>{_fmt_day(r['reported_on'])}</td></tr>")
+    note = ("<div style='color:#999;font-size:11px;margin:3px 0 0'>Ranked by PAT YoY. "
+            "PF totals are unweighted like-for-like sums (this quarter vs the same "
+            "quarter last year, companies with both). Totals, medians and counts use "
+            "Screener rows only"
+            + (f"; the {t['n_filing']} <b>(filing)</b> row"
+               f"{'' if t['n_filing'] == 1 else 's'} are listed but not counted"
+               if t["n_filing"] else "")
+            + ". YoY/QoQ % shown only where the base quarter was positive. Guidance = "
+            "pace of open revenue/EBITDA/PAT/margin promises including this quarter."
+            "</div>")
+    return (f"<h3 style='margin:12px 0 6px;font-size:13px;color:#34495e;"
+            f"border-bottom:2px solid #34495e;padding-bottom:2px'>🏁 PF scoreboard</h3>"
+            + strip
+            + f"<table cellpadding='4' cellspacing='0' style='{QT._TBL}'>{head}{body}"
+            f"</table>" + note)
+
+
+def load_guidance_summaries(drive, index_id, covered, season) -> dict:
+    """{isin: RDG.summary} for the covered holdings. Read-only; empty on failure."""
+    from build_pead_flags import AR_G_COLS, GUIDANCE_COLS, MGMT_CRED_COLS, PPT_G_COLS
+    commits = RDG.prepare_commitments(
+        load_parquet(drive, index_id, "guidance_tracker.parquet", GUIDANCE_COLS),
+        load_parquet(drive, index_id, "ppt_guidance.parquet", PPT_G_COLS),
+        load_parquet(drive, index_id, "ar_guidance.parquet", AR_G_COLS),
+        load_parquet(drive, index_id, "mgmt_credibility.parquet", MGMT_CRED_COLS),
+        isins={r["isin"] for r in covered})
+    out = {}
+    for r in covered:
+        ser = RDG.series_from_statements(r.get("stmts"), r["isin"])
+        if r.get("filing"):
+            RDG.add_filing_quarter(ser, r["isin"], r["filing"])
+        out[r["isin"]] = RDG.summary(
+            RDG.company_progress(commits.get(r["isin"], []), ser, season))
+    return out
+
 
 def build_html(covered, awaiting, season, today, pf_n, in_window,
-               compact_old: bool = False) -> str:
+               compact_old: bool = False, scoreboard: str = "") -> str:
     new = [r for r in covered if str(r["first_covered_at"])[:10] == today]
     old = [r for r in covered if str(r["first_covered_at"])[:10] != today]
     season_lbl = esc(f"{season[:2]} {season[2:]}", 12)   # Q1FY27 -> "Q1 FY27"
@@ -391,7 +578,8 @@ def build_html(covered, awaiting, season, today, pf_n, in_window,
     # collapses, and only when the full mail would be clipped by Gmail
     old_blocks = (_compact_rows(old) if compact_old
                   else "".join(_company_block(r) for r in old))
-    body = (_sec("🆕 NEW TODAY", new, "#1a7a3a",
+    body = (scoreboard
+            + _sec("🆕 NEW TODAY", new, "#1a7a3a",
                  "".join(_company_block(r) for r in new))
             + _sec("EARLIER THIS SEASON", old, "#34495e", old_blocks))
     if compact_old and old:
@@ -437,7 +625,7 @@ def main():
 
     season = QT.season_quarter()
     today = datetime.now().strftime("%Y-%m-%d")
-    in_window = is_peak_season(datetime.now())
+    in_window = in_results_mail_window(datetime.now())
     log(f"season quarter={season} · peak-season={in_window} · today={today}")
 
     if not in_window and not args.force and not args.dry_run:
@@ -491,10 +679,25 @@ def main():
         log(f"no PF holding has reported {season} yet — no mail.")
         return
 
-    html = build_html(covered, awaiting, season, today, len(pf), in_window)
+    # The scoreboard is extra: a failure drops it, never the mail.
+    try:
+        guidance = load_guidance_summaries(drive, index_id, covered, season)
+        log(f"guidance pace measured for {sum(1 for v in guidance.values() if v.get('measured'))}"
+            f"/{len(covered)} covered holdings")
+    except Exception as e:
+        guidance = {}
+        log(f"WARNING: guidance pace unavailable ({str(e)[:70]})")
+    try:
+        board = build_scoreboard(covered, len(pf), guidance)
+    except Exception as e:
+        board = ""
+        log(f"WARNING: scoreboard skipped ({str(e)[:70]})")
+
+    html = build_html(covered, awaiting, season, today, len(pf), in_window,
+                      scoreboard=board)
     if len(html.encode("utf-8")) > MAX_HTML_BYTES:
         html = build_html(covered, awaiting, season, today, len(pf), in_window,
-                          compact_old=True)
+                          compact_old=True, scoreboard=board)
         log(f"full-table mail exceeded {MAX_HTML_BYTES // 1024} KB — "
             f"earlier reporters collapsed to one line each "
             f"({len(html.encode('utf-8')) / 1024:.0f} KB)")
@@ -554,5 +757,75 @@ def main():
     log(f"wrote _index/{LEDGER_NAME} ({len(out)} rows, {len(rows)} this season)")
 
 
+def _self_test() -> int:
+    """Offline: the scoreboard's ranking, totals and no-mixing rule."""
+    fails = 0
+
+    def check(name, ok):
+        nonlocal fails
+        print(("  ok   " if ok else "  FAIL ") + name)
+        fails += 0 if ok else 1
+
+    per = ["Jun 2025", "Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026", "Sep 2026"]
+
+    def st(rev, pat, opm):
+        rows = []
+        for line, vals in (("Sales +", rev), ("Net Profit +", pat), ("OPM %", opm)):
+            rows += [{"statement": "quarterly_pl", "line_item": line, "period": p,
+                      "value": v} for p, v in zip(per, vals)]
+        return pd.DataFrame(rows)
+
+    cov = [
+        {"symbol": "AAA", "isin": "I1", "reported_on": "2026-10-08",
+         "data_source": "screener",
+         "stmts": st([0, 100, 0, 0, 0, 120], [0, 10, 0, 0, 0, 15], [0, 10, 0, 0, 0, 12])},
+        {"symbol": "BBB", "isin": "I2", "reported_on": "2026-10-09",
+         "data_source": "screener",
+         "stmts": st([0, 300, 0, 0, 0, 300], [0, 30, 0, 0, 0, 27], [0, 20, 0, 0, 0, 19])},
+        {"symbol": "FFF", "isin": "I3", "reported_on": "2026-10-09",
+         "data_source": "filing", "stmts": None,
+         "filing": {"revenue_yoy_pct": 90.0, "pat_yoy_pct": 400.0}},
+    ]
+    rows = scoreboard_rows(cov, {"I2": {"measured": 1, "ahead": 0, "on_track": 0,
+                                        "behind": 1}})
+    check("ranked by PAT YoY desc", [r["symbol"] for r in rows] == ["FFF", "AAA", "BBB"])
+    t = scoreboard_totals(rows)
+    check("filing row kept out of totals", t["n_filing"] == 1 and t["n_screener"] == 2)
+    check("like-for-like revenue = (420-400)/400",
+          t["rev_lfl"] is not None and abs(t["rev_lfl"] - 5.0) < 1e-9)
+    check("like-for-like PAT = (42-40)/40",
+          t["pat_lfl"] is not None and abs(t["pat_lfl"] - 5.0) < 1e-9)
+    check("counts", t["rev_up"] == 1 and t["pat_up"] == 1 and t["opm_up"] == 1)
+    check("guidance label carried", rows[2]["guidance"] == "BEHIND" and t["g_behind"] == 1)
+    check("two holdings: the larger mover (+5 of 8 gross) is named",
+          t["pat_dom"] == "AAA")
+    # RAYMOND shape: one holding's year-ago one-off swamps the sum
+    dom = [{"symbol": "BIG", "filing": False, "rev": (100, 100), "pat": (31, 5328),
+            "rev_yoy": 0, "pat_yoy": None, "opm_dpp": None, "guidance": ""},
+           {"symbol": "A", "filing": False, "rev": (120, 100), "pat": (15, 10),
+            "rev_yoy": 20, "pat_yoy": 50, "opm_dpp": None, "guidance": ""},
+           {"symbol": "B", "filing": False, "rev": (220, 200), "pat": (30, 20),
+            "rev_yoy": 10, "pat_yoy": 50, "opm_dpp": None, "guidance": ""}]
+    td = scoreboard_totals(dom)
+    check("dominant holding named", td["pat_dom"] == "BIG")
+    check("total without it = (45-30)/30",
+          td["pat_ex"] is not None and abs(td["pat_ex"] - 50.0) < 1e-9)
+    check("strip says so", "mostly BIG" in _dom_txt(td["pat_dom"], td["pat_ex"]))
+    html = build_scoreboard(cov, 5, {})
+    check("scoreboard renders with (filing) marker",
+          "PF scoreboard" in html and "(filing)" in html and "3 of 5" in html)
+    check("scoreboard is compact", len(html.encode("utf-8")) < 8000)
+    check("no covered -> no scoreboard", build_scoreboard([], 5) == "")
+    for c in cov:
+        c.update(name=c["symbol"], quarter_label="Q2 FY27", date_source="screener",
+                 first_covered_at="2026-10-09")
+    full = build_html(cov, [], "Q2FY27", "2026-10-09", 5, True, scoreboard=html)
+    check("scoreboard leads the mail", full.index("PF scoreboard") < full.index("NEW TODAY"))
+    print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
+    return 1 if fails else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
     main()

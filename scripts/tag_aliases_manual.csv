@@ -1,0 +1,838 @@
+text,tag_type,slug,note
+Automobile Parts,subsector,auto_interiors,reviewed: auto parts are components not OEMs
+Automotive Parts,sector,auto_ancillary,reviewed
+Automotive Ancillaries,sector,auto_ancillary,reviewed
+Automotive Bearings,subsector,bearings,reviewed
+Automotive Cables,subsector,wires_cables,reviewed
+Automotive Castings,subsector,forgings_castings,reviewed
+Automotive Forgings,subsector,forgings_castings,reviewed
+Automotive Gears,subsector,powertrain_components,reviewed
+Automotive Steering,subsector,powertrain_components,reviewed
+Automotive Wheels Manufacturers,subsector,powertrain_components,reviewed
+Automotive Stampings,subsector,auto_interiors,reviewed
+Automotive Glass,sector,auto_ancillary,reviewed
+Automotive Controls,subsector,auto_electronics,reviewed
+Automotive IT Services,sector,it_services,reviewed
+Automotive Software,sector,software_products,reviewed
+Auto Lighting,subsector,auto_electronics,reviewed
+Auto Lighting Systems,subsector,auto_electronics,reviewed
+automotive lighting,subsector,auto_electronics,reviewed
+automotive films,sector,auto_ancillary,reviewed
+automobile retail,sector,auto_retail,reviewed
+automotive retail,sector,auto_retail,reviewed
+power ancillaries,sector,power_transmission,reviewed: grid ancillary services not auto
+Interior Design,subsector,real_estate_services,reviewed
+Interior Design Services,subsector,real_estate_services,reviewed
+Aviation Training,sector,education,reviewed
+NBFC Lenders,sector,nbfc,reviewed
+Food & Beverage,sector,fmcg,reviewed: generic F&B
+Food & Beverages,sector,fmcg,reviewed
+Food & Beverage Manufacturers,sector,fmcg,reviewed
+Food & Beverage Processors,sector,food_processing,reviewed
+Food & Beverage Trading,sector,trading_distribution,reviewed
+IT Services & Consulting,sector,it_services,reviewed
+IT Services and Consulting,sector,it_services,reviewed
+Software Development & Consulting,sector,it_services,reviewed
+Energy Exchange,subsector,power_trading,reviewed
+Energy Exchanges,subsector,power_trading,reviewed
+Fibre Cement Manufacturers,subsector,fibre_cement,reviewed
+Construction Machinery,subsector,construction_equipment,reviewed
+Construction Machinery Manufacturers,subsector,construction_equipment,reviewed
+Cable Television,subsector,broadcasting,reviewed
+Cable Television Providers,subsector,broadcasting,reviewed
+Film & Television Production,subsector,films_music,reviewed
+Television Production,subsector,films_music,reviewed
+Television Production Houses,subsector,films_music,reviewed
+Health & Wellness Products,subsector,consumer_health,reviewed
+Outdoor & Military Apparel,sector,apparel_fashion,reviewed
+Diagnostic Device Manufacturers,sector,medical_devices,reviewed
+Diagnostic Devices,sector,medical_devices,reviewed
+Diagnostic Equipment,sector,medical_devices,reviewed
+Electrical Cables,subsector,wires_cables,reviewed
+Electrical Cables & Wires,subsector,wires_cables,reviewed
+Electrical Wire Manufacturers,subsector,wires_cables,reviewed
+Electrical Wires,subsector,wires_cables,reviewed
+electrical cables,subsector,wires_cables,reviewed
+Electrical Contracting,sector,construction,reviewed
+Electrical Projects,sector,construction,reviewed
+EV Components,sector,ev,reviewed
+Electric Vehicle Components,sector,ev,reviewed
+Footwear Components,sector,footwear,reviewed
+Forged Steel Components,subsector,forgings_castings,reviewed
+Mechanical Component Manufacturers,sector,industrial_products,reviewed
+Mechanical Components,sector,industrial_products,reviewed
+Metal Components,sector,industrial_products,reviewed
+Off-highway Components,sector,auto_ancillary,reviewed
+Engineered Components,sector,industrial_products,reviewed
+Specialty Component Manufacturers,sector,industrial_products,reviewed
+Specialty Components,sector,industrial_products,reviewed
+Valve Components,subsector,pumps_valves_compressors,reviewed
+Bimetal Components,sector,industrial_products,reviewed
+Plastic Components,sector,plastics_polymers,reviewed
+Sugar & Energy,sector,sugar,reviewed
+Fish Farming,subsector,seafood_aquaculture,reviewed
+Poultry Farming,subsector,poultry_meat,reviewed
+Consumer Lending,subsector,consumer_finance,reviewed
+Consumer Lending NBFCs,subsector,consumer_finance,reviewed
+Diversified Chemicals,sector,chemicals,reviewed
+Diversified Metals,sector,metals_nonferrous,reviewed
+Diversified Real Estate,sector,realty,reviewed
+Diversified Real Estate Developers,sector,realty,reviewed
+Diversified Healthcare,sector,healthcare,reviewed
+Diversified Trading,sector,trading_distribution,reviewed
+Financial IT Services,subsector,banking_software,reviewed
+Financial Software,subsector,banking_software,reviewed
+Financial Software Solutions,subsector,banking_software,reviewed
+Industrial Bearings,subsector,bearings,reviewed
+Industrial Explosives,subsector,ammunition_explosives,reviewed
+industrial explosives,subsector,ammunition_explosives,reviewed
+Industrial Foundries,subsector,forgings_castings,reviewed
+Industrial Instruments,subsector,industrial_automation,reviewed
+Industrial Lubricant Manufacturers,subsector,lubricants,reviewed
+Industrial Lubricants,subsector,lubricants,reviewed
+Industrial Metals,sector_group,grp_metals_mining,reviewed
+Industrial Packaging,sector,packaging,reviewed
+industrial packaging,sector,packaging,reviewed
+Industrial Rubber Products,subsector,rubber_products,reviewed
+Industrial Solvent Manufacturers,sector,chemicals,reviewed
+Industrial Solvents,sector,chemicals,reviewed
+Industrial Tool Manufacturers,subsector,fasteners_tools,reviewed
+Industrial Tools,subsector,fasteners_tools,reviewed
+Industrial Valve Manufacturers,subsector,pumps_valves_compressors,reviewed
+Industrial Valves,subsector,pumps_valves_compressors,reviewed
+Industrial Wires,subsector,wires_cables,reviewed
+industrial refrigeration,subsector,hvac,reviewed
+industrials – solar pumps,subsector,solar_epc,reviewed
+Engineering Plastics,sector,plastics_polymers,reviewed
+Engineering Plastics Manufacturers,sector,plastics_polymers,reviewed
+Engineering Consultants,sector,business_services,reviewed
+Engineering Consulting,sector,business_services,reviewed
+Engineering Consulting Services,sector,business_services,reviewed
+Consulting & Engineering,sector,business_services,reviewed
+Civil Engineering,sector,construction,reviewed
+Marine Engineering,subsector,shipbuilding,reviewed
+Offshore Engineering,subsector,oilfield_services,reviewed
+Product Engineering,subsector,erd_services,reviewed
+Textile Engineering,sector,industrial_machinery,reviewed
+Dental Materials,sector,medical_devices,reviewed
+Insulating Materials,subsector,industrial_consumables,reviewed
+Commodity Broking,subsector,stock_broking,reviewed
+Commodity Traders,sector,trading_distribution,reviewed
+Metal Fabricators,subsector,metal_fabrication,reviewed
+Steel Fabricators,subsector,metal_fabrication,reviewed
+Metal Recyclers,subsector,metal_recycling,reviewed
+Metal Tubes,subsector,pipes_tubes,reviewed
+metal pipes,subsector,pipes_tubes,reviewed
+metal injection molding,subsector,precision_components,reviewed
+metal injection moulding,subsector,precision_components,reviewed
+Steel & Metal Products,sector,metals_steel,reviewed
+Steel & Power,sector,metals_steel,reviewed
+Steel & Power Companies,sector,metals_steel,reviewed
+Wind Power,subsector,renewable_ipp,reviewed
+Wind Power Producers,subsector,renewable_ipp,reviewed
+Solar & Wind Power,subsector,renewable_ipp,reviewed
+Lignite Power Producers,subsector,thermal_power,reviewed
+Power Projects EPC,subsector,power_epc,reviewed
+purchasing power parity,macro_factor,macro_general,reviewed
+Commercial Property Developers,subsector,commercial_realty,reviewed
+Education Technology,sector,education,reviewed
+Healthcare Technology,sector,healthcare_services,reviewed
+healthcare technology,sector,healthcare_services,reviewed
+Travel Technology,subsector,online_travel,reviewed
+Travel Technology Software,subsector,online_travel,reviewed
+Logistics Technology,sector,logistics,reviewed
+logistics tech,sector,logistics,reviewed
+Media Technology,sector,media,reviewed
+Green Technology,sector,environmental_services,reviewed
+Laser Technology,sector,industrial_machinery,reviewed
+Laser Technology Manufacturing,sector,industrial_machinery,reviewed
+Plasma Technology,sector,industrial_machinery,reviewed
+Cleanroom Technology,subsector,semiconductor_equipment,reviewed
+Gauging Technologies,subsector,industrial_automation,reviewed
+Wearable Technology,subsector,consumer_electronics,reviewed
+AI Technology,sector,it_services,reviewed
+defense technology,sector,defence,reviewed
+satellite technology,subsector,space_tech,reviewed
+regulatory technology,subsector,banking_software,reviewed
+distributed ledger technology,macro_factor,digital_assets,reviewed
+Cloud Communication,sector,software_products,reviewed: CPaaS
+Cloud Communication Platforms,sector,software_products,reviewed
+Integrated Communication,sector,telecom,reviewed
+Integrated Communication Services,sector,telecom,reviewed
+AI in Healthcare,subsector,healthcare_it,reviewed
+Medical Capsule Manufacturers,subsector,bio_ingredients,reviewed
+Medical Supplies,sector,medical_devices,reviewed
+healthcare bpo,subsector,bpm_bpo,reviewed
+healthcare devices,sector,medical_devices,reviewed
+healthcare retail,subsector,pharmacy_retail,reviewed
+Luxury Hotels,sector,hotels,reviewed
+Luxury Watches,subsector,watches_accessories,reviewed
+Agri-Machinery,subsector,tractors,reviewed
+LNG Infrastructure,subsector,lng_regas,reviewed
+Pipeline Infrastructure,subsector,gas_transmission,reviewed
+Port Infrastructure,sector,ports,reviewed
+Maritime Infrastructure,sector,ports,reviewed
+maritime infrastructure,sector,ports,reviewed
+marine infrastructure services,sector,ports,reviewed
+Rail Infrastructure,sector,railways,reviewed
+rail infrastructure,sector,railways,reviewed
+Tower Infrastructure,subsector,telecom_towers,reviewed
+Logistics Infrastructure,sector,logistics,reviewed
+logistics infrastructure,sector,logistics,reviewed
+Electrical Infrastructure,sector,power_transmission,reviewed
+Aquaculture Infrastructure,subsector,seafood_aquaculture,reviewed
+Agri-Infrastructure,sector_group,grp_agriculture,reviewed
+5g infrastructure,subsector,telecom_towers,reviewed
+ai datacenter infrastructure,sector,data_centers,reviewed
+data center infrastructure,sector,data_centers,reviewed
+data centre infrastructure,sector,data_centers,reviewed
+cloud infrastructure,subsector,cloud_services,reviewed
+gpu cloud infrastructure,subsector,ai_infrastructure,reviewed
+fintech infrastructure,sector,fintech,reviewed
+financial infrastructure,sector,capital_markets,reviewed
+smart grid infrastructure,sector,power_transmission,reviewed
+wastewater infrastructure,sector,water_infrastructure,reviewed
+E-Mobility Solutions,sector,ev,reviewed
+EdTech Platforms,sector,education,reviewed
+Edutech Platforms,sector,education,reviewed
+Logistics Platforms,sector,logistics,reviewed
+SaaS Platforms,sector,software_products,reviewed
+IT Hardware Distributors,subsector,it_distribution,reviewed
+Large Cap Banks,sector,banks,reviewed
+Supply Chain Software,sector,software_products,reviewed
+Leisure & Entertainment,sector,consumer_services,reviewed
+Sports & Entertainment,subsector,sports_events,reviewed
+Lending Tech,subsector,digital_lending,reviewed
+Fintech Lending,subsector,digital_lending,reviewed
+Book Printers,subsector,print_publishing,reviewed
+Calcined Petroleum Coke,subsector,industrial_consumables,reviewed
+Oil & Gas E&P,subsector,upstream_ep,reviewed
+Oil & Gas Exploration,subsector,upstream_ep,reviewed
+Upstream Oil & Gas,subsector,upstream_ep,reviewed
+Oil & Gas Storage,subsector,gas_transmission,reviewed
+Oil & Gas Terminals,subsector,gas_transmission,reviewed
+Petroleum Refiners,sector,refining,reviewed
+Petroleum Refining,sector,refining,reviewed
+Cosmetic Surgery,subsector,single_specialty_care,reviewed
+Generic Pharmaceuticals,subsector,generic_pharma,reviewed
+Specialty Pharmaceuticals,subsector,specialty_pharma,reviewed
+Injectable Pharmaceuticals,subsector,specialty_pharma,reviewed
+OTC Pharmaceuticals,subsector,consumer_health,reviewed
+Pharmaceutical Intermediates,subsector,api_bulk_drug,reviewed
+Branded Generics,subsector,branded_formulations,reviewed: India branded generics = domestic formulations
+Pharma - Branded Generics,subsector,branded_formulations,reviewed
+Metal Composite Manufacturers,sector,building_materials,reviewed: ACP panels
+Metal Composites,sector,building_materials,reviewed
+Solar Power Equipment,subsector,solar_manufacturing,reviewed
+Power Generation Equipment,subsector,power_equipment,reviewed
+power generation equipment,subsector,power_equipment,reviewed
+Renewable Power Generation,subsector,renewable_ipp,reviewed
+Solar Power Generation,subsector,renewable_ipp,reviewed
+Hydro Power Generation,subsector,hydro_power,reviewed
+Thermal Power Generation,subsector,thermal_power,reviewed
+Steam Generation,subsector,power_equipment,reviewed
+Publishing Software,sector,software_products,reviewed
+Writing & Printing Paper,sector,paper,reviewed
+Music Publishing,subsector,films_music,reviewed
+Hotels & Restaurants,sector,hotels,reviewed
+Real Estate Technology,subsector,proptech,reviewed
+Affordable Housing,subsector,residential_realty,reviewed
+Renewable Energy EPC,subsector,solar_epc,reviewed
+Renewable Energy Finance,subsector,infra_power_finance,reviewed
+Renewable Energy Finance NBFC,subsector,infra_power_finance,reviewed
+Solar Equipment,subsector,solar_manufacturing,reviewed
+Solar Equipment Manufacturers,subsector,solar_manufacturing,reviewed
+Solar Equipment Manufacturing,subsector,solar_manufacturing,reviewed
+Solar PV,subsector,solar_manufacturing,reviewed
+Solar PV Manufacturers,subsector,solar_manufacturing,reviewed
+Solar Panel Manufacturers,subsector,solar_manufacturing,reviewed
+Solar Panel Manufacturing,subsector,solar_manufacturing,reviewed
+Coffee Retail,sector,qsr,reviewed: cafe chains
+Footwear Retailers,subsector,specialty_retail,reviewed
+Online Retailers,sector,ecommerce,reviewed
+Pharmacy Retailers,subsector,pharmacy_retail,reviewed
+Retail Tech SaaS,sector,software_products,reviewed
+Travel Retail Food,sector,qsr,reviewed
+Food Retailers,subsector,grocery_retail,reviewed
+Container Handling,sector,ports,reviewed
+Container Logistics,subsector,container_rail,reviewed
+Semiconductor OSAT,subsector,osat_atmp,reviewed
+Marine & Fishing,subsector,seafood_aquaculture,reviewed
+Software Development,sector,it_services,reviewed
+Software Development Companies,sector,it_services,reviewed
+Software Development Services,sector,it_services,reviewed
+Software & IT Solutions,sector,it_services,reviewed
+Software & Services,sector,it_services,reviewed
+Co-working Spaces,subsector,commercial_realty,reviewed
+Coworking Spaces,subsector,commercial_realty,reviewed
+Green Spaces,sector,realty,reviewed
+Green Spaces Development,sector,realty,reviewed
+Polyester Films,subsector,flexible_packaging,reviewed
+Algorithmic Trading,sector,capital_markets,reviewed
+Trading & Broking,subsector,stock_broking,reviewed
+Trading & Finance,sector,financial_holding,reviewed
+Mineral Exploration,sector,mining,reviewed
+Fruit Processing,sector,food_processing,reviewed
+Metals Processing,sector_group,grp_metals_mining,reviewed
+Plastic Processing Machinery,sector,industrial_machinery,reviewed
+Seafood Processing,subsector,seafood_aquaculture,reviewed
+Stone Processing,subsector,natural_stone,reviewed
+Tea Processing,sector,plantations,reviewed
+cashew processing,sector,food_processing,reviewed
+Stainless Steel Pipes & Tubes,subsector,steel_tubes,reviewed
+capex super-cycle,theme,capex_cycle,reviewed
+capital recycling,sector,infrastructure,reviewed: asset recycling by infra/real-estate owners
+nim sustainability,theme,nim_trend,reviewed
+forex management,sector,capital_markets,reviewed
+liquidity management,macro_factor,liquidity,reviewed
+wastewater management,sector,water_infrastructure,reviewed
+electronic bond trading,sector,capital_markets,reviewed
+bearing component industry,subsector,bearings,reviewed
+intellectual property,sector,UNMAPPED,not a sector
+property-backed lender,subsector,loan_against_property,reviewed
+active lifestyle market,sector,consumer_services,reviewed
+carbon markets,theme,esg_sustainability,reviewed
+us government equity stakes,theme,us_policy,reviewed
+ai governance,theme,ai_adoption,reviewed
+ai governance in investing,theme,ai_adoption,reviewed
+knowledge governance,sector,UNMAPPED,off-topic
+ibuprofen api supply chain,subsector,api_bulk_drug,reviewed
+tungsten supply chain,subsector,critical_minerals,reviewed
+supply chain financing,sector,fintech,reviewed
+mutual fund distribution,subsector,wealth_management,reviewed
+unlisted share trading,sector,capital_markets,reviewed
+trading methods,doc_type,technical_report,reviewed
+maritime security,theme,geopolitics,reviewed
+emerging markets infrastructure,macro_factor,global_equity_markets,reviewed
+tokenized securities,macro_factor,digital_assets,reviewed
+energy investment history,sector,UNMAPPED,historical essay
+sports investment,subsector,sports_events,reviewed
+technology_investment_history_other,sector,UNMAPPED,historical essay
+foreign portfolio investment,macro_factor,fii_flows,reviewed
+industrial investment,theme,capex_cycle,reviewed
+investment valuation frameworks,theme,investment_philosophy,reviewed
+strategic investments,theme,ma_consolidation,reviewed
+sports valuation,subsector,sports_events,reviewed
+china's global influence,theme,geopolitics,reviewed
+global settlement cycles,sector,capital_markets,reviewed
+global startup ecosystems,sector,UNMAPPED,off-topic
+global macro long-short investing,subsector,alternative_investments,reviewed
+consumer fmcg,sector,fmcg,reviewed
+consumer discretionary - hotels,sector,hotels,reviewed
+consumer rentals,subsector,rental_services,reviewed
+climate finance,theme,esg_sustainability,reviewed
+cyber-financial crime,theme,cybersecurity_demand,reviewed
+decentralized finance,macro_factor,digital_assets,reviewed
+financial history,theme,investment_philosophy,reviewed
+historical financial crises,theme,investment_philosophy,reviewed
+financial crises,theme,investment_philosophy,reviewed
+quantitative finance,theme,investment_philosophy,reviewed
+public finance,macro_factor,fiscal_policy,reviewed
+industrial history,sector,UNMAPPED,historical essay
+central bank digital currency,macro_factor,digital_assets,reviewed
+foreign exchange regulations,policy,fema,reviewed
+1qfy27 earnings preview,doc_type,earnings_preview,reviewed
+cement 1qfy27 previews,doc_type,earnings_preview,reviewed
+surveillance technology,subsector,safety_security_equipment,reviewed
+biopharma innovation,subsector,biosimilars,reviewed
+emerging innovation patterns,sector,UNMAPPED,too generic
+artificial intelligence capex,theme,ai_capex,reviewed
+artificial intelligence investment,theme,ai_capex,reviewed
+genai capex,theme,ai_capex,reviewed
+unregulated wellness peptides,subsector,consumer_health,reviewed
+shadow banking leverage,sector,nbfc,reviewed
+australian housing,sector,UNMAPPED,foreign market
+retail nbfc,sector,nbfc,reviewed
+retail f,sector,UNMAPPED,truncated text
+india it sector outlook,sector,it_services,reviewed
+metals_other,sector,metals_steel,reviewed
+Innovation Exemption,policy,industrial_policy_general,reviewed
+"Research, Development & Innovation Scheme",policy,industrial_policy_general,reviewed
+"Research, Development and Innovation (RDI) Fund",policy,industrial_policy_general,reviewed
+BCCI Green Dot Ball,policy,UNMAPPED,sports sponsorship not policy
+BS-V emission norms,policy,cafe_norms,reviewed
+Tractor Emission Norms Stage IV,policy,cafe_norms,reviewed
+Green Data Center policy,policy,data_centre_policies,reviewed
+Green Steel Mission,policy,national_steel_policy,reviewed
+Cybersecurity Information Sharing Act of 2015,policy,us_legislation,reviewed
+Cybersecurity Standard Practice Guideline,policy,it_cyber_law,reviewed
+"National Security and Investment Act, UK",policy,foreign_policy_other,reviewed
+FCNR(B) and NRE deposit scheme,policy,fcnr_deposits,reviewed
+FCNR(B) deposits,policy,fcnr_deposits,reviewed
+Corporations Amendment (Digital Assets Framework) Act 2026,policy,foreign_policy_other,reviewed
+Digital Securities Sandbox,policy,foreign_policy_other,reviewed
+Two Policies (Equipment Upgrade),policy,china_policy,reviewed
+Net-Zero Industry Act,policy,eu_regulation,reviewed
+Export Promotion Mission,policy,foreign_trade_policy,reviewed
+export through one door,policy,foreign_trade_policy,reviewed
+Bloomberg Global Agg Index Inclusion,macro_factor,fii_flows,reviewed: bond index inclusion flows
+JPMorgan GBI-EM Index Inclusion,macro_factor,fii_flows,reviewed
+Bloomberg Global Aggregate Index,macro_factor,fii_flows,reviewed
+National Obesity Summit,policy,health_policy,reviewed
+"Code of Corporate Governance Practices for Issuers of Securities to the Public, 2015",policy,foreign_policy_other,reviewed
+Pesticides Management Bill 2025,policy,agri_schemes,reviewed
+"Pesticides Management Bill, 2025",policy,agri_schemes,reviewed
+current_account_deficit_management,macro_factor,current_account,reviewed
+Minimum Import Price (MIP) of Penicillin G,policy,trade_remedies,reviewed
+minimum_import_price_pvc,policy,trade_remedies,reviewed
+Pacific Railroad Act,policy,UNMAPPED,historical US law
+BioE3 Policy,policy,industrial_policy_general,reviewed
+Geospatial Policy 2022,policy,digital_india,reviewed
+National Energy Transition Roadmap,policy,foreign_policy_other,reviewed: Malaysia
+Coastal-Malnad Karnataka Tourism Policy 2026,policy,tourism_policy,reviewed
+EPFO portfolio manager,policy,pay_commission_pension,reviewed
+UN Environment Programme Partnership,policy,UNMAPPED,not a policy
+Andhra Pradesh data center policy,policy,data_centre_policies,reviewed
+Maharashtra data center policy,policy,data_centre_policies,reviewed
+Tamil Nadu data center policy,policy,data_centre_policies,reviewed
+Telangana data center policy,policy,data_centre_policies,reviewed
+Uttar Pradesh data center policy,policy,data_centre_policies,reviewed
+Viksit Gujarat Data Center Policy 2026-2029,policy,data_centre_policies,reviewed
+West Bengal data center policy,policy,data_centre_policies,reviewed
+MCGM regulations,policy,real_estate_regulation,reviewed
+Gujarat Essential Services Maintenance Act 1972,policy,labour_codes,reviewed
+CGHS tariff reset,policy,cghs,reviewed
+Ukraine Support Tariff,policy,foreign_policy_other,reviewed
+TVK Budget,policy,UNMAPPED,state political manifesto
+federal_reserve_monetary_policy,policy,monetary_policy_framework,reviewed
+Colorado River Compact,policy,foreign_policy_other,reviewed
+Delta Act,policy,foreign_policy_other,reviewed
+Saudi National Water Strategy 2030,policy,foreign_policy_other,reviewed
+Trans-ASEAN Gas Pipeline (TAGP),policy,foreign_policy_other,reviewed
+TRANS_ASEAN_GAS_PIPELINE,policy,foreign_policy_other,reviewed
+Japan-US Agreement of Insurance Deregulation,policy,foreign_policy_other,reviewed
+Insurance Business Act 1995,policy,foreign_policy_other,reviewed
+EV import duty waivers Malaysia,policy,foreign_policy_other,reviewed
+IEA Global EV Outlook 2026,policy,UNMAPPED,report title not a policy
+Medicare negotiated drug prices,policy,us_legislation,reviewed
+ehealth law (Germany),policy,foreign_policy_other,reviewed
+Employment Rights Act,policy,foreign_policy_other,reviewed: UK
+FAA Aviation Workforce Development Grants,policy,us_legislation,reviewed
+Morrill Act,policy,UNMAPPED,historical US law
+Hatch Act,policy,UNMAPPED,historical US law
+Smith-Lever Act,policy,UNMAPPED,historical US law
+Sherman Antitrust Act,policy,UNMAPPED,historical US law
+Kingsbury Agreement,policy,UNMAPPED,historical
+New Deal,policy,UNMAPPED,historical
+Riegle-Neal Act,policy,UNMAPPED,historical US law
+Memorandum of Understanding,policy,UNMAPPED,too generic
+3% Solution,policy,UNMAPPED,too generic
+SAP,policy,UNMAPPED,ambiguous acronym
+FRP,policy,food_commodity_controls,reviewed: sugarcane fair and remunerative price
+PPP,policy,UNMAPPED,ambiguous acronym
+PMP,policy,UNMAPPED,ambiguous acronym
+March 2026 framework,policy,UNMAPPED,too generic
+New Infrastructure,policy,UNMAPPED,too generic
+Modernization Agenda,policy,UNMAPPED,too generic
+stoicism,theme,UNMAPPED,off-topic
+history,theme,UNMAPPED,off-topic
+historiography,theme,UNMAPPED,off-topic
+colonialism,theme,UNMAPPED,off-topic
+heritage preservation,theme,UNMAPPED,off-topic
+architecture,theme,UNMAPPED,off-topic
+academic,theme,UNMAPPED,off-topic
+theory,theme,UNMAPPED,off-topic
+science,theme,UNMAPPED,off-topic
+stem,theme,UNMAPPED,off-topic
+trends,theme,UNMAPPED,too generic
+emerging trends,theme,UNMAPPED,too generic
+future trends,theme,UNMAPPED,too generic
+development,theme,UNMAPPED,too generic
+performance,theme,UNMAPPED,too generic
+diversification,theme,UNMAPPED,too generic
+disruption,theme,UNMAPPED,too generic
+resilience,theme,UNMAPPED,too generic
+productivity,theme,UNMAPPED,too generic
+data,theme,UNMAPPED,too generic
+actions,theme,UNMAPPED,too generic
+eng,theme,UNMAPPED,truncated text
+global m,theme,UNMAPPED,truncated text
+a outlook,theme,UNMAPPED,truncated text
+power t,theme,UNMAPPED,truncated text
+may 2026,theme,UNMAPPED,date not a topic
+h2 cy26,theme,UNMAPPED,date not a topic
+pfy,theme,UNMAPPED,unclear acronym
+bsm,theme,UNMAPPED,unclear acronym
+sti,theme,UNMAPPED,unclear acronym
+mim,theme,UNMAPPED,unclear acronym
+rpp,theme,UNMAPPED,unclear acronym
+nccbr,theme,UNMAPPED,foreign regulatory acronym
+aeoi,theme,UNMAPPED,foreign tax acronym
+poverty,theme,UNMAPPED,social topic
+deprivation,theme,UNMAPPED,social topic
+social enterprise,theme,UNMAPPED,social topic
+wealth inequality,theme,UNMAPPED,social topic
+supply,theme,UNMAPPED,too generic
+equipment,theme,UNMAPPED,too generic
+repair,theme,UNMAPPED,too generic
+licensing,theme,UNMAPPED,too generic
+legal,theme,UNMAPPED,too generic
+security,theme,UNMAPPED,too generic
+connectivity,theme,UNMAPPED,too generic
+personalization,theme,UNMAPPED,too generic
+prediction,theme,UNMAPPED,too generic
+modeling,theme,UNMAPPED,too generic
+maintenance,theme,UNMAPPED,too generic
+instruments,subsector,industrial_automation,reviewed
+animal,subsector,animal_health,reviewed
+food,sector,food_processing,reviewed
+b2b,sector,UNMAPPED,too generic
+specialty b2b,sector,UNMAPPED,too generic
+specialty b2b transition,sector,UNMAPPED,too generic
+dark patterns,policy,consumer_protection,reviewed
+consumerware,subsector,housewares,reviewed
+doors,subsector,facades_windows,reviewed
+windows,subsector,facades_windows,reviewed
+facades,subsector,facades_windows,reviewed
+fa�ade solutions,subsector,facades_windows,reviewed
+upvc windows,subsector,facades_windows,reviewed
+pvc profiles,subsector,facades_windows,reviewed
+peb vs rcc,subsector,metal_fabrication,reviewed
+rtc,sector,UNMAPPED,ambiguous: ready-to-cook or round-the-clock power
+ech oversupply,sector,chemicals,reviewed: epichlorohydrin
+smart cards,subsector,digital_identity_security,reviewed
+identity,subsector,digital_identity_security,reviewed
+identity solutions,subsector,digital_identity_security,reviewed
+pipes,subsector,pipes_tubes,reviewed
+glass,subsector,glass_building,reviewed
+home decor,subsector,furniture_home_decor,reviewed
+luggage,subsector,luggage_travel_goods,reviewed
+stationery,subsector,stationery_writing,reviewed
+Benzoplast,sector,UNMAPPED,company name in label
+Kirloskar Group,sector,conglomerates,reviewed
+Social Impact Tech,sector,UNMAPPED,too generic
+Lifestyle,sector,UNMAPPED,too generic
+Lifestyle Products,sector,UNMAPPED,too generic
+Commercial,sector,UNMAPPED,too generic
+Converters,subsector,electrical_equipment,reviewed
+Ashika Institutional Equities Research,source,ashika,reviewed
+Ashika Institutional Equity Research,source,ashika,reviewed
+Securities and Exchange Board of India (SEBI),source,sebi_source,reviewed
+Supplied conference notes,source,industry_association,reviewed
+Multiple,source,source_other,reviewed
+Equity Research,source,source_other,reviewed
+Independent Research Compilation,source,independent_analyst,reviewed
+Independent Research Desk,source,independent_analyst,reviewed
+Internal Research Pipeline,source,source_other,reviewed
+Industry & Investment Research,source,source_other,reviewed
+General Manufacturing,sector_group,grp_industrials,reviewed
+Portfolio Management,subsector,wealth_management,reviewed
+Container Manufacturing,subsector,metal_fabrication,reviewed
+Containers,subsector,metal_fabrication,reviewed
+Container Services,subsector,container_rail,reviewed
+E&C Services,sector,construction,reviewed
+Newsprint Manufacturing,sector,paper,reviewed
+Newsprint,sector,paper,reviewed
+Loan Guarantees,sector,financial_holding,reviewed
+Custodial Services,sector,capital_markets,reviewed
+Trusteeship Services,sector,capital_markets,reviewed
+Furnace Manufacturing,sector,industrial_machinery,reviewed
+Elevator Manufacturing,sector,industrial_machinery,reviewed
+BPO & IT Services,subsector,bpm_bpo,reviewed
+Gemological Services,subsector,diamonds_gems,reviewed
+Wholesale Trade,sector,trading_distribution,reviewed
+Geophysical Services,subsector,oilfield_services,reviewed
+Forensic Services,sector,business_services,reviewed
+Online Services,sector,internet_platforms,reviewed
+Rice & Food Products,subsector,rice_grains,reviewed
+Mobility Services,sector,internet_platforms,reviewed
+Cab Services,subsector,road_transport,reviewed
+Brass Product Manufacturers,sector,metals_nonferrous,reviewed
+Vehicle Manufacturing,sector,auto,reviewed
+R&D Services,subsector,erd_services,reviewed
+Visa & Passport Services,sector,business_services,reviewed
+Advisory Services,sector,business_services,reviewed
+eGovernance IT Services,sector,it_services,reviewed
+Mobile Value Added Services,sector,telecom,reviewed
+Carbon Product Manufacturers,subsector,industrial_consumables,reviewed
+IT Distributors,subsector,it_distribution,reviewed
+Food Product Manufacturers,subsector,packaged_foods,reviewed
+Bidi Manufacturing,subsector,tobacco,reviewed
+Pipe Manufacturers,subsector,pipes_tubes,reviewed
+Aircraft Manufacturing,sector,aerospace,reviewed
+Wood Product Manufacturers,subsector,wood_panels,reviewed
+Components,sector,UNMAPPED,too generic
+Television,subsector,broadcasting,reviewed
+Gold Ornaments,sector,jewellery,reviewed
+Ingredients,subsector,specialty_fats,reviewed
+Electro Mechanical Components,subsector,electronic_components,reviewed
+Concrete,subsector,concrete_aac_prefab,reviewed
+Post-Production Services,subsector,films_music,reviewed
+multi-sector industry,doc_type,multi_company_sector,reviewed
+management,theme,UNMAPPED,too generic
+allied industries,sector,UNMAPPED,too generic
+portfolio update,doc_type,strategy_report,reviewed
+steam-as-a-service,subsector,power_equipment,reviewed
+blockchain,macro_factor,digital_assets,reviewed
+online home services,sector,internet_platforms,reviewed
+home services,sector,internet_platforms,reviewed
+revisions,theme,UNMAPPED,direction unknown
+strategic foresight,theme,UNMAPPED,too generic
+insightx virtual forum 2026,doc_type,multi_company_seminar,reviewed
+insightx 2026 virtual forum,doc_type,multi_company_seminar,reviewed
+investor summit,doc_type,multi_company_seminar,reviewed
+tax,macro_factor,tax_collections,reviewed
+corporate law,policy,company_law,reviewed
+fluorine chemistry,subsector,fluorochemicals,reviewed
+legal precedent,theme,UNMAPPED,too generic
+legal dispute,theme,UNMAPPED,too generic
+growth opportunities,theme,UNMAPPED,too generic
+current affairs,theme,UNMAPPED,too generic
+natural resources,sector_group,grp_metals_mining,reviewed
+metallurgy,sector_group,grp_metals_mining,reviewed
+spacs,theme,primary_market_activity,reviewed
+asset monetization,policy,national_infrastructure_pipeline,reviewed
+multi_sector_other,sector_group,grp_diversified,reviewed
+organizational design,theme,UNMAPPED,off-topic
+operating model transformation,theme,UNMAPPED,off-topic
+data quality,theme,UNMAPPED,off-topic
+fmcg expansion,sector,fmcg,reviewed
+suptech,subsector,banking_software,reviewed
+t+1,policy,sebi_regulations,reviewed
+cdr,theme,asset_quality,reviewed
+it enabled services,subsector,bpm_bpo,reviewed
+political,macro_factor,elections_politics,reviewed
+hqla,policy,rbi_regulations,reviewed
+india it services,sector,it_services,reviewed
+multinational corporations,theme,UNMAPPED,too generic
+data privacy,policy,dpdp_act,reviewed
+i open access,theme,UNMAPPED,unclear
+india autos,sector,auto,reviewed
+smart manufacturing,subsector,industrial_automation,reviewed
+advanced manufacturing,subsector,industrial_automation,reviewed
+krw,macro_factor,global_growth,reviewed
+south korean macroeconomy,macro_factor,global_growth,reviewed
+adr premium arbitrage,sector,capital_markets,reviewed
+finfluencers,policy,sebi_regulations,reviewed
+investor protection,policy,sebi_regulations,reviewed
+capital expenditure,theme,capex_cycle,reviewed
+capital stratification,theme,UNMAPPED,unclear
+fcnr scheme implications,policy,fcnr_deposits,reviewed
+institutional quality,theme,UNMAPPED,too generic
+us non-centrally cleared bilateral repo,macro_factor,credit_markets,reviewed
+cyclical inflection,theme,UNMAPPED,too generic
+tax transparency,policy,finance_act,reviewed
+record keeping,theme,UNMAPPED,off-topic
+india nbfc,sector,nbfc,reviewed
+family-owned businesses,theme,UNMAPPED,too generic
+insolvency,policy,ibc,reviewed
+bankruptcy,policy,ibc,reviewed
+ibc part iii,policy,ibc,reviewed
+d2c scaling,subsector,d2c_brands,reviewed
+discount analysis,theme,UNMAPPED,unclear
+redevelopment,sector,realty,reviewed
+façade solutions,subsector,facades_windows,reviewed
+agentic commerce,sector,ecommerce,reviewed
+defi,macro_factor,digital_assets,reviewed
+display manufacturing,subsector,electronic_components,reviewed
+commercial growth,theme,UNMAPPED,too generic
+unincorporated sector,theme,msme_growth,reviewed
+patent trends,theme,UNMAPPED,too generic
+may-26 volume expectations,theme,UNMAPPED,unclear
+ecb leverage schemes,theme,UNMAPPED,unclear
+fundamental update,doc_type,single_company_note,reviewed
+FSSAI,policy,health_policy,reviewed
+MoRTH,policy,bharatmala,reviewed
+Minimum Import Price,policy,trade_remedies,reviewed
+NMCG,policy,namami_gange,reviewed
+GRIHA,theme,esg_sustainability,reviewed
+NCMC,policy,payments_policy,reviewed
+Anusandhan National Research Foundation (ANRF) Act 2023,policy,industrial_policy_general,reviewed
+One Nation One Subscription (ONOS),policy,nep_2020,reviewed
+CAFÉ-3,policy,cafe_norms,reviewed
+CAFÉ 3 norms,policy,cafe_norms,reviewed
+SASCI,policy,union_budget,reviewed
+CCPA Guidelines 2023,policy,consumer_protection,reviewed
+ASCI Influencer Guidelines,policy,consumer_protection,reviewed
+ECHS,policy,health_policy,reviewed
+ESI,policy,labour_codes,reviewed
+BEE rating,policy,bee_norms,reviewed
+ISO 31000,policy,UNMAPPED,standard not policy
+Free Nutritious Meal Programme,policy,foreign_policy_other,reviewed
+patriot bonds,policy,foreign_policy_other,reviewed
+Right to Try Act,policy,us_legislation,reviewed
+Single Patient IND,policy,us_legislation,reviewed
+Travel Rule,policy,foreign_policy_other,reviewed
+Commercial Resupply Services,policy,space_programmes,reviewed
+Commercial Crew Transportation Capability,policy,space_programmes,reviewed
+Passenger Reservation System (PRS),policy,railway_policies,reviewed
+Passenger Reservation System,policy,railway_policies,reviewed
+Ammonium Nitrate Rules,theme,regulatory_changes,reviewed
+section_11_directions,policy,national_electricity_plan,reviewed
+Section-11,policy,national_electricity_plan,reviewed
+Rule 419,policy,UNMAPPED,unclear
+External Balance Assessment,macro_factor,current_account,reviewed
+modi_austerity_call,macro_factor,fiscal_policy,reviewed
+FRBM,macro_factor,fiscal_policy,reviewed
+FRBM Act,macro_factor,fiscal_policy,reviewed
+IFSCA,policy,sebi_regulations,reviewed
+SFTR,policy,eu_regulation,reviewed
+MMFR,policy,eu_regulation,reviewed
+ESEF,policy,eu_regulation,reviewed
+ECSPR,policy,eu_regulation,reviewed
+Financial Services Growth and Competitiveness Strategy,policy,foreign_policy_other,reviewed
+Financial Services Industry Transformation Map 2025,policy,foreign_policy_other,reviewed
+Project Agorá,macro_factor,digital_assets,reviewed
+mBridge,macro_factor,digital_assets,reviewed
+CBDC Pilot,macro_factor,digital_assets,reviewed
+Chiang Mai Initiative,policy,foreign_policy_other,reviewed
+IFRS S1,theme,esg_sustainability,reviewed
+IFRS S2,theme,esg_sustainability,reviewed
+neutrality principle for gold purchases,policy,monetary_policy_framework,reviewed
+minimum reserve requirement,policy,monetary_policy_framework,reviewed
+FIMA facility,policy,monetary_policy_framework,reviewed
+Punyashlok Ahilyadevi Holkar Shetkari Karzamukti Yojana,policy,agri_schemes,reviewed
+FISA Section 702,policy,us_legislation,reviewed
+ICDS,policy,health_policy,reviewed
+TCAS,policy,kavach,reviewed
+Annapurna Yojana,policy,rural_infra_schemes,reviewed
+Bhorsa Karmasathi Scheme,policy,rural_infra_schemes,reviewed
+Indiramma Bheema,policy,rural_infra_schemes,reviewed
+RTPP Act,policy,state_industrial_policies,reviewed
+Régimen de Incentivo para Grandes Inversiones,policy,foreign_policy_other,reviewed
+FAST-41,policy,us_legislation,reviewed
+National Maximum Speed Limit,policy,foreign_policy_other,reviewed
+sdg_14,theme,esg_sustainability,reviewed
+mgnregs,policy,mgnrega,reviewed
+DAC,policy,defence_procurement,reviewed
+FEFTA,policy,foreign_policy_other,reviewed
+RDSO,policy,railway_policies,reviewed
+Public Procurement Order No. 4,policy,make_in_india,reviewed
+Public Procurement Order,policy,make_in_india,reviewed
+GFR Rule 144(xi),policy,make_in_india,reviewed
+Ude Desh ka Aam Nagrik (UDAN),policy,udan,reviewed
+RCS-UDAN,policy,udan,reviewed
+MOEF_notification,theme,esg_sustainability,reviewed
+RDI Scheme,policy,industrial_policy_general,reviewed
+Fit India,policy,UNMAPPED,sports programme
+Khelo India,policy,UNMAPPED,sports programme
+Bhartiya Nyaya Sanhita 2023,policy,it_cyber_law,reviewed
+National Quantum Mission,policy,industrial_policy_general,reviewed
+Implementation Plan for Judicial Protection of Intellectual Property Rights by People’s Courts (2026–2030),policy,china_policy,reviewed
+Interpretation on the Application of Punitive Damages in IP Civil Disputes,policy,china_policy,reviewed
+Sword Net 2026,policy,UNMAPPED,unclear
+Replicator initiative,policy,us_legislation,reviewed
+Third Offset Strategy,policy,us_legislation,reviewed
+post_quantum_cryptography,policy,it_cyber_law,reviewed
+National Building Code 2016,policy,real_estate_regulation,reviewed
+Sahkar Se Samriddhi,policy,agri_schemes,reviewed
+National Wealth Fund,policy,foreign_policy_other,reviewed
+BIS Affiliates Rule,policy,us_legislation,reviewed
+Smart Sampa,policy,foreign_policy_other,reviewed
+Trump Accounts,policy,us_legislation,reviewed
+Jan Nivesh SIP,policy,sebi_fund_regulations,reviewed
+Indian Arms Act,policy,defence_procurement,reviewed
+NSTM-4,policy,UNMAPPED,unclear
+Industrial Promotion Scheme,policy,state_industrial_policies,reviewed
+Reshoring Investment Account,policy,foreign_policy_other,reviewed
+Reshoring Investment Accounts,policy,foreign_policy_other,reviewed
+BioShakti Mission,policy,industrial_policy_general,reviewed
+BioE3,policy,industrial_policy_general,reviewed
+WHO Framework Convention on Tobacco Control,policy,health_policy,reviewed
+Touch-High Plan,policy,UNMAPPED,unclear
+System Improvement (SI) Scheme,policy,electricity_act,reviewed
+Spark Sanchay,policy,UNMAPPED,unclear
+NCRF 2024,policy,nep_2020,reviewed
+IPARD II,policy,foreign_policy_other,reviewed
+PIDF Scheme,policy,payments_policy,reviewed
+CMS LEAD programme,policy,UNMAPPED,unclear
+Spatial Information Corridor,policy,UNMAPPED,unclear
+Pax Silica,policy,us_legislation,reviewed
+United Nations Convention on the Law of the Sea,policy,geopolitical_treaties,reviewed
+Nifty Waves Index,policy,UNMAPPED,index not policy
+National List of Essential Medicines,policy,dpco,reviewed
+Project Pontes,policy,UNMAPPED,unclear
+BWSIMP,policy,UNMAPPED,unclear
+BHAVYA,policy,industrial_policy_general,reviewed
+Bhavya scheme,policy,industrial_policy_general,reviewed
+SWAGAT-FI,policy,fema,reviewed
+EQDP,policy,UNMAPPED,unclear
+"Rights of Persons with Disabilities (Amendment) Rules, 2026",policy,UNMAPPED,social policy
+CCUS Allocation,policy,carbon_credit_trading,reviewed
+PMSGY,policy,pm_surya_ghar,reviewed
+DBFOT,policy,national_infrastructure_pipeline,reviewed
+GPRA redevelopment,policy,real_estate_regulation,reviewed
+JNNURM,policy,smart_cities_mission,reviewed
+NEN subsidy,policy,UNMAPPED,unclear
+Southbound Bond Connect,policy,china_policy,reviewed
+HIPC Initiative,policy,foreign_policy_other,reviewed
+Section 35(2AB),policy,finance_act,reviewed
+Common Reporting Standard,policy,finance_act,reviewed
+removal of 12-minute-per-hour TV advertising cap,theme,regulatory_changes,reviewed
+Bessent Put,policy,UNMAPPED,market slang
+3 Arrows,policy,UNMAPPED,market slang
+PRIP,policy,biopharma_shakti,reviewed
+TREM-V,policy,cafe_norms,reviewed
+ToT,policy,UNMAPPED,ambiguous acronym
+C2S,policy,india_semiconductor_mission,reviewed
+MPMS,policy,UNMAPPED,unclear
+Gold Eagle Initiative,policy,UNMAPPED,unclear
+Samriddhi 2.0,policy,UNMAPPED,unclear
+MOVCDNER,policy,agri_schemes,reviewed
+APAP-2026,policy,UNMAPPED,unclear
+CRIF,policy,UNMAPPED,credit bureau not policy
+RELIEF,policy,UNMAPPED,unclear
+RIPS,policy,UNMAPPED,unclear
+MTSKPY,policy,UNMAPPED,unclear
+TCA,policy,UNMAPPED,ambiguous acronym
+CICRA 2005,policy,rbi_regulations,reviewed
+manodarpan,policy,nep_2020,reviewed
+Project Freedom,policy,UNMAPPED,unclear
+DOGE,policy,us_legislation,reviewed
+Professional and Amateur Sports Protection Act,policy,us_legislation,reviewed
+PwC India,source,pwc,reviewed
+KPMG in India,source,kpmg,reviewed
+NCDEX,source,nse,reviewed
+Tata Sons,source,company_self,reviewed
+Tech Mahindra,source,company_self,reviewed
+Palantir Technologies,source,company_self,reviewed
+Samsung Electro-Mechanics,source,company_self,reviewed
+Air India Express,source,company_self,reviewed
+mastercard,source,company_self,reviewed
+Anthropic,source,company_self,reviewed
+Google Cloud,source,company_self,reviewed
+Z.ai,source,company_self,reviewed
+Adani Portfolio,source,company_self,reviewed
+SemiCab,source,company_self,reviewed
+Glass Wall Systems,source,company_self,reviewed
+Horizon Industrial Parks,source,company_self,reviewed
+ekincare,source,company_self,reviewed
+Ajay Joshi Chemicals,source,company_self,reviewed
+Customized Energy Solutions,source,consulting_firm,reviewed
+Swiss Re,source,foreign_broker_other,reviewed
+Marsh Re,source,foreign_broker_other,reviewed
+Capco,source,consulting_firm,reviewed
+Norton Rose Fulbright,source,consulting_firm,reviewed
+UK Finance & Freshfields,source,consulting_firm,reviewed
+Ipsos,source,consulting_firm,reviewed
+Kantar & Dainik Bhaskar Group,source,consulting_firm,reviewed
+World Health Organization,source,foreign_govt_regulator,reviewed
+Office of Financial Research,source,foreign_govt_regulator,reviewed
+World Investment Report 2026,source,foreign_govt_regulator,reviewed
+National Cybersecurity Standardization Technical Committee,source,foreign_govt_regulator,reviewed
+U.S. Sen. Mark R. Warner (D-VA),source,foreign_govt_regulator,reviewed
+armasuisse,source,foreign_govt_regulator,reviewed
+NITI Frontier Tech Hub,source,niti_aayog,reviewed
+Maharashtra Co-operative Societies Act Framework,source,govt_india_bodies,reviewed
+Economic Research-Ekonomska Istrazivanja,source,think_tank_academic,reviewed
+"Laura Alfaro, Maggie X. Chen, Beata S. Javorcik",source,think_tank_academic,reviewed
+Vanderbilt Policy Accelerator,source,think_tank_academic,reviewed
+Just Security,source,think_tank_academic,reviewed
+China Leadership Monitor,source,think_tank_academic,reviewed
+Geoeconomic Strategy Unit,source,think_tank_academic,reviewed
+StartupBlink,source,think_tank_academic,reviewed
+American Innovators Network Coalition,source,industry_association,reviewed
+Climate Angels,source,industry_association,reviewed
+VP Kolkata 20-20 Ideas,source,industry_association,reviewed
+IADN Centre,source,industry_association,reviewed
+Dow Jones & Company,source,media_other,reviewed
+Maggie Haberman and Jonathan Swan,source,media_other,reviewed
+"Rohit Lamba, Raghuram Rajan (Express Opinion)",source,media_other,reviewed
+Asian Metal,source,media_other,reviewed
+India Oil & Gas,source,media_other,reviewed
+Investing India,source,media_other,reviewed
+soic.in,source,soic,reviewed
+JMFS Research,source,jm_financial,reviewed
+Spark,source,avendus,reviewed
+KS Commodity Research,source,independent_analyst,reviewed
+Institutional Equity Research,source,source_other,reviewed

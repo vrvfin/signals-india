@@ -77,9 +77,12 @@ NARRATIVE_LIMIT = 2600
 # an annual report to the FINANCIAL YEAR. Applies to these two and to nothing else, so
 # the established presentation/rating/results mails keep their behaviour exactly.
 SCOPED_TYPES = ("concall", "annual_report")
+_DOC_LABEL = {"presentation": "investor presentation", "rating": "credit rating",
+              "concall": "concall transcript", "annual_report": "annual report"}
 
 
-def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None) -> set:
+def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None,
+                    min_snapshots: int = 1) -> set:
     """ISINs that ENTERED the portfolio within the last `days`.
 
     THE POINT. The month scope answers "what did the exchanges send this month", which is
@@ -105,9 +108,59 @@ def new_pf_holdings(snaps: pd.DataFrame, days: int, today: date | None = None) -
         return set()
     d = snaps["snapshot_date"].astype(str).str.slice(0, 10)
     hist_start = d.min()
-    first = snaps.assign(_d=d).groupby(snaps["isin"].astype(str))["_d"].min()
+    _isin = snaps["isin"].astype(str)
+    first = snaps.assign(_d=d).groupby(_isin)["_d"].min()
     cutoff = ((today or date.today()) - timedelta(days=days)).isoformat()
-    return {i for i, f in first.items() if str(f) >= cutoff and str(f) > hist_start}
+
+    # STILL HELD, OR DO NOT MAIL ABOUT IT. A holding absent from the newest file has
+    # been sold, and sending its annual report is noise. At a 30-day window that alone
+    # removes 8 of 28 - DEEPA, EMIL, ENS, LALITHAA, LUMINO, SUSAN and two SME names -
+    # every one of them bought and sold inside the window.
+    #
+    # WHAT THIS DELIBERATELY DOES *NOT* DO is second-guess the churn. An earlier version
+    # required TWO snapshots on the theory that the history had holes and a single
+    # appearance was a parse glitch. That theory was WRONG, and the data says so: every
+    # snapshot comes from its own distinct holdings file (0 files reused across dates,
+    # 0 dates drawing on two files), every row carries a real weight_pct, and only 3
+    # rows in 1,770 have a symbol that is not a ticker. The membership differences are
+    # what the files said - i.e. actual trading, at roughly one upload a day.
+    # The cost of that wrong theory was exactly one holding, and the worst possible one:
+    # MANINDS, bought on the most recent upload and still held, whose concall and annual
+    # report would have been withheld until the next file arrived. The freshest buy is
+    # the one most worth reading about. min_snapshots stays as a parameter for a caller
+    # that genuinely wants corroboration, but 1 is the honest default.
+    #
+    # The WINDOW, not a heuristic, is what controls volume: 1 at 3 days, 4 at 7,
+    # 16 at 14, 20 at 30.
+    latest = d.max()
+    in_latest = set(_isin[d == latest])
+    seen = _isin.value_counts()
+    return {i for i, f in first.items()
+            if str(f) >= cutoff and str(f) > hist_start
+            and i in in_latest
+            and int(seen.get(i, 0)) >= int(min_snapshots)}
+
+
+def _processed_within(stamp, days: int) -> bool:
+    """Was this document EXTRACTED within the last `days`? 0 or less means no limit.
+
+    This is the concall scope (user, 2026-09-13): a call is mailed because it was just
+    processed, not because the quarter it names matches the calendar. processed_at is
+    the right clock and discovered_at is the wrong one - the queue rebuild of
+    2026-08-30 stamped discovered_at = "now" on rows going back to 2017, so a window on
+    that would tip the whole back catalogue into one morning.
+
+    A document that was never processed returns False: there is nothing to mail yet.
+    """
+    if int(days) <= 0:
+        return True
+    s = str(stamp or "")[:19]
+    if not s:
+        return False
+    try:
+        return (datetime.now() - datetime.fromisoformat(s)).days <= int(days)
+    except Exception:
+        return False
 
 
 def concall_quarter(doc_date) -> str:
@@ -204,6 +257,23 @@ def _is_esg(*fields) -> bool:
 
 
 _NUM_RE = __import__("re").compile(r"^\s*([+-]?)\s*([\d,]+(?:\.\d+)?)\s*(%|x|bps|Cr|cr)?\s*$")
+
+
+def _unit_txt(unit) -> str:
+    """The deck's unit as a reader sees it ('mn' -> 'Rs mn'); '' for none."""
+    u = DS.display_unit(unit)
+    return "" if u.lower() in ("", "nan", "none", "null") else u
+
+
+def _crore_note(value, unit) -> str:
+    """' (~ Rs 2,814 cr)' beside a figure the deck printed in Rs mn / bn / lakh, so a
+    Rs 28,137 mn order book is never read as 28,137 crore (CYIENTDLM, 2026-10-15)."""
+    cr = DS.crore_equiv(value, unit)
+    if cr is None:
+        return ""
+    txt = f"{cr:,.0f}" if abs(cr) >= 100 else f"{cr:,.1f}" if abs(cr) >= 1 else f"{cr:,.2f}"
+    return (f" <span style='color:{MUTED};font-weight:400;font-size:11px'>"
+            f"(&asymp; &#8377;{txt} cr)</span>")
 
 
 def colour_num(text, good_up: bool = True, bold: bool = True) -> str:
@@ -326,7 +396,7 @@ def season_rows(df, season, tables):
     return df[df["quarter"].astype(str).map(lambda x: QT.norm_q(x) == want)]
 
 
-def standalone_summary(isin, season, tables) -> str:
+def standalone_summary(isin, season, tables, numbers_only: bool = False) -> str:
     """The deck read as a company note in its own right.
 
     This is the section that matters for a company that never holds a concall: eighteen
@@ -349,7 +419,14 @@ def standalone_summary(isin, season, tables) -> str:
 
     out = [_h("The deck on its own terms",
               f"Everything this presentation discloses, quoted from it. "
-              f"<b>{n_have} of 18</b> sections are covered by this deck.")]
+              f"<b>{n_have} of 18</b> sections are covered by this deck.")
+           if not numbers_only else
+           _h("The numbers, as the deck states them",
+              f"Every figure quoted from the presentation, by section "
+              f"(<b>{n_have} of 18</b> sections covered; the story above has the rest).")]
+    if numbers_only:
+        ds = ds[ds["value"].map(lambda v: v is not None and str(v).strip().lower()
+                                not in ("", "nan", "none"))]
 
     body = []
     for sec, title, colour in _SUMMARY_SECTIONS:
@@ -367,7 +444,8 @@ def standalone_summary(isin, season, tables) -> str:
                 # level is not — a bigger number is not automatically better news.
                 txt = f"{float(val):g}"
                 num = (colour_num(f"{txt}{unit}") if unit == "%"
-                       else f"<b>{_esc(txt, 18)}{(' ' + unit) if unit else ''}</b>")
+                       else f"<b>{_esc(txt, 18)}{(' ' + unit) if unit else ''}</b>"
+                       + _crore_note(val, r.get("unit")))
             per = _esc(r.get("period"), 16)
             det = _esc(r.get("detail"), 210)
             body.append(
@@ -381,6 +459,108 @@ def standalone_summary(isin, season, tables) -> str:
     out.append(f"<table cellpadding='4' cellspacing='0' style='{_TBL}'>"
                + "".join(body) + "</table>")
     return "".join(out)
+
+
+# The deck read as a STORY first (user 2026-10-15: "the presentation mail needs to read like
+# a quick story, not a data set ... what the presentation talks about, then guidance /
+# risk / growth / commentary, and then numbers in a table"). Built from the same quoted
+# deck_summary rows as the table below, so it adds no model call and no new claim.
+_STORY_GROUPS = (
+    ("What the deck says", ("business_overview", "segment_performance", "strategy",
+                            "customers", "products_rd", "industry_market",
+                            "subsidiary_ma"), 8, BLUE, ""),
+    ("Guidance and outlook", ("guidance_outlook",), 6, PURPLE,
+     "The deck gives no forward guidance."),
+    ("Growth drivers", ("capacity_expansion", "capex", "orderbook_pipeline",
+                        "capital_allocation", "geography"), 6, UP, ""),
+    ("Risks the deck admits", ("risks",), 5, DOWN,
+     "The deck names no risks or headwinds — decks rarely volunteer bad news."),
+    ("Management commentary", ("management_commentary",), 4, "#34495e", ""),
+)
+
+
+def _story_line(r) -> str:
+    """One readable sentence from a deck_summary row (escaped HTML)."""
+    det = str(r.get("detail") or "").strip()
+    if det.lower() in ("nan", "none"):
+        det = ""
+    val = r.get("value")
+    has_val = val is not None and str(val).strip().lower() not in ("", "nan", "none")
+    if det and not has_val:
+        return _esc(det, 260)
+    lab = _esc(r.get("label"), 80)
+    num = ""
+    if has_val:
+        try:
+            txt = f"{float(val):,g}"
+        except (TypeError, ValueError):
+            txt = str(val)
+        u = _unit_txt(r.get("unit"))
+        num = f"<b>{_esc(txt, 18)}{'' if u in ('', '%', 'x') else ' '}{_esc(u, 10)}</b>" \
+              + _crore_note(val, r.get("unit"))
+    per = str(r.get("period") or "").strip()
+    per = "" if per.lower() in ("nan", "none") else f" ({_esc(per, 20)})"
+    head = f"{lab}: {num}{per}" if num else lab
+    return head + (f" &mdash; {_esc(det, 200)}" if det else "")
+
+
+def deck_story(isin, season, tables) -> str:
+    """'What the deck says', then guidance / growth / risks / commentary, as short bullet
+    paragraphs. '' when the deck has no deck_summary rows this season."""
+    ds = _slice(tables.get("deck_summary"), isin)
+    if ds.empty:
+        return ""
+    ds = season_rows(ds, season, tables)
+    if ds.empty:
+        return ""
+    sec = ds["section"].astype(str).str.strip()
+    out = []
+    for title, sections, cap, colour, empty_note in _STORY_GROUPS:
+        part = ds[sec.isin(sections)]
+        if title == "What the deck says":
+            # Balanced across sections, sentences before figures: two per section first.
+            order = {s: i for i, s in enumerate(sections)}
+            part = part.assign(
+                _o=part["section"].astype(str).str.strip().map(order),
+                _n=part["value"].map(lambda v: v is not None and str(v).strip().lower()
+                                     not in ("", "nan", "none")),
+            ).sort_values(["_n", "_o"], kind="stable")
+            part = part.groupby("_o", sort=True).head(2).sort_values(["_o"], kind="stable")
+        lines = [_story_line(r) for _, r in part.head(cap).iterrows()]
+        lines = [l for l in lines if l]
+        if not lines and not empty_note:
+            continue
+        body = ("".join(f"<li style='margin:2px 0'>{l}</li>" for l in lines)
+                if lines else f"<li style='color:{MUTED};list-style:none'>{empty_note}</li>")
+        out.append(f"<div style='margin:10px 0 2px;font-weight:700;color:{colour}'>{title}</div>"
+                   f"<ul style='margin:0 0 4px 18px;padding:0;font-size:13px;color:#222'>"
+                   f"{body}</ul>")
+    return "".join(out)
+
+
+def sources_footer(symbol: str, doc_type: str, pdf_url: str = "") -> str:
+    """Links to re-check a mail against the exchange (user 2026-10-15, P4): the filing as
+    fetched (its own queue pdf_url), the company's NSE page, and Screener. Pure.
+
+    A purely numeric symbol is a BSE-only listing: no NSE page exists, so none is shown.
+    """
+    sym = str(symbol or "").strip().upper()
+    url = str(pdf_url or "").strip()
+    links = []
+    if url.lower().startswith("http"):
+        where = ("BSE filing" if "bseindia" in url.lower() else
+                 "NSE filing" if "nseindia" in url.lower() else "Source document")
+        links.append(f"<a href='{_esc(url, 600)}'>{where} ({_esc(_DOC_LABEL.get(doc_type, doc_type), 30)})</a>")
+    if sym and not sym.isdigit():
+        links.append(f"<a href='https://www.nseindia.com/get-quotes/equity?symbol="
+                     f"{_esc(sym, 20)}'>NSE: {_esc(sym, 20)}</a>")
+    if sym:
+        links.append(f"<a href='https://www.screener.in/company/{_esc(sym, 20)}/'>Screener</a>")
+    if not links:
+        return ""
+    return (f"<div style='{_WRAP};border-top:1px solid #e0e6ea;margin-top:12px;"
+            f"padding-top:6px;color:{MUTED};font-size:11.5px'>Verify at source: "
+            + " &middot; ".join(links) + "</div>")
 
 
 def _deck_key(isin: str, tables: dict) -> str:
@@ -789,6 +969,24 @@ def _narrative_html(narrative, title: str, sub: str) -> str:
               f"margin:0 0 14px'>{inner}</div>")
 
 
+def _size_band(text) -> str:
+    """How big the report is, to an order of magnitude. NOT a hash.
+
+    Fingerprinting the prose was rejected on purpose and stays rejected: the body is an
+    LLM pass over a long PDF, its wording drifts between extractions, and a hash would
+    mark almost every re-read as changed and re-send the book. A DECIMAL MAGNITUDE does
+    not drift - a report stays in the 10k-99k band while its sentences move around - but
+    it moves decisively when a document is REPAIRED.
+
+    Raymond Realty is the case this exists for. Its FY26 annual report was stored as 481
+    real characters (a title, one table heading, then 119,686 spaces). The re-read that
+    fixed it produced 22,180. Band 3 -> 5. Without this the key was "FY26|1" before and
+    "FY26|1" after - identical - so the good report would never have been mailed, and it
+    had to be forced by hand on 2026-09-23.
+    """
+    return str(len(str(len(str(text or "").strip()))))
+
+
 def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
     """Coarse fingerprint for a narrative document: its period, and whether a narrative
     could be lifted at all.
@@ -806,11 +1004,14 @@ def _narrative_key(doc_type: str, isin: str, tables: dict) -> str:
     n = (tables.get("_narr") or {}).get((str(isin).strip(), doc_type)) or {}
     per = str(n.get("period") or "").strip().upper()
     _t = n.get("text")
-    has = "1" if (_t if isinstance(_t, str) else "".join(x for _h, x in (_t or []))
-                  ).strip() else "0"
+    _flat = (_t if isinstance(_t, str)
+             else "".join(x for _h, x in (_t or ""))).strip()
+    has = "1" if _flat else "0"
     if not per and has == "0":
         return ""                    # nothing known; no key means no change check
-    return f"{doc_type}|{per}|{has}"
+    # The band is a FOURTH field. pf_coverage compares these keys field-wise, so a row
+    # written before the band existed is not read as changed - see keys_differ().
+    return f"{doc_type}|{per}|{has}|{_size_band(_flat)}"
 
 
 def content_key(doc_type: str, isin: str, tables: dict) -> str:
@@ -860,7 +1061,10 @@ def content_key(doc_type: str, isin: str, tables: dict) -> str:
     cur = rt.iloc[-1]
 
     def _v(k):
-        return str(cur.get(k) or "").strip().upper()
+        # NaN is truthy, so `or ""` let it through as "NAN"; None became "". Same
+        # meaning, two keys - see pf_coverage._EMPTY_TOKENS.
+        v = str(cur.get(k) if cur.get(k) is not None else "").strip().upper()
+        return "" if v in ("NAN", "NONE", "<NA>", "NULL", "NAT") else v
 
     return "|".join((_v("agency"), _v("rating"), _v("outlook"), _v("rating_action")))
 
@@ -894,8 +1098,9 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
     # The standalone summary is computed BEFORE the gate: a company that holds no concall
     # may have a full deck_summary and no ppt_highlights at all, and gating on the old
     # two tables would suppress exactly the mail this section was built for.
-    standalone = standalone_summary(isin, season, tables)
-    if cur_hi.empty and cur_gu.empty and not standalone:
+    story = deck_story(isin, season, tables)
+    standalone = standalone_summary(isin, season, tables, numbers_only=bool(story))
+    if cur_hi.empty and cur_gu.empty and not standalone and not story:
         return ""
 
     out = [f"<div style='{_WRAP}'>",
@@ -906,9 +1111,14 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
            f"</div>"]
 
     def _val(r):
-        v, u = _esc(r.get("value"), 24), _esc(r.get("unit"), 10)
-        return f"<b>{v}{u}</b>" if v else ""
+        v, u = _esc(r.get("value"), 24), _esc(_unit_txt(r.get("unit")), 10)
+        if not v or v.lower() in ("nan", "none"):
+            return ""
+        sep = "" if u in ("", "%", "x") else " "
+        return f"<b>{v}{sep}{u}</b>" + _crore_note(r.get("value"), r.get("unit"))
 
+    # Story first (P2), then the numbers: call-outs, the deck's own figures, the tables.
+    out.append(story)
     out.append(_key_callouts(cur_hi))
     out.append(standalone)
 
@@ -916,7 +1126,7 @@ def presentation_body(isin, symbol, name, season, tables) -> str:
                for _, r in cur_hi.iterrows()
                if not _is_esg(r.get("statement"), r.get("category"))]
     if hi_rows:
-        out.append(_h("What the deck says", "Highlights as published this quarter.")
+        out.append(_h("Deck highlights", "Highlights as published this quarter.")
                    + _rows_html(hi_rows[:10], ["Area", "Statement", "Value"]))
 
     gu_rows = [[f"<b>{_esc(r.get('metric'), 40)}</b>", _val(r), _esc(r.get("horizon"), 24)]
@@ -969,12 +1179,14 @@ def _key_callouts(cur_hi) -> str:
         in_key = any(k in (cat + " " + stmt).lower() for k in _KEY_CATEGORIES)
         if not has_num:
             continue
-        scored.append((2 if in_key else 1, stmt, val, unit, cat))
+        scored.append((2 if in_key else 1, stmt, val, unit, cat, _crore_note(val, unit)))
     if not scored:
         return ""
     scored.sort(key=lambda x: -x[0])
     cards = ""
-    for _s, stmt, val, unit, cat in scored[:4]:
+    for _s, stmt, val, unit, cat, cr_note in scored[:4]:
+        unit = _unit_txt(unit)
+        sep = "" if unit in ("", "%", "x") else "&nbsp;"   # _esc strips a plain space
         cards += (
             f"<td style='vertical-align:top;padding:0 8px 0 0;width:25%'>"
             f"<div style='border:1px solid #e0e6ea;border-left:3px solid {UP};"
@@ -982,7 +1194,7 @@ def _key_callouts(cur_hi) -> str:
             f"<div style='font-size:10.5px;color:{MUTED};text-transform:uppercase;"
             f"letter-spacing:.3px'>{_esc(cat, 22)}</div>"
             f"<div style='font-size:17px;font-weight:700;color:#111;margin:2px 0'>"
-            f"{_esc(val, 18)}{_esc(unit, 8)}</div>"
+            f"{_esc(val, 18)}{sep}{_esc(unit, 10)}{cr_note}</div>"
             f"<div style='font-size:11px;color:#444'>{_esc(stmt, 90)}</div>"
             f"</div></td>")
     return (_h("Key call-outs", "The numbers from this deck worth reading first.")
@@ -1104,8 +1316,9 @@ def _business_view(isin, season, tables) -> str:
                 continue
             items.append((f"{r.get('category','')} {r.get('metric','')}",
                           str(r.get("metric") or ""),
-                          f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}",
-                          str(r.get("slide_ref") or "")))
+                          f"{_esc(r.get('value'), 20)}{_esc(_unit_txt(r.get('unit')), 10)}",
+                          str(r.get("slide_ref") or ""),
+                          _crore_note(r.get("value"), r.get("unit"))))
     if not items and not hi.empty:
         h = season_rows(hi, season, tables)
         for _, r in h.iterrows():
@@ -1113,14 +1326,15 @@ def _business_view(isin, season, tables) -> str:
                 continue
             items.append((f"{r.get('category','')} {r.get('statement','')}",
                           str(r.get("statement") or ""),
-                          f"{_esc(r.get('value'), 20)}{_esc(r.get('unit'), 10)}", ""))
+                          f"{_esc(r.get('value'), 20)}{_esc(_unit_txt(r.get('unit')), 10)}", "",
+                          _crore_note(r.get("value"), r.get("unit"))))
     if not items:
         return ""
 
     out, used = [], set()
     for title, keys in _BUSINESS_VIEWS:
         rows = []
-        for i, (blob, label, val, ref) in enumerate(items):
+        for i, (blob, label, val, ref, cr_note) in enumerate(items):
             if i in used:
                 continue
             if any(k in blob.lower() for k in keys):
@@ -1128,7 +1342,7 @@ def _business_view(isin, season, tables) -> str:
                 th, tcol = theme_of(label)
                 rows.append([_chip(th, tcol) if th else "",
                              _esc(label, 190),
-                             colour_num(val) if val else "",
+                             (colour_num(val) + cr_note) if val else "",
                              _esc(ref, 14)])
         if rows:
             out.append(_h(title) + _rows_html(rows[:6], ["", "What the deck says",
@@ -1794,11 +2008,16 @@ def concall_section_is_for(heading: str, want_quarter: str) -> bool:
     head = str(heading or "")
     if head.strip() and not _CONCALL_HEAD_RE.search(head):
         return False
-    want = str(want_quarter or "").replace(" ", "").upper()
-    got = heading_quarter(head)
-    if not want or not got:
-        return True
-    return got == want
+    # THE QUARTER NO LONGER REFUSES THE SECTION (user, 2026-09-13). A call is news
+    # because it was just processed, and it goes out under ITS OWN quarter: a call
+    # covering Q4 FY26 that lands in the Q1 FY27 season is mailed AS Q4 FY26. Demanding
+    # the two agree threw away a late filer for the whole quarter, and a half-yearly
+    # filer permanently - ANONDITA heads its sections "H1 FY26" and "H2 FY26" and can
+    # never name a Q. The protection that mattered is the TYPE test above: it is what
+    # stopped MOREPENLAB being served "## 2026-07-28 Announcement - Board Meeting" as a
+    # concall. Serving the wrong QUARTER is now harmless because the label follows the
+    # section instead of the subject - see _narratives, which reports what it found.
+    return True
 
 
 def _clean_period(value) -> str:
@@ -1823,6 +2042,40 @@ def _clean_period(value) -> str:
             pass
     s = str(value).strip()
     return "" if s.lower() in ("nan", "nat", "none", "null") else s
+
+
+# extract_annual_report.MIN_REPORT_CHARS. Deliberately NOT imported: that module pulls
+# in Drive auth and a model pool at import time, which this mail path does not want.
+MIN_REAL_CHARS = 2000
+
+
+def real_report(text: str) -> tuple[str, str]:
+    """(text with padding squeezed, reason it is not a report) — "" reason means fine.
+
+    A REPORT THAT IS MOSTLY SPACES IS NOT A REPORT, and every size-based guard is blind
+    to it because the spaces COUNT. Measured on RAYMONDREL's FY26 annual report:
+
+        stored                120,166 chars
+        one run of spaces     119,686
+        actual content            481   - a title and one table heading
+
+    The extractor's own "thin report" rule squeezes before measuring and would have
+    caught it, but that landed 2026-09-04 and this report was written on 2026-08-23.
+    The mail had no such rule at all: it saw 120 KB, concluded "report present", and
+    sent a heading followed by "[report truncated]".
+
+    SQUEEZING IS ALSO A FIX IN ITS OWN RIGHT, not just a test. The rendered report is
+    capped at REPORT_LIMIT characters, and padding eats that budget: TIRUPATIFL's FY26
+    report is 5,014 real characters followed by 83,111 spaces. Handing the renderer the
+    squeezed text spends the budget on content. New reports are already stored squeezed
+    (extract_annual_report does it on write), so this only brings older ones into line.
+    """
+    from _extractor_base import squeeze_padding    # deferred: see _narratives
+    t = squeeze_padding(str(text or ""))
+    n = len(t.strip())
+    if n and n < MIN_REAL_CHARS:
+        return t, f"hollow report: {n:,} real chars (min {MIN_REAL_CHARS:,})"
+    return t, ""
 
 
 def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -> dict:
@@ -1874,8 +2127,9 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
             # The echo guard must sit on BOTH paths. It was added to the page walk only,
             # so a doc_reports row holding a prompt echo went straight to the reader -
             # the exact-record lookup runs first and returned before the check.
+            exact, _hollow = real_report(exact)
             _bad_exact = ("prompt echo" if is_prompt_echo(exact)
-                          else degenerate_reason(exact))
+                          else (degenerate_reason(exact) or _hollow))
             if _bad_exact:
                 _log(f"  {dt} for {isin}: doc_reports row is a failed generation "
                      f"({_bad_exact}) — ignored")
@@ -1883,8 +2137,11 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
                 out[(isin, dt)] = {"period": period, "text": exact}
                 continue
         try:
+            # allow_newest for a concall: if the page does not carry the quarter the
+            # queue names, take the newest call it does carry. The label then follows
+            # the section (below), so the mail can never claim a quarter it has not got.
             reg = _find_region(_company_page(drive, repo_id, isin, cache), period, dt,
-                               doc_id)
+                               doc_id, allow_newest=(dt == "concall"))
             # THE MATCHED SECTION MUST BELONG TO THE DOCUMENT WE ASKED FOR. Concall
             # sections carry no doc marker, so a walk that starts on an empty stub can
             # land on another quarter's call and the mail would send it under today's
@@ -1892,9 +2149,21 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
             if reg and dt == "concall":
                 _head = str((reg[0][0] if reg[0] else "") or "")
                 if not concall_section_is_for(_head, period):
-                    _log(f"  concall for {isin}: section {_head[:40]!r} is not "
-                         f"{period} — refusing to serve another quarter's call")
+                    _log(f"  concall for {isin}: section {_head[:40]!r} does not read "
+                         f"like a concall — refusing to serve another document")
                     reg = []
+                else:
+                    # TELL THE TRUTH ABOUT WHICH CALL THIS IS. The section names the
+                    # quarter the call actually covers; the subject used to name the
+                    # season it was filed in, so a Q4 FY26 call filed in the Q1 FY27
+                    # season went out titled Q1 FY27. Report what was found, and the
+                    # subject, the content_key and the mail all follow it.
+                    _hq = heading_quarter(_head)
+                    if _hq and _hq != period:
+                        _was = period or "an unknown season"
+                        _log(f"  concall for {isin}: filed in {_was}, but the call "
+                             f"covers {_hq} — mailing it as {_hq}")
+                        period = _hq
             # The whole region, headings and tables intact. lift_report stays for
             # anything that wants a short extract; the mail wants the report.
             txt = "\n".join(((h + "\n") if h else "") + b
@@ -1919,7 +2188,8 @@ def _narratives(drive, repo_id, latest: dict, cache: dict, index_id: str = "") -
         # walk reaches the bad one. Guard the text that is about to be rendered, which is
         # the one place both paths meet.
         if txt:
-            _why_loop = degenerate_reason(txt)
+            txt, _hollow = real_report(txt)
+            _why_loop = degenerate_reason(txt) or _hollow
             if _why_loop:
                 _log(f"  {dt} for {isin}: stored report is a {_why_loop} — "
                      f"treated as empty")
@@ -1966,7 +2236,17 @@ def main() -> None:
                          "concalls (the quarter the presentation mail already uses) and "
                          "this financial year's annual reports. 'all' disables both "
                          "scopes and mails the latest of each, whenever it was filed.")
-    ap.add_argument("--new-holding-days", type=int, default=30,
+    ap.add_argument("--concall-fresh-days", type=int, default=3,
+                    help="A concall is in scope when it was EXTRACTED within this many "
+                         "days, whatever quarter it covers - a call filed late, or by a "
+                         "half-yearly filer, is still news the day it is processed. "
+                         "0 disables the window. Replaces the season test, which "
+                         "dropped both of those cases silently. THREE, not thirty: a "
+                         "backfill re-stamps processed_at across the whole book, and a "
+                         "month-wide window then mails all 50-odd holdings in one "
+                         "morning (measured 2026-09-13). Widen it deliberately for a "
+                         "one-off catch-up.")
+    ap.add_argument("--new-holding-days", type=int, default=7,
                     help="A holding that entered the portfolio within this many days is "
                          "ONBOARDED: its latest concall and latest annual report are "
                          "mailed whatever month they were filed, once. 0 disables it, "
@@ -2033,7 +2313,9 @@ def main() -> None:
         if _did:
             _k = content_key(_dt, _i, _pre)
             if _k:
-                _keys[_did] = _k
+                # keyed per TYPE: one doc_id can be queued as both concall and
+                # presentation (KANOHAR, Oct 2026) - per-doc_id keys overwrote each other
+                _keys[(_did, _dt)] = _k
     due = COV.mail_due(pf, queue, calendar, ledger, season, on=today,
                        window_days=args.window_days, doc_types=tuple(want),
                        require_calendar=args.require_calendar, tables=_pre,
@@ -2083,9 +2365,22 @@ def main() -> None:
             # against it - --force found nothing, because "annual_report" is not a
             # substring of "Q1FY27".
             if d["doc_type"] == "concall":
-                got, expect = concall_quarter(d.get("doc_date")), season_q
-            else:
-                got, expect = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
+                # A CALL IS NEWS BECAUSE IT WAS JUST PROCESSED (user, 2026-09-13):
+                # "any concall updated on the day needs to be sent", and one covering
+                # Q4 FY26 goes out LABELLED Q4 FY26 rather than as the season it landed
+                # in. The season test used to gate this, which silently dropped a late
+                # filer for a whole quarter and a half-yearly filer for ever - ANONDITA
+                # heads its sections "H1 FY26"/"H2 FY26" and can never name a Q.
+                # This cannot flood: latest_doc_per_type returns the NEWEST row per
+                # (isin, doc_type), so the ceiling is one call per holding no matter
+                # how much history a backfill re-stamps.
+                if _processed_within(d.get("processed_at"),
+                                     args.concall_fresh_days):
+                    kept.append(d)
+                else:
+                    out_of_scope += 1
+                continue
+            got, expect = ar_fy_year(d.get("doc_date"), d.get("period")), ar_fy
             if not got:
                 # Undatable. Skipped rather than assumed current, and COUNTED so that it
                 # is visible rather than silent.
@@ -2096,7 +2391,8 @@ def main() -> None:
                 out_of_scope += 1
         n_scoped = sum(1 for k in kept
                        if k["doc_type"] in SCOPED_TYPES and not k.get("onboarding"))
-        log(f"scope: concall={season_q} AR=FY{ar_fy} -> {n_scoped} in scope"
+        log(f"scope: concall=processed within {args.concall_fresh_days}d "
+            f"AR=FY{ar_fy} -> {n_scoped} in scope"
             + (f", {onboarded} onboarding a new holding" if onboarded else "")
             + (f", {out_of_scope} from an earlier quarter/FY" if out_of_scope else "")
             + (f", {undated} undatable" if undated else ""))
@@ -2104,7 +2400,7 @@ def main() -> None:
 
     log(f"season={season} pf={len(pf)} due={len(due)} "
         f"({', '.join(sorted({d['doc_type'] for d in due})) or 'nothing'})")
-    if not due:
+    if not due and not args.force:      # --force rebuilds its own list below
         log("nothing due — no mail.")
         return
 
@@ -2148,7 +2444,8 @@ def main() -> None:
                       "doc_type": d["doc_type"], "period": season,
                       "doc_id": d.get("doc_id", ""), "mailed_at": _now,
                       "subject": "(seeded - back catalogue, never sent)",
-                      "content_key": _keys.get(str(d.get("doc_id") or ""), "")}
+                      "content_key": _keys.get((str(d.get("doc_id") or ""),
+                                                d["doc_type"]), "")}
                      for d in due]
         out = pd.concat([ledger, pd.DataFrame(seed_rows, columns=LEDGER_COLS)],
                         ignore_index=True) if ledger is not None and not ledger.empty \
@@ -2193,9 +2490,21 @@ def main() -> None:
     if args.limit:
         due = due[: args.limit]
 
+    # {doc_id: pdf_url} from the one global queue, for the "verify at source" links.
+    try:
+        _pdf_urls = dict(zip(queue["doc_id"].astype(str), queue["pdf_url"].fillna("").astype(str)))
+    except Exception:
+        _pdf_urls = {}
+
     sent_rows = []
     for d in due:
         isin, sym, name, dt = d["isin"], d["symbol"], d["name"], d["doc_type"]
+        # A notice of a FUTURE call / board meeting is not a transcript or a result
+        # (ATHERENERG, CGPOWER 16 Oct: mailed as "concall transcript, Q2FY27").
+        if QT.is_meeting_notice(d.get("doc_title"), dt):
+            log(f"  {sym:<12} {dt}: meeting notice, not the document — skipped "
+                f"({str(d.get('doc_title') or '')[:70]})")
+            continue
         _attach = None
         if dt == "presentation":
             body = presentation_body(isin, sym, name, season, tables)
@@ -2252,9 +2561,21 @@ def main() -> None:
         if not body:
             log(f"  {sym:<12} {dt}: nothing renderable — skipped")
             continue
+        # How fresh THIS document is, gallery-style (user 2026-10-14). An AR's
+        # doc_date is its FY-END, so it is dated by when it reached us instead.
+        try:
+            import mail_freshness as MF
+            _filed = (d.get("discovered_at") or d.get("processed_at")
+                      if dt == "annual_report" else d.get("doc_date"))
+            body = MF.doc_strip(_DOC_LABEL.get(dt, dt), _filed,
+                                d.get("processed_at")) + body
+        except Exception as e:
+            log(f"  {sym:<12} {dt}: freshness line skipped ({str(e)[:50]})")
         if len(body.encode()) > MAX_HTML_BYTES:
             log(f"  {sym:<12} {dt}: {len(body.encode()):,} B over budget — trimmed")
             body = body[:MAX_HTML_BYTES]
+        # P4: exchange links last, after the trim, so they always survive it.
+        body += sources_footer(sym, dt, _pdf_urls.get(str(d.get("doc_id") or ""), ""))
 
         if args.dry_run:
             p = os.path.join(args.out_dir, f"mail_{sym}_{dt}.html")
@@ -2287,7 +2608,8 @@ def main() -> None:
                               "doc_id": d.get("doc_id", ""),
                               "mailed_at": datetime.now().isoformat(timespec="seconds"),
                               "subject": subject[:200],
-                              "content_key": _keys.get(str(d.get("doc_id") or ""), "")})
+                              "content_key": _keys.get((str(d.get("doc_id") or ""),
+                                                        dt), "")})
 
     # Ledger advances ONLY on confirmed sends — a failed mail must stay due.
     if sent_rows:
@@ -2520,8 +2842,21 @@ def _self_test() -> int:
     check("other quarters excluded", "Old capex" not in ss and "Capex" not in ss)
     check("no deck_summary renders nothing", standalone_summary("INE1", "Q1FY27", T) == "")
     check("other company renders nothing", standalone_summary("INE9", "Q1FY27", T_ds) == "")
-    check("summary reaches the mail body",
-          "The deck on its own terms" in presentation_body("INE1", "AAA", "A", "Q1FY27", T_ds))
+    _pb = presentation_body("INE1", "AAA", "A", "Q1FY27", T_ds)
+    check("summary reaches the mail body", "The numbers, as the deck states them" in _pb)
+    # P2 (2026-10-15): the story comes first, the numbers after it.
+    check("story leads the deck mail",
+          "What the deck says" in _pb
+          and _pb.index("What the deck says") < _pb.index("The numbers, as the deck states them"))
+    check("story carries the narrative line", "Top-5 customers are 46%" in deck_story("INE1", "Q1FY27", T_ds))
+    check("story says when the deck gives no guidance",
+          "no forward guidance" in deck_story("INE1", "Q1FY27", T_ds)
+          or "Guidance and outlook" in deck_story("INE1", "Q1FY27", T_ds))
+    check("numbers table drops sentence-only rows under a story",
+          "Top-5 customers are 46%" not in standalone_summary("INE1", "Q1FY27", T_ds, numbers_only=True))
+    check("Rs mn figure shows its crore equivalent",
+          "2,814 cr" in _story_line({"label": "Order book", "value": 28137, "unit": "mn",
+                                     "period": "Q2FY27", "detail": ""}))
     check("18 sections mapped, matching the extractor",
           {s for s, _, _ in _SUMMARY_SECTIONS} == set(DS.SECTIONS))
 
@@ -2530,11 +2865,18 @@ def _self_test() -> int:
     only_ds = {k: pd.DataFrame() for k in T}
     only_ds["deck_summary"] = _ds
     check("deck-only company still gets a mail",
-          "The deck on its own terms" in presentation_body("INE1", "AAA", "A", "Q1FY27", only_ds))
+          "What the deck says" in presentation_body("INE1", "AAA", "A", "Q1FY27", only_ds))
 
     check("no data renders nothing, not an empty shell",
           presentation_body("INE_NONE", "X", "X", "Q1FY27", T) == "")
     check("no ratings renders nothing", rating_body("INE_NONE", "X", "X", T) == "")
+    # P4 (2026-10-15): verify-at-source links at the foot of every document mail.
+    _f = sources_footer("CYIENTDLM", "presentation",
+                        "https://www.bseindia.com/xml-data/corpfiling/AttachLive/x.pdf")
+    check("footer: BSE filing link from the queue pdf_url", "BSE filing" in _f and "x.pdf" in _f)
+    check("footer: NSE + Screener links", "symbol=CYIENTDLM" in _f and "screener.in/company/CYIENTDLM/" in _f)
+    check("footer: BSE-only numeric code has no NSE link", "nseindia" not in sources_footer("543210", "rating"))
+    check("footer: no url still links the company", "Screener" in sources_footer("ABC", "concall", "nan"))
 
     # ---- content_key: the fingerprint that makes a correction detectable
     rt_d = pd.DataFrame([{"isin": "INE1", "agency": "CRISIL", "rating": "D",
@@ -2823,6 +3165,8 @@ Capacity reaches eight million tons by FY28.
 
     # ---- track 2: holdings that just entered the portfolio -----------------
     _T = date(2026, 9, 2)
+    # The LATEST snapshot in this fixture is 2026-08-31 — that is what "still held"
+    # means below.
     _snaps = pd.DataFrame([
         # history starts 2026-07-23; OLD was there from the first snapshot
         {"snapshot_date": "2026-07-23", "isin": "OLD"},
@@ -2830,13 +3174,32 @@ Capacity reaches eight million tons by FY28.
         {"snapshot_date": "2026-08-27", "isin": "NEW"},      # bought 6 days ago
         {"snapshot_date": "2026-08-31", "isin": "NEW"},
         {"snapshot_date": "2026-08-06", "isin": "MID"},      # bought 27 days ago
+        {"snapshot_date": "2026-08-31", "isin": "MID"},      # and still held
+        {"snapshot_date": "2026-08-28", "isin": "BLIP"},     # listed once, then gone
+        {"snapshot_date": "2026-08-29", "isin": "GONE"},     # held briefly, then sold
+        {"snapshot_date": "2026-08-30", "isin": "GONE"},
+        {"snapshot_date": "2026-08-31", "isin": "ONCE"},     # in the latest file only
     ])
     _n30 = new_pf_holdings(_snaps, 30, _T)
     check("a holding bought 6 days ago is new", "NEW" in _n30)
     check("a holding bought 27 days ago is new at 30d", "MID" in _n30)
     check("a holding held since before the history is NOT new", "OLD" not in _n30)
     check("a 7-day window excludes the 27-day-old buy",
-          new_pf_holdings(_snaps, 7, _T) == {"NEW"})
+          new_pf_holdings(_snaps, 7, _T) == {"NEW", "ONCE"})
+
+    # STILL HELD IS THE ONLY CORROBORATION. The user trades daily, every snapshot is
+    # its own uploaded file, and a position appearing once is a PURCHASE, not a glitch -
+    # so a buy on the newest file is onboarded immediately. That is the case worth
+    # getting right: the freshest buy is the one most worth reading about.
+    check("a buy that appears only in the NEWEST file is onboarded at once",
+          "ONCE" in _n30)
+    check("a holding listed once and then gone is not onboarded", "BLIP" not in _n30)
+    check("a holding missing from the LATEST snapshot is not newly bought",
+          "GONE" not in _n30)
+    check("min_snapshots stays available for a caller that wants corroboration",
+          "ONCE" not in new_pf_holdings(_snaps, 30, _T, min_snapshots=2))
+    check("demanding corroboration still will not resurrect a sold holding",
+          "GONE" not in new_pf_holdings(_snaps, 30, _T, min_snapshots=2))
     # The guard that matters: once the window outruns the history, everything present on
     # the first snapshot would otherwise read as newly bought.
     check("a 60-day window does NOT declare the whole book new",
@@ -2997,19 +3360,91 @@ Management guided to twenty percent growth.
     check("a marker anywhere in the first lines makes it a boundary",
           _D._is_boundary("## Anything At All", "*Processed: x*\n<!-- doc:abc -->"))
 
+    # ---- the size band: stable under drift, decisive on a repair ---------------
+    # Raymond Realty's real numbers, before and after the re-read that fixed it.
+    check("Raymond's hollow report and its repair sit in different bands",
+          _size_band("x" * 481) == "3" and _size_band("x" * 22180) == "5"
+          and _size_band("x" * 481) != _size_band("x" * 22180))
+    check("wording drift inside a magnitude does not move the band",
+          _size_band("x" * 22180) == _size_band("x" * 31999))
+    check("nothing at all has its own band", _size_band("") == "1"
+          and _size_band(None) == "1")
+    check("the band ignores surrounding whitespace",
+          _size_band("   " + "x" * 22180 + "   ") == _size_band("x" * 22180))
+
+    # ---- a report that is mostly SPACES is not a report ------------------------
+    # RAYMONDREL's FY26 annual report, measured 2026-09-18: 120,166 stored characters,
+    # of which 119,686 were one run of spaces. 481 characters of actual content - a
+    # title and one table heading - and the mail sent it as a summary.
+    _pad = " " * 119686
+    _hollow_src = chr(10).join(["# Raymond Realty - Forensic Report", "",
+                               "## 1. SOURCE COVERAGE", _pad])
+    _sq, _why = real_report(_hollow_src)
+    check("a report that is mostly spaces is refused",
+          _why.startswith("hollow report"))
+    check("and the padding is gone from what would be rendered", len(_sq) < 200)
+    check("the reason names the REAL size, not the stored size", "120,166" not in _why)
+
+    # TIRUPATIFL's shape: real content, then padding. That IS a report - short, but
+    # real - and squeezing is what stops the padding eating the render budget.
+    _short_real = ("Revenue rose twelve percent on volume. " * 130)   # ~5,000 chars
+    _sq2, _why2 = real_report(_short_real + " " * 83111)
+    check("real content followed by padding is still a report", _why2 == "")
+    check("but it is handed on squeezed, so the render budget is spent on content",
+          len(_sq2) < 6000 and "Revenue rose twelve percent" in _sq2)
+
+    check("a genuine report is returned unchanged",
+          real_report("x" * 5000) == ("x" * 5000, ""))
+    check("nothing at all is not reported as hollow", real_report("") == ("", "")
+          and real_report(None)[1] == "")
+
     # ---- the model sometimes echoes the prompt back into the stored report -------
     _echo = ("Generate the final report immediately without displaying preliminary "
              "steps. No individual paragraph may be longer than 3 lines. The ENTIRE "
              "report must stay under ~1,200 lines. Output must be completely clean.")
-    # A concall must never be served from another quarter (MOREPENLAB Q1FY27 -> Q4FY25).
+    from _extractor_base import is_prompt_echo as _ipe
+
+    # A COMPLIANT REPORT REPRODUCES THE PROMPT'S SECTION TITLES BY CONSTRUCTION, and for
+    # a while that condemned it. The heading filter knew "Section 1)" and "e-1)" but not
+    # a plain numbered title, so these four lines counted as echoed instructions and
+    # three of them was the threshold. Measured 2026-09-27 over the 1,145 stored
+    # annual-report reports: 7 good ones were discarded, SENORES and MOREPENLAB among
+    # them, and their holders saw no summary. The marker test scored zero on every one.
+    _titles = chr(10).join([
+        "5. Governance & Related-Party Transactions (RPT)",
+        "5b. Management Outlook & Expansion (Chairman's/MD Letter + MD&A)",
+        "6. Forensic Financial Risk Scorecard (Mandatory Weighted Matrix)",
+        "8. Probing Questions for the Next Earnings Call",
+        "Revenue grew 22% to Rs 1,240 crore on volume, and the auditor raised no "
+        "qualification. Receivable days moved from 48 to 61.",
+    ])
+    check("a report carrying the prompt's own section titles is NOT an echo",
+          not _ipe(_titles))
+    check("but real echoed instruction prose still is", _ipe(_echo))
+    # WHAT A CONCALL SECTION MUST BE: a concall. NOT a particular quarter (user,
+    # 2026-09-13) - a call covering Q4 FY26 that is filed in the Q1 FY27 season is
+    # mailed AS Q4 FY26, because it is news the day it is processed. The label comes
+    # from heading_quarter, so the subject cannot claim a quarter the section does not.
     check("heading_quarter reads the label", heading_quarter("## Q1 FY27 Concall — PPT")
           == "Q1FY27")
     check("heading_quarter handles a 4-digit year",
           heading_quarter("## Q3 FY2021 Concall — Transcript") == "Q3FY21")
     check("a matching quarter is served",
           concall_section_is_for("## Q1 FY27 Concall — PPT", "Q1FY27"))
-    check("a DIFFERENT quarter is refused",
-          not concall_section_is_for("## Q4 FY25 Concall — Transcript", "Q1FY27"))
+    check("a call from another quarter is SERVED, and it is the label that moves",
+          concall_section_is_for("## Q4 FY25 Concall — Transcript", "Q1FY27")
+          and heading_quarter("## Q4 FY25 Concall — Transcript") == "Q4FY25")
+    check("a half-yearly filer, which can never name a Q, is served",
+          concall_section_is_for("## H1 FY26 Concall — PPT", "Q1FY27"))
+
+    # ---- the freshness window that replaced the season test -----------------
+    _now = datetime.now().isoformat(timespec="seconds")
+    _old = (datetime.now() - timedelta(days=45)).isoformat(timespec="seconds")
+    check("a call processed today is in scope", _processed_within(_now, 30))
+    check("a call processed 45 days ago is not", not _processed_within(_old, 30))
+    check("days=0 disables the window", _processed_within(_old, 0))
+    check("a never-processed document is not mailed", not _processed_within("", 30))
+    check("an unparseable stamp is not mailed", not _processed_within("soon", 30))
     check("an unlabelled CONCALL heading is not blocked",
           concall_section_is_for("## Morepen Laboratories — Earnings Call", "Q1FY27"))
     check("an ANNOUNCEMENT section is refused, even with no quarter to contradict",

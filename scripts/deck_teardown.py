@@ -145,8 +145,11 @@ def parse_teardown(payload, row, quarter: str, now_str: str,
         if k in seen:
             drop("duplicate"); continue
         seen.add(k)
+        _u = _s(o.get("unit"), 16)
+        from deck_summary import corrected_unit     # local: deck_summary imports this module
+        _u = corrected_unit(_u, val, ev) or _u      # "cr" over a printed "Rs 1,890 Mn"
         metrics.append({**base, "category": cat, "metric": name, "value": val,
-                        "unit": _s(o.get("unit"), 16), "period": _s(o.get("period"), 20),
+                        "unit": _u, "period": _s(o.get("period"), 20),
                         "slide_ref": _s(o.get("slide_ref"), 60), "evidence": ev})
 
     # ---- diff

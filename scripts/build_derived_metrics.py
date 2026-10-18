@@ -125,7 +125,8 @@ def derive_company(df_c: pd.DataFrame, isin: str, symbol: str, now: str) -> list
         emit("npm_pct", p, "annual", (np_a.get(p) / s * 100) if (s and np_a.get(p) is not None) else None, "%")
         emit("fcf_sales_pct", p, "annual",
              ((cfo_a.get(p, 0) + cfi_a.get(p, 0)) / s * 100) if s else None, "%")
-        if i >= 3 and sales_a[i-3][1] not in (None, 0) and s not in (None, 0):
+        # both > 0: a negative base makes ** (1/3) return a complex (no exception)
+        if i >= 3 and sales_a[i-3][1] is not None and s is not None and sales_a[i-3][1] > 0 and s > 0:
             try:
                 emit("rev_cagr_3y_pct", p, "annual",
                      ((s / sales_a[i-3][1]) ** (1/3) - 1) * 100, "%")

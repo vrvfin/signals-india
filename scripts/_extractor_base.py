@@ -141,7 +141,17 @@ QUEUE_COLS = ["doc_id", "key", "isin", "symbol", "company_name", "doc_type",
               # and save_queue writes the frame as-is, so extra columns survive every
               # load/save cycle in every pipeline (this is how backfill_process_date
               # and source already work).
-              "attempts", "last_error", "last_attempt_at"]
+              "attempts", "last_error", "last_attempt_at",
+              # WHAT THE EXCHANGE ITSELF CALLED IT (added 2026-09-13, ADDITIVE).
+              # BSE files every announcement against a controlled vocabulary -
+              # CATEGORYNAME and SUBCATNAME, 8 categories and 76 subcategories across
+              # our own 5,197-row announcement ledger. We were discarding it at enqueue
+              # and re-deriving doc_type from keywords in the title, which is how 19
+              # SEBI rights-issue pages entered the queue as annual reports. Keeping
+              # the exchange's answer makes the classification auditable after the
+              # fact: you can ask WHY a document was typed the way it was.
+              # Blank for rows from sources that publish no category (Screener, NSE).
+              "exch_category", "exch_subcategory"]
 
 
 # A model sometimes returns the PROMPT instead of an answer. Measured 2026-09-02:
@@ -182,9 +192,27 @@ _prompt_lines_cache: list | None = None
 #     "section 2) executive summaries & commentary section"     (382)
 # Counting those made 45% of every concall look like an echo. Excluding heading-shaped
 # lines leaves only real instruction prose, so the threshold means what it says.
+# THE SAME MISTAKE, ONE SHAPE LATER (2026-09-27). The alternatives below all start
+# with a LETTER or the word "section", so a PLAIN NUMBERED title slipped through and was
+# counted as instruction prose:
+#     "5. governance & related-party transactions (rpt)"
+#     "5b. management outlook & expansion (chairman's/md letter + md&a)"
+#     "6. forensic financial risk scorecard (mandatory weighted matrix)"
+#     "8. probing questions for the next earnings call"
+# The annual-report prompt ORDERS the model to emit those headings, so a correct report
+# contains them by construction; three of them condemned it. Measured on the 1,145 stored
+# annual-report reports: 7 good ones were being thrown away as echoes, SENORES and
+# MOREPENLAB among them, and the mail showed their holders no summary at all. The marker
+# test scored ZERO on all seven - it was only ever this.
+# 84 of 1,209 prompt lines are titles of this shape. After excluding them the false
+# positives go to 0 of 1,145, while every prompt file, and a prompt followed by a real
+# report, still read as an echo.
 _PROMPT_HEADING_RE = re.compile(
     r"^(?:output\s+)?section\b"          # "Section 1) ...", "OUTPUT SECTION C ..."
     r"|^[a-z]-?\d*[\)\.]\s"              # "e-1) ...", "a-2) ...", "c) ..."
+    r"|^\d{1,2}[a-z]?\s*[\)\.]\s"         # "5. ...", "5b. ...", "8) ..." -
+                                         # one or two digits, so a sentence
+                                         # opening "2026. ..." is not a heading
     r"|^table_[a-z0-9]", re.I)
 
 

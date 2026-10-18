@@ -304,8 +304,73 @@ def scheduled_ahead(calendar: pd.DataFrame, pf, on: date | None = None,
     return {str(i).strip(): by_sym[_norm(s)] for i, s, _n in pf if _norm(s) in by_sym}
 
 
-def mailed_content_keys(ledger: pd.DataFrame, season: str) -> dict:
-    """{doc_id: content_key} for ledger rows that recorded one.
+def _season_rows(ledger: pd.DataFrame, season: str | None) -> pd.DataFrame:
+    """Ledger rows for `season`, or EVERY row when season is None.
+
+    None is what the mail decisions pass. A document's identity does not change when the
+    quarter label does: filtering on the current season made every rating, deck and FY
+    annual report mailed in Q1 look unmailed the moment Q2 began — measured 2026-09-25 on
+    the live ledger, 3 due mails became 120 on a simulated 1 Oct. An explicit season keeps
+    the old, per-season answer for any caller that wants it.
+    """
+    if season is None:
+        return ledger
+    if "season" not in ledger.columns:
+        return ledger.iloc[0:0]
+    return ledger[ledger["season"].astype(str) == str(season)]
+
+
+TYPED_KEY_FAMILIES = {"deck", "concall", "annual_report"}
+
+
+# Every spelling of "empty" a key field has ever been written with. A ratings.parquet
+# rewrite turned blank outlooks from NaN into None; the key built "NAN" from one and ""
+# from the other, so RAYMOND (22 Jul 2025), CPPLUS and GRAPHITE were re-sent as
+# "credit rating CORRECTED" on 2026-10-15 with nothing changed. Compare on meaning.
+_EMPTY_TOKENS = {"", "NAN", "NONE", "<NA>", "NULL", "NAT"}
+
+
+def _key_fields(key: str) -> list[str]:
+    return ["" if t.strip().upper() in _EMPTY_TOKENS else t.strip().upper()
+            for t in str(key).split("|")]
+
+
+def keys_differ(prev: str, cur: str) -> bool:
+    """Do two content keys disagree on a field they BOTH carry?
+
+    FIELDS GET ADDED TO THESE KEYS OVER TIME - the narrative size band arrived
+    2026-09-26 - and a stored key written before a field existed is simply SHORTER.
+    Comparing the whole string would read every one of those as changed and re-send the
+    entire book in one morning, which is the same trap the "both keys must be present"
+    rule already guards against one level up.
+
+    So compare only as far as BOTH keys go. A row stored with three fields is unaffected
+    by the fourth; it starts being protected by the new field from its next send onward,
+    because that send records the full key.
+    """
+    if not str(prev or "").strip() or not str(cur or "").strip():
+        return False                 # unknown on either side is never a change
+    a = _key_fields(prev)
+    b = _key_fields(cur)
+    # A DIFFERENT KEY FAMILY is not a change in content - it means the two keys
+    # describe different document types. KANOHAR (Oct 2026): one doc_id sat in the queue
+    # as both concall and presentation, the keys were stored per doc_id, so the concall
+    # row recorded "deck|111" and every run read "concall|..." vs "deck|..." as a
+    # correction and re-sent both mails. Only the typed families are guarded: a rating
+    # key starts with the agency, and an agency fix is a real correction.
+    fams = {a[0].lower(), b[0].lower()} & TYPED_KEY_FAMILIES
+    if fams and a[0] != b[0]:
+        return False
+    n = min(len(a), len(b))
+    return a[:n] != b[:n]
+
+
+def mailed_content_keys(ledger: pd.DataFrame, season: str | None) -> dict:
+    """{(doc_id, doc_type): content_key} for ledger rows that recorded one, plus a plain
+    {doc_id: content_key} entry for callers/rows that carry no doc_type.
+
+    doc_id is NOT unique across types (the same filing can be queued as a concall and as
+    a presentation), so lookups must try (doc_id, doc_type) first - see mail_due.
 
     A row written before `content_key` existed returns nothing, which is what keeps the
     change check from firing on the entire back catalogue the first time it runs.
@@ -314,26 +379,29 @@ def mailed_content_keys(ledger: pd.DataFrame, season: str) -> dict:
         return {}
     if "doc_id" not in ledger.columns or "content_key" not in ledger.columns:
         return {}
-    l = ledger[ledger["season"].astype(str) == str(season)]
+    l = _season_rows(ledger, season)
     out = {}
     for _, r in l.iterrows():
         d = str(r.get("doc_id") or "").strip()
         k = str(r.get("content_key") or "").strip()
         if d and k and k.lower() not in ("none", "nan"):
             out[d] = k
+            t = str(r.get("doc_type") or "").strip()
+            if t:
+                out[(d, t)] = k
     return out
 
 
-def already_mailed_docs(ledger: pd.DataFrame, season: str) -> set[str]:
-    """Set of doc_ids already mailed this season."""
+def already_mailed_docs(ledger: pd.DataFrame, season: str | None) -> set[str]:
+    """Set of doc_ids already mailed this season (season=None: in any season)."""
     if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
         return set()
-    l = ledger[ledger["season"].astype(str) == str(season)]
+    l = _season_rows(ledger, season)
     return {str(x).strip() for x in l["doc_id"] if str(x).strip()
             and str(x).strip().lower() not in ("none", "nan")}
 
 
-def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
+def tracked_docs(ledger: pd.DataFrame, season: str | None) -> set[tuple[str, str]]:
     """{(isin, doc_type)} that have at least one ledger row CARRYING a doc_id.
 
     Distinguishes "this company has never been mailed under the doc_id scheme" from
@@ -342,7 +410,7 @@ def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     """
     if ledger is None or ledger.empty or "doc_id" not in ledger.columns:
         return set()
-    l = ledger[ledger["season"].astype(str) == str(season)]
+    l = _season_rows(ledger, season)
     out = set()
     for _, r in l.iterrows():
         d = str(r.get("doc_id") or "").strip()
@@ -351,15 +419,15 @@ def tracked_docs(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
     return out
 
 
-def already_mailed(ledger: pd.DataFrame, season: str) -> set[tuple[str, str]]:
-    """{(isin, doc_type)} already delivered for this season."""
+def already_mailed(ledger: pd.DataFrame, season: str | None) -> set[tuple[str, str]]:
+    """{(isin, doc_type)} already delivered for this season (season=None: any season)."""
     if ledger is None or ledger.empty:
         return set()
     l = ledger.copy()
     for c in ("season", "isin", "doc_type"):
         if c not in l.columns:
             l[c] = ""
-    l = l[l["season"].astype(str) == str(season)]
+    l = _season_rows(l, season)
     return {(str(r["isin"]).strip(), str(r["doc_type"]))
             for _, r in l.iterrows()}
 
@@ -451,9 +519,11 @@ def season_status(pf, queue, calendar, ledger, season, on=None, window_days=2,
     on = on or date.today()
     cov = coverage(pf, queue, season, doc_types=doc_types, tables=tables)
     latest = latest_doc_per_type(pf, queue, doc_types)
-    mailed_docs = already_mailed_docs(ledger, season)
-    legacy = already_mailed(ledger, season)
-    tracked = tracked_docs(ledger, season)
+    # season=None: "delivered" means mailed in ANY season — the same memory mail_due uses,
+    # so a rating mailed in Q1 is not reported as outstanding the day Q2 begins.
+    mailed_docs = already_mailed_docs(ledger, None)
+    legacy = already_mailed(ledger, None)
+    tracked = tracked_docs(ledger, None)
     reporting = reporting_on(calendar, pf, on, window_days=120)   # whole season so far
     upcoming = scheduled_ahead(calendar, pf, on)                  # meetings still to come
 
@@ -537,10 +607,12 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
     on = on or date.today()
     cov = coverage(pf, queue, season, doc_types=doc_types, tables=tables)
     latest = latest_doc_per_type(pf, queue, doc_types)
-    mailed_docs = already_mailed_docs(ledger, season)
-    legacy = already_mailed(ledger, season)          # rows written before doc_id existed
-    tracked = tracked_docs(ledger, season)           # ...and those written after
-    prev_keys = mailed_content_keys(ledger, season)  # what the mail actually SAID
+    # The ledger is read ACROSS seasons (None): a document mailed in Q1 stays mailed in Q2.
+    # Season-scoped reads here re-sent 117 rating/AR/deck mails on a simulated 1 Oct.
+    mailed_docs = already_mailed_docs(ledger, None)
+    legacy = already_mailed(ledger, None)            # rows written before doc_id existed
+    tracked = tracked_docs(ledger, None)             # ...and those written after
+    prev_keys = mailed_content_keys(ledger, None)    # what the mail actually SAID
     reporting = reporting_on(calendar, pf, on, window_days)
 
     out = []
@@ -563,9 +635,12 @@ def mail_due(pf, queue: pd.DataFrame, calendar: pd.DataFrame, ledger: pd.DataFra
             #
             # Both keys must be present to fire: a blank stored key means the row predates
             # this field, and treating unknown as changed would re-send the back catalogue.
-            prev = prev_keys.get(doc_id, "")
-            cur = (content_keys or {}).get(doc_id, "")
-            if not (prev and cur and prev != cur):
+            # per (doc_id, doc_type) first: one doc_id can carry two types
+            _dt = r["doc_type"]
+            prev = prev_keys.get((doc_id, _dt), prev_keys.get(doc_id, ""))
+            _ck = content_keys or {}
+            cur = _ck.get((doc_id, _dt), _ck.get(doc_id, ""))
+            if not (prev and cur and keys_differ(prev, cur)):
                 continue
             resend = True
         if not doc_id and (isin, r["doc_type"]) in legacy:
@@ -900,15 +975,109 @@ def _self_test() -> int:
           not mail_due([pf[0]], q_corr, pd.DataFrame(), led_legacy_k, "Q1FY27",
                        on=date(2026, 8, 14),
                        content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"}))
+    # ---- keys grow fields over time, and a SHORTER stored key is not a change ----
+    # The narrative band became a 4th field on 2026-09-26. Every row already in the
+    # ledger has 3. Comparing whole strings would read all of them as changed and mail
+    # the entire book in one morning.
+    check("an older key missing the newest field is NOT a change",
+          not keys_differ("annual_report|FY26|1", "annual_report|FY26|1|5"))
+    check("a repair IS a change once both keys carry the band",
+          keys_differ("annual_report|FY26|1|3", "annual_report|FY26|1|5"))
+    check("disagreement on a shared field still fires",
+          keys_differ("CRISIL|D|STABLE", "CRISIL|BBB+|STABLE|DOWNGRADE"))
+    check("identical keys are not a change",
+          not keys_differ("a|b|c", "a|b|c"))
+    check("an empty key is not a change", not keys_differ("", "a|b")
+          and not keys_differ("a|b", ""))
+    # End to end: Raymond's shape, through mail_due. The stored row is a 3-field key.
+    led_old = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                             "doc_id": "tatva1", "content_key": "CRISIL|D|STABLE"}])
+    check("a 3-field ledger row is not re-sent just because a field was added",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_old, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={"tatva1": "CRISIL|D|STABLE|REAFFIRMED"}))
+
     check("no current key means no re-send either",
           not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
                        on=date(2026, 8, 14), content_keys={}))
-    check("mailed_content_keys reads what was stored",
-          mailed_content_keys(led_corr, "Q1FY27") == {"tatva1": "CRISIL|D|STABLE|REAFFIRMED"})
+    check("mailed_content_keys reads what was stored (plain + per type)",
+          mailed_content_keys(led_corr, "Q1FY27")
+          == {"tatva1": "CRISIL|D|STABLE|REAFFIRMED",
+              ("tatva1", "rating"): "CRISIL|D|STABLE|REAFFIRMED"})
+    # ---- KANOHAR (Oct 2026): one doc_id queued as concall AND presentation ----------
+    check("different key family is not a change",
+          not keys_differ("deck|111", "concall|Q1FY27|1|4"))
+    check("same family still detects a change",
+          keys_differ("concall|Q1FY27|0", "concall|Q1FY27|1"))
+    check("rating agency correction still detected",
+          keys_differ("CRISIL|D|STABLE|REAFFIRMED", "ICRA|D|STABLE|REAFFIRMED"))
+    # 2026-10-15: NaN -> None in ratings.parquet re-sent three old ratings as CORRECTED
+    check("RAYMOND: NAN vs empty outlook is NOT a change",
+          not keys_differ("CARE|DATA_MISSING|NAN|ASSIGNED", "CARE|DATA_MISSING||ASSIGNED"))
+    check("CPPLUS: NAN vs empty is NOT a change",
+          not keys_differ("DATA_MISSING|A|NAN|REAFFIRMED", "DATA_MISSING|A||REAFFIRMED"))
+    check("GRAPHITE: NONE / <NA> spellings are NOT a change",
+          not keys_differ("DATA_MISSING|DATA_MISSING|NONE|", "DATA_MISSING|DATA_MISSING|<NA>|"))
+    check("a real rating change still fires",
+          keys_differ("CARE|A|NAN|REAFFIRMED", "CARE|AA|NAN|UPGRADED"))
+    led_kan = pd.DataFrame([
+        {"season": "Q2FY27", "isin": "INE1", "doc_type": "presentation", "doc_id": "kan1",
+         "content_key": "deck|111"},
+        {"season": "Q2FY27", "isin": "INE1", "doc_type": "concall", "doc_id": "kan1",
+         "content_key": "concall|Q1FY27|1|4"}])
+    mk = mailed_content_keys(led_kan, None)
+    check("per-type keys survive a shared doc_id",
+          mk[("kan1", "presentation")] == "deck|111"
+          and mk[("kan1", "concall")] == "concall|Q1FY27|1|4")
+    # the corrections path itself, with per-type keys: unchanged -> not due
+    check("per-type content key, unchanged -> not re-sent",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={("tatva1", "rating"): "CRISIL|D|STABLE|REAFFIRMED",
+                                     ("tatva1", "presentation"): "deck|111"}))
+    check("per-type content key, changed -> re-sent",
+          len(mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q1FY27",
+                       on=date(2026, 8, 14),
+                       content_keys={("tatva1", "rating"):
+                                     "CRISIL|BBB+|STABLE|DOWNGRADE"})) == 1)
     check("mailed_content_keys ignores other seasons",
           mailed_content_keys(led_corr, "Q2FY27") == {})
     check("mailed_content_keys tolerates a missing column",
           mailed_content_keys(led_legacy_k, "Q1FY27") == {})
+
+    # ---- THE QUARTER TURNS (1 Oct 2026): a Q1-mailed document is still mailed in Q2.
+    # Season-scoped reads re-sent 117 rating/AR/deck mails on a simulated 1 Oct.
+    check("season change: Q1-mailed rating is NOT due in Q2",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q2FY27",
+                       on=date(2026, 10, 1),
+                       content_keys={"tatva1": "CRISIL|D|STABLE|REAFFIRMED"}))
+    check("season change: a correction still re-sends in Q2",
+          len(mail_due([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q2FY27",
+                        on=date(2026, 10, 1),
+                        content_keys={"tatva1": "CRISIL|BBB+|STABLE|DOWNGRADE"})) == 1)
+    q_new = _q([{"isin": "INE1", "doc_type": "rating", "status": "done",
+                 "announcement_date": "2026-10-03", "doc_id": "tatva2"}])
+    check("season change: a genuinely NEW rating is due in Q2",
+          [d["doc_id"] for d in mail_due([pf[0]], q_new, pd.DataFrame(), led_corr,
+                                         "Q2FY27", on=date(2026, 10, 4))] == ["tatva2"])
+    check("explicit season still filters (old answer kept for callers)",
+          already_mailed_docs(led_corr, "Q2FY27") == set()
+          and already_mailed_docs(led_corr, None) == {"tatva1"})
+    # Legacy rows (no doc_id) keep their existing per-company suppression, now across
+    # seasons too (user decision 2026-09-26: no date rule — it would have mailed 15
+    # ratings on the first run, 9 of them old ratings re-discovered by a 31 Aug sweep).
+    led_leg = pd.DataFrame([{"season": "Q1FY27", "isin": "INE1", "doc_type": "rating",
+                             "doc_id": "None", "mailed_at": "2026-08-15T10:00:00"}])
+    check("legacy row suppresses its company's rating across seasons",
+          not mail_due([pf[0]], q_corr, pd.DataFrame(), led_leg, "Q2FY27",
+                       on=date(2026, 10, 1)))
+    check("legacy row keeps today's behaviour for a newer doc (suppressed)",
+          not mail_due([pf[0]], q_new, pd.DataFrame(), led_leg, "Q2FY27",
+                       on=date(2026, 10, 4)))
+    st = season_status([pf[0]], q_corr, pd.DataFrame(), led_corr, "Q2FY27",
+                       on=date(2026, 10, 1), doc_types=("rating",))
+    check("season status: Q1-mailed rating reads delivered in Q2",
+          [r["state"] for r in st] == [DELIVERED])
 
     print(f"\npf_coverage self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0

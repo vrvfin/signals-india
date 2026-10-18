@@ -46,6 +46,13 @@ import build_gallery as BG
 
 PICKS = "guru_picks.parquet"
 
+# O6 (2026-10-17): each rule's backtest record + "what to expect" from the stock's
+# strongest rule. Loaded in main() from the local backtest artefacts; empty -> the
+# page renders exactly as before.
+import rule_record as RR
+RECORDS: dict = {}
+NAME_IDX: dict = {}
+
 
 def log(m):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
@@ -132,8 +139,29 @@ def annot_for(picks: pd.DataFrame) -> dict:
         head = ('<div style="background:#1b4332;color:#fff;border-radius:6px 6px 0 0;'
                 'padding:4px 10px;font-size:13px;font-weight:700;margin:3px 0 0 0">'
                 f'🎯 {" · ".join(bits)}</div>')
-        out[sym] = head + why_block(r)
+        out[sym] = head + why_block(r) + expect_for(r)
     return out
+
+
+def _rule_ids(r) -> list:
+    return [x.strip() for x in str(r.get("rules", "") or "").split(",") if x.strip()]
+
+
+def expect_for(r) -> str:
+    """'What to expect' from this stock's strongest rule (user 2026-10-17: 1a, 2a)."""
+    if not RECORDS:
+        return ""
+    ids = _rule_ids(r) or [NAME_IDX[n.strip().lower()] for n in
+                           str(r.get("rule_names", "") or "").split("|")
+                           if n.strip().lower() in NAME_IDX]
+    return RR.expect_box(RR.strongest(ids, RECORDS), r.get("price"))
+
+
+def _h(s) -> str:
+    """Rule names carry '<' and '->' ("listed < 2 years -> Trigger"); unescaped, the
+    browser read them as a tag and swallowed the text."""
+    import html as _html
+    return _html.escape(str(s), quote=False)
 
 
 def why_block(r) -> str:
@@ -152,13 +180,16 @@ def why_block(r) -> str:
     for it in items:
         if "→" in it:
             rule, ev = it.split("→", 1)
+            rec = RECORDS.get(NAME_IDX.get(rule.strip().lower(), ""), {})
             rows.append(
                 f'<li style="margin:2px 0"><span style="color:#1b4332;'
-                f'font-weight:600">{rule.strip()}</span>'
-                f'<span style="color:#555"> — {ev.strip()}</span></li>')
+                f'font-weight:600">{_h(rule.strip())}</span>'
+                f'<span style="color:#555"> — {_h(ev.strip())}</span>'
+                f'{RR.record_line(rec)}</li>')
         else:
+            rec = RECORDS.get(NAME_IDX.get(it.strip().lower(), ""), {})
             rows.append(f'<li style="margin:2px 0"><span style="color:#1b4332;'
-                        f'font-weight:600">{it}</span></li>')
+                        f'font-weight:600">{_h(it)}</span>{RR.record_line(rec)}</li>')
     return ('<details open style="background:#f2f7f4;border:1px solid #cfe3d8;'
             'border-top:none;border-radius:0 0 6px 6px;padding:6px 10px;'
             'margin:0 0 3px 0;font-size:12px">'
@@ -239,7 +270,18 @@ def main():
     ap.add_argument("--max-missing-pct", type=float, default=5.0)
     ap.add_argument("--dry-run", action="store_true",
                     help="resolve inputs and report what would be drawn")
+    ap.add_argument("--backtest-dir", default=BT,
+                    help="where the backtest artefacts live (rule records)")
     args = ap.parse_args()
+
+    global RECORDS, NAME_IDX
+    try:
+        RECORDS = RR.load_records(args.backtest_dir)
+    except Exception as e:
+        log(f"rule records unavailable ({str(e)[:80]}) — page renders without them")
+        RECORDS = {}
+    NAME_IDX = RR.name_index(RECORDS)
+    log(f"rule records: {len(RECORDS)} live rules with a backtest record")
 
     cache = BG.ParquetCache(enabled=not args.no_cache)
     if args.purge_cache:

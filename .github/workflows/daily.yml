@@ -106,6 +106,16 @@ jobs:
         run: python scripts/fetch_bse_eod_api.py --workers 16
         continue-on-error: true
 
+      # NSE SME names Yahoo has no data for (276 of 593 had no price file,
+      # 2026-10-14): official NSE bhavcopy rows, merged with the BSE step's own
+      # _merge_bars (14-day re-take, split/bonus rescale on NSE's corporate-action
+      # list). Only names today's Yahoo ingest did not refresh. Before listing
+      # dates, which dates new names from their first bar.
+      - name: Ingest OHLCV (NSE SME names Yahoo lacks, NSE bhavcopy)
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/fetch_nse_sme_eod.py --workers 16
+        continue-on-error: true
+
       # Listing dates — must run AFTER both OHLCV steps, since new names are
       # dated from the first bar of data/ohlcv when NSE has no date for them.
       # DAILY mode only touches names with no row yet (typically a handful), so
@@ -120,14 +130,19 @@ jobs:
           python scripts/build_listing_dates.py --classify
         continue-on-error: true
 
-      - name: Ingest indices + macro
-        if: steps.fresh.outputs.skip != 'true'
-        run: python scripts/ingest_indices_macro.py
-        continue-on-error: true
-
+      # NSE first, Yahoo second. NSE's official index file appears only in the
+      # evening (~23:20 IST), so it can fill every missed session up to YESTERDAY;
+      # Yahoo (NIFTY_MIDCAP_100.NS / ^CNXSC) returns only the LATEST bar, so it adds
+      # today. In the old order Yahoo wrote today first and the NSE step (which
+      # fetches only after the last stored date) could never fill a missed day.
       - name: Fix indices (NSE midcap/smallcap)
         if: steps.fresh.outputs.skip != 'true'
         run: python scripts/fix_indices_nse.py
+        continue-on-error: true
+
+      - name: Ingest indices + macro
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/ingest_indices_macro.py
         continue-on-error: true
 
       - name: Ingest FII/DII
@@ -293,6 +308,15 @@ jobs:
           GMAIL_USER:          ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:        ${{ secrets.NOTIFY_EMAIL }}
+
+      # Market cap = weekly share count (share_count.yml) x today's close from
+      # features/latest.parquet. Rewrites universe/market_cap.csv with the same
+      # 3 columns; names without a share count keep their existing value.
+      # compute_features picks it up at the start of the next run.
+      - name: Update market cap (share count x close)
+        if: steps.fresh.outputs.skip != 'true'
+        run: python scripts/update_market_cap.py
+        continue-on-error: true
 
       # ---- Truth gate: the ONLY step allowed to fail the run ----
       - name: Health check (truth gate)

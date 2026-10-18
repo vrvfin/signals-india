@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import sys
 from datetime import date, datetime
 
@@ -46,6 +47,9 @@ import ar_scorecard as ARS
 import deck_teardown as DT
 import filing_results as FR
 import season_summary as SS
+import results_day_guidance as RDG
+import mail_freshness as MF
+import teardown_docs as TD
 from provenance import (Fact, MISSING, SCREENER, ANNUAL, QUARTERLY, write_audit, audit)
 
 MAIL_KEY = "quarter_teardown"
@@ -1192,6 +1196,22 @@ def block_d(d: dict) -> str:
     return "".join(out)
 
 
+def block_progress(d: dict) -> str:
+    """D2 - each OPEN P&L promise measured including the quarter just reported.
+
+    Block D can only judge a horizon once it has closed (guidance_vs_actual is annual),
+    so on a Q1-Q3 results day it is silent about the quarter itself. This is the same
+    pace measurement as the weekly guidance-progress mail, run at mail time
+    (results_day_guidance). `d["progress"]` is filled by main(); absent -> no block.
+    """
+    pr = d.get("progress")
+    if pr is None:
+        return ""
+    return RDG.render_block(pr, filing_quarter=d.get("progress_filing_q"),
+                            tbl=_tbl, heading=_h,
+                            max_rows=d.get("progress_rows", RDG.MAX_ROWS))
+
+
 # --------------------------------------------------------------------------- #
 # page assembly
 # --------------------------------------------------------------------------- #
@@ -1380,6 +1400,36 @@ def block_season(d: dict) -> str:
               "mail — this page is the financial view.") + inner
 
 
+def block_docs(d: dict) -> str:
+    """Step 6: this quarter's concall + results release and this FY's annual report,
+    condensed, each with its NEW / RECENT badge (teardown_docs). Filled by main()."""
+    docs = d.get("docs") or {}
+    if not docs:
+        return ""
+    from pf_company_mails import md_to_html
+    compact = bool(d.get("docs_compact"))
+    texts = {} if compact else (d.get("doc_texts") or {})
+    return TD.render(docs, texts, MF.today_ist(), _h, MF.badge, md_to_html, compact=compact)
+
+
+def block_today(d: dict) -> str:
+    """The 'what is new today' strip at the top of the page (mail_freshness)."""
+    ents = []
+    for kind, label in TD.KINDS:
+        row = (d.get("docs") or {}).get(kind)
+        if row:
+            ents.append({"date": row["date"], "label": label.split(" ", 1)[-1].lower()})
+    fil = d.get("filing") or {}
+    if fil.get("filed_on"):
+        ents.append({"date": fil["filed_on"], "label": "results filing"})
+    if d.get("reported_on"):
+        ents.append({"date": d["reported_on"], "label": "quarterly numbers"})
+    for f in ((d.get("season_summary") or {}).get("filings") or [])[:8]:
+        ents.append({"date": f.get("date"), "label": "filing: "
+                     + str(f.get("headline") or "")[:70]})
+    return MF.today_strip(ents)
+
+
 def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
     if not d.get("quarter"):
         return ""
@@ -1390,9 +1440,11 @@ def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
             f"&middot; <b>{d['quarter']}</b> ({d['period']}) &middot; ISIN "
             f"{esc(d['isin'], 16)} &middot; generated "
             f"{datetime.now().strftime('%d %b %Y')}</div>")
+    head += block_today(d)
     body = (block_a(d) + block_b(d) + block_ladder(d, stmts) + block_h1(d, rich)
             + block_financials(d)
-            + block_h2(d) + block_deck(d) + block_d(d) + block_season(d))
+            + block_h2(d) + block_deck(d) + block_d(d) + block_progress(d)
+            + block_docs(d) + block_season(d))
     foot = (
         f"<div style='margin-top:22px;padding-top:12px;border-top:1px solid #ddd;"
         f"font-size:11.5px;color:{MUTED};line-height:1.6'>"
@@ -1559,8 +1611,17 @@ def compact_table(rows_html: str) -> str:
 # loading
 # --------------------------------------------------------------------------- #
 
+def _not_a_results_filing(doc_type, title) -> bool:
+    """A 'results' queue row that is not a results filing (2026-10-18): a board-meeting
+    NOTICE (ATHERENERG, meeting on 26 Oct) or a credit-rating release queued as results
+    (WELCORP, CARE). Both sat in the 'filed, numbers pending' mail. Pure."""
+    t = str(title or "")
+    return (QT.is_meeting_notice(t, str(doc_type))
+            or (str(doc_type) == "results" and bool(re.search(r"(?i)credit\s*rating", t))))
+
+
 def filed_awaiting_numbers(queue, pf, season: str, hours: float | None,
-                           rendered: set) -> list[dict]:
+                           rendered: set, mailed: set = frozenset()) -> list[dict]:
     """PF holdings that HAVE FILED results but whose numbers are not on Screener yet.
 
     The 'has reported' test is deliberately statements-based — rendering a teardown from
@@ -1600,6 +1661,12 @@ def filed_awaiting_numbers(queue, pf, season: str, hours: float | None,
         isin = str(r["isin"]).strip()
         if isin in rendered:                # numbers already rendered — nothing pending
             continue
+        # Already sent its teardown THIS SEASON in an earlier run (RPEL, 18 Oct: mailed on
+        # the 16th, still listed as pending because only this run's pages were checked).
+        if isin in mailed:
+            continue
+        if _not_a_results_filing(r.get("doc_type"), r.get("title")):
+            continue
         sym, name = by_isin.get(isin, ("", ""))
         e = out.setdefault(isin, {"isin": isin, "symbol": sym, "name": name,
                                   "filed_on": r["_d"], "title": "", "deck": False})
@@ -1609,6 +1676,27 @@ def filed_awaiting_numbers(queue, pf, season: str, hours: float | None,
         elif not e["title"]:
             e["title"] = str(r.get("title") or "")[:90]
     return sorted(out.values(), key=lambda x: x["filed_on"], reverse=True)
+
+
+PENDING_SENT = "teardown_pending_sent.parquet"      # new 2026-10-18, additive
+PENDING_COLS = ["season_quarter", "mail_mode", "pending_key", "sent_at"]
+
+
+def pending_key(rows: list[dict]) -> str:
+    """The pending list as a comparable key: the set of ISINs. Pure."""
+    return ",".join(sorted({str(r.get("isin") or "") for r in rows if r.get("isin")}))
+
+
+def pending_changed(sent: pd.DataFrame, season: str, mode: str, key: str) -> bool:
+    """Send the 'filed, numbers pending' mail only when its list CHANGED since the last
+    one in this mode this season (it went out 2-4 times a day, identical). Pure."""
+    if not key:
+        return False
+    if sent is None or sent.empty:
+        return True
+    x = sent[(sent["season_quarter"].astype(str) == season)
+             & (sent["mail_mode"].astype(str) == mode)]
+    return x.empty or str(x["pending_key"].iloc[-1]) != key
 
 
 def render_awaiting(rows: list[dict]) -> str:
@@ -1705,6 +1793,25 @@ LEDGER_COLS = ["season_quarter", "isin", "symbol", "quarter_label", "reported_on
                "mail_mode"]
 
 
+def owed_full_teardown(ledger: pd.DataFrame, season: str, mode: str) -> set:
+    """ISINs mailed ONLY as a filing card this season in this mail mode: the full
+    Screener teardown has not followed yet. Pure."""
+    if ledger is None or ledger.empty:
+        return set()
+    l = ledger[ledger["season_quarter"].astype(str) == season].copy()
+    if l.empty:
+        return set()
+    m = (l["mail_mode"].astype(str).replace({"None": "combined", "nan": "combined",
+                                              "": "combined"})
+         if "mail_mode" in l.columns else pd.Series("combined", index=l.index))
+    l = l[m == mode]
+    src = l["data_source"].fillna("screener").astype(str).replace(
+        {"None": "screener", "nan": "screener", "": "screener"})
+    fil = set(l[src == "filing"]["isin"].astype(str))
+    full = set(l[src == "screener"]["isin"].astype(str))
+    return fil - full
+
+
 def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tuple]:
     """PF holdings whose results for THIS season landed inside the window.
 
@@ -1772,7 +1879,7 @@ def recent_reporters(drive, idx, pf, season: str, hours: float, log) -> list[tup
 
 
 def _write_and_send(args, drive, idx, season, pages, reported, body, subject, log,
-                    attachments=None) -> None:
+                    attachments=None) -> bool:
     """Write the preview, then send if this environment can. Shared by the day-grouped
     and per-company mail paths so the ledger/toggle/credential rules cannot diverge."""
     prev = os.path.join(args.out_dir, "quarter_teardown_preview.html")
@@ -1783,17 +1890,17 @@ def _write_and_send(args, drive, idx, season, pages, reported, body, subject, lo
         log(f"  WARNING: body exceeds {MAX_HTML_BYTES:,} B — Gmail may clip it")
     if args.dry_run:
         log("  --dry-run: not sending")
-        return
+        return False
     from mailer import send_email, load_mail_settings
     if not load_mail_settings(drive, idx).get(MAIL_KEY, True):
         log(f"  mail toggle '{MAIL_KEY}' is OFF — not sending")
-        return
+        return False
     if not (os.getenv("GMAIL_USER") and os.getenv("GMAIL_APP_PASSWORD")
             and os.getenv("NOTIFY_EMAIL")):
         log("  mail NOT sent — GMAIL_USER / GMAIL_APP_PASSWORD / NOTIFY_EMAIL are not "
             "set in this environment. The preview above is the exact body that would "
             "go out. Add them to .env, or run this from CI.")
-        return
+        return False
     ok = send_email(subject, body, attachments=attachments or None)
     log(f"  mail sent={ok}  ({subject.encode('ascii', 'ignore').decode()})")
     # Ledger is stamped ONLY after a confirmed send — a failed or toggled-off mail
@@ -1802,6 +1909,7 @@ def _write_and_send(args, drive, idx, season, pages, reported, body, subject, lo
         _stamp_ledger(drive, idx, season, pages, reported, log,
                       mode="per_company" if getattr(args, "per_company", False)
                       else "combined")
+    return bool(ok)
 
 
 def results_content_key(d: dict) -> str:
@@ -2110,6 +2218,71 @@ def _self_test() -> int:
     # It must NOT imply a teardown was done.
     check("filing card withholds the bridge", "Adjusted PAT" not in fh)
 
+    # ---- D2: guidance progress (results_day_guidance) ----------------------------
+    check("D2 absent when main() did not measure", block_progress({}) == "")
+    # ---- P5: the full teardown follows a filing card ----------------------------
+    _led = pd.DataFrame([
+        {"season_quarter": "Q2FY27", "isin": "F1", "data_source": "filing", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F2", "data_source": "filing", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F2", "data_source": "screener", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F3", "data_source": "filing", "mail_mode": "combined"},
+        {"season_quarter": "Q1FY27", "isin": "F4", "data_source": "filing", "mail_mode": "per_company"},
+        {"season_quarter": "Q2FY27", "isin": "F5", "data_source": None, "mail_mode": None}])
+    check("owed: filing card only, this season, this mode",
+          owed_full_teardown(_led, "Q2FY27", "per_company") == {"F1"})
+    check("owed: combined mode is its own ledger",
+          owed_full_teardown(_led, "Q2FY27", "combined") == {"F3"})
+    check("owed: empty ledger", owed_full_teardown(pd.DataFrame(), "Q2FY27", "combined") == set())
+    # ---- 2026-10-18: "filed, numbers pending" — 18 Oct list was RPEL, WELCORP, ATHERENERG,
+    # none of which belonged there.
+    _pq = pd.DataFrame([
+        {"doc_type": "results", "announcement_date": "2026-10-16", "isin": "RP",
+         "title": "Board Meeting Outcome for Outcome Of Board Meeting Held On 16 October"},
+        {"doc_type": "results", "announcement_date": "2026-10-16", "isin": "WC",
+         "title": "Announcement under Regulation 30 (LODR)-Credit Rating 16 Oct - Press Release"},
+        {"doc_type": "results", "announcement_date": "2026-10-16", "isin": "AT",
+         "title": "Board Meeting Intimation for To Consider And Approve The Unaudited Results"},
+        {"doc_type": "results", "announcement_date": "2026-10-16", "isin": "IN",
+         "title": "Financial Results for the quarter ended September 30, 2026"}])
+    _ppf = [("RP", "RPEL", "R"), ("WC", "WELCORP", "W"), ("AT", "ATHERENERG", "A"),
+            ("IN", "INDOMIM", "I")]
+    _aw = filed_awaiting_numbers(_pq, _ppf, "Q2FY27", None, set(), mailed={"RP"})
+    check("pending: notice, rating release and already-mailed RPEL all excluded",
+          [a["symbol"] for a in _aw] == ["INDOMIM"])
+    _ps = pd.DataFrame([{"season_quarter": "Q2FY27", "mail_mode": "per_company",
+                         "pending_key": "IN", "sent_at": "x"}])
+    check("pending mail: unchanged list -> not re-sent",
+          not pending_changed(_ps, "Q2FY27", "per_company", "IN"))
+    check("pending mail: list changed -> sent",
+          pending_changed(_ps, "Q2FY27", "per_company", "IN,XX"))
+    check("pending mail: first time this season -> sent",
+          pending_changed(None, "Q2FY27", "per_company", "IN"))
+    check("pending key is order-free", pending_key([{"isin": "B"}, {"isin": "A"}]) == "A,B")
+    # ---- step 6: documents block + the 'new today' strip ----------------------------
+    _t = MF.today_ist().isoformat()
+    _dd = {"docs": {"concall": {"date": _t, "doc_id": "c", "title": "", "period": ""}},
+           "doc_texts": {"concall": "Guided **20%** growth"}}
+    check("docs block renders with a NEW badge", "What the documents say" in block_docs(_dd)
+          and "NEW" in block_docs(_dd))
+    check("compact docs block keeps the header, drops the text",
+          "Guided" not in block_docs(dict(_dd, docs_compact=True))
+          and "Concall" in block_docs(dict(_dd, docs_compact=True)))
+    check("today strip names today's concall", "New today" in block_today(_dd)
+          and "concall" in block_today(_dd))
+    check("no docs -> no block, no strip", block_docs({}) == "" and block_today({}) == "")
+    _pr = pd.DataFrame([{"metric": "pat", "guided_text": "Rs 60 crore",
+                         "target_period": "FY27", "kind": "level",
+                         "actual_to_date": 18.0, "periods_elapsed": 2,
+                         "periods_total": 4, "pct_of_target": 30.0, "time_pct": 50.0,
+                         "status": "BEHIND"}])
+    d2 = block_progress({"progress": _pr, "progress_filing_q": "Q1 FY27"})
+    check("D2 renders a measured promise", "BEHIND" in d2 and "Rs 60 crore" in d2)
+    check("D2 says the quarter came from the filing", "exchange filing" in d2)
+    check("D2 explains an empty measurement",
+          "No open" in block_progress({"progress": pd.DataFrame()}))
+    check("D2 sits after D on the full page",
+          "block_d(d) + block_progress(d)" in open(__file__, encoding="utf-8").read())
+
     # ---- the send path itself ----------------------------------------------------
     # THE REGRESSION THAT SHIPPED: the per-company branch called
     #     send_email(subject, body, attachments=attachments or None)
@@ -2274,6 +2447,13 @@ def main() -> None:
     reported = {}
     pf_all = list(targets)
     windowed = args.since_hours is not None or args.season_all
+    # Bound for the non-windowed paths too (--pf / --symbols without a window): the
+    # per-company loop reads it unconditionally and crashed with UnboundLocalError.
+    prev_keys: dict = {}
+    # {isin: content_key} of FILING cards already mailed in this mode this season, so a
+    # card is not re-sent on every run while Screener lags (harmless at 3-hourly, a
+    # mail every 20 min under results_watch). A changed filing still re-sends.
+    prev_filing: dict = {}
     if windowed:
         pf_n = len(targets)
         recent = recent_reporters(drive, idx, targets, season, args.since_hours, log)
@@ -2289,6 +2469,22 @@ def main() -> None:
             targets = [(i, s, n) for i, s, n, _w, _src in recent]
             log(f"  {len(targets)} of {pf_n} PF holding(s) have a {season} report date "
                 f"in the last {args.since_hours:g}h")
+            # P5 (2026-10-15): a holding mailed ONLY as a filing card this season is
+            # still owed the full teardown, however long Screener took. The report-date
+            # window used to drop it for good (Q1 FY27: OBSCP, VMARCIND never got theirs).
+            try:
+                from _extractor_base import load_parquet as _lp
+                _led = _lp(drive, idx, LEDGER_NAME, LEDGER_COLS)
+                owed = owed_full_teardown(_led, season,
+                                          "per_company" if args.per_company else "combined")
+                have = {t[0] for t in targets}
+                extra = [t for t in pf_all if t[0] in owed and t[0] not in have]
+                if extra:
+                    targets += extra
+                    log(f"  + {len(extra)} holding(s) owed the full teardown after a "
+                        f"filing card: {', '.join(t[1] for t in extra)}")
+            except Exception as e:
+                log(f"  WARNING: filing-card follow-up check failed ({str(e)[:60]})")
 
         # {isin: content_key} for holdings already mailed WITH a key recorded. Populated
         # below; declared here because --force skips that block and the post-load check
@@ -2314,6 +2510,9 @@ def main() -> None:
                     # teardown (bridge, divergence rails, register) still owes it a
                     # mail once Screener publishes the ladder.
                     if str(r.get("data_source") or "screener").strip() == "filing":
+                        _fk = str(r.get("content_key") or "").strip()
+                        if _fk and _fk.lower() not in ("none", "nan"):
+                            prev_filing[str(r["isin"]).strip()] = _fk
                         continue
                     # A ROW CARRYING A content_key IS NOT DECIDED HERE. Its numbers may
                     # have been restated since, and the only way to know is to build the
@@ -2325,6 +2524,19 @@ def main() -> None:
                         prev_keys[str(r["isin"]).strip()] = _k
                         continue
                     done.add(str(r["isin"]).strip())
+                # The COMBINED (t4_nightly --daily) mail leaves out holdings that already
+                # had their own per-company mail this season (2026-10-17: RPEL got both,
+                # 14:26 per-company + 14:37 combined). Per-company + results_watch now
+                # cover every reporter; the combined mail keeps only what they missed.
+                if not args.per_company and "mail_mode" in led.columns:
+                    _pc = led[(led["season_quarter"].astype(str) == season)
+                              & (led["mail_mode"].astype(str) == "per_company")]
+                    _pc_isins = set(_pc["isin"].astype(str).str.strip())
+                    if _pc_isins:
+                        done |= _pc_isins
+                        for _i in _pc_isins:
+                            prev_keys.pop(_i, None)
+                            prev_filing.pop(_i, None)
             before = len(targets)
             targets = [t for t in targets if t[0] not in done]
             if before != len(targets):
@@ -2365,6 +2577,35 @@ def main() -> None:
                    "announcements": tables_ann},
     }
 
+    # Open guidance for block D2, parsed once for the whole run and only for the
+    # companies in it. Read-only; a failure drops the block, never the mail.
+    try:
+        commits_by_isin = RDG.prepare_commitments(
+            _read(drive, idx, "guidance_tracker.parquet"),
+            _read(drive, idx, "ppt_guidance.parquet"),
+            _read(drive, idx, "ar_guidance.parquet"),
+            _read(drive, idx, "mgmt_credibility.parquet"),
+            isins={t[0] for t in targets})
+        log(f"  open P&L guidance: {sum(map(len, commits_by_isin.values()))} "
+            f"promises across {len(commits_by_isin)} company(ies)")
+    except Exception as e:
+        commits_by_isin = None
+        log(f"  WARNING: guidance progress unavailable ({str(e)[:70]})")
+
+    def _progress(d, stmts, filing=None):
+        """Fill d['progress'] for block D2. Silent on failure - the block is extra."""
+        if commits_by_isin is None:
+            return
+        try:
+            ser = RDG.series_from_statements(stmts, d["isin"])
+            if filing and RDG.add_filing_quarter(ser, d["isin"], filing):
+                d["progress_filing_q"] = filing.get("quarter")
+            d["progress"] = RDG.company_progress(
+                commits_by_isin.get(d["isin"], []), ser, season)
+            d["progress_summary"] = RDG.summary(d["progress"])
+        except Exception as e:
+            log(f"  {d.get('symbol')}: guidance progress skipped ({str(e)[:60]})")
+
     # The filing fallback. Screener is a lagging mirror of the exchange filing, and a
     # holding that filed is not "not reported" — it is reported and unpublished.
     try:
@@ -2372,6 +2613,30 @@ def main() -> None:
         _queue_all = _lq0(drive, idx)
     except Exception:
         _queue_all = pd.DataFrame()
+
+    # Step 6 (user 2026-10-14): what the company's own documents say, condensed.
+    _page_cache: dict = {}
+    _today_ist = MF.today_ist()
+    try:
+        from pf_company_mails import current_ar_fy, ar_fy_year
+        _ar_fy = current_ar_fy(_today_ist)
+        _win = SS.season_window(season, _today_ist)
+    except Exception as e:
+        _ar_fy, _win = None, None
+        log(f"  WARNING: document summaries unavailable ({str(e)[:70]})")
+
+    def _docs(d):
+        """Fill d['docs'] / d['doc_texts']. Silent on failure - the block is extra."""
+        if _ar_fy is None or _queue_all is None or _queue_all.empty:
+            return
+        try:
+            d["docs"] = TD.pick_docs(_queue_all, d["isin"], season, _today_ist, _win,
+                                     _ar_fy, ar_fy_year)
+            d["doc_texts"] = {k: TD.doc_text(drive, repo_id, idx, d["isin"], k, row,
+                                             _page_cache)
+                              for k, row in d["docs"].items()}
+        except Exception as e:
+            log(f"  {d.get('symbol')}: document summaries skipped ({str(e)[:60]})")
     try:
         filings = FR.load_filing_results(drive, idx, season, queue=_queue_all, log=log)
     except Exception as e:
@@ -2380,7 +2645,7 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     pages, filing_pages = [], []
-    def _try_filing(isin, symbol, name, why, stmts=None) -> bool:
+    def _try_filing(isin, symbol, name, why, stmts=None, gva=None) -> bool:
         """Render the filing card when the statements cannot carry a teardown."""
         fil = filings.get(isin)
         if not fil:
@@ -2393,14 +2658,26 @@ def main() -> None:
                 FR.apply_unit_check({isin: fil}, {isin: ref}, log)
         d = {"isin": isin, "symbol": symbol, "name": name,
              "quarter": fil["quarter"], "filing": fil, "data_source": "filing"}
+        _fk = results_content_key(d)
+        if _fk and prev_filing.get(isin) == _fk:
+            log(f"  {symbol}: filing card already mailed, same numbers — waiting for "
+                f"Screener's statements for the full teardown")
+            return True
         # A holding Screener has not caught up with still published a deck, a concall
         # and its other filings — that is exactly what the season summary carries, and
         # it needs no quarterly ladder.
         d["season_summary"] = SS.build_summary(
             isin, season, filing=fil, deck=tables["deck"], **tables["season"])
-        html = render_filing(d) + block_season(d)
-        if not html:
+        card = render_filing(d)
+        if not card:
             return False
+        # Said-vs-delivered and the pace of open promises need no quarterly ladder:
+        # D reads guidance_vs_actual, D2 measures with the filing's own quarter.
+        d["gva"] = gva if gva is not None else pd.DataFrame()
+        _progress(d, stmts, filing=fil)
+        _docs(d)
+        html = (block_today(d) + card + block_d(d) + block_progress(d) + block_docs(d)
+                + block_season(d))
         filing_pages.append((symbol, d, html))
         log(f"  {symbol}: {why} — rendered from the filing "
             f"({fil['quarter']}, filed {fil.get('filed_on') or '?'})")
@@ -2410,7 +2687,7 @@ def main() -> None:
         stmts, register, arsc, gva, deck = load_company(
             drive, idx, stmt_fid, repo_id, isin, symbol, name, tables)
         if stmts is None or stmts.empty:
-            if not _try_filing(isin, symbol, name, "no statements parquet"):
+            if not _try_filing(isin, symbol, name, "no statements parquet", gva=gva):
                 log(f"  {symbol}: no statements parquet — skipped")
             continue
         # NO QUARTER MIXING. A filing can be dated before the numbers land, so the
@@ -2425,7 +2702,8 @@ def main() -> None:
                 # company still reported, so fall back to the filing's own numbers
                 # rather than dropping it out of the mail entirely.
                 if not _try_filing(isin, symbol, name,
-                                   f"statements still at {lbl or 'n/a'}", stmts=stmts):
+                                   f"statements still at {lbl or 'n/a'}", stmts=stmts,
+                                   gva=gva):
                     log(f"  {symbol}: filing dated {season} but statements still at "
                         f"{lbl or 'n/a'} — skipped until the numbers land")
                 continue
@@ -2447,7 +2725,19 @@ def main() -> None:
                 continue
             log(f"  {symbol}: numbers RESTATED since the last mail "
                 f"({_prev} -> {_cur}) — re-sending")
+        _progress(d, stmts)
+        _docs(d)
         html = render(d, stmts, rich=args.html)
+        if len(html.encode("utf-8")) > MAX_HTML_BYTES and d.get("progress") is not None:
+            # D2 is the newest block; it gives way first rather than tipping the
+            # page over Gmail's clip — worst three promises only.
+            d["progress_rows"] = 3
+            html = render(d, stmts, rich=args.html)
+        if len(html.encode("utf-8")) > MAX_HTML_BYTES and d.get("docs"):
+            # then the document summaries shrink to their headers and badges; the
+            # full reports come in the per-company concall / annual-report mails
+            d["docs_compact"] = True
+            html = render(d, stmts, rich=args.html)
         pages.append((symbol, d, html))
         log(f"  {symbol}: {d['quarter']} · {len(d['facts'])} facts · "
             f"{len(register)} register rows · {len(html):,} bytes")
@@ -2470,19 +2760,33 @@ def main() -> None:
     if windowed:
         try:
             from _extractor_base import load_queue as _lq
+            from _extractor_base import load_parquet as _lp2
+            _led_all = _lp2(drive, idx, LEDGER_NAME, LEDGER_COLS)
+            _mailed = (set(_led_all[_led_all["season_quarter"].astype(str) == season]
+                           ["isin"].astype(str).str.strip())
+                       if _led_all is not None and not _led_all.empty else set())
             awaiting = filed_awaiting_numbers(
                 _lq(drive, idx), pf_all, season,
                 None if args.season_all else args.since_hours,
+                mailed=_mailed,
+                rendered=
                 # A holding rendered from its filing has been SHOWN, with numbers — it
                 # must not also appear under "filed, numbers pending".
-                {d["isin"] for _s, d, _h in pages}
-                | {d["isin"] for _s, d, _h in filing_pages})
+                ({d["isin"] for _s, d, _h in pages}
+                 | {d["isin"] for _s, d, _h in filing_pages}))
             if awaiting:
                 log(f"  filed but numbers pending: "
                     f"{', '.join(a['symbol'] or a['isin'] for a in awaiting)}")
         except Exception as e:
             log(f"  WARNING: could not compute pending filings ({str(e)[:70]})")
 
+    if args.mail and not args.per_company and not (pages or filing_pages) and awaiting:
+        # 2026-10-18: "Quarterly teardown — 0 companies · 3 awaiting" went out nightly.
+        # The per-company job already mails the pending list (on change); a combined
+        # mail with no company in it adds nothing.
+        log(f"  combined mail: no company to show, only {len(awaiting)} pending — "
+            f"not sent (the per-company job mails the pending list)")
+        return
     if args.mail and (pages or filing_pages or awaiting):
         qlabel = (pages[0][1]["quarter"] if pages else
                   filing_pages[0][1]["quarter"] if filing_pages else
@@ -2588,11 +2892,28 @@ def main() -> None:
                 n_sent += 1
             # Companies that filed with no numbers anywhere still deserve to be named,
             # but they have no page of their own — one short mail covers them.
+            _pk = pending_key(awaiting)
+            _sent = None
             if awaiting:
-                _write_and_send(args, drive, idx, season, [], reported,
-                                render_awaiting(awaiting),
-                                f"📊 {qlabel} — {len(awaiting)} filed, numbers pending",
-                                log)
+                from _extractor_base import load_parquet as _lp3
+                _sent = _lp3(drive, idx, PENDING_SENT, PENDING_COLS)
+            if awaiting and not pending_changed(_sent, season, "per_company", _pk):
+                log(f"  pending list unchanged ({len(awaiting)}) — not re-sent")
+                awaiting = []
+            if awaiting:
+                _ok = _write_and_send(args, drive, idx, season, [], reported,
+                                      render_awaiting(awaiting),
+                                      f"📊 {qlabel} — {len(awaiting)} filed, numbers pending",
+                                      log)
+                if _ok:
+                    from _extractor_base import save_parquet as _sp
+                    _row = pd.DataFrame([{"season_quarter": season, "mail_mode": "per_company",
+                                          "pending_key": _pk,
+                                          "sent_at": datetime.now().isoformat(timespec="seconds")}],
+                                        columns=PENDING_COLS)
+                    _sp(drive, idx, PENDING_SENT,
+                        (pd.concat([_sent, _row], ignore_index=True)
+                         if _sent is not None and not _sent.empty else _row).tail(500))
             log(f"  per-company: {n_sent} teardown mail(s)"
                 + (f" + 1 awaiting-summary mail" if awaiting else ""))
             return

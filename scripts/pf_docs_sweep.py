@@ -215,6 +215,52 @@ _DATE_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?(?:\s+(\d{4}))?\b")
 _MONYEAR_RE = re.compile(r"\b([A-Za-z]{3})[a-z]*\.?\s+(\d{4})\b")
 
 
+# BSE's CONTROLLED VOCABULARY, measured from our own announcement_ledger.parquet
+# (5,197 rows): 8 CATEGORYNAME values and 76 SUBCATNAME values. This is the exchange's
+# own word for what a filing IS, and it beats reading the title for keywords - the title
+# is prose written by the company, the subcategory is a field chosen from a list.
+# Only UNAMBIGUOUS values belong here; everything else falls through to classify().
+EXCH_SUBCAT_TYPE = {
+    "financial results": "results",
+    "outcome of board meeting": "results",
+    "analyst / investor meet": "concall",
+    "analyst/institutional investor meet": "concall",
+    "investor presentation": "presentation",
+    "credit rating": "rating",
+    "annual report": "annual_report",
+}
+# Subcategories that are NEVER one of our summarisable documents, whatever words happen
+# to appear in the title. BRSR is the live example: a sustainability filing that says
+# "Annual" and was rendering as an annual report.
+EXCH_SUBCAT_REJECT = {
+    "business responsibility and sustainability reporting (brsr)",
+    "postal ballot", "record date", "dividend",
+    "allotment of esop / esps", "allotment of equity shares",
+    "change in directorate", "change in management", "open offer",
+    "monitoring agency report",
+    "disclosures under reg. 29(1) of sebi (sast) regulations, 2011",
+    "disclosures under reg. 29(2) of sebi (sast) regulations, 2011",
+}
+
+
+def classify_exchange(category: str, subcategory: str):
+    """What the EXCHANGE says this document is. None when it expresses no opinion.
+
+    THREE ANSWERS, AND THE DIFFERENCE MATTERS:
+      a doc_type  - the exchange named it; use that and do not guess.
+      ""          - the exchange named it as something we never summarise. A real
+                    answer, so the caller must DROP the document rather than fall
+                    through to the keyword guess that would mis-type it.
+      None        - the exchange said nothing useful; guess from the title as before.
+    """
+    sub = str(subcategory or "").strip().lower()
+    if sub in EXCH_SUBCAT_REJECT:
+        return ""
+    if sub in EXCH_SUBCAT_TYPE:
+        return EXCH_SUBCAT_TYPE[sub]
+    return None
+
+
 def classify(text: str) -> str:
     low = (text or "").lower().strip()
     if low in ("rec", "ppt", "transcript"):      # Screener's bare link labels
@@ -578,8 +624,14 @@ def bse_company_docs(code: str, days: int) -> list[dict]:
         if str(x.get("AUDIO_VIDEO_FILE") or "").strip():
             continue
         head = str(x.get("NEWSSUB") or x.get("HEADLINE") or "").strip()
+        cat = str(x.get("CATEGORYNAME") or "").strip()
         sub = str(x.get("SUBCATNAME") or "").strip()
-        doc_type = classify(f"{head} {sub}")
+        # THE EXCHANGE FIRST. Its subcategory is a field chosen from a list; the title
+        # is prose. Only when it says nothing do we read the title for keywords.
+        decided = classify_exchange(cat, sub)
+        if decided == "":
+            continue                     # named as something we never summarise
+        doc_type = decided or classify(f"{head} {sub}")
         if not doc_type:
             continue
         when = str(x.get("NEWS_DT") or "")[:10]
@@ -587,7 +639,8 @@ def bse_company_docs(code: str, days: int) -> list[dict]:
             continue
         out.append({"doc_type": doc_type, "title": (head or sub)[:200],
                     "pdf_url": _BSE_ATTACH + att,
-                    "announcement_date": when, "source": "bse"})
+                    "announcement_date": when, "source": "bse",
+                    "exch_category": cat, "exch_subcategory": sub})
     return out
 
 
@@ -864,6 +917,14 @@ def main() -> None:
             miss = [d for d in miss if d not in _audio]
             log(f"  - {sym:<14} dropped {len(_audio)} audio link(s) "
                 f"(recordings are not extractable documents)")
+        # ...nor a NOTICE of a future call / board meeting (ATHERENERG, CGPOWER 16 Oct:
+        # mailed as a "concall transcript" and counted as a results report date).
+        import quarterly_table as _QT
+        _notice = [d for d in miss if _QT.is_meeting_notice(d.get("title"), d.get("doc_type"))]
+        if _notice:
+            miss = [d for d in miss if d not in _notice]
+            log(f"  - {sym:<14} dropped {len(_notice)} meeting notice(s) "
+                f"(an intimation of a future call / board meeting is not the document)")
         if miss:
             per_company[sym] = miss
             for d in miss:
@@ -905,6 +966,9 @@ def main() -> None:
             "doc_type": d["doc_type"], "title": d["title"], "description": "",
             "announcement_date": d["announcement_date"], "pdf_url": d["pdf_url"],
             "drive_file_id": "", "status": "pending", "discovered_at": now,
+            # Blank unless the source published one - Screener and NSE do not.
+            "exch_category": d.get("exch_category", ""),
+            "exch_subcategory": d.get("exch_subcategory", ""),
             # SOURCE IS THE PIPELINE ORIGIN, NOT THE DISCOVERY CHANNEL. This sweep
             # fetches documents companies filed in the last few days - they ARE live
             # filings, so they carry the live tag and the live extractors drain them,
@@ -941,6 +1005,33 @@ def _self_test() -> int:
             print(f"  FAIL {name}")
 
     T = datetime(2026, 8, 15)
+
+    # ---- the exchange's own word beats reading the title ---------------------
+    # Values are real: taken from announcement_ledger.parquet, 5,197 rows.
+    check("the exchange names a results filing",
+          classify_exchange("Result", "Financial Results") == "results")
+    check("the exchange names an investor call",
+          classify_exchange("Company Update", "Analyst / Investor Meet") == "concall")
+    check("SUBCATNAME is matched case-insensitively",
+          classify_exchange("result", "FINANCIAL RESULTS") == "results")
+    # The difference between "" and None is the whole point of the helper.
+    check("a BRSR filing is REFUSED, not guessed at",
+          classify_exchange("Company Update",
+                            "Business Responsibility and Sustainability "
+                            "Reporting (BRSR)") == "")
+    check("a refusal is not the same as no opinion",
+          classify_exchange("Company Update", "Postal Ballot") == ""
+          and classify_exchange("Others", "General") is None)
+    check("no opinion falls through to the title guess",
+          classify_exchange("", "") is None)
+    # The class of error this exists to stop. Today classify() happens to reject a
+    # rights issue outright, so the 19 that reached the queue as annual reports came
+    # from an older path - but a title is prose and the next one may read
+    # "Annual Rights Issue Letter to Shareholders", which the keyword rule WOULD take.
+    check("a rights issue is not a document we summarise",
+          classify("Right Issue") == "" and classify("Rights Issue of Equity") == "")
+    check("a real annual report title still classifies",
+          classify("Annual Report 2026 from bse") == "annual_report")
 
     # ---- the shape that always worked: day + month, year inferred
     check("day-month infers the current year",
@@ -1000,6 +1091,31 @@ def _self_test() -> int:
           classify("Allotment of equity shares") == "")
     check("'Segment' does not trip the egm rule",
           classify("Segment wise Financial Results") == "results")
+    # 2026-10-17: notices of a future call / board meeting are not documents (real titles)
+    import quarterly_table as _QT
+    N = _QT.is_meeting_notice
+    check("investor-meet INTIMATION is a notice (ATHERENERG)", N(
+        "Announcement under Regulation 30 (LODR)-Analyst / Investor Meet - Intimation 16 Oct - "
+        "Ather Energy to host Q2FY27 earnings conference call on October 26, 2026", "concall"))
+    check("board meeting intimation is a notice (CGPOWER)", N(
+        "Board Meeting Intimation for Consideration And Approval Of The Unaudited Financial "
+        "Results For The Half Year And Quarter Ended 30Th September, 2026", "results"))
+    check("'Intimation of Board Meeting To Be Held' is a notice",
+          N("Board Meeting Intimation for Intimation Of Board Meeting To Be Held On Monday", "results"))
+    check("investor-meet OUTCOME / transcript is NOT a notice", not N(
+        "Analyst / Investor Meet - Outcome 3 Aug - Transcript of the earnings call", "concall"))
+    check("credit-rating intimation IS the rating, not a notice", not N(
+        "Announcement under Regulation 30 (LODR)-Credit Rating 29 Sep - Intimation of Credit "
+        "Ratings from India Ratings", "rating"))
+    check("outcome of board meeting is NOT a notice",
+          not N("Outcome of Board Meeting - Financial Results Q2 FY27", "results"))
+    _q = pd.DataFrame([
+        {"doc_type": "results", "announcement_date": "2026-10-14", "period": "",
+         "isin": "CG", "title": "Board Meeting Intimation for Consideration of Results"},
+        {"doc_type": "results", "announcement_date": "2026-10-16", "period": "",
+         "isin": "RP", "title": "Financial Results for the quarter ended September 30, 2026"}])
+    check("report dates ignore board-meeting notices",
+          set(_QT.queue_report_dates(_q, "Q2FY27")) == {"RP"})
     check("bare REC is an audio link", is_audio_link("REC", "http://x/rec"))
     check("REC enriched with its parent row is still audio",
           is_audio_link("REC — Aug 2026 Transcript PPT REC", "http://x/r"))

@@ -204,12 +204,22 @@ hr {
 
 # --------------------------------------------------------------------------
 
-def _make_cover(name: str, symbol: str, isin: str, coverage: str = "") -> str:
+def report_basename(company: str, kind: str, when: dt.date | None = None) -> str:
+    """The ONE name for report files a person receives (mail attachments, local copies):
+    company name _ report type _ date, e.g.
+      ("Tata Consultancy Services Limited", "DeepDive") -> Tata_Consultancy_Services_Limited_DeepDive_02Oct26
+    Drive keeps its own names (company_deepdive_*.md) — deep_dive_index and readers use them."""
+    words = re.findall(r"[A-Za-z0-9]+", str(company or "Company"))
+    return f"{'_'.join(words) or 'Company'}_{kind}_{(when or dt.date.today()):%d%b%y}"
+
+
+def _make_cover(name: str, symbol: str, isin: str, coverage: str = "",
+                title: str = "Deep Dive") -> str:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     cov_line = f"<p class='meta'>Coverage: {coverage}</p>" if coverage else ""
     return f"""
 <div class="cover">
-  <h1>DEEP DIVE REPORT</h1>
+  <h1>{title.upper()} REPORT</h1>
   <div class="divider"></div>
   <p class="company">{name}</p>
   <p class="meta">{symbol} &nbsp;·&nbsp; {isin}</p>
@@ -235,8 +245,26 @@ def _normalise_tables(md_text: str) -> str:
     return "\n".join(out)
 
 
+_BULLET = re.compile(r"^(\s*)[•▪◦]\s+")     # • ▪ ◦
+
+
+def _normalise_bullets(md_text: str) -> str:
+    """The models write bullets as "• item" lines. Markdown does not know "•", so
+    consecutive lines merged into ONE paragraph ("• a • b • c"). Turn them into list
+    items, with the blank line a list needs before it. Table rows are left alone."""
+    out = []
+    for line in md_text.splitlines():
+        m = _BULLET.match(line)
+        if m and not line.lstrip().startswith("|"):
+            line = f"{m.group(1)}- {line[m.end():]}"
+            if out and out[-1].strip() and not out[-1].lstrip().startswith("- "):
+                out.append("")
+        out.append(line)
+    return "\n".join(out)
+
+
 def _md_to_html_body(md_text: str) -> str:
-    md_text = _normalise_tables(md_text)
+    md_text = _normalise_tables(_normalise_bullets(md_text))
     try:
         import markdown as md_lib
         # NOTE: no `nl2br` — it converts table newlines to <br> and breaks the
@@ -301,10 +329,10 @@ def _md_to_html_body(md_text: str) -> str:
 
 
 def _build_full_html(name: str, symbol: str, isin: str,
-                     md_text: str, coverage: str = "") -> str:
-    cover = _make_cover(name, symbol, isin, coverage)
+                     md_text: str, coverage: str = "", title: str = "Deep Dive") -> str:
+    cover = _make_cover(name, symbol, isin, coverage, title)
     body  = _md_to_html_body(md_text)
-    footer = (f"<div class='report-footer'>signals-india · Deep Dive · "
+    footer = (f"<div class='report-footer'>signals-india · {title} · "
               f"{name} ({symbol}) · {dt.date.today()}</div>")
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -321,7 +349,9 @@ def _build_full_html(name: str, symbol: str, isin: str,
 
 
 def md_to_pdf(md_text: str, name: str = "", symbol: str = "",
-              isin: str = "", coverage: str = "") -> bytes:
+              isin: str = "", coverage: str = "", title: str = "Deep Dive") -> bytes:
+    """title: cover + footer label. "Deep Dive" (default) for the deep dive; the story
+    report passes "Narrative" so both reports share one look."""
     _ensure_native_libs()
     try:
         from weasyprint import HTML as WP_HTML
@@ -329,7 +359,7 @@ def md_to_pdf(md_text: str, name: str = "", symbol: str = "",
         raise RuntimeError(f"weasyprint unavailable: {e}")
 
     html = _build_full_html(
-        name or "Company", symbol or "", isin or "", md_text, coverage)
+        name or "Company", symbol or "", isin or "", md_text, coverage, title)
     buf = io.BytesIO()
     WP_HTML(string=html).write_pdf(buf)
     return buf.getvalue()

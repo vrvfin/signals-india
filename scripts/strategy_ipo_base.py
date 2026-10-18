@@ -241,8 +241,11 @@ def ipo_signal(symbol: str, ohlcv: pd.DataFrame, feat: pd.Series,
 
 
 def _upload_csv(drive, folder_id, name, df):
+    # Overwrite the existing file, as every other strategy does. Without the id
+    # each run CREATED a new latest.csv (24 copies by 2026-09-30) and the
+    # aggregator picked the 2026-09-02 one, skipping ipo_base as stale daily.
     upload_bytes(drive, folder_id, name, df.to_csv(index=False).encode(),
-                 "text/csv")
+                 "text/csv", existing_id=find_file(drive, folder_id, name))
 
 
 def main() -> int:

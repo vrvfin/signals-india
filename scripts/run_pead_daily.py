@@ -336,10 +336,14 @@ def _pf_preview_html(events: list[dict], pf_map: dict, g: pd.DataFrame) -> tuple
 
 def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
                   pead: pd.DataFrame, sym_map: dict,
-                  doc_by: dict | None = None) -> str | None:
+                  doc_by: dict | None = None,
+                  pf_isins: set | None = None) -> str | None:
+    """`pf_isins` (user 2026-10-09): holdings that reported lead the mail in their own
+    table, same as mail A's PF block; everyone else follows unchanged."""
     if reporters.empty:
         return None
-    rows_html = []
+    pf_isins = pf_isins or set()
+    rows_html, pf_rows = [], []
     for _, rep in reporters.iterrows():
         slug = str(rep.get("slug", ""))
         isin = str(rep.get("isin", ""))
@@ -369,16 +373,27 @@ def _email_b_html(reporters: pd.DataFrame, res: pd.DataFrame,
                 bits.append(f"<span style='color:#999;font-size:11px'>"
                             f"…{n_hidden} older guidance line(s) hidden</span>")
             verdict_cell = "<br>".join(bits)
-        rows_html.append(
+        (pf_rows if isin in pf_isins else rows_html).append(
             f"<tr><td><b>{sym}</b></td><td>{comp[:34]}</td><td>{qtr}</td>"
             f"<td>{rdate}</td><td align=right>{sales_cell}</td>"
             f"<td align=right>{pat_cell}</td><td>{verdict_cell}</td></tr>")
-    return (f"<p><b>{len(reporters)} company(ies)</b> declared results in the last 24h"
-            f" — actuals + guidance check:</p>"
-            f"<table border=1 cellpadding=5 cellspacing=0>"
-            f"<tr><th>Symbol</th><th>Company</th><th>Qtr</th><th>Result date</th>"
-            f"<th>Sales ₹Cr (YoY)</th><th>Net profit ₹Cr (YoY)</th>"
-            f"<th>Guidance vs Actual</th></tr>{''.join(rows_html)}</table>"
+    head = ("<tr><th>Symbol</th><th>Company</th><th>Qtr</th><th>Result date</th>"
+            "<th>Sales ₹Cr (YoY)</th><th>Net profit ₹Cr (YoY)</th>"
+            "<th>Guidance vs Actual</th></tr>")
+    tbl = "<table border=1 cellpadding=5 cellspacing=0>{}{}</table>"
+    pf_html = ""
+    if pf_rows:
+        pf_html = (f"<h3 style='margin:0 0 6px;font-size:15px'>&#128188; Your portfolio: "
+                   f"{len(pf_rows)} holding{'' if len(pf_rows) == 1 else 's'} reported"
+                   f"</h3>" + tbl.format(head, "".join(pf_rows))
+                   + "<div style='border-top:1px solid #ddd;margin:14px 0 10px'></div>")
+    rest = (tbl.format(head, "".join(rows_html)) if rows_html else
+            "<p style='color:#999'>No other company in the window.</p>")
+    return (pf_html
+            + f"<p><b>{len(reporters)} company(ies)</b> declared results in the last 24h"
+            f" — actuals + guidance check"
+            + (f" ({len(pf_rows)} in your portfolio, shown above)" if pf_rows else "")
+            + f":</p>{rest}"
             f"<p style='font-size:11px;color:#999'><b>How to read the guidance "
             f"column:</b> 'guided' = what management publicly committed to (in the "
             f"named source, with the concall quarter + filing date it was said in) "
@@ -418,7 +433,17 @@ def main() -> None:
         if not q.empty:
             doc_by = {str(d): {"date": a} for d, a in
                       zip(q["doc_id"], q["announcement_date"])}
-    html_b = _email_b_html(reporters, res, pead, sym_map, doc_by)
+    # PF holdings lead mail B. Like mail A's PF block, it must never stop the mail.
+    pf_isins: set = set()
+    if not reporters.empty:
+        try:
+            pf_isins = {str(i).strip() for i in
+                        (load_portfolio_isins(drive, root_id) or set())}
+        except Exception as exc:                       # noqa: BLE001
+            log(f"  PF lookup for mail B FAILED ({type(exc).__name__}: {exc})")
+    n_pf_b = (int(reporters["isin"].astype(str).isin(pf_isins).sum())
+              if pf_isins and "isin" in reporters.columns else 0)
+    html_b = _email_b_html(reporters, res, pead, sym_map, doc_by, pf_isins)
 
     # ---- Email A: tomorrow's announcers, PF holdings first ----
     events = get_results_calendar(args.days_ahead)
@@ -441,7 +466,7 @@ def main() -> None:
         print("=== EMAIL A (results tomorrow) ===")
         print(f"{len(events)} events; {n_pf} PF holding(s)" if events else "(none)")
         print(pf_html or "(no PF holdings on the calendar)")
-        print("\n=== EMAIL B (today's earnings vs guidance) ===")
+        print(f"\n=== EMAIL B (today's earnings vs guidance) — {n_pf_b} PF ===")
         print(html_b or "(no reporters today)")
         return
 
@@ -449,7 +474,10 @@ def main() -> None:
     sent = 0
     if html_b:
         if toggles.get("pead_guidance", True):
-            sent += send_email(f"📊 Results last 24h vs guidance — {date.today()}", html_b)
+            subj_b = (f"📊 Results last 24h vs guidance — {n_pf_b} PF holding"
+                      f"{'' if n_pf_b == 1 else 's'} — {date.today()}" if n_pf_b
+                      else f"📊 Results last 24h vs guidance — {date.today()}")
+            sent += send_email(subj_b, html_b)
         else:
             print("pead_guidance mail toggled OFF — skipped.")
     if html_a:

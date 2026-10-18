@@ -49,6 +49,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
 from mailer import send_email, load_mail_settings, esc
 from flag_growth_surge import _pat_from_results   # freshest-reported-PAT realign
 import gradation as G
+import mail_chart
 
 MIN_GUIDANCE_CAGR = 20.0        # forward CAGR that counts as strong guidance
 MAX_GUIDANCE_CAGR = 200.0       # above this the "CAGR" is a misparsed absolute
@@ -60,6 +61,25 @@ GROWTH_METRICS = ("revenue", "ebitda", "pat",   # % growth metrics only (exclude
                                 # BFSI growth metrics added 2026-07-29 so a bank
                                 # guiding 25% AUM growth qualifies like any other.
 TECH_ZONES = ("buy", "add")     # conviction zones that count as strong technical
+MIN_SETUPS = 2                  # distinct setups that must agree (user 2026-10-12;
+                                # was n_strategies >= 2, which momentum variants met alone)
+
+
+def setup_of(strategy: str) -> str:
+    """The IDEA behind a strategy. Variants of one idea collapse: momentum_1m..12m ->
+    momentum, ma_respect_20ema_30d/_20ema_60d/_50ema_60d -> ma_respect. volume_breakout
+    (a volume surge) and volume_vcp (a volume dry-up) are opposite tells, kept apart."""
+    s = str(strategy or "").strip()
+    if s.startswith("momentum_"):
+        return "momentum"
+    if s.startswith("ma_respect_"):
+        return "ma_respect"
+    return s
+
+
+def setups_of(strategies) -> list[str]:
+    """Distinct setups in a conviction row's comma-joined `strategies`."""
+    return sorted({setup_of(x) for x in str(strategies or "").split(",") if x.strip()})
 SURGE_STRONG = ("CONSISTENT", "EMERGING")
 MAIL_TOP_N = 30                 # mail shows the top N; full list lives on Drive
 _QUARTER_RE = re.compile(r"Q([1-4])\s*FY[\s'\-]*?(\d{2,4})", re.I)
@@ -151,6 +171,25 @@ def _fmt_date(s) -> str:
         return str(s or "")[:10]
 
 
+# A GF1 line tagged IMMEDIATE with none of these words is a result already reported,
+# not guidance. Measured 2026-10-16: 56 of 1,219 picked quotes were IMMEDIATE; this keeps
+# the forward ones among them (WIPRO "we are projecting ...", NAVINFLUOR "will be
+# commissioned") and drops the past ones (SYRMA, AEROFLEX, IRISDOREME, LTTS).
+_FORWARD_WORDS = re.compile(
+    r"(?i)\b(expect\w*|guid\w*|target\w*|will|would|going forward|next|coming|aim\w*|"
+    r"plan\w*|outlook|on track|should|anticipat\w*|envisag\w*|project\w*|forecast\w*|"
+    r"estimat\w*|confident|fy\s?'?(2[7-9]|3\d)|fy\s?20(2[7-9]|3\d))\b")
+
+
+def is_past_result(statement, timeframe) -> bool:
+    """True for a GF1 line that is a reported result, not guidance — or is empty. Pure."""
+    s = str(statement or "").strip().strip('"').strip()
+    if s.lower() in ("", "na", "n/a", "none", "nan"):
+        return True
+    return (str(timeframe or "").strip().upper() == "IMMEDIATE"
+            and not _FORWARD_WORDS.search(s))
+
+
 def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
                      cur_key: int, doc_by: dict | None = None) -> dict | None:
     """Most-RECENT quantified growth guidance (revenue/EBITDA/PAT) for one company.
@@ -186,6 +225,12 @@ def _latest_guidance(gt_iso: pd.DataFrame, gf1_iso: pd.DataFrame,
     stmt = tf = ""
     if gf1_iso is not None and not gf1_iso.empty:
         f = gf1_iso[gf1_iso["quarter"].map(_qkey) == latest_qk]
+        # Never quote a REPORTED RESULT as guidance (SYRMA, 2026-10: "revenue for the
+        # quarter stood at Rs 1,604 crores, registering 67% YoY" beat the call's own
+        # "30% to 35% growth for FY27-28"). No line at all beats a past one.
+        if not f.empty:
+            f = f[[not is_past_result(s, t) for s, t in
+                   zip(f["exact_statement"], f["timeframe"])]]
         if not f.empty:
             fm = f[f["metric_type"].astype(str).str.lower().str.contains(metric, na=False)]
             pick = fm if not fm.empty else f
@@ -246,15 +291,26 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
     # --- axis 1: technical (symbol-keyed) ---
     tech: dict[str, dict] = {}
     if not conv.empty:
-        c = conv[conv["zone_type"].astype(str).str.lower().isin(TECH_ZONES)]
-        c = c[pd.to_numeric(c["n_strategies"], errors="coerce") >= 2]
+        c = conv[conv["zone_type"].astype(str).str.lower().isin(TECH_ZONES)].copy()
+        # TWO DIFFERENT SETUPS, not two strategies (user 2026-10-12). momentum_3m +
+        # momentum_6m, or two ma_respect variants, are one idea counted twice.
+        c["_setups"] = c["strategies"].map(setups_of)
+        c = c[c["_setups"].map(len) >= MIN_SETUPS]
         for _, r in c.iterrows():
             sym = str(r["symbol"]).strip().upper()
             cur = tech.get(sym)
-            if cur is None or r["n_strategies"] > cur["n_strategies"]:
+            n_set = len(r["_setups"])
+            if cur is None or n_set > cur["n_families"]:
                 tech[sym] = {"n_strategies": int(r["n_strategies"]),
                              "composite_score": float(r["composite_score"]),
-                             "strategies": str(r.get("strategies", ""))}
+                             "strategies": str(r.get("strategies", "")),
+                             # mail-only context (user 2026-10-10: "explain it");
+                             # rows are projected onto HIST_COLS before any write
+                             "zone": str(r.get("zone_type", "")).lower(),
+                             "n_families": n_set,
+                             "families": ", ".join(r["_setups"]),
+                             "entry": _flt(r.get("entry_median")),
+                             "stop": _flt(r.get("stop_median"))}
 
     # --- axis 2: results (isin-keyed) ---
     surge_by = {}
@@ -341,104 +397,364 @@ def build_list(conv: pd.DataFrame, surge: pd.DataFrame, grades: pd.DataFrame,
             "guid_track": _gf2_track(gf2_by.get(iso)),
             "cred_score": cred_by.get(iso),
             "rank_score": rank, "in_pf": iso in pf,
+            # mail-only: the score's parts and the technical context
+            "tech_pts": round(min(100.0, t["composite_score"]), 1),
+            "results_pts": results_pts, "guid_pts": guid_pts,
+            "zone": t.get("zone", ""), "n_families": t.get("n_families"),
+            "families": t.get("families", ""),
+            "entry": t.get("entry"), "stop": t.get("stop"),
         })
     rows.sort(key=lambda r: (-r["rank_score"], -(r["pat_yoy_pct"] or 0)))
     return rows, unmapped
 
 
-def build_html(rows: list[dict], today: str) -> str:
-    td = ("padding:6px 10px;border:1px solid #ddd;font-size:13px;"
-          "font-family:Arial,sans-serif;")
-    th = td + "background:#34495e;color:#fff;text-align:left;"
+def _flt(v):
+    try:
+        f = float(v)
+        return None if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _int(v):
+    f = _flt(v)
+    return None if f is None else int(f)
+
+
+# Plain-English one-liners, taken from each strategy file's own docstring.
+STRATEGY_PLAIN = {
+    "canslim": "CANSLIM: EPS growth ≥25% (qtr and year), near 52-wk high, RS ≥80, ROE ≥15%",
+    "darvas": "Darvas box: tight sideways box near the 52-wk high, breaking out on volume",
+    "ipo_base": "IPO base: first base breakout in a recent listing",
+    "minervini": "Minervini trend template: price above stacked, rising 50/100/200 averages",
+    "pead": "Post-earnings drift: gapped up ≥5% on results day on ≥2× volume, still holding",
+    "pullback": "Pullback: dip to a rising average inside an intact uptrend (lower-risk entry)",
+    "qullamaggie": "Qullamaggie: ≥30% 3-month run, then a tight consolidation",
+    "volume_breakout": "Volume breakout: volume surge in an uptrend near the highs",
+    "volume_vcp": "Volume dry-up: volume and range contracting in a tight base near highs",
+}
+
+
+def plain_strategy(name: str) -> str:
+    n = str(name or "").strip()
+    if n in STRATEGY_PLAIN:
+        return STRATEGY_PLAIN[n]
+    m = re.fullmatch(r"momentum_(\d+m)", n)
+    if m:
+        return (f"Momentum {m.group(1)}: top-decile relative strength over "
+                f"{m.group(1)}, price above the 200-day average")
+    m = re.fullmatch(r"ma_respect_(\d+)ema_(\d+)d", n)
+    if m:
+        return (f"Holds above its {m.group(1)}-day average: no close below it "
+                f"for {m.group(2)}+ days")
+    return n
+
+
+def _pct(v, signed=True):
+    return "—" if v is None else (f"{v:+,.0f}%" if signed else f"{v:,.0f}%")
+
+
+def why_line(r: dict) -> str:
+    """One sentence: why this stock is on the list, in the order the rule checks it."""
+    bits = []
+    if r.get("pat_yoy_pct") is not None:
+        q = f" in {r['pat_qtr']}" if r.get("pat_qtr") else ""
+        cls = {"CONSISTENT": " — 3+ of the last 4 quarters ≥100%",
+               "EMERGING": " — 2 of the last 4 quarters ≥100%"}.get(
+                   r.get("surge_class") or "", "")
+        bits.append(f"profit {_pct(r['pat_yoy_pct'])} YoY{q}{cls}")
+    if r.get("guidance_cagr") is not None:
+        met = str(r.get("guid_metric") or "growth").upper()
+        src = f" ({r['guid_from']} concall)" if r.get("guid_from") else ""
+        bits.append(f"management guides {met} {_pct(r['guidance_cagr'])}{src}")
+    nf = r.get("n_families")
+    fam = (f"{nf} independent setups" if nf else f"{r['n_strategies']} strategies")
+    bits.append(f"{fam} say {r.get('zone') or 'buy'}")
+    return "; ".join(bits) + "."
+
+
+def score_math(r: dict) -> str:
+    """The rank score, worked: same formula build_list uses."""
+    t, re_, g = r.get("tech_pts"), r.get("results_pts"), r.get("guid_pts")
+    if None in (t, re_, g):
+        return f"Score {r['rank_score']:.0f}"
+    return (f"Score <b>{r['rank_score']:.0f}</b> = 0.4×chart {t:.0f} + "
+            f"0.3×results {re_:.0f} + 0.3×guidance {g:.0f}")
+
+
+CARD_N = 15            # stocks shown as full cards (chart + reasons); approved cap
+
+
+# ---- what is NEW or CHANGED since the previous list (user 2026-10-15) ------------
+# "I need to know which one to focus on or has come fresh in today's mail; colour
+# coding needs to indicate that - if something new has come up, or information
+# changed, highlight it - similar to the gallery render."
+FRESH_TONE = {"new": ("#1a7a3a", "#e8f5e9", "🆕 NEW TODAY"),
+              "changed": ("#b8860b", "#fff8e1", "✳ CHANGED"),
+              "same": ("#dde3e8", "#ffffff", "")}
+_ORDER = {"new": 0, "changed": 1, "same": 2, None: 2}
+
+
+def annotate_freshness(rows: list[dict], hist: pd.DataFrame, today: str) -> str | None:
+    """Compare each row with the same stock on the PREVIOUS list date in the history.
+    Sets mail-only keys on every row: _fresh ('new'|'changed'|'same'|None),
+    _changes [str], _score_delta, _days_on. Returns the previous date (None on the
+    first ever run, when nothing can be called new). Pure."""
+    for r in rows:
+        r.update(_fresh=None, _changes=[], _chart_notes=[], _score_delta=None,
+                 _days_on=None)
+    if hist is None or hist.empty or "as_of" not in hist.columns:
+        return None
+    h = hist[hist["as_of"].astype(str) < str(today)]
+    if h.empty:
+        return None
+    prev_date = str(h["as_of"].astype(str).max())
+    prev = {str(x["isin"]): x for _, x in h[h["as_of"].astype(str) == prev_date].iterrows()}
+    since = (pd.Timestamp(today) - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    days = (h[h["as_of"].astype(str) >= since].groupby(h["isin"].astype(str))["as_of"]
+            .nunique().to_dict())
+
+    def _s(v):
+        t = str(v if v is not None else "").strip()
+        return "" if t.lower() in ("nan", "none", "<na>") else t
+
+    for r in rows:
+        iso = str(r["isin"])
+        r["_days_on"] = int(days.get(iso, 0)) + 1
+        p0 = prev.get(iso)
+        if p0 is None:
+            r["_fresh"] = "new"
+            continue
+        ch = []
+        if _s(r.get("pat_qtr")) and _s(r.get("pat_qtr")) != _s(p0.get("pat_qtr")):
+            ch.append(f"new results ({_s(r.get('pat_qtr'))})")
+        if _s(r.get("guid_from")) and _s(r.get("guid_from")) != _s(p0.get("guid_from")):
+            ch.append(f"new guidance ({_s(r.get('guid_from'))} concall)")
+        if _s(r.get("surge_class")) != _s(p0.get("surge_class")):
+            ch.append(f"results trend {(_s(p0.get('surge_class')) or 'none').lower()} → "
+                      f"{(_s(r.get('surge_class')) or 'none').lower()}")
+        # Chart-setup churn is NOT highlighted (user 2026-10-15: "all information
+        # gets highlighted, chart need not be") - it is daily strategy noise (15 of
+        # 16 'changes' on 15 Oct). Kept as a quiet note on the card.
+        a, b = set(setups_of(p0.get("strategies"))), set(setups_of(r.get("strategies")))
+        notes = []
+        if b - a:
+            notes.append("new chart setup: " + ", ".join(sorted(b - a)))
+        if a - b:
+            notes.append("setup dropped: " + ", ".join(sorted(a - b)))
+        r["_chart_notes"] = notes
+        try:
+            r["_score_delta"] = round(float(r["rank_score"]) - float(p0["rank_score"]), 1)
+        except (TypeError, ValueError):
+            r["_score_delta"] = None
+        r["_changes"] = ch
+        r["_fresh"] = "changed" if ch else "same"
+    return prev_date
+
+
+def order_rows(rows: list[dict]) -> list[dict]:
+    """Holdings first; within each, new, then changed, then by score."""
+    return sorted(rows, key=lambda r: (not r["in_pf"], _ORDER.get(r.get("_fresh"), 2),
+                                       -r["rank_score"]))
+
+
+def _chart_note(r: dict) -> str:
+    n = r.get("_chart_notes") or []
+    return (f" <span style='color:#888;font-size:11px'>· {esc('; '.join(n), 120)}</span>"
+            if n else "")
+
+
+def fresh_badge(r: dict) -> str:
+    st = r.get("_fresh")
+    if st not in ("new", "changed"):
+        d = r.get("_days_on")
+        return ((f"<span style='color:#888;font-size:11px'>on the list {d} days</span>"
+                 if d else "") + _chart_note(r))
+    edge, _bg, label = FRESH_TONE[st]
+    extra = (": " + esc("; ".join(r.get("_changes") or []), 160)) if st == "changed" else ""
+    return (f"<span style='background:{edge};color:#fff;padding:1px 7px;border-radius:6px;"
+            f"font-size:11px;font-weight:700'>{label}</span>"
+            f"<span style='font-size:12px;color:{edge}'>{extra}</span>" + _chart_note(r))
+
+
+def score_move(r: dict) -> str:
+    d = r.get("_score_delta")
+    if d is None or abs(d) < 0.05:
+        return ""
+    col = "#1a7a3a" if d > 0 else "#c0392b"
+    return f" <span style='color:{col};font-size:12px'>{'▲' if d > 0 else '▼'}{abs(d):.0f}</span>"
+
+
+def fresh_strip(rows: list[dict], prev_date: str | None) -> str:
+    if not prev_date:
+        return ""
+    new = [r for r in rows if r.get("_fresh") == "new"]
+    ch = [r for r in rows if r.get("_fresh") == "changed"]
+    same = len(rows) - len(new) - len(ch)
+
+    def _names(rs):
+        return ", ".join(("💼" if r["in_pf"] else "") + esc(r["symbol"], 14) for r in rs[:20])
+    parts = []
+    if new:
+        parts.append(f"<b style='color:#1a7a3a'>🆕 New today ({len(new)}):</b> {_names(new)}")
+    if ch:
+        parts.append(f"<b style='color:#b8860b'>✳ Changed ({len(ch)}):</b> {_names(ch)}")
+    parts.append(f"<span style='color:#888'>{same} unchanged since {esc(prev_date, 10)}</span>")
+    return ("<div style='background:#f6f8fa;border-left:4px solid #1a7a3a;padding:7px 11px;"
+            "margin:0 0 12px;font:13px Arial,sans-serif;line-height:1.6'>"
+            + "<br>".join(parts) + "</div>")
+
+
+def _card(i: int, r: dict, cid: str | None) -> str:
+    sym = esc(r["symbol"], 14)
+    pf = "💼 " if r["in_pf"] else ""
+    strat = [x.strip() for x in str(r.get("strategies") or "").split(",") if x.strip()]
+    strat_li = "".join(f"<li>{esc(plain_strategy(x), 140)}</li>" for x in strat[:6])
+    if len(strat) > 6:
+        strat_li += f"<li style='color:#999'>+{len(strat) - 6} more</li>"
+    gq = esc(str(r.get("guid_stmt") or ""), 160)
+    src_bits = " · ".join(x for x in (str(r.get("guid_src_type") or ""),
+                                      str(r.get("guid_src_title") or ""),
+                                      str(r.get("guid_src_date") or "")) if x)
+    qold = r.get("guid_qtrs_old")
+    fresh = ("" if qold is None else " · latest concall" if qold <= 1
+             else f" · ⚠ {int(qold)} quarters old")
+    trk = str(r.get("guid_track") or "")
+    cred = (f" · credibility {r['cred_score']:.1f}/5" if r.get("cred_score") is not None
+            else "")
+    lvl = ""
+    if r.get("entry") or r.get("stop"):
+        lvl = (f"<div style='font-size:12px;color:#555;margin-top:4px'>Strategy levels: "
+               f"entry ~{r['entry']:,.1f} · stop ~{r['stop']:,.1f} (median across the "
+               f"agreeing strategies)</div>"
+               if r.get("entry") and r.get("stop") else "")
+    chart = mail_chart.img_tag(cid, sym) if cid else (
+        "<div style='color:#999;font-size:11px'>(no price history for a chart)</div>")
+    return (
+        f"<div style='border:1px solid #dde3e8;border-left:5px solid "
+        f"{FRESH_TONE.get(r.get('_fresh') or 'same', FRESH_TONE['same'])[0]};"
+        f"background:{FRESH_TONE.get(r.get('_fresh') or 'same', FRESH_TONE['same'])[1]};"
+        f"border-radius:6px;padding:10px 12px;"
+        f"margin:0 0 14px;font-family:Arial,sans-serif;font-size:13px'>"
+        f"<div style='margin:0 0 4px'>{fresh_badge(r)}</div>"
+        f"<div style='font-size:15px'><b>{i}. {pf}<a href='https://www.screener.in/company/"
+        f"{sym}/' style='color:#1a237e'>{sym}</a></b> · {esc(r['company_name'], 50)}"
+        f"<span style='float:right'>{score_math(r)}{score_move(r)}</span></div>"
+        f"<div style='margin:6px 0;color:#222'><b>Why here:</b> {esc(why_line(r), 400)}</div>"
+        f"{chart}"
+        f"<table style='width:100%;border-collapse:collapse;margin-top:6px;font-size:12px'>"
+        f"<tr><td style='vertical-align:top;width:34%;padding:4px'><b>📈 Chart</b>"
+        f"<ul style='margin:2px 0 0 16px;padding:0'>{strat_li}</ul>"
+        f"<div style='color:#999'>src: signals/aggregated/conviction.csv</div></td>"
+        f"<td style='vertical-align:top;width:33%;padding:4px'><b>📊 Results</b><br>"
+        f"PAT YoY {_pct(r.get('pat_yoy_pct'))}"
+        f"{(' (' + esc(r['pat_qtr'], 10) + ')') if r.get('pat_qtr') else ''}"
+        f"{('<br>' + esc(r['surge_class'], 12)) if r.get('surge_class') else ''}"
+        f"<div style='color:#999'>src: Screener quarterly P&amp;L "
+        f"(growth_surge / screener_grades)</div></td>"
+        f"<td style='vertical-align:top;width:33%;padding:4px'><b>🎯 Guidance</b><br>"
+        f"{esc(str(r.get('guid_metric') or '').upper(), 10)} "
+        f"{_pct(r.get('guidance_cagr'))}{fresh}{cred}"
+        f"{('<br><i>“' + gq + '”</i>') if gq else ''}"
+        f"{('<br>mgmt ' + esc(trk, 20)) if trk else ''}"
+        f"<div style='color:#999'>src: {esc(src_bits, 90) or 'concall guidance'}</div>"
+        f"</td></tr></table>{lvl}</div>")
+
+
+def explainer() -> str:
+    return (
+        "<div style='background:#f6f8fa;border:1px solid #e0e6ea;border-radius:6px;"
+        "padding:9px 12px;margin:0 0 12px;font:12px Arial,sans-serif;line-height:1.6'>"
+        "<b>How this list is built</b> — a stock must pass ALL three:<br>"
+        "1. <b>Chart:</b> ≥2 DIFFERENT setups put it in a buy/add zone today "
+        "(conviction.csv) — variants of one idea (momentum 3m and 6m; the three "
+        "moving-average-hold rules) count once. Chart points = average percentile of its signal in each "
+        "agreeing strategy (90 = top 10% of that strategy's picks).<br>"
+        f"2. <b>Results:</b> latest-quarter profit growth ≥30% YoY, or a ≥100% surge in "
+        f"2+ of the last 4 quarters. Points: 3 of 4 quarters = 100, 2 of 4 = 80, else "
+        f"by growth band (≥100% = 100, ≥50% = 80, ≥30% = 60).<br>"
+        f"3. <b>Guidance:</b> management's latest concall guides ≥{MIN_GUIDANCE_CAGR:.0f}% "
+        f"growth, said within the last {GUID_STALE_MAX_Q} quarters. Points: ≥50% = 100, "
+        f"≥{MIN_GUIDANCE_CAGR:.0f}% = 80 (or the growth band, if higher).<br>"
+        "<b>Score</b> = 0.4×chart + 0.3×results + 0.3×guidance (0-100). "
+        "</div>")
+
+
+def build_html(rows: list[dict], today: str, cids: dict | None = None,
+               prev_date: str | None = None) -> str:
+    """Cards (chart + why + maths + sources) for the top CARD_N, then one line each."""
+    cids = cids or {}
     n_pf = sum(1 for r in rows if r["in_pf"])
-    out = [
-        f"<div style='max-width:700px'>"
-        f"<p style='font-family:Arial,sans-serif;font-size:13px'>"
-        f"<b>{len(rows)} stock(s)</b> strong on ALL THREE axes today ({today}): "
-        f"technical (≥2 strategies agree) + results (surging/green PAT YoY) + "
-        f"guidance (green tier or ≥{MIN_GUIDANCE_CAGR:.0f}% CAGR)"
-        + (f" — 💼 {n_pf} in PF" if n_pf else "") + ".</p>",
-        "<table style='border-collapse:collapse;width:100%'>",
-        "<tr>" + "".join(f"<th style='{th}'>{c}</th>" for c in
-                         ["#", "Company", "Score", "Tech", "PAT YoY",
-                          "Guidance", "Cred"]) + "</tr>",
-    ]
-    rows = sorted(rows, key=lambda r: (not r["in_pf"], -r["rank_score"]))
+    strip = fresh_strip(rows, prev_date)
+    rows = order_rows(rows)
     n_total = len(rows)
     rows = rows[:MAIL_TOP_N]
-    for i, r in enumerate(rows, 1):
-        sym = esc(r["symbol"], 14)
-        link = f"https://www.screener.in/company/{sym}/"
-        pf_badge = "💼 " if r["in_pf"] else ""
-        yoy_css = G.cell_css(G.grade_growth(r["pat_yoy_pct"]))
-        guid_css = G.cell_css(r["guidance_tier"])
-        surge_txt = f" · {r['surge_class']}" if r["surge_class"] else ""
-        qtr_txt = f" ({esc(r.get('pat_qtr') or '', 10)})" if r.get("pat_qtr") else ""
-        # guidance: metric + latest-quarter value, then the concall quarter with a
-        # freshness tag (✓ latest / ⚠ N q old), then the verbatim GF1 quote + track.
-        gq = str(r.get("guid_from") or "").strip()
-        qold = r.get("guid_qtrs_old")
-        if qold is None:
-            fresh_tag = ""
-        elif qold <= 1:
-            fresh_tag = " <span style='color:#1a7a3a'>✓ latest</span>"
-        else:
-            fresh_tag = f" <span style='color:#c0392b'>⚠ {int(qold)}q old</span>"
-        gmet = str(r.get("guid_metric") or "").upper()[:3]
-        cagr_txt = (f"{gmet} +{r['guidance_cagr']:.0f}%"
-                    if r["guidance_cagr"] is not None else r["guidance_tier"])
-        sdate = str(r.get("guid_src_date") or "").strip()
-        date_txt = f" · {esc(sdate, 12)}" if sdate else ""
-        gsub = (f"<br><span style='font-size:11px;color:#555'>{esc(gq, 10)}"
-                f"{date_txt}{fresh_tag}</span>") if gq else ""
-        stmt = str(r.get("guid_stmt") or "").strip()
-        gstmt = (f"<br><span style='font-size:10px;color:#888'>“{esc(stmt, 90)}”</span>"
-                 if stmt else "")
-        # where it was pulled from: doc type + the filing title
-        stype = str(r.get("guid_src_type") or "").strip()
-        stitle = str(r.get("guid_src_title") or "").strip()
-        src_bits = " · ".join(x for x in (stype, stitle) if x)
-        gsrc = (f"<br><span style='font-size:10px;color:#999'>src: {esc(src_bits, 70)}"
-                f"</span>" if src_bits else "")
-        trk = str(r.get("guid_track") or "").strip()
-        gtrk = (f"<br><span style='font-size:10px;color:"
-                f"{'#1a7a3a' if trk == 'delivers' else '#c0392b'}'>mgmt {trk}</span>"
-                if trk else "")
-        cred_txt = f"{r['cred_score']:.1f}/5" if r["cred_score"] is not None else ""
-        yoy_txt = (f"+{r['pat_yoy_pct']:,.0f}%{qtr_txt}" if r["pat_yoy_pct"] is not None
-                   else r["yoy_tier"])
-        out.append(
-            "<tr>"
-            f"<td style='{td}'>{i}</td>"
-            f"<td style='{td}'>{pf_badge}<a href='{link}' style='color:#1a237e'>"
-            f"<b>{sym}</b></a> · {esc(r['company_name'], 30)}</td>"
-            f"<td style='{td}'><b>{r['rank_score']:.0f}</b></td>"
-            f"<td style='{td}'>{r['n_strategies']} strat · "
-            f"{r['composite_score']:.0f}</td>"
-            f"<td style='{td}{yoy_css}'>{yoy_txt}{surge_txt}</td>"
-            f"<td style='{td}{guid_css}'>{cagr_txt}{gsub}{gstmt}{gsrc}{gtrk}</td>"
-            f"<td style='{td}'>{cred_txt}</td>"
-            "</tr>")
-    out.append("</table>"
-               + (f"<p style='font-family:Arial,sans-serif;font-size:12px'>"
-                  f"…plus {n_total - len(rows)} more — full list on Drive.</p>"
-                  if n_total > len(rows) else "")
-               + "<p style='font-size:11px;color:#999;font-family:Arial,sans-serif'>"
-               "<b>How to read:</b> <b>PAT YoY</b> = that quarter's net-profit growth, "
-               "quarter in brackets, realigned to the latest REPORTED quarter "
-               "(Screener financials). <b>Guidance</b> = the growth management "
-               "committed to in its <b>most recent concall</b> (revenue &gt; EBITDA &gt; "
-               "PAT), NOT the biggest number ever said. Under it: the concall "
-               "<b>quarter + the filing date</b> it was pulled from, freshness "
-               f"(✓ latest / ⚠ N quarters old; older than {GUID_STALE_MAX_Q}q doesn't "
-               "qualify), the verbatim GF1 statement, <b>src:</b> the exact source "
-               "document, and the GF2 delivery record (‘mgmt delivers/has missed’). "
-               "<b>Cred</b> = "
-               "GF_TRACK mgmt credibility (5=delivers). <b>Tech</b> = strategies "
-               "agreeing · composite. Weekly/quarterly lists live on Drive under "
-               "signals/combined_strength/. Toggle this mail in the app sidebar "
-               "(📧 Email toggles).</p></div>")
+    out = [f"<div style='max-width:720px;font-family:Arial,sans-serif'>"
+           f"<p style='font-size:13px'><b>{n_total} stock(s)</b> strong on chart + results "
+           f"+ guidance today ({today})" + (f" — 💼 {n_pf} in PF" if n_pf else "")
+           + ". Holdings first; within each, new, then changed, then by score.</p>",
+           strip, explainer()]
+    for i, r in enumerate(rows[:CARD_N], 1):
+        out.append(_card(i, r, cids.get(r["symbol"])))
+    rest = rows[CARD_N:]
+    if rest:
+        td = "padding:4px 8px;border-bottom:1px solid #eee;font-size:12px"
+        out.append("<p style='font-size:13px;margin:10px 0 4px'><b>Also on the list</b> "
+                   "(no chart to keep the mail light):</p><table style='width:100%;"
+                   "border-collapse:collapse'>")
+        for i, r in enumerate(rest, CARD_N + 1):
+            _ed = FRESH_TONE.get(r.get("_fresh") or "same", FRESH_TONE["same"])[0]
+            out.append(f"<tr style='border-left:4px solid {_ed}'><td style='{td}'>{i}</td>"
+                       f"<td style='{td}'>"
+                       f"{'💼 ' if r['in_pf'] else ''}<b>{esc(r['symbol'], 14)}</b>"
+                       f"{(' ' + fresh_badge(r)) if r.get('_fresh') in ('new', 'changed') else ''}"
+                       f"</td>"
+                       f"<td style='{td}'>{r['rank_score']:.0f}</td>"
+                       f"<td style='{td}'>{esc(why_line(r), 220)}</td></tr>")
+        out.append("</table>")
+    if n_total > len(rows):
+        out.append(f"<p style='font-size:12px'>…plus {n_total - len(rows)} more — full "
+                   f"list on Drive (signals/combined_strength/latest.csv).</p>")
+    out.append("<p style='font-size:11px;color:#999'>Charts: 1 year daily, 50/200-day "
+               "averages, dashed line = 52-week high. Signals only — not advice. Toggle "
+               "this mail in the app sidebar (📧 Email toggles).</p></div>")
     return "\n".join(out)
+
+
+def render_charts(drive, rows: list[dict], log=print) -> tuple[dict, list]:
+    """{symbol: cid}, [(cid, png)] for the card stocks. A failure costs the chart,
+    never the mail."""
+    cids, imgs = {}, []
+    top = order_rows(rows)[:CARD_N]
+    syms = [r["symbol"] for r in top]
+    try:
+        from build_gallery import _bulk_parquet, _folder as _gfolder
+        omap = _bulk_parquet(drive, _gfolder(drive, "data/ohlcv"), syms)
+    except Exception as e:
+        log(f"charts skipped — OHLCV load failed ({str(e)[:70]})")
+        return cids, imgs
+    for s_ in syms:
+        try:
+            png = mail_chart.render_png(omap.get(s_), s_)
+        except Exception as e:
+            log(f"  chart {s_} failed ({str(e)[:50]})")
+            png = b""
+        if png:
+            cid = f"cs_{re.sub(r'[^A-Za-z0-9]', '_', s_)}"
+            cids[s_] = cid
+            imgs.append((cid, png))
+    log(f"charts: {len(imgs)}/{len(syms)} rendered "
+        f"({sum(len(b) for _, b in imgs) / 1024:.0f} KB)")
+    return cids, imgs
+
+
+def _preview_with_images(html: str, imgs: list) -> str:
+    """Dry-run only: inline the PNGs as data URIs so a browser shows the mail."""
+    import base64
+    for cid, png in imgs:
+        html = html.replace(f"cid:{cid}",
+                            "data:image/png;base64," + base64.b64encode(png).decode())
+    return html
 
 
 def main() -> None:
@@ -546,6 +862,10 @@ def main() -> None:
     # history -> weekly / quarterly roll-ups (latest row per isin in window)
     hist = load_parquet(drive, index_id, HIST_NAME, HIST_COLS)
     hist = hist[hist["as_of"].astype(str) != today]        # idempotent per day
+    prev_date = annotate_freshness(rows, hist, today)
+    log(f"vs previous list {prev_date}: "
+        f"{sum(1 for r in rows if r.get('_fresh') == 'new')} new, "
+        f"{sum(1 for r in rows if r.get('_fresh') == 'changed')} changed")
     if not daily_df.empty:
         hist = daily_df.copy() if hist.empty else pd.concat(
             [hist, daily_df], ignore_index=True)
@@ -570,7 +890,8 @@ def main() -> None:
                     "surge_class", "yoy_tier", "guidance_cagr", "guidance_tier",
                     "cred_score", "in_pf"]
             print(daily_df[cols].head(25).to_string(index=False))
-        html = build_html(rows, today)
+        cids, imgs = render_charts(drive, rows, log)
+        html = _preview_with_images(build_html(rows, today, cids, prev_date), imgs)
         prev = Path(__file__).resolve().parent.parent / "combined_strength_preview.html"
         prev.write_text(html, encoding="utf-8")
         print(f"\nDRY RUN — preview saved to {prev.name}; no Drive write, no mail.")
@@ -591,13 +912,168 @@ def main() -> None:
         log("combined_strength mail toggled OFF — skipped.")
         return
     n_pf = int(daily_df["in_pf"].sum())
-    subject = (f"🏆 Combined strength — {len(daily_df)} stocks "
-               f"(tech+results+guidance)" + (f" · 💼{n_pf} PF" if n_pf else ""))
-    sent = send_email(subject, build_html(rows, today))
+    n_new = sum(1 for r in rows if r.get("_fresh") == "new")
+    n_ch = sum(1 for r in rows if r.get("_fresh") == "changed")
+    subject = (f"🏆 Combined strength — {len(daily_df)} stocks"
+               + (f" · 🆕 {n_new} new" if n_new else "")
+               + (f" · ✳ {n_ch} changed" if n_ch else "")
+               + (f" · 💼{n_pf} PF" if n_pf else ""))
+    cids, imgs = render_charts(drive, rows, log)
+    sent = send_email(subject, build_html(rows, today, cids, prev_date),
+                      inline_images=imgs)
     # ascii-only in log lines — local console is cp1252, emoji crash print()
     log(f"Email {'sent' if sent else 'FAILED'}: "
         f"{subject.encode('ascii', 'ignore').decode().strip()}")
 
 
+def _self_test() -> int:
+    """Offline: rule + score maths + mail layout. No Drive, no mail."""
+    fails = 0
+
+    def check(name, ok):
+        nonlocal fails
+        print(("  ok   " if ok else "  FAIL ") + name)
+        fails += 0 if ok else 1
+
+    conv = pd.DataFrame([
+        {"symbol": "AAA", "zone_type": "buy", "n_strategies": 3, "composite_score": 90,
+         "strategies": "minervini, momentum_3m, momentum_6m", "n_families": 2,
+         "families": "minervini, momentum", "entry_median": 100.0, "stop_median": 92.0},
+        {"symbol": "BBB", "zone_type": "add", "n_strategies": 2, "composite_score": 70,
+         "strategies": "darvas, volume_breakout", "n_families": 2,
+         "families": "darvas, volume_breakout"},
+        {"symbol": "CCC", "zone_type": "buy", "n_strategies": 1, "composite_score": 99,
+         "strategies": "pead"}])
+    surge = pd.DataFrame([{"isin": "I1", "classification": "CONSISTENT",
+                           "pat_yoy_pct": 150.0, "quarter": "Jun 2026"}])
+    grades = pd.DataFrame([{"isin": "I2", "yoy_tier": "great", "yoy": 60.0},
+                           {"isin": "I3", "yoy_tier": "exceptional", "yoy": 200.0}])
+    gt = {"I1": None, "I2": None}
+    orig = globals()["_latest_guidance"]
+    globals()["_latest_guidance"] = lambda g, f, k, d: {
+        "cagr": 35.0, "quarter": "Q1 FY27", "metric": "revenue", "qtrs_old": 0,
+        "statement": "we expect 35% growth", "src_date": "2026-08-10",
+        "src_type": "concall", "src_title": "Transcript"}
+    try:
+        rows, _ = build_list(conv, surge, grades, pd.DataFrame(),
+                             {"AAA": "I1", "BBB": "I2", "CCC": "I3"},
+                             {"I1": "Alpha", "I2": "Beta", "I3": "Gamma"}, {"I2"},
+                             "2026-10-11", gt_by=gt)
+    finally:
+        globals()["_latest_guidance"] = orig
+    by = {r["symbol"]: r for r in rows}
+    check("1-strategy stock excluded", "CCC" not in by)
+    check("setups collapse variants",
+          setups_of("momentum_3m, momentum_6m, ma_respect_20ema_30d, ma_respect_50ema_60d")
+          == ["ma_respect", "momentum"])
+    check("volume surge and dry-up stay two setups",
+          len(setups_of("volume_breakout, volume_vcp")) == 2)
+    conv2 = pd.DataFrame([
+        {"symbol": "MOM", "zone_type": "buy", "n_strategies": 3, "composite_score": 95,
+         "strategies": "momentum_1m, momentum_3m, momentum_6m"},
+        {"symbol": "MAR", "zone_type": "buy", "n_strategies": 2, "composite_score": 95,
+         "strategies": "ma_respect_20ema_30d, ma_respect_20ema_60d"}])
+    globals()["_latest_guidance"] = lambda g, f, k, d: {
+        "cagr": 35.0, "quarter": "Q1 FY27", "metric": "revenue", "qtrs_old": 0,
+        "statement": "", "src_date": "", "src_type": "", "src_title": ""}
+    try:
+        rows2, _ = build_list(conv2, surge, grades, pd.DataFrame(),
+                              {"MOM": "I1", "MAR": "I2"}, {}, set(), "2026-10-12",
+                              gt_by=gt)
+    finally:
+        globals()["_latest_guidance"] = orig
+    check("one idea counted many times does NOT qualify", rows2 == [])
+    a = by.get("AAA", {})
+    check("score parts: chart 90, results 100 (CONSISTENT), guidance 80 (>=20%)",
+          (a.get("tech_pts"), a.get("results_pts"), a.get("guid_pts")) == (90.0, 100.0, 80.0))
+    check("score = 0.4*90+0.3*100+0.3*80 = 90", a.get("rank_score") == 90.0)
+    check("score maths shown", "0.4×chart 90" in score_math(a))
+    check("why line names the surge and families",
+          "3+ of the last 4" in why_line(a) and "2 independent setups" in why_line(a))
+    check("plain strategy names",
+          plain_strategy("momentum_6m").startswith("Momentum 6m")
+          and plain_strategy("ma_respect_20ema_30d").startswith("Holds above its 20-day")
+          and plain_strategy("unknown_x") == "unknown_x")
+    html = build_html(rows, "2026-10-11", {"AAA": "cs_AAA"})
+    check("PF holding listed first", html.index("Beta") < html.index("Alpha"))
+    check("chart tag present for AAA", 'src="cid:cs_AAA"' in html)
+    check("no-chart note for BBB", "no price history" in html)
+    check("explainer present", "How this list is built" in html)
+    check("persisted frame unchanged (HIST_COLS only)",
+          list(pd.DataFrame(rows, columns=HIST_COLS).columns) == HIST_COLS)
+    check("mail html small (<60 KB for 2 cards)", len(html.encode()) < 60_000)
+    # ---- new / changed vs the previous list --------------------------------------
+    hist = pd.DataFrame([
+        {**{c: None for c in HIST_COLS}, "isin": "I1", "symbol": "AAA", "as_of": "2026-10-14",
+         "strategies": "minervini, momentum_3m", "pat_qtr": "Mar 2026", "guid_from": "Q4 FY26",
+         "surge_class": "CONSISTENT", "rank_score": 85.0},
+        {**{c: None for c in HIST_COLS}, "isin": "I1", "symbol": "AAA", "as_of": "2026-10-10",
+         "rank_score": 80.0}])
+    rws = [dict(by["AAA"]), dict(by["BBB"])]
+    pdate = annotate_freshness(rws, hist, "2026-10-15")
+    fa = {r["symbol"]: r for r in rws}
+    check("previous list date found", pdate == "2026-10-14")
+    check("stock absent yesterday is NEW", fa["BBB"]["_fresh"] == "new")
+    check("new results + new guidance flagged as CHANGED",
+          fa["AAA"]["_fresh"] == "changed"
+          and any("new results" in c for c in fa["AAA"]["_changes"])
+          and any("new guidance" in c for c in fa["AAA"]["_changes"]))
+    check("score move tracked", fa["AAA"]["_score_delta"] == 5.0)
+    check("days on list counted", fa["AAA"]["_days_on"] == 3)
+    check("first ever run: nothing called new", annotate_freshness(
+        [dict(by["AAA"])], pd.DataFrame(columns=HIST_COLS), "2026-10-15") is None)
+    o = order_rows([dict(fa["AAA"], in_pf=False), dict(fa["BBB"], in_pf=False)])
+    check("new comes before changed", [r["symbol"] for r in o] == ["BBB", "AAA"])
+    h2 = build_html(rws, "2026-10-15", {}, pdate)
+    check("strip + badges in the mail", "New today (1)" in h2 and "Changed (1)" in h2
+          and "NEW TODAY" in h2 and "#1a7a3a" in h2 and "#b8860b" in h2)
+    same = [dict(by["AAA"])]
+    annotate_freshness(same, pd.DataFrame([{**{c: None for c in HIST_COLS},
+                       **{k: by["AAA"].get(k) for k in HIST_COLS if k in by["AAA"]},
+                       "as_of": "2026-10-14"}]), "2026-10-15")
+    check("identical row is SAME, no badge", same[0]["_fresh"] == "same"
+          and "NEW TODAY" not in fresh_badge(same[0]))
+    chart_only = [dict(by["AAA"], strategies="minervini, darvas")]
+    annotate_freshness(chart_only, pd.DataFrame([{**{c: None for c in HIST_COLS},
+                       **{k: by["AAA"].get(k) for k in HIST_COLS if k in by["AAA"]},
+                       "as_of": "2026-10-14"}]), "2026-10-15")
+    check("chart-setup change alone is NOT highlighted, shown as a note",
+          chart_only[0]["_fresh"] == "same" and "new chart setup: darvas" in fresh_badge(chart_only[0]))
+    # O4 (2026-10-16): a reported result is never quoted as guidance — real GF1 lines.
+    check("past result (IMMEDIATE, no forward word) is dropped", is_past_result(
+        "our consolidated total revenue for the quarter stood at Rs. 1,604 crores, "
+        "registering a 67% year-on-year growth.", "IMMEDIATE"))
+    check("forward line tagged IMMEDIATE is kept", not is_past_result(
+        "In Quarter 3, we are projecting sequential IT services revenue growth of "
+        "minus 0.5% to plus 1.5%", "IMMEDIATE"))
+    check("'will be commissioned' is kept", not is_past_result(
+        "R32 capex of INR80 crores in Surat will be commissioned as per schedule", "IMMEDIATE"))
+    check("long-term line kept whatever its wording", not is_past_result(
+        "for FY27-28, FY28-29, and maybe thereafter, we are on track to achieve 30% to "
+        "35% growth rate.", "LONG_TERM"))
+    check("'NA' is never a quote", is_past_result("NA", "LONG_TERM"))
+    _gt = pd.DataFrame([{"isin": "S1", "symbol": "SYRMA", "quarter": "Q1 FY27",
+                         "metric": "revenue", "cagr_pct": 32.5, "source_doc_id": "d1"}])
+    _gf = pd.DataFrame([
+        {"isin": "S1", "quarter": "Q1 FY27", "metric_type": "Revenue", "timeframe": "IMMEDIATE",
+         "quantifiable": "Yes", "source_doc_id": "d1",
+         "exact_statement": "our consolidated total revenue for the quarter stood at Rs. "
+                            "1,604 crores, registering a 67% year-on-year growth."},
+        {"isin": "S1", "quarter": "Q1 FY27", "metric_type": "Revenue", "timeframe": "LONG_TERM",
+         "quantifiable": "Yes", "source_doc_id": "d1",
+         "exact_statement": "for FY27-28, FY28-29 we are on track to achieve 30% to 35% growth rate."}])
+    _lg = _latest_guidance(_gt, _gf, _qkey("Q2 FY27"), {})
+    check("SYRMA: the forward line wins over the reported result",
+          _lg is not None and "on track to achieve 30% to 35%" in _lg["statement"])
+    _lg2 = _latest_guidance(_gt, _gf.iloc[:1], _qkey("Q2 FY27"), {})
+    check("only a past line -> no quote, cagr kept",
+          _lg2 is not None and _lg2["statement"] == "" and _lg2["cagr"] == 32.5)
+
+    print(f"\n{'ALL PASS' if not fails else f'{fails} FAILED'}")
+    return 1 if fails else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
     main()

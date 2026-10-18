@@ -46,6 +46,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, load_parquet, save_parquet,
                              load_portfolio_isins, log)
 from mailer import send_email, load_mail_settings, esc
+import quarterly_table as QT
 
 # narrative doc types drained from the global queue (rating comes from ratings.parquet)
 TYPED = ("concall", "annual_report", "presentation", "results")
@@ -232,7 +233,8 @@ def _is_boundary(header: str, body: str = "") -> bool:
                                               for k in _BOUNDARY_KW))
 
 
-def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str | None:
+def _find_region(sections, period: str, doc_type: str, doc_id: str = "",
+                 allow_newest: bool = False) -> str | None:
     """Concatenated body of a document's FULL block: its boundary section plus the
     following intra-doc sections, up to the next document boundary.
 
@@ -302,7 +304,12 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
             if pn and pn in hn and not _other_type_heading(hn, doc_type):
                 start = i
                 break
-    if start is None and not pn:
+    # LAST RESORT, opt-in: the NEWEST section of this type, whatever period it names.
+    # Reached when the caller asked for a period the page does not carry - a call filed
+    # late, or by a half-yearly filer whose headings read "H1 FY26". The per-company
+    # mail wants that call and labels it with the quarter the SECTION names, so nothing
+    # can be presented as a quarter it is not; the digest leaves this off.
+    if start is None and (not pn or allow_newest):
         # PERIOD UNKNOWN. Concall sections carry no <!-- doc:... --> marker
         # (extract_concall.py writes the header without one), and `period` on the queue
         # row is frequently blank - which renders the heading as "##  Concall - Title"
@@ -310,10 +317,13 @@ def _find_region(sections, period: str, doc_type: str, doc_id: str = "") -> str 
         # summary at all. Fall back to the doc_type keyword alone and take the LAST
         # match, i.e. the most recent document of that type on the page.
         for i, (h, _b) in enumerate(sections):
-            hn = _norm(h)
+            hn = _qnorm(h)
             if not any(_norm(k) in hn for k in kws):
                 continue
-            if _other_type_heading(hn, doc_type):          # not another doc's section
+            # TYPE WORDS, not the whole heading - the title after the dash names the
+            # SOURCE DOCUMENT ("PPT" for a call read from a deck), and testing it here
+            # skipped the newest call and fell back to a much older transcript.
+            if _other_type_heading(_norm(_type_words(h)), doc_type):
                 continue
             start = i
     if start is None:
@@ -387,6 +397,223 @@ def _lift_summary(region: list, limit: int = SUMMARY_LIMIT) -> str:
         if got:
             return got
     return ""
+
+
+# ------------------------------------------------------------------ #
+#  readable layout (user 2026-10-17): In short -> table -> by theme   #
+# ------------------------------------------------------------------ #
+# The old body flattened everything into one paragraph; a results table written without
+# a leading "|" ("Metric | Q2 FY27 | Q2 FY26 | YoY%") ran straight into the prose.
+_NA = {"", "na", "n/a", "nan", "none", "-", "–", "null", "data_missing"}
+_TAG_RE = re.compile(r"^\[([A-Za-z ]+)\]\s*(.*)$")
+_SKIP_SEC = ("raw guidance", "gf1", "extraction", "methodology", "footnote", "metadata",
+             "statement id")
+_THEMES = (
+    ("Financial performance", ("revenue", "sales", "ebitda", "pat", "profit", "margin",
+                               "eps", "income", "turnover", "pbt")),
+    ("Growth & guidance", ("expect", "guid", "target", "outlook", "plan", "capex",
+                           "capacity", "order book", "orderbook", "pipeline", "will ",
+                           "going forward", "next year", "fy2")),
+    ("Corporate actions", ("joint venture", " jv", "acqui", "subsidiar", "merger",
+                           "amalgamat", "fund rais", "qip", "dividend", "buyback",
+                           "allot", "stake")),
+    ("Risks & watch-outs", ("decline", "fell", "lower", "pressure", "delay", "litigation",
+                            "risk", "loss", "weak", "headwind", "contingent", "penalty")),
+)
+
+
+def _is_na(v) -> bool:
+    return str(v if v is not None else "").strip().lower() in _NA
+
+
+def _cells(line: str) -> list:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def structure_doc(text: str) -> dict:
+    """A company_page section -> {'tags', 'tables', 'points', 'sections'}. Pure.
+
+    tables   : [[header, row, ...]] — pipe tables with OR without a leading '|'
+    points   : bullets / prose lines outside any ### sub-heading
+    sections : [(heading, [points])] for ### / #### sub-headings (concall, AR, deck)
+    """
+    text = re.sub(r"<!--.*?-->", " ", str(text or ""), flags=re.S)
+    out = {"tags": {}, "tables": [], "points": [], "sections": []}
+    cur_sec, table = None, None
+    skip = False
+
+    def _flush():
+        nonlocal table
+        if table and len(table) >= 2:
+            out["tables"].append(table)
+        table = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.count("|") >= 2:
+            cells = _cells(line)
+            if all(re.fullmatch(r":?-{2,}:?", c) or not c for c in cells):
+                continue                               # separator row
+            if skip:
+                continue
+            table = (table or []) + [cells]
+            continue
+        _flush()
+        if not line:
+            continue
+        h = re.match(r"^(#{2,4})\s+(.*)", line)
+        if h:
+            title = re.sub(r"^(section\s*[\w-]*\)?\s*[—:-]?\s*)", "", h.group(2),
+                           flags=re.I).strip(" *#")
+            skip = any(k in title.lower() for k in _SKIP_SEC)
+            cur_sec = None
+            if not skip and len(h.group(1)) >= 3:
+                cur_sec = (title, [])
+                out["sections"].append(cur_sec)
+            continue
+        if skip or _META_RE.match(line.lstrip("*_ ")):
+            continue
+        t = _TAG_RE.match(line)
+        if t:
+            out["tags"][t.group(1).strip()] = t.group(2).strip()
+            continue
+        p = line.lstrip("-*•· ").strip()
+        p = re.sub(r"^\d+[.)]\s+", "", p).strip("* ")
+        if not p or p.endswith(":") and len(p) < 40 or not (set(p) - set("-:|*# ")):
+            continue                                   # "Key Highlights:" labels
+        if (len(p.split()) <= 5 and not re.search(r"\d", p)
+                and not re.search(r"[.!?]$", p)):
+            continue                                   # "Financial Summary Table" labels
+        if any(k in p.lower() for k in _SKIP_SEC):
+            continue
+        (cur_sec[1] if cur_sec else out["points"]).append(p)
+    _flush()
+    return out
+
+
+def skip_document(doc_type: str, title: str) -> bool:
+    """Not a document to report (2026-10-17). A notice of a future call / board meeting
+    (ATHERENERG, CGPOWER), or a 'results' row whose title says it is a credit-rating
+    release (WELCORP: one CARE PDF queued as both results AND rating). Pure."""
+    if QT.is_meeting_notice(title, doc_type):
+        return True
+    return doc_type == "results" and bool(re.search(r"(?i)credit\s*rating", str(title or "")))
+
+
+def compact_table(table: list, max_cols: int = 6, max_rows: int = 12) -> list:
+    """Drop columns that are constant or empty everywhere and rows that are NA in every
+    data column; cap the size. First row is the header. Pure."""
+    if not table or len(table) < 2:
+        return []
+    width = max(len(r) for r in table)
+    rows = [r + [""] * (width - len(r)) for r in table]
+    head, body = rows[0], rows[1:]
+    keep = []
+    for j in range(width):
+        col = [r[j] for r in body]
+        if all(_is_na(c) for c in col):
+            continue
+        if len(body) > 1 and len({c.strip().lower() for c in col}) == 1:
+            continue                    # company name, quarter, "Explicit" - same on every row
+        keep.append(j)
+    keep = keep[:max_cols]
+    body = [r for r in body if not all(_is_na(r[j]) for j in keep[1:])]
+    if not body or len(keep) < 2:
+        return []
+    return [[head[j] for j in keep]] + [[r[j] for j in keep] for r in body[:max_rows]]
+
+
+def _num(s):
+    try:
+        return float(str(s).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def theme_of_point(p: str) -> str:
+    low = f" {p.lower()}"
+    for name, keys in _THEMES:
+        if any(k in low for k in keys):
+            return name
+    return "Other"
+
+
+def in_short(struct: dict, fallback: str = "") -> str:
+    """1-2 lines: Revenue and PAT from the results table (+YoY), then the first point
+    that is not about the numbers. Plain text. Pure."""
+    bits = []
+    for t in struct.get("tables", []):
+        head = [h.lower() for h in t[0]]
+        yoy = next((j for j, h in enumerate(head) if "yoy" in h), None)
+        for r in t[1:]:
+            lab = r[0].lower()
+            for key, name in (("revenue", "Revenue"), ("pat", "PAT")):
+                if lab.startswith(key) and name not in " ".join(bits):
+                    v = _num(r[1]) if len(r) > 1 else None
+                    if v is None:
+                        continue
+                    unit = " cr" if "cr" in lab else ""
+                    g = _num(r[yoy]) if yoy is not None and yoy < len(r) else None
+                    bits.append(f"{name} ₹{v:,.2f}{unit}"
+                                + (f" ({g:+.0f}% YoY)" if g is not None else ""))
+        if bits:
+            break
+    other = next((p for p in struct.get("points", [])
+                  if theme_of_point(p) != "Financial performance"), "")
+    if bits:
+        return " · ".join(bits) + (f"; {other[:160]}" if other else "")
+    return (fallback or "")[:320]
+
+
+def render_doc(struct: dict, fallback: str = "") -> str:
+    """In short -> financial table(s) -> points by theme. HTML. Pure."""
+    parts = []
+    short = in_short(struct, fallback)
+    if short:
+        parts.append(f"<div style='margin:3px 0 6px;font-size:13px'><b>In short:</b> "
+                     f"{esc(short, 420)}</div>")
+    for t in struct.get("tables", [])[:2]:
+        ct = compact_table(t)
+        if not ct:
+            continue
+        head = ct[0]
+        yoy = {j for j, h in enumerate(head) if re.search(r"(?i)yoy|qoq|growth|chg|%", h)}
+        th = "".join(f"<th style='text-align:{'left' if j == 0 else 'right'};"
+                     f"padding:3px 8px;border-bottom:1px solid #ccc;font-size:12px'>"
+                     f"{esc(h, 40)}</th>" for j, h in enumerate(head))
+        trs = []
+        for r in ct[1:]:
+            tds = []
+            for j, c in enumerate(r):
+                col = "#222"
+                if j in yoy and j and _num(c) is not None:
+                    col = "#1a7a3a" if _num(c) > 0 else "#c0392b" if _num(c) < 0 else "#777"
+                tds.append(f"<td style='text-align:{'left' if j == 0 else 'right'};"
+                           f"padding:2px 8px;border-bottom:1px solid #f0f0f0;color:{col};"
+                           f"font-size:12px'>{esc(c, 60)}</td>")
+            trs.append("<tr>" + "".join(tds) + "</tr>")
+        parts.append("<table cellspacing='0' style='border-collapse:collapse;margin:2px 0 6px'>"
+                     f"<tr>{th}</tr>{''.join(trs)}</table>")
+    groups: dict = {}
+    for p in struct.get("points", []):
+        groups.setdefault(theme_of_point(p), []).append(p)
+    order = [n for n, _ in _THEMES] + ["Other"]
+    themed = [(n, groups[n]) for n in order if n in groups]
+    themed += [(h, ps) for h, ps in struct.get("sections", []) if ps]
+    for name, ps in themed[:6]:
+        lis = "".join(f"<li style='margin:1px 0'>{esc(p, 260)}</li>" for p in ps[:4])
+        more = (f"<li style='color:#999;list-style:none'>+{len(ps) - 4} more</li>"
+                if len(ps) > 4 else "")
+        parts.append(f"<div style='margin:4px 0 0;font-weight:700;font-size:12px;"
+                     f"color:#1f4d6b'>{esc(name, 70)}</div>"
+                     f"<ul style='margin:1px 0 4px 18px;padding:0;font-size:12.5px;"
+                     f"color:#333'>{lis}{more}</ul>")
+    return "".join(parts)
 
 
 # ------------------------------------------------------------------ #
@@ -515,10 +742,28 @@ def collect(drive, repo_id, index_id, pf, since_date, mailed_ids, cache):
             for _, r in grp.iterrows():
                 period = str(r.get("period") or "").strip()
                 doc_id = str(r["doc_id"])
-                summary = _lift_summary(_find_region(
-                    _company_page(drive, repo_id, isin, cache), period, dt, doc_id) or "")
+                title = str(r.get("title") or "")
+                if skip_document(dt, title):
+                    log(f"  {str(r.get('symbol') or ''):<12} {dt}: skipped — "
+                        f"{'meeting notice' if QT.is_meeting_notice(title, dt) else 'a credit-rating release, not results'}"
+                        f" ({title[:60]})")
+                    continue
+                region = _find_region(
+                    _company_page(drive, repo_id, isin, cache), period, dt, doc_id) or []
+                summary = _lift_summary(region)
                 if not summary:   # narrative missing -> structured guidance rows
                     summary = _structured_fallback(dt, doc_id, isin, tables)
+                if region:
+                    # Loose points come only from the document's OWN first section; the
+                    # region can run on into an unrelated press release (Augmont award,
+                    # 17 Oct). Sub-sections (###) still come from the whole block.
+                    st = structure_doc("\n".join(f"{h}\n{b}" for h, b in region))
+                    st["points"] = structure_doc(f"{region[0][0]}\n{region[0][1]}")["points"]
+                    rich = render_doc(st, fallback=summary)
+                    if rich:
+                        out.setdefault(isin, {"symbol": str(r.get("symbol") or ""),
+                                              "name": str(r.get("company_name") or ""),
+                                              "items": []}).setdefault("rich", {})[doc_id] = rich
                 # unambiguous doc name: ARs get FY2024-25-style labels
                 label = (_ar_display(r.get("announcement_date"))
                          if dt == "annual_report" else period)
@@ -586,9 +831,12 @@ def build_html(blocks: dict, since_date: str, days: float) -> str:
         parts.append(f"<h3 style='margin:16px 0 4px'>"
                      f"<a href='{link}' style='color:#1a237e;text-decoration:none'>"
                      f"{sym}</a> · {esc(v['name'], 40)}</h3>")
+        rich = v.get("rich", {})
         for dt, header, summary, _id, arr in items:
             icon = DOC_ICON.get(dt, "📄")
-            body = (f"<div style='margin:2px 0 8px 6px;font-size:12.5px;color:#333;"
+            body = (f"<div style='margin:2px 0 8px 6px;color:#333;border-left:3px solid "
+                    f"#ccc;padding-left:8px'>{rich[_id]}</div>" if rich.get(_id) else
+                    f"<div style='margin:2px 0 8px 6px;font-size:12.5px;color:#333;"
                     f"border-left:3px solid #ccc;padding-left:8px'>{esc(summary, SUMMARY_LIMIT)}</div>"
                     if summary else "<div style='margin:2px 0 8px 6px;font-size:12px;"
                     "color:#999'>(summary pending — the nightly backfill will extract "
@@ -658,6 +906,33 @@ def main() -> None:
         print(f"\nDRY RUN — preview saved to {prev.name}; no ledger write, no mail.")
         return
 
+    send_and_record(drive, index_id, mailed, blocks, html, n_docs)
+
+
+def send_and_record(drive, index_id, mailed, blocks, html, n_docs, *,
+                    send=None, save=None, settings=None) -> bool:
+    """Send the digest; ONLY a delivered mail marks its items as mailed.
+
+    The ledger used to be written BEFORE the toggle check and the send, so a failed send
+    or a toggled-off mail burnt those documents for good — they never reached the reader.
+    Now a failed/skipped send leaves the ledger untouched and the items retry on the next
+    run (bounded by the --days arrival window, so switching the toggle back on is no flood).
+    send/save/settings are injectable so the self-test can prove this without Drive/SMTP.
+    """
+    send = send or send_email
+    save = save or save_parquet
+    settings = settings or load_mail_settings
+    if not settings(drive, index_id).get("pf_docs_digest", True):
+        log("pf_docs_digest mail toggled OFF — skipped (items stay unmailed).")
+        return False
+    subject = f"📂 PF new documents — {n_docs} across {len(blocks)} stocks — {date.today()}"
+    sent = send(subject, html)
+    log(f"Email {'sent' if sent else 'FAILED'}: "
+        f"{subject.encode('ascii', 'ignore').decode().strip()}")
+    if not sent:
+        log("send failed — ledger NOT updated; items retry next run.")
+        return False
+
     # record every reported item so it never mails again
     _now = datetime.now().isoformat(timespec="seconds")
     new_rows = [{"item_id": _id, "isin": isin, "symbol": v["symbol"],
@@ -667,22 +942,92 @@ def main() -> None:
                 for (dt, _h, _s, _id, arr) in v["items"]]
     if new_rows:
         combined = pd.concat([mailed, pd.DataFrame(new_rows, columns=MAILED_COLS)],
-                             ignore_index=True) if not mailed.empty \
+                             ignore_index=True) if mailed is not None and not mailed.empty \
             else pd.DataFrame(new_rows, columns=MAILED_COLS)
-        save_parquet(drive, index_id, MAILED_NAME, combined)
+        save(drive, index_id, MAILED_NAME, combined)
         _pend = sum(1 for r in new_rows if r["summary_state"] == "pending")
         log(f"ledger updated: +{len(new_rows)} -> {len(combined)} rows"
             + (f" ({_pend} pending - will retry until extracted or "
                f"{LEDGER_BURN_DAYS}d old)" if _pend else ""))
+    return True
 
-    if not load_mail_settings(drive, index_id).get("pf_docs_digest", True):
-        log("pf_docs_digest mail toggled OFF — skipped.")
-        return
-    subject = f"📂 PF new documents — {n_docs} across {len(blocks)} stocks — {date.today()}"
-    sent = send_email(subject, html)
-    log(f"Email {'sent' if sent else 'FAILED'}: "
-        f"{subject.encode('ascii', 'ignore').decode().strip()}")
+
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        ok, fail = (ok + 1, fail) if cond else (ok, fail + 1)
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+
+    blocks = {"INE1": {"symbol": "AAA", "name": "A Ltd",
+                       "items": [("rating", "h", "summary", "id1", "2026-09-24")]}}
+    saved = []
+    save = lambda d, i, n, df: saved.append(df)
+    on = lambda d, i: {"pf_docs_digest": True}
+    off = lambda d, i: {"pf_docs_digest": False}
+    empty = pd.DataFrame(columns=MAILED_COLS)
+
+    r = send_and_record(None, "x", empty, blocks, "<p>", 1,
+                        send=lambda s, h: False, save=save, settings=on)
+    check("failed send does NOT write the ledger", r is False and not saved)
+    r = send_and_record(None, "x", empty, blocks, "<p>", 1,
+                        send=lambda s, h: True, save=save, settings=off)
+    check("toggled-off mail does NOT write the ledger", r is False and not saved)
+    sent = []
+    r = send_and_record(None, "x", empty, blocks, "<p>", 1,
+                        send=lambda s, h: sent.append(s) or True, save=save, settings=on)
+    check("delivered mail writes the ledger once", r is True and len(saved) == 1)
+    check("ledger row carries the item id",
+          saved and list(saved[0]["item_id"]) == ["id1"])
+    check("exactly one mail sent", len(sent) == 1)
+    # ---- readable layout (2026-10-17) — the real RPEL results section ----
+    rpel = ("## Q2 FY27 Results — Board Meeting Outcome\n*Processed: 2026-10-16*\n\n"
+            "[QuarterYear] Q2 FY27\n[PriorYearQuarter] Q2 FY26\n\n"
+            "Metric | Q2 FY27 | Q2 FY26 | YoY%\n"
+            "Revenue (Cr) | 93.92 | 64.21 | 46.26\nEBITDA (Cr) | NA | NA | NA\n"
+            "PAT (Cr) | 21.63 | 13.84 | 56.29\nEPS (Rs) | 4.71 | 3.02 | 55.96\n\n"
+            "Key Highlights:\n- Revenue from operations for the quarter was Rs 93.92 Crores.\n"
+            "- The company has entered into a joint venture arrangement with TRL Krosaki "
+            "Refractories Limited.\n")
+    st = structure_doc(rpel)
+    check("table read WITHOUT a leading '|'", st["tables"] and st["tables"][0][0][0] == "Metric")
+    ct = compact_table(st["tables"][0])
+    check("all-NA row (EBITDA) dropped, others kept",
+          [r[0] for r in ct[1:]] == ["Revenue (Cr)", "PAT (Cr)", "EPS (Rs)"])
+    check("tags read, not printed as text", st["tags"].get("QuarterYear") == "Q2 FY27"
+          and not any("[QuarterYear]" in p for p in st["points"]))
+    check("'Key Highlights:' label is not a point",
+          all(not p.startswith("Key Highlights") for p in st["points"]))
+    s = in_short(st)
+    check("in short: revenue + PAT with YoY, then the JV",
+          s.startswith("Revenue ₹93.92 cr (+46% YoY) · PAT ₹21.63 cr (+56% YoY)") and "TRL Krosaki" in s)
+    check("themes: JV is a corporate action", theme_of_point(
+        "The company has entered into a joint venture arrangement with TRL Krosaki") == "Corporate actions")
+    html = render_doc(st)
+    check("render: in short, table, themed list", all(x in html for x in (
+        "In short", "<table", "Corporate actions", "#1a7a3a")))
+    # SYRMA-style wide extraction table: constant + empty columns go
+    wide = [["company", "Current Qtr", "metric", "Guidance type", "current growth", "next qtr", "1yr fwd"],
+            ["SYRMA", "Q1 FY27", "Revenue", "Explicit", "67%", "NA", "35-40%"],
+            ["SYRMA", "Q1 FY27", "PAT", "Explicit", "112%", "NA", "NA"]]
+    check("wide table: constant/empty columns dropped, incl. a constant first column",
+          compact_table(wide)[0] == ["metric", "current growth", "1yr fwd"])
+    check("short heading-like label is not a point", structure_doc(
+        "## X\nFinancial Summary Table\n- Revenue grew 30%.")["points"] == ["Revenue grew 30%."])
+    check("raw-guidance (GF1) section skipped", structure_doc(
+        "### Section GF1 — Raw Guidance Extraction\n| a | b |\n| 1 | 2 |\n- x")["tables"] == [])
+    check("skip: investor-meet intimation", skip_document(
+        "concall", "Announcement under Regulation 30 (LODR)-Analyst / Investor Meet - Intimation"))
+    check("skip: credit-rating release filed as results (WELCORP)", skip_document(
+        "results", "Announcement under Regulation 30 (LODR)-Credit Rating 16 Oct - Press Release"))
+    check("keep: a real results outcome", not skip_document(
+        "results", "Board Meeting Outcome for Outcome Of Board Meeting Held On 16 October"))
+    print(f"\nrun_pf_docs_digest self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
     main()

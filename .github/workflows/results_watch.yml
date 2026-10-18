@@ -1,0 +1,104 @@
+name: results_watch
+
+# Same-day results teardown for PF holdings (user 2026-10-16) — see
+# scripts/results_watch.py. On 15 Oct CYIENTDLM was on Screener at 19:51 IST but its
+# full teardown arrived at 01:03, because the statements refresh and the PF mail job
+# are separate crons that GitHub started ~4 h late. This job polls instead.
+#
+# Two runs a day, each LOOPING every 20 min for ~5.5 h (the mgmt_interviews pattern:
+# one long run instead of many short ones, so check_infra_health's 40-run window is
+# not flooded; public repo, minutes are free). Together they cover roughly
+# 17:20 IST -> 04:20 IST even when GitHub starts them late.
+# Outside the results season the script exits in seconds. It sits out the Phase-1
+# Drive window (10:30-11:45 UTC). Each pass touches only holdings that reported in the
+# last 4 days and have not had their full teardown; the teardown's own mail ledger
+# stops any repeat, so overlapping with pf_daily_mails is safe.
+
+on:
+  schedule:
+    - cron: "50 11 * * *"     # 17:20 IST
+    - cron: "20 17 * * *"     # 22:50 IST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "one pass: statements refresh + teardown both in dry-run (no writes, no mail)"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: results-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # tk.json as well as oauth.json: ingest_fundamentals runs its own auth and reads
+      # GDRIVE_OAUTH_TOKEN_PATH first (see t4_nightly.yml for the failure without it).
+      - name: Write credentials (.env)
+        env:
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GMAIL_USER:              ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:            ${{ secrets.NOTIFY_EMAIL }}
+          SCREENER_SESSION_COOKIE: ${{ secrets.SCREENER_SESSION_COOKIE }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/oauth.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON" > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/oauth.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+            echo "GMAIL_USER=$GMAIL_USER"
+            echo "GMAIL_APP_PASSWORD=$GMAIL_APP_PASSWORD"
+            echo "NOTIFY_EMAIL=$NOTIFY_EMAIL"
+            echo "SCREENER_SESSION_COOKIE=$SCREENER_SESSION_COOKIE"
+          } > .env
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Self-test (fail fast)
+        run: |
+          python scripts/results_watch.py --self-test
+          python scripts/quarter_teardown.py --self-test
+
+      - name: Watch for PF results on Screener
+        env:
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$DRY" = "true" ]; then
+              python scripts/results_watch.py --once --dry-run
+            else
+              python scripts/results_watch.py --once
+            fi
+          else
+            python scripts/results_watch.py --loop-min 330 --every-min 20
+          fi
+
+      - name: Upload previews (dry-run inspection)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-watch-previews
+          path: quarter_teardown_preview.html
+          if-no-files-found: ignore

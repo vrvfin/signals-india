@@ -56,7 +56,7 @@ a number, a name, a place, a date, a product, a decision.
       "section":  "<one of the eighteen section names listed below>",
       "label":    "<short name for the point, e.g. 'Revenue', 'Dahej expansion', 'Top-5 client share'>",
       "value":    <the number if this point is a figure, else null>,
-      "unit":     "<cr|%|MT|MW|units|x|days|null>",
+      "unit":     "<cr|mn|bn|lakh|usd_mn|usd_bn|%|MT|MW|units|x|days|null>",
       "period":   "<the period the figure belongs to, as printed: 'Q1FY27'|'FY26'|'FY28E'>",
       "detail":   "<one specific sentence stating the point. REQUIRED when value is null.>",
       "slide_ref":"<slide number or slide title>",

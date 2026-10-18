@@ -9,6 +9,7 @@ GLOBAL NON-NEGOTIABLE RULES
 • Every single factual claim must be explicitly cited directly to its slide number, document section, or broker name.
 • If any operational metric, segment breakdown, or ratio is missing, explicitly output "DATA_MISSING".
 • Make absolutely zero assumptions, zero estimates, and zero generic industry fillers.
+• Every money figure carries its scale EXACTLY as the slide prints it (₹ Cr, ₹ Mn, ₹ Bn, ₹ Lakh, US$ Mn). Never convert between scales and never assume crore — a ₹ Mn order book written as crore is ten times wrong.
 • Formatting style: Use clear signifiers for critical trends (Positive items = Green/Comfort; Negative/Risk items = Red/Warning; Informational items = Purple).
 • Output must be completely clean and structural for direct copy-pasting into Google Docs or Google Sheets.
 

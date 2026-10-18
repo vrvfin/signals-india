@@ -9,6 +9,11 @@ on:
   schedule:
     - cron: "30 2 * * *"        # 02:30 UTC = 08:00 IST, once a day
   workflow_dispatch:
+    inputs:
+      names:
+        description: "Company token(s), COMMA separated (e.g. TCS,LANDMARK). Blank = drain deep_dive_queue."
+        required: false
+        type: string
   repository_dispatch:
     types: [trigger-deepdive]
 
@@ -105,9 +110,21 @@ jobs:
 
       - name: Run deep-dive queue
         id: run_deepdive
+        env:
+          # Via env, not inline ${{ }}, so the value cannot break out of the command.
+          NAMES: ${{ inputs.names }}
         run: |
           echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%S)" >> $GITHUB_OUTPUT
-          python scripts/company_deep_report.py
+          # NOTE: company_deep_report.py takes --names as ONE comma-separated value
+          # (unlike narrative.yml, whose --names is nargs="*" and space separated), so
+          # the token list must stay quoted as a single argument.
+          # NAMES is empty on schedule and repository_dispatch, so those paths invoke the
+          # script bare and drain deep_dive_queue exactly as before.
+          if [ -n "$NAMES" ]; then
+            python scripts/company_deep_report.py --names "$NAMES"
+          else
+            python scripts/company_deep_report.py
+          fi
 
       - name: Send email notifications
         if: always()

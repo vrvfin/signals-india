@@ -183,8 +183,16 @@ class Adjudicator:
             raise RuntimeError("no adjudicator keys: set CEREBRAS_API_KEY_n / "
                                "GROQ_API_KEY_n, or FREE_POOL_n for the degraded path")
         from _extractor_base import GeminiKeyPool
-        self._gem = GeminiKeyPool(keys, GEMINI_FALLBACK)
-        self.model = f"gemini/{GEMINI_FALLBACK[0]}"
+        from model_registry import pick, overload_keys
+        # Registry WRITE models (discover -> probe -> quality exam), ROTATED one place so
+        # the audit does not lead with the model the writer leads with (narrative_generate
+        # uses pick("WRITE")[0]). Still Gemini, so still flagged degraded. GEMINI_FALLBACK
+        # only when the registry is unavailable. Give-up rule scales with the keys.
+        ranked = pick("WRITE", GEMINI_FALLBACK, log=lambda *_: None)
+        models = ranked[1:] + ranked[:1] if len(ranked) > 1 else ranked
+        self._gem = GeminiKeyPool(keys, models)
+        self._gem._pool.model_overload_keys = overload_keys(len(keys))
+        self.model = f"gemini/{models[0]}"
         self.degraded = True
 
     def call(self, prompt: str, max_tokens: int = 4000) -> str:

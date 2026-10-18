@@ -34,7 +34,7 @@ import json
 import os
 import sys
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPTS_DIR not in sys.path:
@@ -334,16 +334,46 @@ def _q_order(qs):
     return (int(m.group(2)) % 100) * 100 + int(m.group(1))
 
 
+def _last_weekday(d):
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+# "Today's" information = dated on/after the last market close. Defaults to the
+# latest weekday (annotations are built before build_html); build_html narrows it
+# to the page's own last-bar date, so a Monday-morning render still flags
+# Friday-evening and weekend filings.
+_NEW_FROM = _last_weekday(date.today())
+
+_TODAY_CHIP = ('<span style="background:#e65100;color:#fff;padding:1px 7px;'
+               'border-radius:6px;font-size:12px;font-weight:800">🆕 TODAY</span> ')
+
+
+def _is_new(date_str):
+    try:
+        return date.fromisoformat(str(date_str)[:10]) >= _NEW_FROM
+    except Exception:
+        return False
+
+
+def _line_attr(date_str, kind, style):
+    """Attributes for one dated item line: new ones get the highlighter class
+    and a data-k tag that build_html counts for the card banner."""
+    if _is_new(date_str):
+        return f'class="today" data-k="{kind}" style="{style}"'
+    return f'style="{style}"'
+
+
 def _fresh_badge(date_str):
-    """🆕 NEW (today) / 🕓 RECENT (last 7d) / grey age chip — same tiers as app.py."""
+    """🆕 TODAY (since last close) / 🕓 RECENT (last 7d) / grey age chip."""
     from datetime import date as _d
     try:
         age = (_d.today() - _d.fromisoformat(str(date_str)[:10])).days
     except Exception:
         return ""
-    if age <= 0:
-        return ('<span style="background:#1a7a3a;color:#fff;padding:1px 6px;'
-                'border-radius:6px;font-size:10px;font-weight:700">🆕 NEW</span> ')
+    if _is_new(date_str):
+        return _TODAY_CHIP
     if age <= 7:
         return ('<span style="background:#1565c0;color:#fff;padding:1px 6px;'
                 'border-radius:6px;font-size:10px;font-weight:700">🕓 RECENT</span> ')
@@ -609,7 +639,12 @@ class Cards:
                 mt = str(gr.get("metric_type", "") or "").strip()
                 tf = str(gr.get("timeframe", "") or "").strip()
                 tag = " · ".join(t for t in (qv, mt, tf) if t and t.lower() != "nan")
-                lines.append((f'<i style="color:#1565c0">[{tag}]</i> ' if tag else "") + stmt[:200])
+                ln = (f'<i style="color:#1565c0">[{tag}]</i> ' if tag else "") + stmt[:200]
+                pa = str(gr.get("processed_at", "") or "")
+                if _is_new(pa):
+                    ln = (f'<span class="today" data-k="guidance">{_TODAY_CHIP}'
+                          f'{ln}</span>')
+                lines.append(ln)
                 shown += 1
                 if shown >= 3:
                     break
@@ -684,7 +719,7 @@ class Cards:
             mcol = {"high": "#c0392b", "med": "#a66300"}.get(mat, "#7f8c8d")
             s = _highlight_numbers(str(r.get("summary", "")).strip()[:320])
             lines.append(
-                f'<div style="margin:3px 0">{dot} {_fresh_badge(adate)}'
+                f'<div {_line_attr(adate, "filing", "margin:3px 0")}>{dot} {_fresh_badge(adate)}'
                 f'<b style="color:{mcol}">{adate}'
                 f' · {str(r.get("event_type", r.get("category", "")) or "").replace("_", " ")}'
                 f'{" · " + mat.upper() if mat else ""}:</b> {s}'
@@ -732,7 +767,7 @@ class Cards:
             tag = ("" if score >= _NEWS_DIRECT_MIN else
                    ' <span style="background:#b0bec5;color:#fff;padding:0 5px;'
                    'border-radius:4px;font-size:10px">unverified</span>')
-            lines.append(f'<div style="margin:2px 0">{_fresh_badge(dt_s)}'
+            lines.append(f'<div {_line_attr(dt_s, "news", "margin:2px 0")}>{_fresh_badge(dt_s)}'
                          f'<b style="color:#00695c">{dt_s}</b>'
                          f' · {_highlight_numbers(head)}{tag}</div>')
         newest = max((d for _, d, _ in items), default="")
@@ -779,7 +814,7 @@ class Cards:
             ddate = str(r.get("doc_date", ""))[:10]
             tags = " · ".join(x for x in [dtype, theme] if x)
             lines.append(
-                f'<div style="margin:3px 0">{_fresh_badge(ddate)}'
+                f'<div {_line_attr(ddate, "research", "margin:3px 0")}>{_fresh_badge(ddate)}'
                 f'<b style="color:#4a148c">{ddate} · {str(r.get("source", ""))[:40]}</b>'
                 + (f' <span style="background:#ede7f6;color:#4a148c;padding:0 5px;'
                    f'border-radius:4px;font-size:10.5px">{tags}</span>' if tags else "")
@@ -999,6 +1034,9 @@ _TPL = """<!doctype html><html><head><meta charset="utf-8">
  .fresh-bad{background:#fdecea;color:#96231a;border:1px solid #f5c6c0}
  .stale{font-size:10.5px;font-weight:600;color:#8a5300;background:#fff4e0;border:1px solid #f2d9a8;border-radius:4px;padding:1px 5px;margin-left:6px;white-space:nowrap}
  .stale-bad{font-size:10.5px;font-weight:600;color:#96231a;background:#fdecea;border:1px solid #f5c6c0;border-radius:4px;padding:1px 5px;margin-left:6px;white-space:nowrap}
+ .today{background:#fff3a0;border-left:4px solid #e65100;padding:2px 6px;font-weight:600;border-radius:3px}
+ .card.upd{border:2px solid #e65100;box-shadow:0 0 0 3px rgba(230,81,0,.12)}
+ .updbar{background:#e65100;color:#fff;font-size:13px;font-weight:800;padding:4px 10px;border-radius:5px;margin:3px 0}
  .dlfail{font-size:11px;color:#96231a;background:#fdecea;border:1px solid #f5c6c0;border-radius:4px;padding:5px 7px;margin:4px 0}
 </style></head><body>
 <h1>__TITLE__ — __N__ charts — __DATE__ (rendered in your browser)</h1>
@@ -1072,6 +1110,50 @@ def _freshness_banner(mkt_date, gen_date, n_behind, n_charts):
     return f'<div class="fresh {cls}">{msg}{tail}</div>'
 
 
+def _mcap_floor(df, syms, mcap_map, floor):
+    """Drop rows whose market cap is KNOWN and below `floor` (Rs cr). A missing
+    market cap is kept — absent data must not hide a stock. floor <= 0 = off."""
+    if floor <= 0 or df is None or df.empty:
+        return df
+    keep = [not (mcap_map.get(str(s).upper()) is not None
+                 and pd.notna(mcap_map.get(str(s).upper()))
+                 and float(mcap_map[str(s).upper()]) < floor) for s in syms]
+    out = df[keep].reset_index(drop=True)
+    n_unknown = sum(1 for s in syms if mcap_map.get(str(s).upper()) is None)
+    log(f"  {len(out)}/{len(df)} pass Rs{floor:,.0f}cr market-cap floor "
+        f"({n_unknown} with unknown market cap kept)")
+    return out
+
+
+_UPD_LABEL = (("filing", "filing"), ("news", "news"), ("research", "research note"),
+              ("guidance", "guidance line"))
+
+
+def _updated_banner(meta, annot_html):
+    """If the card holds anything new since the last close, put a strip under
+    its header saying what, and return the extra card class. Cards with nothing
+    new come back unchanged."""
+    bits = []
+    for k, lbl in _UPD_LABEL:
+        n = meta.count(f'data-k="{k}"')
+        if n:
+            bits.append(f"{n} {lbl}{'s' if n > 1 else ''}")
+    # The EVENT chip comes from n_events_at_signal, i.e. the event seen when the
+    # signal FIRST fired (often weeks ago) — it is only today's news when the
+    # signal itself is new today.
+    if "NEW TODAY" in annot_html:
+        bits.append("🆕 NEW signal" + (" + ⚡ EVENT" if "EVENT AT SIGNAL" in annot_html
+                                       else ""))
+    if not bits:
+        return meta, ""
+    bar = f'<div class="updbar">🔔 UPDATED TODAY · {" · ".join(bits)}</div>'
+    i = meta.find("</div>")                  # end of the .hd header line
+    if i < 0:
+        return bar + meta, " upd"
+    i += len("</div>")
+    return meta[:i] + bar + meta[i:], " upd"
+
+
 def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
                annot=None, resample=None, prelude="", failed_syms=None):
     """`prelude` is optional page furniture rendered ABOVE the card grid (the
@@ -1101,6 +1183,9 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         _modes = pd.Series(list(bar_dates.values())).mode()
         if not _modes.empty:
             mkt_date = _modes.iloc[0]
+    global _NEW_FROM
+    if mkt_date:
+        _NEW_FROM = mkt_date
     for j, (_, rr) in enumerate(ranked.iterrows()):
         s = str(rr.get("symbol", "") or "")
         pfname = str(rr.get("_pfname", "") or "")          # PF holding name (raw list)
@@ -1133,6 +1218,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             cards.llm_summary(s), cards.news_card(s, nmj),
             cards.research_card(s, nmj),
         ] if x)
+        meta, upd_cls = _updated_banner(meta, annot.get(s.upper(), ""))
         if not c:
             # Fundamentals present but no price series — panels + a small note,
             # no chart div. A DOWNLOAD FAILURE is called out separately: it used
@@ -1144,7 +1230,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
                     if s.upper() in failed_syms or s in failed_syms else
                     f'<div style="font-size:11px;color:#999;padding:6px 2px">'
                     f'No chart/price data for this name (no OHLCV feed).</div>')
-            card_html.append(f'<div class="card">{meta}{note}</div>')
+            card_html.append(f'<div class="card{upd_cls}">{meta}{note}</div>')
             continue
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
         # Per-chart legend — the page-level note scrolls away on a long gallery,
@@ -1153,7 +1239,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
                   'Candles + volume · <b style="color:#2962FF">━ EMA20</b> '
                   '(short-term trend) · <b style="color:#FF6D00">━ EMA50</b> '
                   '(medium-term trend)</div>')
-        card_html.append(f'<div class="card">{meta}{legend}'
+        card_html.append(f'<div class="card{upd_cls}">{meta}{legend}'
                          f'<div class="chart" id="ch{j}"></div></div>')
     now = datetime.now()
     n_behind = sum(1 for d in bar_dates.values() if mkt_date and d < mkt_date)
@@ -1324,16 +1410,20 @@ def _select_ipos(drive, args, exch):
             rec = pd.DataFrame({"symbol": wider["symbol"], "_ld": wider["_ld2"]})
         ltype = dict(zip(lt["symbol"], lt["listing_type"].fillna("")))
         before = len(rec)
+        # IPO ONLY (user 2026-10-07): a name is shown only with positive proof —
+        # a SEBI prospectus or NSE's own public-issue list (build_listing_dates
+        # --classify). Migrations, ETFs, demergers/re-listings and anything
+        # unproven are left out.
         bad = rec["symbol"].astype(str).map(
-            lambda x: str(ltype.get(x, "")).lower() in ("migration", "etf"))
+            lambda x: str(ltype.get(x, "")).lower() != "ipo")
         dropped = rec[bad]
         rec = rec[~bad]
         if len(dropped):
-            kinds = (dropped["symbol"].astype(str).map(lambda x: ltype.get(x, ""))
+            kinds = (dropped["symbol"].astype(str)
+                     .map(lambda x: ltype.get(x, "") or "(no type)")
                      .value_counts().to_dict())
-            log(f"  listing_type gate: {before} -> {len(rec)} "
-                f"({len(dropped)} dropped: {kinds}) — re-listings and funds are "
-                f"not IPOs")
+            log(f"  IPO-only gate: {before} -> {len(rec)} "
+                f"({len(dropped)} dropped: {kinds})")
     else:
         log("  listing_dates.parquet has no listing_type — showing every recent "
             "DATE, which includes re-listings and ETFs. Run "
@@ -1591,13 +1681,13 @@ def _build_meta_annot(ranked, feats, mem, opens=None) -> dict:
                             + ", ".join(o["families"]) + '</span>')
             if o["times_seen"] == 1:
                 bits.append('<span style="background:#0d7a35;color:#fff;'
-                            'padding:0 6px;border-radius:6px">🆕 NEW TODAY</span>')
+                            'padding:1px 7px;border-radius:6px;font-size:13px;font-weight:800">🆕 NEW TODAY</span>')
             elif o["times_seen"] > 1:
                 bits.append(f'<span style="color:#666">held {o["times_seen"]}d'
                             f'</span>')
             if o["events"] > 0:
                 bits.append('<span style="background:#b8860b;color:#fff;'
-                            'padding:0 6px;border-radius:6px">⚡ EVENT TODAY'
+                            'padding:1px 7px;border-radius:6px;font-size:13px;font-weight:800">⚡ EVENT AT SIGNAL'
                             '</span>')
             e, st = o["entry"], o["stop"]
             if pd.notna(e) and pd.notna(st) and float(e) > 0 and float(st) < float(e):
@@ -1847,8 +1937,8 @@ def main():
                          "drops=fell off the select list in last 7d; "
                          "ipo=names listed in the last --ipo-days, ranked on "
                          "pure returns (no strategy-count gate).")
-    ap.add_argument("--ipo-days", type=int, default=365,
-                    help="IPO view: listing-date lookback window (default 365)")
+    ap.add_argument("--ipo-days", type=int, default=548,
+                    help="IPO view: listing-date lookback window (default 548 = 18 months)")
     ap.add_argument("--min-strats", type=int, default=2)
     ap.add_argument("--zones", default="buy,add", help="comma list; '' = all")
     ap.add_argument("--timeframe-days", type=int, default=252)
@@ -1856,6 +1946,10 @@ def main():
                     help="candle timeframe: D=daily (default), W=weekly, "
                          "M=monthly. EMAs are recomputed on the chosen bars.")
     ap.add_argument("--turnover", type=float, default=1.0, help="min Rs cr/day, 0=off")
+    ap.add_argument("--min-mcap", type=float, default=0.0,
+                    help="signal + watchlist pages: hide names below this market "
+                         "cap in Rs cr (0=off). Unknown market cap is kept; PF "
+                         "mode is never filtered.")
     ap.add_argument("--max", type=int, default=0,
                     help="cap chart count (0=all; guidance mode defaults to 100)")
     ap.add_argument("--out", default="")
@@ -1914,6 +2008,22 @@ def main():
                 base_pat[s] = float(pd.Series(r.get("q_netprofit_last_4q")).astype(float).sum())
             except Exception:
                 pass
+    # Daily market cap (weekly share count x latest close, update_market_cap.py)
+    # replaces the summary snapshot, which Screener refreshes ~once a quarter.
+    # Only for names WITH a share count: the rest of market_cap.csv still holds
+    # old Yahoo values that must not override Screener's.
+    uni_dir = _folder(drive, "universe")
+    sc, mc_daily = _read_csv(drive, uni_dir, "share_count.csv"), _read_csv(drive, uni_dir, "market_cap.csv")
+    if not sc.empty and not mc_daily.empty and "symbol" in sc.columns \
+            and {"symbol", "market_cap_cr"} <= set(mc_daily.columns):
+        have = set(sc["symbol"].astype(str).str.upper())
+        n = 0
+        for s, v in zip(mc_daily["symbol"].astype(str).str.upper(),
+                        pd.to_numeric(mc_daily["market_cap_cr"], errors="coerce")):
+            if s in have and pd.notna(v) and v > 0:
+                mcap_map[s] = float(v)
+                n += 1
+        log(f"  market cap: {n:,} names from the daily share-count x close file")
 
     title, annot, prelude = "📊 Signals gallery", {}, ""
     out_default = "gallery.html"
@@ -2000,6 +2110,9 @@ def main():
                 == str(q).replace(" ", "")]
         if args.min_cagr > 0 and "cagr_pct" in wl.columns:
             wl = wl[pd.to_numeric(wl["cagr_pct"], errors="coerce") >= args.min_cagr]
+        wl = _mcap_floor(wl, [str(s or t or "") for s, t in
+                              zip(wl.get("symbol", ""), wl.get("nse_symbol", ""))],
+                         mcap_map, args.min_mcap)
         top = args.max if args.max > 0 else 100
         # newest idea on top; CAGR breaks a same-day tie so the order is stable
         wl = wl.sort_values(["date_added", "cagr_pct"], ascending=[False, False],
@@ -2036,7 +2149,7 @@ def main():
             ranked["_exch"] = ranked["symbol"].map(exch).fillna("NSE")
             log(f"  {len(ranked)} names dropped from the select list in last 7d")
         elif args.view == "ipo":
-            title = f"🚀 Recent listings ({args.ipo_days}d) — ranked by return"
+            title = f"🚀 Recent IPOs ({args.ipo_days}d) — ranked by return"
             out_default = "gallery_ipo.html"
             ranked = _select_ipos(drive, args, exch)
             if ranked.empty:
@@ -2067,6 +2180,8 @@ def main():
                 ev = sum(1 for k in fresh if om[k]["events"] > 0)
                 log(f"  {len(ranked)} NEW today ({ev} of them with an event "
                     f"firing, the rest are states that just qualified)")
+        ranked = _mcap_floor(ranked, ranked["symbol"].tolist(), mcap_map,
+                             args.min_mcap)
         annot = _build_meta_annot(ranked, feats_g, mem, opens_df)
         if args.max > 0:
             ranked = ranked.head(args.max)

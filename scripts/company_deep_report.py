@@ -64,6 +64,11 @@ class DeadlineReached(Exception):
     pending to resume next run from its cached chunk/doc sidecars."""
     pass
 
+class UnresolvedToken(Exception):
+    """The token matched nothing in the universe — skip it (queue row -> error)
+    instead of writing an empty report under company_repo/<token>/."""
+    pass
+
 SCRIPTS_DIR = _SCRIPTS_DIR
 INTER_CALL_SLEEP = 6.0
 
@@ -76,6 +81,22 @@ DEEPDIVE_MODELS = [
     "gemini-2.5-flash-lite",
     "gemini-3.1-flash-lite",
 ]
+
+class _TwoTierPool:
+    """Two BucketPools behind the one `pool` every function here already takes: plain
+    pool.call_text / call_pdf go to BULK (the many summary calls); the final write-up asks
+    for pool.write. Keeps every signature unchanged."""
+    def __init__(self, bulk, write):
+        self.bulk, self.write = bulk, write
+
+    def __getattr__(self, name):
+        return getattr(self.bulk, name)
+
+
+def _writer(pool):
+    """The WRITE-tier pool when there is one (main run), else the pool itself."""
+    return getattr(pool, "write", pool)
+
 
 DRIVE = dict(
     queue        = "company_repo/_index/deep_dive_queue.parquet",
@@ -236,18 +257,32 @@ def queue_update(svc, root, mutate, owner="deepdive"):
         if got:
             _release_queue_lock(svc, root)
 
-def enqueue_tokens(svc, root, tokens, owner="streamlit") -> int:
+def enqueue_tokens(svc, root, tokens, owner="streamlit", requeue=False) -> int:
     """Add pending rows for tokens, skipping any already pending OR done (locked +
     deduped). Returns how many were actually added. Use this from EVERY enqueue path
-    (Streamlit, --add, synthesise) so the queue can never be clobbered or duplicated."""
+    (Streamlit, --add, synthesise) so the queue can never be clobbered or duplicated.
+
+    requeue=True (only `--add X --requeue`, used by run_report.bat "queue BOTH"): a token
+    that is already DONE goes back to pending, because the queued story waits for a FRESH
+    deep dive. Its done rows flip in place — a second, pending row would be dropped by
+    _dedup_queue ("a token that is done is not also left pending")."""
     toks = list(dict.fromkeys(str(t).strip() for t in tokens if str(t).strip()))
     added = {"n": 0}
     def m(df):
+        if requeue and not df.empty:
+            now = dt.datetime.now().isoformat()
+            for t in toks:
+                done = (df["token"].astype(str) == t) & (df["status"].astype(str) == "done")
+                if done.any():
+                    df.loc[done, ["status", "added_at", "done_at"]] = ["pending", now, None]
+                    if "error" in df.columns:
+                        df.loc[done, "error"] = None
+                    added["n"] += 1
         seen = (set(df[df["status"].astype(str).isin(["pending", "done"])]["token"].astype(str))
                 if not df.empty else set())
         new = [dict(token=t, status="pending", added_at=dt.datetime.now().isoformat())
                for t in toks if t not in seen]
-        added["n"] = len(new)
+        added["n"] += len(new)
         return pd.concat([df, pd.DataFrame(new)], ignore_index=True) if new else df
     queue_update(svc, root, m, owner=owner)
     return added["n"]
@@ -298,7 +333,7 @@ def resolve_isin(token, universe, interactive=False):
         if not hit.empty: return row_out(hit.iloc[0])
     # fuzzy fallback — partial name contains
     if name_c:
-        fuzzy = universe[universe[name_c].astype(str).str.contains(t, case=False, na=False)]
+        fuzzy = universe[universe[name_c].astype(str).str.contains(t, case=False, na=False, regex=False)]
         if not fuzzy.empty:
             if len(fuzzy) == 1 or not interactive:
                 return row_out(fuzzy.iloc[0])
@@ -340,6 +375,8 @@ def screener_block(fund, results, isin, symbol):
             if col in df.columns:
                 r = df[df[col].astype(str) == isin]
                 if not r.empty: return r
+        if not symbol:                  # BSE-only co: "" would match blank-symbol rows
+            return None
         for col in ("symbol", "Symbol", "nse_symbol"):
             if col in df.columns:
                 r = df[df[col].astype(str).str.upper() == symbol.upper()]
@@ -464,9 +501,13 @@ def screener_financials_block(svc, root, isin, symbol, bse_code=None) -> str:
 def research_block(ridx, isin, symbol, name):
     if ridx is None or ridx.empty:
         return "No external research context provided."
+    # empty needles dropped: "" in blob is always True (BSE-only cos have symbol "")
+    needles = [s.lower() for s in (isin, symbol, name) if str(s or "").strip()]
+    if not needles:
+        return "No external research context provided."
     def hit(row):
         blob = f"{row.get('isins','')}{row.get('companies','')}".lower()
-        return isin.lower() in blob or symbol.lower() in blob or name.lower() in blob
+        return any(n in blob for n in needles)
     sel = ridx[ridx.apply(hit, axis=1)].tail(MAX_RESEARCH_ROWS)
     if sel.empty:
         return "No external research context provided."
@@ -516,6 +557,8 @@ from alt_sources import NEWS_WHITELIST, news_block  # noqa: F401
 def nse_announcements(symbol, limit=20):
     """Best-effort NSE corporate announcements. NSE blocks datacenter IPs often
     (CI) and needs cookie bootstrap — failures are silent (returns '')."""
+    if not str(symbol or "").strip():   # BSE-only co: an empty symbol is not a filter
+        return ""
     try:
         s = requests.Session()
         s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -619,7 +662,7 @@ def youtube_block(svc, root, isin, symbol, name, pool, max_videos=8, months=24):
             ch = sn.get("channelTitle", "")
             chl = ch.lower()
             official = (name_tok and name_tok in re.sub(r"[^a-z]", "", chl)) \
-                or symbol.lower() in chl
+                or (bool(symbol) and symbol.lower() in chl)
             if not vid or not (official or any(w in chl for w in YOUTUBE_CHANNEL_WHITELIST)):
                 continue
             picked.append((vid, ch, sn.get("title", ""), sn.get("publishedAt", "")[:10]))
@@ -1128,7 +1171,8 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
     n = src.page_count
     if meta_out is not None:
         meta_out.update({"pages": n, "chunks_total": 0, "chunks_ok": 0,
-                         "chunks_scanned": 0, "mode": "pdf"})
+                         "chunks_scanned": 0, "chunks_failed": 0,
+                         "merge_failed": False, "mode": "pdf"})
     # short enough -> one pass
     if n <= CHUNK_TRIGGER_PAGES and len(pdf_bytes) <= MAX_INLINE_PDF and not prefer_text:
         src.close()
@@ -1203,6 +1247,8 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
             print(f"      {label}: chunk pages {start+1}-{end}/{n} ok")
         except FatalCallError as e:
             print(f"      {label}: chunk {start+1}-{end} FATAL ({str(e)[:50]}) — skip chunk")
+            if meta_out is not None:
+                meta_out["chunks_failed"] += 1
     src.close()
     if not partials:
         return None
@@ -1219,6 +1265,8 @@ def _summarise_pdf_chunked(pool, prompt, pdf_bytes, label, prefer_text=False,
         return pool.call_text(merge_prompt)[0]
     except FatalCallError:
         # merge failed — return the concatenated partials rather than nothing
+        if meta_out is not None:
+            meta_out["merge_failed"] = True
         return "\n\n".join(partials)[:MAX_DOC_TEXT_CHARS]
 
 def summarise_doc(svc, root, pool, isin, row, deadline_ts=None, meta_out=None) -> str | None:
@@ -1250,6 +1298,7 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None, meta_out=None) -
     pfx = _partial_prefix(isin, row)
     is_pdf = data[:5].startswith(b"%PDF")
     _cmeta = {}
+    incomplete = False
     if is_pdf:
         # complete-read with page-range chunking for long reports; partials cached
         # on Drive so a stopped run resumes here rather than restarting the doc.
@@ -1258,9 +1307,15 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None, meta_out=None) -
                                       deadline_ts=deadline_ts, meta_out=_cmeta)
         if not summ:
             return None
+        # A chunk that failed (FatalCallError) or a failed merge is an INCOMPLETE read:
+        # label it honestly and do NOT persist the sidecar, so the next run retries (the
+        # good chunks stay cached in _partials, so only the failed ones cost calls again).
+        incomplete = _cmeta.get("chunks_failed", 0) > 0 or _cmeta.get("merge_failed")
         if meta_out is not None:
             partial = _cmeta.get("chunks_scanned", 0) > 0
-            meta_out.update({"status": "partial(scanned)" if partial else "full",
+            status = ("partial(chunk_failed)" if incomplete
+                      else "partial(scanned)" if partial else "full")
+            meta_out.update({"status": status,
                              "pages": _cmeta.get("pages"),
                              "chunks_ok": _cmeta.get("chunks_ok"),
                              "chunks_total": _cmeta.get("chunks_total"),
@@ -1282,6 +1337,8 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None, meta_out=None) -
         if meta_out is not None:
             meta_out.update({"status": "full", "mode": "html/text", "chars": len(summ)})
 
+    if is_pdf and incomplete:
+        return summ                     # use it this run; retry the doc next run
     try:
         drive_upload(svc, sidecar, root, summ.encode("utf-8"), "text/markdown")
         # Full summary persisted -> the per-chunk partials are now redundant; sweep
@@ -1292,6 +1349,15 @@ def summarise_doc(svc, root, pool, isin, row, deadline_ts=None, meta_out=None) -
         pass
     return summ
 
+def _candidate_doc_rows(q, isin):
+    """processing_queue rows the dive reads for this ISIN. Skips download_failed (no
+    file) and superseded (rule 7c: a richer doc for the same period replaced it —
+    re-summarising it wastes quota and feeds conflicting numbers into synthesis)."""
+    if q is None or q.empty or "isin" not in q.columns:
+        return pd.DataFrame()
+    return q[(q["isin"].astype(str) == isin) &
+             (~q["status"].astype(str).isin(["download_failed", "superseded"]))]
+
 def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[list[dict], list[dict]]:
     """Summarise every actual document for this ISIN (reuse-or-generate) and
     return (combined_block, used_docs). Docs already folded into company_page.md
@@ -1301,11 +1367,7 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[lis
     Gemini summary are gated by deadline_ts. If the wall-clock budget is hit before a
     not-yet-cached doc, raise DeadlineReached so the run exits cleanly and resumes
     next time from the sidecars written so far."""
-    q = _read_parquet(svc, DRIVE["proc_queue"], root)
-    if q.empty or "isin" not in q.columns:
-        return [], []
-    rows = q[(q["isin"].astype(str) == isin) &
-             (q["status"].astype(str) != "download_failed")]
+    rows = _candidate_doc_rows(_read_parquet(svc, DRIVE["proc_queue"], root), isin)
     if rows.empty:
         return [], []
 
@@ -1339,7 +1401,8 @@ def assemble_doc_summaries(svc, root, pool, isin, deadline_ts=None) -> tuple[lis
                          "read_status": meta.get("status", "unreadable"),
                          "pages": meta.get("pages")})
             continue
-        if is_thin and str(r.get("status")) == "done":
+        if (is_thin and str(r.get("status")) == "done"
+                and meta.get("status") != "partial(chunk_failed)"):
             n_thin += 1
             _writeback_thin_section(svc, root, isin, r, summ)
         blocks.append({"doc_type": str(r["doc_type"]), "date": d, "title": title,
@@ -1459,7 +1522,7 @@ def phase3_block(svc, root, isin, symbol) -> str:
             m = df[df["isin"].astype(str) == isin]
             if not m.empty:
                 return m
-        if "symbol" in df.columns:
+        if sym and "symbol" in df.columns:   # "" would match blank-symbol rows
             return df[df["symbol"].astype(str).str.upper() == sym]
         return df.iloc[0:0]
 
@@ -1481,8 +1544,10 @@ def phase3_block(svc, root, isin, symbol) -> str:
             if v is None or (isinstance(v, float) and v != v):
                 return "?"
             return round(v, 1) if isinstance(v, float) else v
+        _asof = str(r.get("mcap_as_of") or "").strip()          # added 2026-10-05
+        _asof = f" (as of {_asof})" if _asof and _asof.lower() != "nan" else ""
         parts.append(
-            f"MARKET & FINANCIALS (latest): mcap={_g('mcap_cr')} cr | "
+            f"MARKET & FINANCIALS (latest): mcap={_g('mcap_cr')} cr{_asof} | "
             f"P/E={_g('pe')} | P/B={_g('pb')} | price ret 3m/6m/12m="
             f"{_g('ret_3m_pct')}/{_g('ret_6m_pct')}/{_g('ret_12m_pct')}% | "
             f"latest {_g('latest_q')}: rev={_g('rev_q')} (YoY {_g('rev_q_yoy')}%, "
@@ -1640,6 +1705,66 @@ def build_prompt(name, symbol, isin, screener, page, research, bse,
                        "None supplied. Rely on Screener + Document Summaries + Company Page.")
     return tpl
 
+# Visible sections comapnydeepdive_prompt.txt asks for (Layer 0, Layer 1, PM one-pager). A
+# section counts as present when a heading-like line carries ALL its keywords. The single
+# call can stop early or merge sections: measured on the 6 dives on Drive (Jul-Aug 2026),
+# 3 silently lacked sections (Infinity Infoway 5/7/9, Tatva 8/9, one 9).
+REQUIRED_SECTIONS = [
+    ("0.1", "BUSINESS OVERVIEW", ("business overview",)),
+    ("0.2", "SEGMENT / PRODUCT-WISE PERFORMANCE", ("segment",)),
+    ("0.3", "OPERATIONS — CAPACITY & UTILISATION", ("capacity",)),
+    ("0.4", "RAW MATERIAL & COST STRUCTURE", ("raw material",)),
+    ("0.5", "WHY THE BUSINESS WORKS (OR DOESN'T)", ("why the business",)),
+    ("0.6", "MANAGEMENT STRATEGY & GROWTH PLANS", ("strategy",)),
+    ("0.7", "RISKS TO THESIS", ("risks to thesis",)),
+    ("0.8", "NEWS FLOW", ("news flow",)),
+    ("0.9", "SECTOR & INDUSTRY UPDATE", ("sector", "industry")),
+    ("1", "SOURCE COVERAGE & DATA INTEGRITY", ("source coverage",)),
+    ("2", "FINANCIAL TRAJECTORY (5-YEAR)", ("financial trajectory",)),
+    ("3", "CAPITAL EFFICIENCY & MANAGEMENT ALLOCATION", ("capital efficiency",)),
+    ("4", "FORENSIC FINANCIAL SHENANIGANS EXAMINATION", ("shenanigan",)),
+    ("5", "FRAUD & GOVERNANCE DETECTOR", ("fraud",)),
+    ("6", "FORENSIC RISK SCORECARD (WEIGHTED MATRIX)", ("risk scorecard",)),
+    ("7", "INVESTMENT THESIS SUMMARY", ("investment thesis",)),
+    ("8", "EARNINGS QUALITY ASSESSMENT", ("earnings quality",)),
+    ("9", "DATA RELIABILITY CHECK", ("data reliability",)),
+    ("PM", "PM ONE-PAGER TEAR SHEET", ("one-pager",)),
+]
+
+def missing_sections(md: str) -> list[str]:
+    heads = []
+    for line in md.splitlines():
+        s = line.strip()
+        if s.startswith(("#", "**")) or (8 < len(s) < 110 and s.upper() == s):
+            heads.append(s.lower().replace("one pager", "one-pager"))
+    return [num for num, _t, words in REQUIRED_SECTIONS
+            if not any(all(w in h for w in words) for h in heads)]
+
+def complete_sections(pool, prompt: str, report: str) -> tuple[str, list[str]]:
+    """One extra call that writes ONLY the missing sections, inserted before Layer 2 / the
+    one-pager (or appended). Returns (report, still_missing). Never loses the first pass."""
+    missing = missing_sections(report)
+    if not missing:
+        return report, []
+    want = [f"{n} {t}" if n != "PM" else t for n, t, _w in REQUIRED_SECTIONS if n in missing]
+    print(f"    sections missing after first pass: {', '.join(missing)} — one completion call")
+    ask = (prompt + "\n\n================================\nCOMPLETION PASS\n"
+           "================================\nThe report below is MISSING these required sections: "
+           + "; ".join(want) + ". Write ONLY those sections now — exact numbers and titles as "
+           "specified above, same style, same citation rules, using only the inputs above. Do not "
+           "repeat, rewrite or summarise any section that is already present.\n\n"
+           "=== REPORT SO FAR ===\n" + report)
+    try:
+        extra, _m = _writer(pool).call_text(ask)
+    except Exception as e:                          # quota/fatal: keep the first pass as-is
+        print(f"    completion call failed ({type(e).__name__}) — report kept with gaps marked")
+        return report, missing
+    extra = _clean_report_md(extra).strip()
+    cut = re.search(r"(?im)^#{1,3}\s*(layer\s*2|analytical notes|phase\s*4|layer\s*4|pm one-pager)", report)
+    merged = (report[:cut.start()].rstrip() + "\n\n" + extra + "\n\n" + report[cut.start():]) if cut \
+        else (report.rstrip() + "\n\n" + extra + "\n")
+    return merged, missing_sections(merged)
+
 def _clean_report_md(md: str) -> str:
     """Strip raw template artifacts the model echoes: ====/---- divider bars,
     'END OF LAYER' separators, $$ LaTeX, and [BRACKET] labels used as headings.
@@ -1673,21 +1798,83 @@ def _clean_report_md(md: str) -> str:
     return text
 
 # --------------------------------------------------------------------------
+def _dry_run_report(svc, root, isin, symbol, bse_code, do_backfill):
+    """--dry-run: print what a real dive WOULD do for this company. Drive READS only —
+    no Gemini calls, no Drive writes, no backfill fetch, no queue/index update."""
+    page_b = drive_download(svc, f"{DRIVE['company_page']}/{isin}/company_page.md", root)
+    cov = coverage_check(page_b.decode("utf-8", "ignore") if page_b else "")
+    print(f"    [dry-run] coverage: page={cov['has_page']} ar={cov['ar_years']}")
+    print(f"    [dry-run] backfill: "
+          f"{'would pull Screener doc history (under _extract.lock)' if do_backfill and isin.startswith('INE') else 'skipped'}")
+    q = _read_parquet(svc, DRIVE["proc_queue"], root)
+    rows = _candidate_doc_rows(q, isin)
+    n_sup = int(((q["isin"].astype(str) == isin) &
+                 (q["status"].astype(str) == "superseded")).sum()) \
+        if not q.empty and "isin" in q.columns else 0
+    thin = _thin_doc_ids(svc, root, isin) if not rows.empty else set()
+    counts = {"in_brief": 0, "cached": 0, "fresh": 0}
+    for _, r in rows.sort_values("announcement_date").iterrows():
+        is_thin = str(r["doc_id"]) in thin
+        if str(r.get("status")) == "done" and not is_thin:
+            act = "in_brief"
+        elif _doc_sidecar_cached(svc, root, isin, r):
+            act = "cached"
+        else:
+            act = "fresh"
+        counts[act] += 1
+        print(f"      {act:<8} {str(r['doc_type']):<14} {str(r['announcement_date'])[:10]}  "
+              f"[{r.get('status')}{', thin' if is_thin else ''}] {str(r.get('title', ''))[:50]}")
+    print(f"    [dry-run] docs: {len(rows)} ({counts['in_brief']} in brief · "
+          f"{counts['cached']} cached · {counts['fresh']} need a fresh Gemini summary) "
+          f"· {n_sup} superseded skipped")
+    print(f"    [dry-run] sources: symbol={'yes' if symbol else 'none (BSE-only)'} "
+          f"bse_code={bse_code or 'none'} youtube_key={'yes' if os.environ.get('YOUTUBE_API_KEY') else 'no'} "
+          f"screener_cookie={'yes' if os.environ.get('SCREENER_SESSION_COOKIE') else 'no'}")
+    import research_context
+    print(f"    [dry-run] {research_context.context_block(svc, root, isin, symbol, '')[1]}")
+    print(f"    [dry-run] would write company_repo/{isin}/company_deepdive_"
+          f"{dt.datetime.now():%d%b%y}.md/.docx/.pptx + deep_dive_index row")
+
 def process_one(svc, root, pool, universe, fund, results, ridx, token,
-                interactive=False, do_backfill=DO_BACKFILL, deadline_ts=None):
+                interactive=False, do_backfill=DO_BACKFILL, deadline_ts=None,
+                dry_run=False):
     isin, symbol, name, bse_code = resolve_isin(token, universe, interactive=interactive)
-    print(f"  deep dive: {token} -> {name} ({symbol} / {isin})")
+    t = str(token).strip()
+    if isin == t and symbol == t:
+        # resolve_isin's no-match fallback — don't spend Gemini on an empty report
+        raise UnresolvedToken(f"could not resolve '{t}' against the universe")
+    print(f"  deep dive: {token} -> {name} ({symbol or '-'} / {isin}"
+          f"{' / BSE ' + bse_code if bse_code else ''})")
+    if dry_run:
+        _dry_run_report(svc, root, isin, symbol, bse_code, do_backfill)
+        return None
 
     # Phase 1 — pull full Screener document history (annual reports, ratings,
     # concalls) into processing_queue before we assemble. Best-effort; never fatal.
     if do_backfill and isin.startswith("INE"):
+        # backfill() read-modify-writes the GLOBAL processing_queue with PDF downloads in
+        # between, so it must hold the shared _extract.lock (as run_backfill.py does) or a
+        # concurrent Phase 2 / nightly-backfill status write gets clobbered (rules 4 + 7).
+        # Lock busy -> skip the backfill; the dive proceeds on the docs already queued.
+        index_id = None
         try:
-            from backfill_company_docs import backfill as _backfill
-            c = _backfill(symbol, isin, bse_code=str(bse_code or ""))
-            print(f"    backfill: {c.get('downloaded',0)} new doc(s), "
-                  f"{c.get('found',0)} on Screener")
+            from _extractor_base import acquire_lock, release_lock
+            index_id = _folder_id(svc, "company_repo/_index", root)
+            if not index_id or not acquire_lock(svc, index_id, "_extract.lock",
+                                                "deepdive_backfill", wait_min=0.5,
+                                                defer_to_phase2=True):
+                index_id = None
+                print("    backfill skipped (extract lock busy — Phase 2 / nightly backfill)")
+            else:
+                from backfill_company_docs import backfill as _backfill
+                c = _backfill(symbol, isin, bse_code=str(bse_code or ""))
+                print(f"    backfill: {c.get('downloaded',0)} new doc(s), "
+                      f"{c.get('found',0)} on Screener")
         except Exception as e:
             print(f"    backfill skipped ({type(e).__name__}: {str(e)[:80]})")
+        finally:
+            if index_id:
+                release_lock(svc, index_id, "_extract.lock")
 
     page_b = drive_download(svc, f"{DRIVE['company_page']}/{isin}/company_page.md", root)
     page = page_b.decode("utf-8") if page_b else ""
@@ -1742,10 +1929,18 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
           f"NSE={'ok' if nse else 'skip'} · news={'ok' if not news.startswith(('DATA_MISSING','No recent')) else 'none'} "
           f"· youtube={'ok' if yt_ok else 'none'} · drhp={'ok' if drhp_ok else 'none'}")
 
+    # Research: the research store (company notes + sector/industry + macro/policy, real
+    # content) when it is available; otherwise the old research_index file-name list.
+    import research_context
+    research_txt, research_stats = research_context.context_block(svc, root, isin, symbol, name)
+    print(f"    {research_stats}")
+    if not research_txt:
+        research_txt = research_block(ridx, isin, symbol, name)
+
     prompt = build_prompt(name, symbol, isin,
                           screener_block(fund, results, isin, symbol),
                           page,
-                          research_block(ridx, isin, symbol, name),
+                          research_txt,
                           exchange,
                           docs=doc_block,
                           screener_cross=screener_cross,
@@ -1754,8 +1949,14 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                           drhp=drhp,
                           phase3=p3,
                           community=community)
-    report, model_used = pool.call_text(prompt)
+    report, model_used = _writer(pool).call_text(prompt)
     report = _clean_report_md(report)
+    report, still_missing = complete_sections(pool, prompt, report)
+    n_req = len(REQUIRED_SECTIONS)
+    sections_line = (f"*Sections: {n_req}/{n_req}*" if not still_missing else
+                     f"*Sections: {n_req - len(still_missing)}/{n_req} — STILL MISSING: "
+                     f"{', '.join(still_missing)}*")
+    print(f"    {sections_line.strip('*')}")
 
     stamp = dt.datetime.now().strftime("%d%b%y")
     out_path = f"{DRIVE['company_page']}/{isin}/company_deepdive_{stamp}.md"
@@ -1771,7 +1972,8 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
               f"research~{cov['n_research']} · {len(used_docs)} documents "
               f"(read: {_full} full · {_cached} cached · {_brief} in brief · "
               f"{_partial} partial)*\n\n"
-              f"*Documents fed fresh to synthesis: {prov}*\n\n---\n\n")
+              f"*Documents fed fresh to synthesis: {prov}*\n\n"
+              f"{sections_line} · *{research_stats}*\n\n---\n\n")
     # Deterministic read-confirmation appendix (computed, not model-written).
     full_md = header + report + _read_confirmation_table(used_docs)
     drive_upload(svc, out_path, root, full_md.encode("utf-8"), "text/markdown")
@@ -1801,12 +2003,14 @@ def process_one(svc, root, pool, universe, fund, results, ridx, token,
                 last_update=dt.datetime.now().isoformat(),
                 coverage=json.dumps(cov),
                 _report_md=full_md,   # internal — not persisted to parquet
-                _slug=f"{symbol.lower()}_{dt.datetime.now().strftime('%d%b%y').lower()}")
+                # local file name = company _ report type _ date (same rule as the mail)
+                _slug=__import__("format_deepdive_pdf").report_basename(name, "DeepDive"))
 
 def open_report_local(report_md: str, slug: str,
                       name: str = "", symbol: str = "", isin: str = ""):
-    """Open a markdown report locally — Obsidian if available, else HTML in browser.
-    Also saves .docx and .pptx to the local reports folder.
+    """Save the report locally and open it: the PDF (same file and look as the mail), with
+    the .md beside it and in Obsidian. If no PDF can be made: Obsidian, else HTML in the
+    browser, as before. Also saves .docx and .pptx to the local reports folder.
     """
     obsidian_vault = os.path.join(
         os.environ.get("OBSIDIAN_VAULT", r"D:\EMA_Screener\Obsidian"),
@@ -1843,6 +2047,18 @@ def open_report_local(report_md: str, slug: str,
     except Exception as e:
         print(f"    pptx local save skipped: {e}")
 
+    # save .pdf — the file that opens (user 2026-10-02: PDF or MD, same as the story)
+    pdf_path = None
+    try:
+        from format_deepdive_pdf import md_to_pdf
+        pdf_path = os.path.join(local_dir, f"{slug}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(md_to_pdf(report_md, name, symbol, isin))
+        print(f"    saved pdf: {pdf_path}")
+    except Exception as e:
+        pdf_path = None
+        print(f"    pdf local save skipped: {e}")
+
     # try Obsidian for .md
     try:
         os.makedirs(obsidian_vault, exist_ok=True)
@@ -1850,6 +2066,12 @@ def open_report_local(report_md: str, slug: str,
         with open(obs_path, "w", encoding="utf-8") as f:
             f.write(report_md)
         print(f"    saved to Obsidian: {obs_path}")
+        if pdf_path:
+            try:
+                os.startfile(pdf_path)          # noqa (win) — CI/Linux: no-op
+            except Exception:
+                pass
+            return
         # actually OPEN the note in Obsidian (registered obsidian:// handler). Best-effort:
         # a headless/CI run or a machine without Obsidian just skips this silently.
         try:
@@ -1863,6 +2085,12 @@ def open_report_local(report_md: str, slug: str,
         return
     except Exception:
         pass
+    if pdf_path:                                 # Obsidian unavailable: still open the PDF
+        try:
+            os.startfile(pdf_path)              # noqa (win)
+        except Exception:
+            pass
+        return
 
     # HTML fallback
     try:
@@ -1901,6 +2129,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--names",        help="comma-separated tokens, ad-hoc run (bypass queue)")
     ap.add_argument("--add",          help="comma-separated tokens, enqueue only (no processing)")
+    ap.add_argument("--requeue",      action="store_true",
+                    help="with --add: put an already-DONE company back to pending "
+                         "(queue BOTH reports wants a fresh deep dive)")
     ap.add_argument("--open",         action="store_true",
                     help="open report locally in Obsidian / browser after writing")
     ap.add_argument("--interactive",  action="store_true",
@@ -1918,6 +2149,9 @@ def main():
                     default=float(os.environ.get("DEEPDIVE_DEADLINE_MIN", "0") or 0),
                     help="wall-clock budget; stop starting new docs/companies past it so "
                          "the queue + sidecars flush cleanly (0 = no cap). Resumes next run.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="resolve + list the docs/sources a dive WOULD use; no Gemini "
+                         "calls, no Drive writes, no queue/index update")
     args = ap.parse_args()
 
     from dotenv import load_dotenv
@@ -1935,26 +2169,52 @@ def main():
         return
 
     if args.add:
-        n = enqueue_tokens(svc, root, args.add.split(","), owner="add")
-        print(f"Enqueued {n} (skipped any already pending/done)."); return
+        if args.dry_run:
+            print(f"[dry-run] would enqueue: {[t.strip() for t in args.add.split(',') if t.strip()]}"
+                  + (" (re-queueing any already done)" if args.requeue else ""))
+            return
+        n = enqueue_tokens(svc, root, args.add.split(","), owner="add", requeue=args.requeue)
+        print(f"Enqueued {n} (skipped any already pending"
+              + ("" if args.requeue else "/done") + ")."); return
 
-    if BucketPool is None or load_keys is None:
+    if args.dry_run:
+        pool = None                     # dry-run never calls Gemini
+        deadline_ts = None
+        try:                            # which models a live run WOULD use (Drive read only)
+            from model_registry import pick
+            print(f"[dry-run] models BULK : {pick('BULK', DEEPDIVE_MODELS, log=lambda *_: None)}")
+            print(f"[dry-run] models WRITE: {pick('WRITE', DEEPDIVE_MODELS, log=lambda *_: None)}")
+        except Exception as e:
+            print(f"[dry-run] model registry not readable ({str(e)[:80]})")
+    elif BucketPool is None or load_keys is None:
         print("ERROR: google-genai not installed — cannot run the deep dive here. "
               "Install it (pip install google-genai) or run via CI/local with deps.")
         sys.exit(1)
-    # Default to the big FREE_POOL+BACKFILL quota (separate Cloud projects, lightly
-    # used outside the nightly window) and fall back to the Phase-2 GEMINI_API_KEY
-    # pool — dedup keeps order, so a key shared across prefixes is counted once.
-    _load = load_keys_multi or (lambda env, pfx: load_keys(env, prefix=pfx.split(",")[0]))
-    api_keys = _load(os.environ, args.key_prefix)
-    if not api_keys:
-        print(f"ERROR: no Gemini keys found for prefixes '{args.key_prefix}' in .env")
-        sys.exit(1)
-    pool = BucketPool(api_keys, DEEPDIVE_MODELS, inter_call_s=INTER_CALL_SLEEP)
-    print(f"Pool: {len(api_keys)} key(s) × {len(DEEPDIVE_MODELS)} model(s) "
-          f"= {len(api_keys) * len(DEEPDIVE_MODELS)} daily buckets "
-          f"[{args.key_prefix}]")
-    deadline_ts = (time.monotonic() + args.deadline_min * 60) if args.deadline_min > 0 else None
+    else:
+        # Default to the big FREE_POOL+BACKFILL quota (separate Cloud projects, lightly
+        # used outside the nightly window) and fall back to the Phase-2 GEMINI_API_KEY
+        # pool — dedup keeps order, so a key shared across prefixes is counted once.
+        _load = load_keys_multi or (lambda env, pfx: load_keys(env, prefix=pfx.split(",")[0]))
+        api_keys = _load(os.environ, args.key_prefix)
+        if not api_keys:
+            print(f"ERROR: no Gemini keys found for prefixes '{args.key_prefix}' in .env")
+            sys.exit(1)
+        # Models come from the registry (discover -> probe -> quality exam), not a typed
+        # list: BULK for the many chunk / document / theme summaries, WRITE for the final
+        # report. DEEPDIVE_MODELS is only the fallback when the registry is unavailable.
+        # Give-up rule scales with the keys (a model is dropped for the run after busy
+        # replies on a third of them, not 3) — user decisions 2026-10-03.
+        from model_registry import pick, overload_keys
+        give_up = overload_keys(len(api_keys))
+        pool = _TwoTierPool(
+            BucketPool(api_keys, pick("BULK", DEEPDIVE_MODELS),
+                       inter_call_s=INTER_CALL_SLEEP, model_overload_keys=give_up),
+            BucketPool(api_keys, pick("WRITE", DEEPDIVE_MODELS),
+                       inter_call_s=INTER_CALL_SLEEP, model_overload_keys=give_up))
+        print(f"Pool: {len(api_keys)} key(s) [{args.key_prefix}] · BULK "
+              f"{len(pool.bulk.models)} model(s) · WRITE {len(pool.write.models)} model(s) · "
+              f"a model is dropped after busy replies on {give_up} keys")
+        deadline_ts = (time.monotonic() + args.deadline_min * 60) if args.deadline_min > 0 else None
 
     universe = _load_universe(svc, root)
     fund     = _read_parquet(svc, DRIVE["fundamentals"], root)
@@ -1968,10 +2228,14 @@ def main():
             if deadline_ts and time.monotonic() >= deadline_ts:
                 print("  Deadline reached — stopping (remaining tokens not processed)."); break
             try:
-                recs.append(process_one(svc, root, pool, universe, fund, results, ridx, t,
-                                        interactive=args.interactive,
-                                        do_backfill=not args.no_backfill,
-                                        deadline_ts=deadline_ts))
+                rec = process_one(svc, root, pool, universe, fund, results, ridx, t,
+                                  interactive=args.interactive,
+                                  do_backfill=not args.no_backfill,
+                                  deadline_ts=deadline_ts, dry_run=args.dry_run)
+                if rec:
+                    recs.append(rec)
+            except UnresolvedToken as exc:
+                print(f"  SKIP '{t}': {exc}")
             except AllBucketsExhausted as exc:
                 print(f"  All Gemini buckets exhausted — stopping. ({exc})")
                 break
@@ -1985,6 +2249,7 @@ def main():
                     open_report_local(r["_report_md"], r["_slug"],
                                       r.get("name",""), r.get("symbol",""), r.get("isin",""))
             update_index(svc, root, [_strip_internal(r) for r in recs])
+        _record_usage(pool)
         return
 
     queue = _dedup_queue(_read_parquet(svc, DRIVE["queue"], root))
@@ -1993,6 +2258,16 @@ def main():
     pending = queue[queue["status"] == "pending"]
     if pending.empty:
         print("No pending companies."); return
+    if args.dry_run:
+        print(f"[dry-run] {len(pending)} pending in deep_dive_queue (queue NOT updated):")
+        for i in pending.index:
+            t = queue.at[i, "token"]
+            try:
+                process_one(svc, root, None, universe, fund, results, ridx, t,
+                            do_backfill=not args.no_backfill, dry_run=True)
+            except UnresolvedToken as exc:
+                print(f"  SKIP '{t}': {exc} (a real run marks it error)")
+        return
 
     def _mark(token, added_at, status, **fields):
         """Locked re-read-merge: set this token's row status on the CURRENT queue, so a
@@ -2029,6 +2304,9 @@ def main():
             if args.open:
                 open_report_local(rec["_report_md"], rec["_slug"],
                                   rec.get("name",""), rec.get("symbol",""), rec.get("isin",""))
+        except UnresolvedToken as exc:
+            print(f"  SKIP {token}: {exc}")
+            _mark(token, added, "error", error=_safe_err(exc))
         except AllBucketsExhausted as exc:
             print(f"  All Gemini buckets exhausted — stopping queue drain. ({exc})")
             break
@@ -2043,6 +2321,18 @@ def main():
             _mark(token, added, "error", error=_safe_err(e))
 
     print(f"Done. {len(recs)} report(s) generated.")
+    _record_usage(pool)
+
+
+def _record_usage(pool):
+    """Log both pools' per-(key, model) outcome to gemini_usage.parquet (the registry's
+    standard), so the busy demotion sees the models the deep dive used. Best-effort."""
+    if pool is None:
+        return
+    from model_registry import record_usage
+    record_usage(getattr(pool, "bulk", pool), "deepdive_bulk", "deepdive")
+    if getattr(pool, "write", None) is not None:
+        record_usage(pool.write, "deepdive_write", "deepdive")
 
 
 if __name__ == "__main__":

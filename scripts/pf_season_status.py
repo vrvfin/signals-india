@@ -158,12 +158,25 @@ def render(rows: list[dict], roll: dict, season: str, today: str) -> str:
     return f"<div style='{_WRAP}'>{''.join(out)}</div>"
 
 
+SENT_LEDGER = "pf_season_status_sent.parquet"      # new 2026-10-17, additive
+SENT_COLS = ["ist_date", "sent_at", "subject"]
+
+
+def sent_today(sent: pd.DataFrame, ist_date: str) -> bool:
+    """Once a day (user 2026-10-17: it arrived 3-4 times in 24 h - pf_daily_mails runs
+    5 times a day and every run mailed). Pure."""
+    return (sent is not None and not sent.empty and "ist_date" in sent.columns
+            and (sent["ist_date"].astype(str) == ist_date).any())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="send even though today's status mail already went out")
     args = ap.parse_args()
     if args.self_test:
         sys.exit(_self_test())
@@ -176,6 +189,15 @@ def main() -> None:
     root = os.environ["GDRIVE_FOLDER_ID"]
     repo = get_or_create_subfolder(drive, root, "company_repo")
     idx = get_or_create_subfolder(drive, repo, "_index")
+
+    from datetime import datetime as _dt
+    from mail_freshness import IST
+    ist_date = _dt.now(IST).date().isoformat()
+    sent = load_parquet(drive, idx, SENT_LEDGER, SENT_COLS)
+    if not args.dry_run and not args.force and sent_today(sent, ist_date):
+        log(f"season status already mailed today ({ist_date} IST) — once a day; "
+            f"use --force to send again")
+        return
 
     season = QT.season_quarter()
     today = date.today().isoformat()
@@ -259,7 +281,16 @@ def main() -> None:
             and os.getenv("NOTIFY_EMAIL")):
         log("mail NOT sent — GMAIL_* not set in this environment.")
         return
-    log(f"sent={send_email(subject, html)}")
+    ok = send_email(subject, html)
+    log(f"sent={ok}")
+    if ok:
+        from _extractor_base import save_parquet
+        row = pd.DataFrame([{"ist_date": ist_date,
+                             "sent_at": _dt.utcnow().isoformat(timespec="seconds"),
+                             "subject": subject}], columns=SENT_COLS)
+        sent = (pd.concat([sent, row], ignore_index=True)
+                if sent is not None and not sent.empty else row)
+        save_parquet(drive, idx, SENT_LEDGER, sent.tail(400))
 
 
 def _self_test() -> int:
@@ -313,6 +344,10 @@ def _self_test() -> int:
     check("a complete season says so", "nothing outstanding" in h2)
     check("complete season shows no pending table", "Not delivered yet" not in h2)
 
+    _sent = pd.DataFrame([{"ist_date": "2026-10-16", "sent_at": "x", "subject": "s"}])
+    check("once a day: already sent today -> skip", sent_today(_sent, "2026-10-16"))
+    check("once a day: new IST day -> send", not sent_today(_sent, "2026-10-17"))
+    check("once a day: no ledger yet -> send", not sent_today(pd.DataFrame(), "2026-10-17"))
     print(f"\npf_season_status self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 

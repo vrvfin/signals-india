@@ -83,6 +83,7 @@ DAILY_MODELS = [
 INTER_CALL_SLEEP = 6.0            # seconds between successful calls (RPM hygiene)
 MAX_CHARS_CALL   = 400_000        # ~100k tokens; chunk above this (map-reduce)
 MIN_TEXT_CHARS   = 200            # below this -> scanned/empty -> NEEDS_OCR, skip
+STORM_WAIT_MIN   = 10             # one wait-and-retry per run when every model is parked
 
 # Drive layout (reuse existing repo)
 DRIVE = dict(
@@ -144,10 +145,15 @@ def daily_keys() -> list[str]:
     return keys
 
 def build_daily_pool() -> BucketPool:
-    """BucketPool over the dedicated daily keys × DAILY_MODELS (best model first)."""
+    """BucketPool over the dedicated daily keys × the registry's BULK models (discover ->
+    probe -> quality exam; busy models to the back). DAILY_MODELS is only the fallback
+    when the registry is unavailable. Give-up rule scales with the keys (2026-10-03)."""
     if BucketPool is None:
         raise RuntimeError("google-genai not installed — cannot build the Gemini pool here.")
-    return BucketPool(daily_keys(), DAILY_MODELS, inter_call_s=INTER_CALL_SLEEP)
+    from model_registry import pick, overload_keys
+    keys = daily_keys()
+    return BucketPool(keys, pick("BULK", DAILY_MODELS), inter_call_s=INTER_CALL_SLEEP,
+                      model_overload_keys=overload_keys(len(keys)))
 
 # ----------------------------------------------------------------------------
 # DRIVE — minimal helper (swap for _extractor_base if preferred)
@@ -359,21 +365,28 @@ def build_vocab_block(vocab: pd.DataFrame) -> str:
             "\nDOC_TYPES: " + slugs("doc_type") + "\nTHEMES: " + slugs("theme"))
 
 def alias_map(vocab: pd.DataFrame) -> dict:
+    """{tag_type: {alias: slug}} — per type, because one phrase can name tags of several
+    types ("quick commerce" = an industry AND a theme); a flat map let a theme slug land in
+    the sectors list."""
     m = {}
     for _, r in vocab.iterrows():
         if r.status != "closed":
             continue
-        m[r.tag_slug] = r.tag_slug
+        t = m.setdefault(r.tag_type, {})
+        t[r.tag_slug] = r.tag_slug
         for a in str(r.aliases or "").split("|"):
             if a.strip():
-                m[re.sub(r"\s+", " ", a.strip().lower())] = r.tag_slug
+                t.setdefault(re.sub(r"\s+", " ", a.strip().lower()), r.tag_slug)
     return m
 
 def normalise_list(vals, amap, closed_set, fallback):
+    """amap: the {alias: slug} map of ONE tag type (alias_map(vocab)[type])."""
     out = []
     for v in (vals or []):
         k = re.sub(r"\s+", " ", str(v).strip().lower())
         slug = amap.get(k, k if k in closed_set else fallback)
+        if slug and slug != fallback and slug not in closed_set:
+            slug = fallback                      # never let another type's slug through
         if slug and slug not in out:
             out.append(slug)
     return out
@@ -426,12 +439,21 @@ def render_entry(n, tags, meta, summary_md, run_hhmm) -> str:
             f"**Type:** {meta.get('doc_type','other')} · **Companies:** {comp}\n"
             f"**Tags:** {tagline}\n\n{body}\n\n---\n")
 
+def _drop_n(df, n):
+    """df without the rows of research number n (a retry replaces them, gap 3)."""
+    if df is None or df.empty or "research_n" not in df.columns:
+        return df
+    return df[df["research_n"].astype(str) != str(n)]
+
+
 def append_company_page(svc, isin, n, meta, summary_md, root):
     path = f"{DRIVE['company_page_dir']}/{isin}/company_page.md"
     cur = drive_download(svc, path, root)
     cur = cur.decode("utf-8") if cur else f"# Company Page — {isin}\n"
     if "## Research Notes" not in cur:
         cur += "\n## Research Notes\n"
+    if f"### research_{n:04d} " in cur:          # a retry: already appended once
+        return
     block = (f"\n### research_{n:04d} · {meta.get('doc_date','NA')} · {meta.get('source','NA')} "
              f"· {meta.get('doc_type','other')}\n"
              + re.sub(r"```json.*?```", "", summary_md, flags=re.DOTALL).strip() + "\n")
@@ -494,6 +516,11 @@ def main():
     seen_hash = set(blocking.doc_hash); seen_fp = set(blocking.fuzzy_fp)
     seen_ck = set(blocking.get("content_key", pd.Series(dtype=str)))
     prior_status = dict(zip(ledger.doc_hash, ledger.status)) if len(ledger) else {}
+    # research number of each doc whose last attempt failed to UPLOAD: its retry reuses it,
+    # so whatever that attempt already saved (digest entry, index row) is replaced below,
+    # not duplicated under a second number (gap 3, 2026-10-03).
+    prior_n = ({h: int(n) for h, n, st in zip(ledger.doc_hash, ledger.research_n, ledger.status)
+                if st == "upload_error" and pd.notna(n) and int(n) > 0} if len(ledger) else {})
     counter = int(ledger.research_n.max()) if len(ledger) else 0
 
     def add_ledger(**row):
@@ -516,8 +543,8 @@ def main():
     svc  = drive_service()
     pool = build_daily_pool()
     root = os.environ.get("GDRIVE_FOLDER_ID", "")
-    nbuckets = len(daily_keys()) * len(DAILY_MODELS)
-    print(f"Pool: {len(daily_keys())} key(s) × {len(DAILY_MODELS)} model(s) = {nbuckets} daily buckets")
+    nbuckets = len(daily_keys()) * len(pool.models)
+    print(f"Pool: {len(daily_keys())} key(s) × {len(pool.models)} model(s) = {nbuckets} daily buckets")
 
     if not check_drive_service(svc):
         sys.exit("Drive service is not accessible; check credentials and network.")
@@ -525,8 +552,12 @@ def main():
     # vocab + universe (from Drive)
     vocab = universe = None; vblock = ""
     vb = drive_download(svc, DRIVE["vocab_parquet"], root)
-    if vb:
-        vocab = pd.read_parquet(io.BytesIO(vb)); vblock = build_vocab_block(vocab)
+    if not vb:
+        # Without the vocabulary the prompt gets no tag list and normalise_list() maps every
+        # sector to other_sector — this silently mistagged 2,694 of 2,761 docs before 2026-09.
+        sys.exit(f"Tag vocabulary missing on Drive ({DRIVE['vocab_parquet']}). "
+                 "Run: python scripts/build_tag_aliases.py --upload")
+    vocab = pd.read_parquet(io.BytesIO(vb)); vblock = build_vocab_block(vocab)
     uv = drive_download(svc, DRIVE["universe_csv"], root)
     if uv:
         universe = pd.read_csv(io.BytesIO(uv))
@@ -548,6 +579,7 @@ def main():
 
     new_isins_run: set[str] = set()
     counts = dict(processed=0, skipped=0, deferred=0, error=0, ocr=0, dup=0)
+    storm_retry_used = False
 
     for pdf in pdfs:
         if args.limit and counts["processed"] >= args.limit:
@@ -587,9 +619,24 @@ def main():
 
         # ---- Gemini summarise via bucket pool ----
         try:
-            summary = summarise(doc_type, text, vblock, pool)
+            try:
+                summary = summarise(doc_type, text, vblock, pool)
+            except AllBucketsExhausted as exc:
+                # A Google 503 storm parks every model for the run (30 Sep / 1 Oct 2026: 18 and
+                # 22 503s across all 5 models, no PerDay errors) — it usually passes. Wait once,
+                # then retry this doc with a fresh pool before giving up for the night.
+                if storm_retry_used:
+                    raise
+                storm_retry_used = True
+                print(f"\n   all buckets parked ({exc}) — waiting {STORM_WAIT_MIN} min, "
+                      "then one retry with a fresh pool")
+                time.sleep(STORM_WAIT_MIN * 60)
+                pool = build_daily_pool()
+                summary = summarise(doc_type, text, vblock, pool)
         except AllBucketsExhausted as exc:
-            counts["deferred"] = sum(1 for p in pdfs if sha256_file(p) not in seen_hash)
+            # only PDFs still in intake: processed ones were already moved to _processed/,
+            # and hashing a moved path crashed every early stop (FileNotFoundError, exit 1)
+            counts["deferred"] = sum(1 for p in pdfs if p.exists() and sha256_file(p) not in seen_hash)
             print(f"\nStopping: {exc}")
             print(f"{counts['deferred']} PDF(s) remain in intake — they resume on the next "
                   "run (buckets refill at the daily reset).")
@@ -615,18 +662,23 @@ def main():
                        processed_at=dt.datetime.now().isoformat(), status="dup")
             seen_hash.add(h); _move_duplicate(pdf); counts["dup"] += 1; continue
 
-        sectors = normalise_list(meta.get("sectors"),  amap, closed.get("sector", set()),  "other_sector")
-        subs    = normalise_list(meta.get("subsectors"), amap, closed.get("subsector", set()), "")
-        themes  = normalise_list(meta.get("themes"),   amap, closed.get("theme", set()),   "")
+        sectors = normalise_list(meta.get("sectors"),  amap.get("sector", {}),    closed.get("sector", set()),    "other_sector")
+        subs    = normalise_list(meta.get("subsectors"), amap.get("subsector", {}), closed.get("subsector", set()), "")
+        themes  = normalise_list(meta.get("themes"),   amap.get("theme", {}),     closed.get("theme", set()),     "")
         isins   = resolve_isins(meta.get("companies", []), universe)
         tags    = [meta["doc_type"]] + sectors + themes
 
-        counter += 1
-        md_ref = f"{dpath}#research_{counter:04d}"
-        entry  = render_entry(counter, tags, meta, summary, run_hhmm)
+        n = prior_n.get(h)
+        if n:
+            print(f"   retry of research_{n:04d} (its upload failed last run) — same number")
+        else:
+            counter += 1
+            n = counter
+        md_ref = f"{dpath}#research_{n:04d}"
+        entry  = render_entry(n, tags, meta, summary, run_hhmm)
         clean  = re.sub(r"```json.*?```", "", summary, flags=re.DOTALL).strip()
         index_row = dict(
-            research_n=counter, doc_hash=h, fuzzy_fp=fp, content_key=ck,
+            research_n=n, doc_hash=h, fuzzy_fp=fp, content_key=ck,
             file_name=pdf.name, source=meta["source"], doc_date=meta["doc_date"],
             doc_type=meta["doc_type"], companies=json.dumps(meta.get("companies", [])),
             isins=json.dumps(isins), sectors=json.dumps(sectors), subsectors=json.dumps(subs),
@@ -644,39 +696,41 @@ def main():
             tok = str(c.get("ticker_or_isin", "")).strip().upper()
             isin_for_c = tok if tok.startswith("INE") and tok in isins else (isins[0] if isins else "")
             ment_rows.append(dict(
-                research_n=counter, file_name=pdf.name, source=meta["source"],
+                research_n=n, file_name=pdf.name, source=meta["source"],
                 doc_date=meta["doc_date"], doc_type=meta["doc_type"],
                 company_name_raw=raw, company_name_slug=company_slug(raw),
                 isin=isin_for_c, daily_md_ref=md_ref))
 
         # ---- PERSIST THIS DOC (append-each-time: Drive + local) ----
         try:
-            daily_md += entry
+            if f"## research_{n:04d} " not in daily_md:   # a retry may already have it
+                daily_md += entry
             drive_upload_with_retry(svc, dpath, root, daily_md.encode("utf-8"), "text/markdown")
 
-            index_df = pd.concat([index_df, pd.DataFrame([index_row])], ignore_index=True)
+            index_df = pd.concat([_drop_n(index_df, n), pd.DataFrame([index_row])],
+                                 ignore_index=True)
             ibuf = io.BytesIO(); index_df.to_parquet(ibuf, index=False)
             drive_upload_with_retry(svc, DRIVE["index_parquet"], root, ibuf.getvalue(), "application/octet-stream")
             index_df.to_parquet(LOCAL_INDEX_PATH, index=False)
 
             if ment_rows:
-                mentions_df = pd.concat([mentions_df, pd.DataFrame(ment_rows)], ignore_index=True)
+                mentions_df = pd.concat([_drop_n(mentions_df, n), pd.DataFrame(ment_rows)],
+                                        ignore_index=True)
                 mbuf = io.BytesIO(); mentions_df.to_parquet(mbuf, index=False)
                 drive_upload_with_retry(svc, DRIVE["mentions_parquet"], root, mbuf.getvalue(), "application/octet-stream")
                 mentions_df.to_parquet(MENTIONS_PATH, index=False)
 
             for isin in isins:
-                append_company_page(svc, isin, counter, meta, summary, root)
+                append_company_page(svc, isin, n, meta, summary, root)
         except Exception as e:
             print(f"   FATAL (upload): {pdf.name}: {str(e)[:120]}")
-            add_ledger(research_n=counter, doc_hash=h, fuzzy_fp=fp, content_key=ck,
+            print("   the PDF stays in intake: the next run retries it with the same number")
+            add_ledger(research_n=n, doc_hash=h, fuzzy_fp=fp, content_key=ck,
                        file_name=pdf.name, source=source, doc_type=meta["doc_type"],
                        processed_at=dt.datetime.now().isoformat(), status="upload_error")
-            seen_hash.add(h); seen_fp.add(fp); seen_ck.add(ck)
-            _move_processed(pdf)
             raise
 
-        add_ledger(research_n=counter, doc_hash=h, fuzzy_fp=fp, content_key=ck,
+        add_ledger(research_n=n, doc_hash=h, fuzzy_fp=fp, content_key=ck,
                    file_name=pdf.name, source=source, doc_type=meta["doc_type"],
                    processed_at=dt.datetime.now().isoformat(), status="ok")
 
@@ -686,7 +740,7 @@ def main():
         _move_processed(pdf)
         seen_hash.add(h); seen_fp.add(fp); seen_ck.add(ck)
         counts["processed"] += 1
-        print(f"   persisted research_{counter:04d}  ({len(isins)} ISIN, {len(ment_rows)} mention)")
+        print(f"   persisted research_{n:04d}  ({len(isins)} ISIN, {len(ment_rows)} mention)")
 
     print("-" * 56)
     print(f"Processed : {counts['processed']}")
