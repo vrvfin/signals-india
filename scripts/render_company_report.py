@@ -382,10 +382,17 @@ COL_LABELS = {"revenue": "Revenue", "ebitda_incl_oi": "EBITDA incl. other income
               "return_pa_pct": "Return % a year"}
 
 
+def _col_label(c) -> str:
+    """Reader-facing header. Margin-grid columns are named 'm9.58' in the fact pack."""
+    c = str(c)
+    m = re.fullmatch(r"m(\d+(?:\.\d+)?)", c)
+    return f"at {float(m.group(1)):.1f}% margin" if m else COL_LABELS.get(c, c)
+
+
 def _table_md(t: dict) -> list[str]:
     cols = t["columns"]
     L = [f"**{t['title']}**", "",
-         "| " + " | ".join(COL_LABELS.get(str(c), str(c)) for c in cols) + " |",
+         "| " + " | ".join(_col_label(c) for c in cols) + " |",
          "| " + " | ".join("---" for _ in cols) + " |"]
     for row in t["rows"]:
         L.append("| " + " | ".join(_fmt(row.get(c)).replace("|", "/") for c in cols) + " |")

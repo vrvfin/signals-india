@@ -142,8 +142,11 @@ thead th {
     text-align: left;
     font-weight: 700;
     border: 1px solid #1a2a6c;
-    white-space: nowrap;
+    /* headers WRAP: nowrap forced a 7-column table wider than the page and cut its last
+       column off (scenario table, 2026-10-18). Paper cannot scroll. */
+    white-space: normal;
 }
+tbody td { overflow-wrap: anywhere; }
 tbody tr:nth-child(even) {
     background-color: #f0f3ff;
 }

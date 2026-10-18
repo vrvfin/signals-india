@@ -43,6 +43,8 @@ HOW TO WRITE IT
 8. Plain English; gloss any term a non-specialist would not know the first time it is used.
 9. Write money the way a reader says it: "Rs 1,806 crore", "Rs 96 crore" — never
    "1806.0 Rs Cr", no trailing ".0". Percentages as "9.6%". Multiples as "63 times".
+   ROUND for reading: money to the nearest crore ("Rs 2,322 crore", not "Rs 2,321.98
+   crore"), percentages and multiples to one decimal ("47.3%", "22.2 times").
 
 ==================================================================
 OUTPUT - STRICT JSON, NO MARKDOWN FENCE, NO PROSE OUTSIDE THE JSON
