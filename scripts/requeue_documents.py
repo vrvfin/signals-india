@@ -50,6 +50,81 @@ from _extractor_base import (get_drive, get_or_create_subfolder, load_queue,  # 
                              save_queue, acquire_lock, release_lock, log)
 
 
+# ---------------------------------------------------------------------------- #
+#  --retry-errors: the failures worth reading again                             #
+# ---------------------------------------------------------------------------- #
+# A DOCUMENT THAT FAILED ONCE USED TO SIT IN 'error' FOR EVER. Nothing re-queued it,
+# so a model that echoed the prompt back, or a 503 on a busy afternoon, cost that
+# document permanently. 13 PF annual reports were in exactly that state on 2026-09-13
+# and had to be re-queued by hand.
+#
+# THE GENERATION FAILED, NOT THE DOCUMENT. Reading it again plausibly succeeds.
+RETRYABLE = (
+    "prompt echo", "echoed back",                 # the model answered with the prompt
+    "thin report", "degenerate", "repeat",         # a failed generation
+    "429", "503", "500", "timeout", "timed out", "deadline", "rate limit",
+    "quota", "temporarily", "unavailable", "connection",
+)
+# THE DOCUMENT FAILED, and reading it again changes nothing until the source does.
+# Listed EXPLICITLY rather than inferred as "not retryable", because the inference
+# would also sweep in every row whose reason was never recorded — see retryable().
+PERMANENT = (
+    "not a pdf", "html", "no drive_file_id", "download returned nothing",
+    "not an annual report", "needs_ocr", "audio", "encrypted", "0 bytes",
+)
+
+
+def retryable(reason: str) -> bool:
+    """Is this failure worth spending a model call on again? A BLANK reason is NOT.
+
+    2,326 historical failures carry no reason at all, and the PF book alone holds 97 of
+    them. Re-queueing those would spend free-tier quota on documents that may be
+    rights-issue pages, audio recordings or dead links: an UNKNOWN cause is not the
+    same as a transient one, and treating it as one is how a retry loop becomes a
+    quota fire. Silence means leave it alone.
+    """
+    s = str(reason or "").strip().lower()
+    if not s or s in ("none", "nan", "nat", "<na>"):
+        return False
+    if any(p in s for p in PERMANENT):
+        return False
+    return any(p in s for p in RETRYABLE)
+
+
+def _attempts(value) -> int:
+    s = str(value).strip()
+    if s in ("", "None", "nan", "<NA>", "NaT"):
+        return 0
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return 0
+
+
+def select_retryable(queue: pd.DataFrame, max_attempts: int, cooldown_h: int,
+                     isins: set | None, now=None) -> pd.DataFrame:
+    """Error rows worth another read: retryable reason, under the cap, off cooldown.
+
+    THREE GUARDS, EACH CLOSING A DIFFERENT LOOP:
+      attempts  - mark_queue_error() increments it on every failure, so the cap is real
+                  and a document that cannot be read stops costing quota after N tries.
+      cooldown  - a row retried minutes ago must not be retried again in the next run;
+                  the mail workflow fires five times a day.
+      isins     - the PF book by default. The queue is global and holds thousands of
+                  historical failures; draining all of them is a deliberate act.
+    """
+    now = now or pd.Timestamp.now()
+    m = queue["status"].astype(str) == "error"
+    if isins is not None:
+        m &= queue["isin"].astype(str).isin(isins)
+    m &= queue["last_error"].map(retryable)
+    m &= queue["attempts"].map(_attempts) < int(max_attempts)
+    if cooldown_h and "last_attempt_at" in queue.columns:
+        last = pd.to_datetime(queue["last_attempt_at"], errors="coerce")
+        m &= last.isna() | (last <= now - pd.Timedelta(hours=int(cooldown_h)))
+    return queue[m]
+
+
 def select(queue: pd.DataFrame, doc_ids: set, symbols: set,
            doc_type: str, since: str) -> pd.DataFrame:
     """Rows to re-queue. doc_ids wins; symbols+doc_type+since is the broader form."""
@@ -110,6 +185,58 @@ def _self_test() -> int:
     check("untouched rows keep their file id", out.loc[1, "drive_file_id"] == "f2")
     check("no column is lost", list(out.columns) == list(q.columns))
 
+    # ---- --retry-errors: which failures are worth another model call ---------
+    check("a prompt echo is retried",
+          retryable("prompt echoed back instead of a report"))
+    check("a thin report is retried", retryable("thin report: 430 chars (min 2,000)"))
+    check("a 503 is retried", retryable("503 Service Unavailable"))
+    check("a rate limit is retried", retryable("429 rate limit exceeded"))
+    # The guard that stops a retry loop becoming a quota fire.
+    check("a BLANK reason is NOT retried", not retryable(""))
+    check("the string None is not a reason", not retryable("None")
+          and not retryable("nan") and not retryable(None))
+    check("a non-PDF is settled, not retried", not retryable("HTML not PDF"))
+    check("a missing download is settled",
+          not retryable("download returned nothing"))
+    check("an unrecognised reason is left alone",
+          not retryable("something nobody has classified"))
+
+    check("attempts parses the empty spellings", _attempts("") == 0
+          and _attempts(None) == 0 and _attempts("nan") == 0)
+    check("attempts parses a real count", _attempts("2") == 2 and _attempts(3.0) == 3)
+
+    _now = pd.Timestamp("2026-09-14 12:00:00")
+    _old = (_now - pd.Timedelta(hours=48)).isoformat()
+    _recent = (_now - pd.Timedelta(hours=1)).isoformat()
+    eq = pd.DataFrame({
+        "doc_id": ["e1", "e2", "e3", "e4", "e5", "e6"],
+        "isin": ["INE1", "INE1", "INE1", "INE9", "INE1", "INE1"],
+        "status": ["error", "error", "error", "error", "done", "error"],
+        "last_error": ["prompt echoed back instead of a report",
+                       "prompt echoed back instead of a report",
+                       "prompt echoed back instead of a report",
+                       "prompt echoed back instead of a report",
+                       "prompt echoed back instead of a report",
+                       None],
+        "attempts": [1, 3, 1, 1, 1, 1],
+        "last_attempt_at": [_old, _old, _recent, _old, _old, _old],
+    })
+    got = set(select_retryable(eq, 3, 12, {"INE1"}, now=_now)["doc_id"])
+    check("a retryable failure under the cap is selected", "e1" in got)
+    check("the attempt CAP is honoured — 3 of 3 is not retried", "e2" not in got)
+    check("the COOLDOWN is honoured — retried an hour ago, left alone", "e3" not in got)
+    check("a holding outside the PF book is not touched", "e4" not in got)
+    check("a row that is not in error is not touched", "e5" not in got)
+    check("a failure with no recorded reason is not touched", "e6" not in got)
+    check("exactly one row qualifies here", got == {"e1"})
+    check("--all-isins reaches the other holding",
+          "e4" in set(select_retryable(eq, 3, 12, None, now=_now)["doc_id"]))
+    check("a row never attempted is not blocked by the cooldown",
+          "n1" in set(select_retryable(pd.DataFrame({
+              "doc_id": ["n1"], "isin": ["INE1"], "status": ["error"],
+              "last_error": ["503 Service Unavailable"], "attempts": [None],
+              "last_attempt_at": [None]}), 3, 12, {"INE1"}, now=_now)["doc_id"]))
+
     for name in failed:
         print(f"  FAIL  {name}")
     print(f"requeue_documents self-test: {passed} passed, {len(failed)} failed")
@@ -126,6 +253,22 @@ def main() -> int:
     ap.add_argument("--as-origin", default="",
                     help="Set source to this ('backfill' routes the re-read down the "
                          "backfill path). Omit to leave source alone.")
+    ap.add_argument("--retry-errors", action="store_true",
+                    help="Re-queue every FAILED row whose reason is worth another read "
+                         "(a prompt echo, a thin report, a 429/503), under the attempt "
+                         "cap and off cooldown. The PF book unless --all-isins.")
+    ap.add_argument("--max-attempts", type=int, default=3,
+                    help="With --retry-errors: give up after this many failures. "
+                         "mark_queue_error increments attempts on each one, so this "
+                         "cap is what stops a permanently-broken document costing "
+                         "quota for ever.")
+    ap.add_argument("--cooldown-hours", type=int, default=12,
+                    help="With --retry-errors: leave a row alone for this long after "
+                         "its last attempt. The mail workflow runs five times a day; "
+                         "without this, one bad document is retried five times a day.")
+    ap.add_argument("--all-isins", action="store_true",
+                    help="With --retry-errors: the WHOLE queue, not just the PF book. "
+                         "Thousands of historical failures — deliberate act only.")
     ap.add_argument("--limit", type=int, default=50, help="Refuse to touch more than N.")
     ap.add_argument("--live", action="store_true", help="Actually write.")
     ap.add_argument("--self-test", action="store_true")
@@ -136,7 +279,7 @@ def main() -> int:
 
     doc_ids = {s.strip() for s in a.doc_ids.split(",") if s.strip()}
     symbols = {s.strip() for s in a.symbols.split(",") if s.strip()}
-    if not doc_ids and not symbols:
+    if not a.retry_errors and not doc_ids and not symbols:
         log("Give --doc-ids or --symbols. Refusing to act on the whole queue.")
         return 1
 
@@ -146,7 +289,25 @@ def main() -> int:
         drive, get_or_create_subfolder(drive, root, "company_repo"), "_index")
 
     queue = load_queue(drive, idx)          # NEVER load_parquet(COLS) — see the docstring
-    sel = select(queue, doc_ids, symbols, a.doc_type, a.since)
+    if a.retry_errors:
+        isins = None
+        if not a.all_isins:
+            from daily_brief import load_pf
+            _pf = load_pf(drive, root, idx)
+            # load_pf yields (isin, symbol, name) triples, not bare ISINs.
+            _rows = _pf if isinstance(_pf, list) else _pf["isin"].tolist()
+            isins = {str(t[0] if isinstance(t, (tuple, list)) else t).strip()
+                     for t in _rows}
+            log(f"scope: the PF book ({len(isins)} holdings)")
+        _err = int((queue["status"].astype(str) == "error").sum())
+        sel = select_retryable(queue, a.max_attempts, a.cooldown_hours, isins)
+        log(f"{_err:,} failed row(s) in the queue; {len(sel)} worth another read "
+            f"(under {a.max_attempts} attempts, {a.cooldown_hours}h cooldown)")
+        if len(sel) > a.limit:
+            log(f"  taking the {a.limit} oldest — --limit bounds the quota spend")
+            sel = sel.sort_values("last_attempt_at", na_position="first").head(a.limit)
+    else:
+        sel = select(queue, doc_ids, symbols, a.doc_type, a.since)
     log(f"matched {len(sel)} row(s)")
     for _, r in sel.iterrows():
         log(f"  {str(r['symbol']):12s} {str(r['doc_type']):14s} "
@@ -154,7 +315,7 @@ def main() -> int:
             f"source={str(r.get('source'))!r}  {str(r['doc_id'])[:22]}")
     if sel.empty:
         return 0
-    if len(sel) > a.limit:
+    if not a.retry_errors and len(sel) > a.limit:
         log(f"refusing: {len(sel)} rows exceeds --limit {a.limit}")
         return 1
     if not a.live:
