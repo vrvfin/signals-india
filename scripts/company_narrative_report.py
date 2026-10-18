@@ -225,8 +225,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     d = pack.to_dict()
     # A due quarter Screener still does not have: build on the previous quarter and SAY
     # so at the top of the report (statements + summary carry the same sentence).
-    d["data_notes"] = list(dict.fromkeys(ch["detail"] for ch in rep["integrity"]
-                                         if ch.get("due")))
+    # ...and keep the fact pack's own notes (e.g. history pulled live from Screener).
+    d["data_notes"] = list(dict.fromkeys(list(d.get("data_notes") or [])
+                                         + [ch["detail"] for ch in rep["integrity"]
+                                            if ch.get("due")]))
     for n in d["data_notes"]:
         log(f"  DATA NOTE on the report: {n}")
     log(f"  {len(d['facts'])} facts · {len(d['tables'])} tables · "

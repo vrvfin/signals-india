@@ -49,6 +49,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, log)
 import narrative_compute as NC
+import narrative_dynamics as ND       # P3: balance sheet / cash bridge / P/E / scenarios
 
 IDX = "company_repo/_index"
 FUND = "fundamentals"
@@ -148,6 +149,7 @@ class Pack:
         self.gaps: list[dict] = []
         self.tables: list[dict] = []
         self.as_of = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.notes: list[str] = []          # data notes printed at the top of the report
 
     def add(self, fid, label, value, unit, basis, section, source,
             computed_from=None) -> str | None:
@@ -186,6 +188,7 @@ class Pack:
             "uncovered_sections": [{"section": k, "reason": v}
                                    for k, v in sorted(UNCOVERED.items())],
             "fact_counts_by_section": dict(sorted(by_sec.items())),
+            "data_notes": list(self.notes),
         }
 
 
@@ -1300,6 +1303,14 @@ def build(store: Store, token: str, live: bool = True) -> Pack | None:
     log(f"  {name} ({symbol} / {isin})")
     pack = Pack(isin, symbol, name)
     st = _statements(store, symbol)
+    # Screener live when it has MORE years than the stored file (user 2026-10-17: a report may
+    # pull standalone; the incomplete database itself is a separate fix). In memory only.
+    live_view = ""
+    if live:
+        st_live, note = ND.deeper_statements(symbol, st, log=log)
+        if note:
+            st, live_view = st_live, note
+            pack.notes.append(note)
     if st.empty:
         log(f"  WARNING: no fundamentals/statements/{symbol}.parquet — the financial "
             f"sections will be empty")
@@ -1326,6 +1337,18 @@ def build(store: Store, token: str, live: bool = True) -> Pack | None:
     # live exchange feed
     sec27_exchange_filings(pack, store, live=live)
     sec29_documents_read(pack, store)
+    # P3 financial dynamics (chapters 4, 5, 11): computed here, explained by the writer
+    cf = store.by_isin("company_facts.parquet", isin, symbol)
+    mcap = pd.to_numeric(cf.iloc[0].get("mcap_cr"), errors="coerce") if not cf.empty else None
+    ND.build_dynamics(pack, store, st, None if mcap is None or pd.isna(mcap) else float(mcap))
+    if live_view:
+        # every statements-sourced fact now came from the live page, not the stored file
+        live_src = {"kind": "statements", "table": f"screener.in/company/{symbol} (live)",
+                    "fetched_at": str(st["fetched_at"].iloc[0])[:19]}
+        for item in pack.facts + pack.tables:
+            src = item.get("source") or {}
+            if src.get("kind") == "statements":
+                item["source"] = dict(src, **live_src)
     return pack
 
 
