@@ -460,6 +460,10 @@ def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
         known = set(_key(queue)) if not queue.empty else set()
         if not queue.empty:
             cc = queue[queue["doc_type"].astype(str) == "concall"]
+            # A DECK stored as a concall (8,323 legacy rows titled "PPT", 2026-10-18) is
+            # not that month's concall: it must not block the real transcript. Rows stay
+            # as they are; only the month check ignores them.
+            cc = cc[[concall_box_link_type(t) == "concall" for t in cc["title"].astype(str)]]
             for _, qr in cc.iterrows():
                 known_concall_month.add(
                     _month_key(str(qr.get("key") or qr.get("isin") or qr.get("symbol") or ""),
@@ -606,6 +610,9 @@ def _self_test() -> int:
     got2 = parse_company_documents(html, run, {"concall", "presentation"})
     check("asking for presentations too queues the deck as a presentation",
           sorted(d["doc_type"] for d in got2) == ["concall", "presentation"])
+    check("legacy 'PPT' concall row does not count as that month's concall",
+          concall_box_link_type("PPT") != "concall"
+          and concall_box_link_type("Transcript") == "concall")
     print(f"\nbackfill_company_docs self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 
