@@ -333,24 +333,42 @@ def _cases(store, pack, st: pd.DataFrame) -> dict | None:
     ebd = dict(zip(NC.ebitda_series(st, "operating_profit").periods,
                    NC.ebitda_series(st, "operating_profit").values))
     rev10 = rev[-10:]
+    # A 3-year stretch that STARTS from a depressed base (below half the series median — the
+    # same test as narrative_compute.cagr_pct's base_warning) is not a growth rate to project:
+    # Ather's FY21 start-up base turned into a 70%-a-year base case (user rule, 2026-10-18).
+    pos = sorted(v for _, v in rev10 if v > 0)
+    med = pos[len(pos) // 2] if pos else 0
     roll = []
     for i in range(3, len(rev10)):
         a, b = rev10[i - 3][1], rev10[i][1]
-        if a > 0 and b > 0:
+        if a > 0 and b > 0 and a >= 0.5 * med:
             roll.append(((b / a) ** (1 / 3) - 1) * 100)
     c5 = NC.cagr_pct(NC.revenue_series(st), window=5)
     margins = [100.0 * pat[p] / v for p, v in rev[-5:] if pat.get(p) is not None and v > 0]
     emargins = [100.0 * ebd[p] / v for p, v in rev[-5:] if ebd.get(p) is not None and v > 0]
     if not roll or not c5 or not margins:
         return None
+    base = (c5["cagr_pct"], f"revenue growth {c5['from_fy']}-{c5['to_fy']}")
+    if "less than half the series median" in (c5.get("base_warning") or ""):
+        c3 = NC.cagr_pct(NC.revenue_series(st), window=3)
+        if c3 and not c3.get("base_warning"):
+            base = (c3["cagr_pct"], f"latest 3-year revenue growth {c3['from_fy']}-"
+                                    f"{c3['to_fy']} (the 5-year figure starts from a "
+                                    f"depressed base)")
+        else:
+            base = (roll[-1], "latest 3-year revenue growth not starting from a depressed "
+                              "base")
     guided = _guided_growth(store, pack.isin)
     rng = lambda xs, what: {"bear": (min(xs), f"lowest {what} of the last 5 years"),
                             "base": (statistics.median(xs), f"median {what} of the last 5 years"),
                             "bull": (max(xs), f"highest {what} of the last 5 years")}
     return {"rev": rev, "rev0_p": rev[-1][0], "rev0": rev[-1][1],
-            "g": {"bear": (min(roll), "weakest 3-year revenue growth in the last 10 years"),
-                  "base": (c5["cagr_pct"], f"revenue growth {c5['from_fy']}-{c5['to_fy']}"),
-                  "bull": guided or (max(roll), "best 3-year revenue growth in the last 10 years")},
+            "g": {"bear": (min(roll), "weakest 3-year revenue growth in the last 10 years "
+                                      "(stretches from a depressed base excluded)"),
+                  "base": base,
+                  "bull": guided or (max(roll), "best 3-year revenue growth in the last 10 "
+                                                "years (stretches from a depressed base "
+                                                "excluded)")},
             "m": rng(margins, "net margin"),
             "em": rng(emargins, "operating EBITDA margin") if emargins else None}
 
@@ -358,6 +376,11 @@ def _cases(store, pack, st: pd.DataFrame) -> dict | None:
 def sec32_scenarios(pack, store, st: pd.DataFrame, pe: dict | None, mcap_now: float | None):
     if st.empty or not pe or not mcap_now:
         pack.gap(SEC_SCN, "scenarios need statements, a P/E history and today's market cap")
+        return
+    if (pe.get("n") or 0) < 2:
+        # user rule 2026-10-18: one year-end is not a range — no scenarios on it
+        pack.gap(SEC_SCN, f"P/E has only {pe.get('n')} year-end ({pe.get('span')}) — "
+                          f"not a range, so no P/E scenarios")
         return
     c = _cases(store, pack, st)
     if c is None:
@@ -506,6 +529,10 @@ def sec35_lens_scenarios(pack, store, st: pd.DataFrame, lenses: dict,
                    "pb": (book0 + sum(r * m[case][0] / 100 for r in revs))
                    if book0 is not None else None}
         for k, label, _ in LENSES:
+            if k == "pe":
+                continue                  # P/E scenarios have their own table (sec32)
+            if ((lenses.get(k) or {}).get("n") or 0) < 2:
+                continue                  # user rule: one year-end is not a range
             mult = (lenses.get(k) or {}).get(mult_of[case])
             b = base_of[k]
             if mult is None or b is None or b <= 0:
@@ -521,6 +548,25 @@ def sec35_lens_scenarios(pack, store, st: pd.DataFrame, lenses: dict,
             rows.append({"case": case.title(), "lens": label,
                          "multiple": f"{mult_of[case]} {round(mult, 1)}",
                          "implied_mcap_cr": round(cap), "return_pa_pct": round(ret, 1)})
+    if rows or any(t["id"] == "tbl.scenarios" for t in pack.tables):
+        # The assumptions, shown once — only when some scenario actually uses them (a
+        # loss-maker has no P/E table to carry them; a company with none has no use for them).
+        pack.table("tbl.scenario_assumptions", "Scenario assumptions — taken from the "
+                   "company's own record", SEC_LSCN,
+                   ["case", "revenue_growth_pct", "growth_from", "net_margin_pct",
+                    "ebitda_margin_pct"],
+                   [{"case": cs.title(), "revenue_growth_pct": round(g[cs][0], 1),
+                     "growth_from": g[cs][1], "net_margin_pct": round(m[cs][0], 1),
+                     "ebitda_margin_pct": None if not em else round(em[cs][0], 1)}
+                    for cs in ("bear", "base", "bull")],
+                   _comp("revenue growth and margin ranges from the statements"))
+        for cs in ("bear", "base", "bull"):
+            pack.add(f"scn.{cs}.growth_used", f"{cs.title()} case: revenue growth a year "
+                     f"({g[cs][1]})", float(g[cs][0]), "%", "computed", SEC_LSCN,
+                     _comp(g[cs][1]))
+    elif lenses:
+        pack.gap(SEC_LSCN, "no valuation lens has two or more year-ends — not a range, so no "
+                           "scenarios (one-year history)")
     if rows:
         pack.table("tbl.scenario_lenses", f"Bear, base and bull on each valuation lens — "
                    f"{HORIZON_YEARS} years", SEC_LSCN,

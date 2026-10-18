@@ -90,7 +90,7 @@ CHAPTER_BRIEFS: list[str] = [
 # to Appendix B so a chapter never turns into a stack of tables.
 EXHIBITS = {"tbl.financials", "tbl.sensitivity_pe", "tbl.said_vs_delivered",
             "tbl.balance_cash", "tbl.cash_bridge", "tbl.pe_history", "tbl.scenarios",
-            "tbl.valuation_lenses", "tbl.scenario_lenses"}
+            "tbl.valuation_lenses", "tbl.scenario_assumptions", "tbl.scenario_lenses"}
 # Deep-dive parts whose TABLES are shown as exhibits in the chaptered report: CFO vs PAT
 # (1.4), the weighted forensic score (1.6), earnings quality (1.8). Labelled as model-
 # extracted, because the deep dive's numbers are not mechanically checked.
@@ -383,7 +383,7 @@ COL_LABELS = {"revenue": "Revenue", "ebitda_incl_oi": "EBITDA incl. other income
               "exit_pe": "Exit P/E", "implied_mcap_cr": "Implied market cap (Rs Cr)",
               "return_pa_pct": "Return % a year", "lens": "Lens", "today": "Today",
               "low": "Low", "median": "Median", "high": "High", "years": "Years",
-              "multiple": "Multiple used"}
+              "multiple": "Multiple used", "ebitda_margin_pct": "EBITDA margin %"}
 
 
 def _col_label(c) -> str:
