@@ -24,7 +24,7 @@ jobs:
     # after Phase 1 only when it succeeded; always on manual dispatch
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120   # first run (empty cache) downloads ~3,300 files: 62 min locally
     steps:
       - uses: actions/checkout@v4
 
