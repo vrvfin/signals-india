@@ -247,9 +247,10 @@ def readiness(store: Store, isin: str, symbol: str, name: str) -> list[dict]:
 
 
 # ------------------------------------------------------------- integrity -----
-def integrity(store: Store, isin: str, symbol: str) -> list[dict]:
+def integrity(store: Store, isin: str, symbol: str, today=None) -> list[dict]:
     """Deterministic correctness checks. Each returns PASS / WARN / FAIL with the
-    numbers that produced the verdict, so a failure is actionable rather than a mood."""
+    numbers that produced the verdict, so a failure is actionable rather than a mood.
+    `today` pins the latest-quarter rule (quarter_status) to a date; None = real date."""
     checks: list[dict] = []
 
     def add(cid, name, status, detail):
@@ -365,7 +366,8 @@ def integrity(store: Store, isin: str, symbol: str) -> list[dict]:
     # `due` tells the story's fetch pass to pull this company before building.
     for src in ("statements", "summary"):
         if src in ages:
-            status, detail, due = quarter_status(store, isin, symbol, latest.get(src))
+            status, detail, due = quarter_status(store, isin, symbol, latest.get(src),
+                                                 today=today)
             add(f"STALE.{src}", f"{src} latest quarter", status, detail)
             checks[-1]["due"] = due
     for src, age in ages.items():
