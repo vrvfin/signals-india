@@ -469,6 +469,16 @@ def upload_to_drive(df: pd.DataFrame) -> None:
         f"({len(df):,} rows, {df['date'].min().date()} -> {df['date'].max().date()})")
 
 
+def store_last_dates(files: list[str]) -> pd.Series:
+    """Last bar date of every price file (one tiny column read each)."""
+    out = {}
+    for f in files:
+        d = _read(f, ["date"])
+        if d is not None and len(d):
+            out[os.path.basename(f)[:-8]] = pd.Timestamp(d["date"].max()).normalize()
+    return pd.Series(out, dtype="datetime64[ns]")
+
+
 def show_status() -> None:
     if not os.path.exists(OUT_PATH):
         print(f"{OUT_PATH} -- not built yet")
@@ -479,8 +489,33 @@ def show_status() -> None:
     print(f"date range      : {d['date'].min().date()} -> {d['date'].max().date()}")
     print(f"trading days    : {d['date'].nunique():,}")
     files = glob.glob(os.path.join(OHLCV_DIR, "*.parquet"))
-    fresh = os.path.getmtime(OUT_PATH) >= newest_source_mtime(files)
-    print(f"vs price store  : {'fresh' if fresh else 'STALE -- rerun'}")
+    # Two different questions, answered separately. "Rebuilt since the price
+    # files last changed?" (file times) used to be printed as "fresh" on its
+    # own — while the table quietly ended weeks before the newest bar, because
+    # days where most of the store had no price yet are dropped by
+    # COVERAGE_MIN. So also compare the CONTENT: table end vs price-store end.
+    rebuilt = os.path.getmtime(OUT_PATH) >= newest_source_mtime(files)
+    print(f"rebuilt since   : {'yes' if rebuilt else 'NO -- price files changed, rerun'}"
+          f" (file times)")
+    last = store_last_dates(files)
+    t_end = pd.Timestamp(d["date"].max()).normalize()
+    if not last.empty:
+        newest = last.max()
+        n_new = int((last >= newest).sum())
+        recent = last[last >= newest - pd.Timedelta(days=60)]
+        print(f"price store end : newest bar {newest.date()} in {n_new:,} of "
+              f"{len(last):,} files")
+        for dt, n in recent.value_counts().head(3).sort_index(ascending=False).items():
+            print(f"                  {n:,} files end {dt.date()}")
+        if t_end < newest:
+            behind = int((last >= t_end + pd.Timedelta(days=1)).sum())
+            print(f"vs price store  : TABLE ENDS {t_end.date()}, {(newest - t_end).days}d "
+                  f"before the newest bar. Later days are dropped on purpose: under "
+                  f"{COVERAGE_MIN:.0%} of securities have a price for them (only "
+                  f"{behind:,} files go past {t_end.date()}). Fix = refresh the "
+                  f"lagging part of the price store, then rebuild.")
+        else:
+            print("vs price store  : up to date (table reaches the newest bar)")
     last = d[d["date"].eq(d["date"].max()) & d["universe"].eq("all")].iloc[0]
     print(f"last day (all)  : {int(last['n_traded']):,} traded, "
           f"{last['pct_above_50dma']:.1f}% >50DMA, "
@@ -516,7 +551,9 @@ def main() -> None:
     if (not args.force and not args.limit and os.path.exists(OUT_PATH)
             and os.path.getmtime(OUT_PATH) >= newest_source_mtime(files)):
         log(f"{os.path.basename(OUT_PATH)} is newer than every price file -- "
-            f"skipping rebuild (use --force to force one)")
+            f"skipping rebuild (use --force to force one); table ends "
+            f"{pd.read_parquet(OUT_PATH, columns=['date'])['date'].max().date()} "
+            f"-- run --status to compare with the price store's end")
         if args.upload:
             upload_to_drive(pd.read_parquet(OUT_PATH))
         return
