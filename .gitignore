@@ -89,3 +89,6 @@ guru/**/*.bak
 _vocab_report/
 # research search store (local, rebuilt from Drive company_repo/_research/)
 _rag/
+
+# Darvas gallery build output (published to Drive, not the repo)
+guru/darvas/*.html
