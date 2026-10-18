@@ -242,9 +242,12 @@ def parse_company_documents(html: str, run_date: dt.date,
                     text = a.get_text(" ", strip=True)
                     if not href or text.lower() == "all" or "corp-announc" in href:
                         continue
+                    kind = concall_box_link_type(text, href)
+                    if kind is None or kind not in want_types:
+                        continue
                     out.append({
                         "doc_id":   _doc_id(href),
-                        "doc_type": "concall",
+                        "doc_type": kind,
                         "title":    text,
                         "announcement_date": ann,
                         "pdf_url":  href,
@@ -362,6 +365,28 @@ def resolve_company(token: str, symbol: str, isin: str,
 # --------------------------------------------------------------------------- #
 #  Backfill core (importable)
 # --------------------------------------------------------------------------- #
+_AUDIO_RE = re.compile(r"\.(mp3|wav|m4a|aac|ogg|wma)(?:[?#]|$)", re.I)
+
+
+def concall_box_link_type(text: str, href: str = "") -> str | None:
+    """What a link in Screener's CONCALLS box really is (2026-10-18). Pure.
+
+    The box holds one row per call with up to four links - Transcript, Notes, PPT, REC -
+    and every one was queued as `concall`. Measured in the live queue: 8,323 concall
+    rows titled "PPT" (7,964 already extracted with the CONCALL prompt), and the
+    one-concall-per-company-per-month dedup could keep the deck and drop the transcript.
+      PPT / presentation      -> presentation
+      REC / audio file        -> None (a recording is not a readable document)
+      Transcript / Notes / *  -> concall
+    """
+    t = str(text or "").strip().lower()
+    if t in ("rec", "recording", "audio", "audio recording") or _AUDIO_RE.search(str(href or "")):
+        return None
+    if t in ("ppt", "presentation", "investor presentation") or t.startswith("ppt"):
+        return "presentation"
+    return "concall"
+
+
 def backfill(symbol: str, isin: str = "", want_types: set[str] | None = None,
              max_docs: int = 0, dry_run: bool = False,
              drive=None, repo_id=None, index_id=None,
@@ -556,5 +581,36 @@ def main() -> None:
     print("Next: run the doc-type extractors (or deep dive) to summarise.")
 
 
+def _self_test() -> int:
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        ok, fail = (ok + 1, fail) if cond else (ok, fail + 1)
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+
+    T = concall_box_link_type
+    check("Transcript -> concall", T("Transcript", "http://x/t.pdf") == "concall")
+    check("Notes -> concall", T("Notes", "http://x/n.pdf") == "concall")
+    check("PPT -> presentation", T("PPT", "http://x/p.pdf") == "presentation")
+    check("REC -> skipped", T("REC", "http://x/r") is None)
+    check("an .mp3 is skipped whatever the label", T("Transcript", "http://x/c.mp3") is None)
+    html = ("<div id='documents'><div class='documents concalls'><ul>"
+            "<li><div>Aug 2026</div><a href='http://x/t.pdf'>Transcript</a>"
+            "<a href='http://x/p.pdf'>PPT</a><a href='http://x/r'>REC</a></li>"
+            "</ul></div></div>")
+    run = dt.date(2026, 10, 18)
+    got = parse_company_documents(html, run, {"concall"})
+    check("concalls box, default types: only the transcript is queued",
+          [(d["doc_type"], d["title"]) for d in got] == [("concall", "Transcript")])
+    got2 = parse_company_documents(html, run, {"concall", "presentation"})
+    check("asking for presentations too queues the deck as a presentation",
+          sorted(d["doc_type"] for d in got2) == ["concall", "presentation"])
+    print(f"\nbackfill_company_docs self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
     main()
