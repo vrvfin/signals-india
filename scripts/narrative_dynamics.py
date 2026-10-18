@@ -241,6 +241,23 @@ def _fy_end_close(ohlcv: pd.DataFrame, period: str) -> float | None:
 
 
 def sec33_pe_history(pack, store, st: pd.DataFrame, years: int = 5) -> dict | None:
+    # Today's valuation belongs to the valuation chapter too (it lived only in chapter 1's
+    # one-pager, so chapter 11 wrote "an elevated P/E" without the number — Morepen 18 Oct).
+    try:
+        cf = store.by_isin("company_facts.parquet", pack.isin, pack.symbol)
+    except Exception:
+        cf = pd.DataFrame()
+    if not cf.empty:
+        r = cf.iloc[0]
+        when = str(r.get("mcap_as_of") or r.get("updated_at") or "")[:10]
+        src = {"kind": "parquet", "table": "company_repo/_index/company_facts.parquet",
+               "note": f"market cap as of {when}" if when else ""}
+        for col, fid, label, unit in (("mcap_cr", "val.mcap_now", "Market cap today", "Rs Cr"),
+                                      ("pe", "val.pe_now", "P/E today", "x"),
+                                      ("pb", "val.pb_now", "Price to book value today", "x")):
+            v = pd.to_numeric(r.get(col), errors="coerce")
+            if pd.notna(v):
+                pack.add(fid, label, float(v), unit, "reported", SEC_PE, src)
     if st.empty:
         return None
     try:

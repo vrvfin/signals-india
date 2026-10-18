@@ -21,6 +21,8 @@ RULES
   number is in the FACT TABLE.
 - No forecasts, no target price, no buy/sell call.
 - Plain English. No jargon a non-specialist would not follow without a gloss.
+- Write money as "Rs 1,806 crore" (never "1806.0 Rs Cr", no trailing ".0"), percentages as
+  "9.6%", multiples as "63 times".
 
 ==================================================================
 OUTPUT - STRICT JSON, NO MARKDOWN FENCE, NO PROSE OUTSIDE THE JSON
