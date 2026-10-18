@@ -53,7 +53,7 @@ CHAPTERS: list[tuple[str, list[int], list[str]]] = [
     ("Financial shenanigans check", [], ["1.4"]),
     ("Research, global learnings and management interaction", [14, 16, 17, 20], []),
     ("Industry scenario", [15, 21, 25], ["0.9"]),
-    ("Valuation check", [33, 32, 22], []),
+    ("Valuation check", [33, 34, 32, 35, 22], []),
     ("Risks — and what could prove this reading wrong", [23, 24], ["0.7"]),
 ]
 # What each chapter covers (the user's list, 2026-10-05). Given to the chapter writer.
@@ -80,7 +80,8 @@ CHAPTER_BRIEFS: list[str] = [
     "The industry scenario: demand, pricing, policy, competition and where this company "
     "stands among its peers.",
     "Valuation check: today's multiples against the company's own year-end P/E history and "
-    "its peers, then the bear / base / bull scenarios in the FACT TABLE: say where each "
+    "its peers on every lens in the FACT TABLE (P/E, price / sales, price / EBITDA, price / "
+    "book), then the bear / base / bull scenarios on each lens: say where each "
     "assumption comes from and what has to happen for each case. Arithmetic on the "
     "company's own record — never call it a forecast or a target.",
     "Risks, and what could prove this reading wrong.",
@@ -88,7 +89,8 @@ CHAPTER_BRIEFS: list[str] = [
 # Tables printed INSIDE the flow (they are the chapter's argument); every other table goes
 # to Appendix B so a chapter never turns into a stack of tables.
 EXHIBITS = {"tbl.financials", "tbl.sensitivity_pe", "tbl.said_vs_delivered",
-            "tbl.balance_cash", "tbl.cash_bridge", "tbl.pe_history", "tbl.scenarios"}
+            "tbl.balance_cash", "tbl.cash_bridge", "tbl.pe_history", "tbl.scenarios",
+            "tbl.valuation_lenses", "tbl.scenario_lenses"}
 # Deep-dive parts whose TABLES are shown as exhibits in the chaptered report: CFO vs PAT
 # (1.4), the weighted forensic score (1.6), earnings quality (1.8). Labelled as model-
 # extracted, because the deep dive's numbers are not mechanically checked.
@@ -379,7 +381,9 @@ COL_LABELS = {"revenue": "Revenue", "ebitda_incl_oi": "EBITDA incl. other income
               "pe": "P/E", "case": "Case", "revenue_growth_pct": "Revenue growth % a year",
               "growth_from": "Growth assumption from", "net_margin_pct": "Net margin %",
               "exit_pe": "Exit P/E", "implied_mcap_cr": "Implied market cap (Rs Cr)",
-              "return_pa_pct": "Return % a year"}
+              "return_pa_pct": "Return % a year", "lens": "Lens", "today": "Today",
+              "low": "Low", "median": "Median", "high": "High", "years": "Years",
+              "multiple": "Multiple used"}
 
 
 def _col_label(c) -> str:
@@ -568,7 +572,7 @@ def render(pack: dict, narrative: dict | None = None, audit: dict | None = None,
             L += _table_md(docs) + [""]
         if dd.get("docs"):
             L += [_forensic_text(dd["docs"], refs), ""]
-    if "tbl.scenarios" in tables:
+    if "tbl.scenarios" in tables or "tbl.scenario_lenses" in tables:
         # user 2026-10-05: scenarios approved for the valuation chapter, worded as arithmetic
         L += ["*The bear, base and bull cases are arithmetic on assumptions taken from the "
               "company's own record (growth, margin and P/E ranges) — not a forecast, a target "

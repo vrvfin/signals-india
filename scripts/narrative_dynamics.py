@@ -324,13 +324,14 @@ def _guided_growth(store, isin: str) -> tuple[float, str] | None:
     return float(r["value_num"]), f"management guidance, {r['quarter']} ({r['value']}, {r['horizon_fy']})"
 
 
-def sec32_scenarios(pack, store, st: pd.DataFrame, pe: dict | None, mcap_now: float | None):
-    if st.empty or not pe or not mcap_now:
-        pack.gap(SEC_SCN, "scenarios need statements, a P/E history and today's market cap")
-        return
+def _cases(store, pack, st: pd.DataFrame) -> dict | None:
+    """The bear / base / bull GROWTH and MARGIN assumptions, shared by every valuation lens
+    (P/E, P/S, P/EBITDA, P/B) so the lenses differ only in the multiple applied."""
     rev = [(p, v) for p, v in zip(NC.revenue_series(st).periods, NC.revenue_series(st).values)
            if v is not None]
     pat = dict(zip(NC.pat_series(st).periods, NC.pat_series(st).values))
+    ebd = dict(zip(NC.ebitda_series(st, "operating_profit").periods,
+                   NC.ebitda_series(st, "operating_profit").values))
     rev10 = rev[-10:]
     roll = []
     for i in range(3, len(rev10)):
@@ -339,16 +340,30 @@ def sec32_scenarios(pack, store, st: pd.DataFrame, pe: dict | None, mcap_now: fl
             roll.append(((b / a) ** (1 / 3) - 1) * 100)
     c5 = NC.cagr_pct(NC.revenue_series(st), window=5)
     margins = [100.0 * pat[p] / v for p, v in rev[-5:] if pat.get(p) is not None and v > 0]
+    emargins = [100.0 * ebd[p] / v for p, v in rev[-5:] if ebd.get(p) is not None and v > 0]
     if not roll or not c5 or not margins:
+        return None
+    guided = _guided_growth(store, pack.isin)
+    rng = lambda xs, what: {"bear": (min(xs), f"lowest {what} of the last 5 years"),
+                            "base": (statistics.median(xs), f"median {what} of the last 5 years"),
+                            "bull": (max(xs), f"highest {what} of the last 5 years")}
+    return {"rev": rev, "rev0_p": rev[-1][0], "rev0": rev[-1][1],
+            "g": {"bear": (min(roll), "weakest 3-year revenue growth in the last 10 years"),
+                  "base": (c5["cagr_pct"], f"revenue growth {c5['from_fy']}-{c5['to_fy']}"),
+                  "bull": guided or (max(roll), "best 3-year revenue growth in the last 10 years")},
+            "m": rng(margins, "net margin"),
+            "em": rng(emargins, "operating EBITDA margin") if emargins else None}
+
+
+def sec32_scenarios(pack, store, st: pd.DataFrame, pe: dict | None, mcap_now: float | None):
+    if st.empty or not pe or not mcap_now:
+        pack.gap(SEC_SCN, "scenarios need statements, a P/E history and today's market cap")
+        return
+    c = _cases(store, pack, st)
+    if c is None:
         pack.gap(SEC_SCN, "scenarios need 6+ years of revenue and 5 years of profit")
         return
-    guided = _guided_growth(store, pack.isin)
-    g = {"bear": (min(roll), "weakest 3-year revenue growth in the last 10 years"),
-         "base": (c5["cagr_pct"], f"revenue growth {c5['from_fy']}-{c5['to_fy']}"),
-         "bull": guided or (max(roll), "best 3-year revenue growth in the last 10 years")}
-    m = {"bear": (min(margins), "lowest net margin of the last 5 years"),
-         "base": (statistics.median(margins), "median net margin of the last 5 years"),
-         "bull": (max(margins), "highest net margin of the last 5 years")}
+    rev, g, m = c["rev"], c["g"], c["m"]
     x = {"bear": (pe["low"], f"lowest year-end P/E {pe['span']}"),
          "base": (pe["median"], f"median year-end P/E {pe['span']}"),
          "bull": (pe["high"], f"highest year-end P/E {pe['span']}")}
@@ -387,8 +402,140 @@ def sec32_scenarios(pack, store, st: pd.DataFrame, pe: dict | None, mcap_now: fl
                          "P/E is the year-end range above.")
 
 
+# ------------------------------------------------- chapter 11: valuation lenses --
+# User 2026-10-18: "add alternative price to sales ... price to ebitda ... price to book".
+# The same year-end method as P/E, applied to revenue, operating EBITDA and net worth, so a
+# loss-maker (no P/E) still gets a valuation check and scenarios.
+SEC_LENS, SEC_LSCN = 34, 35
+LENSES = (("pe", "P/E", "profit"), ("ps", "Price / sales", "revenue"),
+          ("pebitda", "Price / EBITDA", "operating EBITDA"), ("pb", "Price / book", "net worth"))
+
+
+def _year_end_rows(store, pack, st: pd.DataFrame, years: int = 5) -> list[dict]:
+    """Per year-end: price, shares (profit / EPS — same sign, so loss years work too),
+    market cap, and the four multiples where the denominator is positive."""
+    try:
+        ohlcv = store.parquet("data/ohlcv", f"{pack.symbol}.parquet")
+    except Exception:
+        ohlcv = pd.DataFrame()
+    s = {k: dict(zip(f(st).periods, f(st).values)) for k, f in
+         (("rev", NC.revenue_series), ("pat", NC.pat_series), ("eps", NC.eps_series),
+          ("ebitda", lambda d: NC.ebitda_series(d, "operating_profit")))}
+    rows = []
+    for p in _fys(st, years):
+        px, pat, eps = _fy_end_close(ohlcv, p), s["pat"].get(p), s["eps"].get(p)
+        shares = pat / eps if (pat is not None and eps not in (None, 0) and pat * eps > 0) else None
+        cap = px * shares if (px and shares) else None
+        nw = _net_worth(st, p)
+        den = {"pe": pat, "ps": s["rev"].get(p), "pebitda": s["ebitda"].get(p), "pb": nw}
+        r = {"FY": NC.fy_label(p), "mcap": cap}
+        for k, _, _ in LENSES:
+            d = den[k]
+            r[k] = cap / d if (cap and d and d > 0) else None
+        rows.append(r)
+    return rows
+
+
+def sec34_valuation_lenses(pack, store, st: pd.DataFrame, mcap_now: float | None) -> dict:
+    """Today's multiple on each lens against the company's own year-end range."""
+    if st.empty or not mcap_now:
+        pack.gap(SEC_LENS, "valuation lenses need statements and today's market cap")
+        return {}
+    rows = _year_end_rows(store, pack, st)
+    last = _fys(st)[-1]
+    now_den = {"pe": NC.pat_series(st).as_map().get(NC.fy_label(last)),
+               "ps": NC.revenue_series(st).as_map().get(NC.fy_label(last)),
+               "pebitda": NC.ebitda_series(st, "operating_profit").as_map().get(NC.fy_label(last)),
+               "pb": _net_worth(st, last)}
+    out, table = {}, []
+    for k, label, what in LENSES:
+        hist = [(r["FY"], r[k]) for r in rows if r.get(k)]
+        d = now_den.get(k)
+        now = mcap_now / d if (d and d > 0) else None
+        rec = {"now": now}
+        if hist:
+            vals = [v for _, v in hist]
+            rec.update(low=min(vals), median=statistics.median(vals), high=max(vals),
+                       n=len(vals), span=f"{hist[0][0]}-{hist[-1][0]}")
+        out[k] = rec
+        src = _comp(f"market cap / {what}; year-end market cap = year-end price x "
+                    f"(profit / EPS) shares")
+        if now is not None:
+            pack.add(f"val.{k}_today", f"{label} today (on {NC.fy_label(last)} {what})", now,
+                     "x", "computed", SEC_LENS, src)
+        for q in ("low", "median", "high"):
+            if rec.get(q) is not None:
+                pack.add(f"val.{k}_{q}", f"{label} {q} at year-ends {rec['span']} "
+                         f"({rec['n']} year(s))", rec[q], "x", "computed", SEC_LENS, src)
+        table.append({"lens": label, "today": None if now is None else round(now, 1),
+                      **{q: (None if rec.get(q) is None else round(rec[q], 1))
+                         for q in ("low", "median", "high")},
+                      "years": rec.get("n", 0)})
+    if any(r["today"] is not None or r["median"] is not None for r in table):
+        pack.table("tbl.valuation_lenses", "Today's multiples against the company's own "
+                   "year-end range", SEC_LENS, ["lens", "today", "low", "median", "high",
+                                                "years"], table,
+                   _comp("market cap / profit, revenue, operating EBITDA, net worth"),
+                   note="'years' = year-ends with a price and a positive denominator. Blank "
+                        "where the denominator is a loss (a multiple of a loss means nothing).")
+    return out
+
+
+def sec35_lens_scenarios(pack, store, st: pd.DataFrame, lenses: dict,
+                         mcap_now: float | None) -> None:
+    """Bear / base / bull through each lens: the SAME growth and margin cases, the lens's
+    own low / median / high multiple. P/B uses today's book plus three years of profit (or
+    loss) at the case's margin, with no dividends and no new equity — stated in the note."""
+    if not lenses or not mcap_now:
+        return
+    c = _cases(store, pack, st)
+    if c is None:
+        pack.gap(SEC_LSCN, "lens scenarios need 6+ years of revenue and 5 years of profit")
+        return
+    rev0, g, m, em = c["rev0"], c["g"], c["m"], c["em"]
+    book0 = _net_worth(st, _fys(st)[-1])
+    mult_of = {"bear": "low", "base": "median", "bull": "high"}
+    rows = []
+    for case in ("bear", "base", "bull"):
+        gr = g[case][0] / 100
+        revs = [rev0 * (1 + gr) ** y for y in range(1, HORIZON_YEARS + 1)]
+        rev3 = revs[-1]
+        base_of = {"pe": rev3 * m[case][0] / 100,
+                   "ps": rev3,
+                   "pebitda": rev3 * em[case][0] / 100 if em else None,
+                   "pb": (book0 + sum(r * m[case][0] / 100 for r in revs))
+                   if book0 is not None else None}
+        for k, label, _ in LENSES:
+            mult = (lenses.get(k) or {}).get(mult_of[case])
+            b = base_of[k]
+            if mult is None or b is None or b <= 0:
+                continue
+            cap = b * mult
+            ret = ((cap / mcap_now) ** (1 / HORIZON_YEARS) - 1) * 100
+            pack.add(f"scn.{case}.{k}.mcap", f"{case.title()} case on {label}: implied market "
+                     f"cap in {HORIZON_YEARS} years", cap, "Rs Cr", "computed", SEC_LSCN,
+                     _comp(f"{label} {mult_of[case]} x the case's {HORIZON_YEARS}-year figure"))
+            pack.add(f"scn.{case}.{k}.return", f"{case.title()} case on {label}: implied "
+                     f"return a year", ret, "%", "computed", SEC_LSCN,
+                     _comp("(implied market cap / today's) ^ (1/3) - 1"))
+            rows.append({"case": case.title(), "lens": label,
+                         "multiple": f"{mult_of[case]} {round(mult, 1)}",
+                         "implied_mcap_cr": round(cap), "return_pa_pct": round(ret, 1)})
+    if rows:
+        pack.table("tbl.scenario_lenses", f"Bear, base and bull on each valuation lens — "
+                   f"{HORIZON_YEARS} years", SEC_LSCN,
+                   ["case", "lens", "multiple", "implied_mcap_cr", "return_pa_pct"], rows,
+                   _comp("same growth and margin cases as the P/E scenarios; each lens's own "
+                         "year-end multiple range"),
+                   note="Arithmetic, not a forecast. Bear uses the lens's lowest year-end "
+                        "multiple, base the median, bull the highest. Price / book: today's "
+                        "book plus three years of profit or loss, no dividends, no new equity.")
+
+
 def build_dynamics(pack, store, st: pd.DataFrame, mcap_now: float | None) -> None:
     sec30_balance_cash(pack, st)
     sec31_cash_bridge(pack, st)
     pe = sec33_pe_history(pack, store, st)
     sec32_scenarios(pack, store, st, pe, mcap_now)
+    lenses = sec34_valuation_lenses(pack, store, st, mcap_now)
+    sec35_lens_scenarios(pack, store, st, lenses, mcap_now)
