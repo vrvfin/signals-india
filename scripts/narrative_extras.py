@@ -129,17 +129,28 @@ def fraud_breakdown(pack, store) -> None:
 
     if ft:
         sc, band = num(ft.get("fraud_score")), str(ft.get("band") or "")
-        add("fraud.score", "Fraud tracker score", sc, "score", "fraud_tracker.parquet",
+        # The writer sees fact LABELS, not table rows, so the driver must be IN the label:
+        # Morepen 2026-10-19 the chapter said the 75 was "driven by poor cash conversion"
+        # when it was driven by exchange surveillance (ASM-4 / trade-to-trade).
+        reason = str(ft.get("reason") or "")
+        parts = [p.strip() for p in reason.split("|") if p.strip()]
+        top = next((p for p in parts if str(ft.get("score_driver") or "") and
+                    p.lower().startswith(("surveillance", "investigative"))), parts[0] if parts else "")
+        driver = {"investigative": "exchange surveillance and regulator / news checks",
+                  "forensic": "accounting red flags"}.get(str(ft.get("score_driver") or ""),
+                                                           str(ft.get("score_driver") or "n/a"))
+        add("fraud.score", f"Fraud tracker score ({band}) — driven by {driver}: {top[:120]}",
+            sc, "score", "fraud_tracker.parquet",
             "Combined score: market surveillance + forensic accounting flags + regulator "
             "actions + news (higher = more concern)",
             f"{'' if pd.isna(sc) else int(sc)} ({band}); driven by "
             f"{ft.get('score_driver') or 'n/a'}", band or "n/a")
-        reason = str(ft.get("reason") or "")
         if reason:
             rows.append({"check": "Why the tracker scored it so", "what_it_measures":
                          "The tracker's own breakdown", "reading": reason[:220], "status": ""})
         fs = num(ft.get("forensic_score"))
-        add("fraud.forensic_score", "Forensic accounting score", fs, "score",
+        add("fraud.forensic_score", f"Forensic accounting score (statement red flags: "
+            f"{ft.get('forensic_flags') or 'none'})", fs, "score",
             "fraud_tracker.parquet", "Accounting red flags from the statements (cash vs "
             "profit, returns, receivables, etc.)",
             f"{'' if pd.isna(fs) else int(fs)}; flags: {ft.get('forensic_flags') or 'none'}",
