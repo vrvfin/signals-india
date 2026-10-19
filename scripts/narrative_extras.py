@@ -73,6 +73,13 @@ def recent_filings(symbol: str, limit: int = 25, max_docs: int = 8,
                     text = " ".join(" ".join(p.get_text() for p in doc).split())[:text_chars]
             except Exception:
                 text = ""
+        # NSE's own subject is often generic ("has informed the Exchange about General
+        # Updates"); the letter's "Sub:" line says what it is (Morepen 28 Sep: "Press
+        # Release - Morepen strengthens integrated CDMO capabilities with first U.S. ANDA
+        # submission").
+        m = re.search(r"\bSub(?:ject)?\s*[.:]+\s*(.{8,240}?)\s+(?:Dear|Ref\b|Respected|Sir|Madam)", text or "", re.I)
+        if m and (not subj or "informed the exchange" in subj.lower()):
+            subj = m.group(1).strip(" -–")
         out.append({"doc_id": did, "date": day, "kind": kind, "subject": subj, "url": url,
                     "text": text or subj})
         if len(out) >= max_docs:
@@ -158,7 +165,7 @@ def fraud_breakdown(pack, store) -> None:
         rows.append({"check": "Exchange surveillance (ASM / ESM / GSM)",
                      "what_it_measures": "Price-and-volume surveillance by NSE/BSE — about "
                      "trading behaviour, NOT a finding of fraud",
-                     "reading": f"ASM {asm} · ESM {esm} · GSM stage {gsm}",
+                     "reading": f"ASM: {asm} · ESM: {esm} · GSM stage: {gsm}",
                      "status": "flag" if (asm not in ("none", "nan", "0") or esm not in
                                           ("none", "nan") or gsm not in ("0", "none", "nan"))
                      else "clean"})
@@ -252,8 +259,12 @@ def excerpts(sources: dict[str, str], topic: str, window: int = 700,
     pats = [re.compile(p, re.I) for p in TOPICS.get(topic, [])]
     if not pats:
         return {}
-    order = sorted(sources, key=lambda d: next((i for i, k in enumerate(_KIND_ORDER)
-                                                 if d.startswith(k)), 9))
+    # annual reports first, then calls, ...; NEWEST first within a kind
+    def _rank(d):
+        kind = next((i for i, k in enumerate(_KIND_ORDER) if d.startswith(k)), 9)
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", d)
+        return (kind, -int("".join(m.groups())) if m else 0)
+    order = sorted(sources, key=_rank)
     out, used = {}, 0
     for did in order:
         text = sources[did] or ""

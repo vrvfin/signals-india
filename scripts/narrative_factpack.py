@@ -50,6 +50,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, log)
 import narrative_compute as NC
 import narrative_dynamics as ND       # P3: balance sheet / cash bridge / P/E / scenarios
+import narrative_extras as NX         # fraud breakdown, guidance, NSE filings (2026-10-18)
 
 IDX = "company_repo/_index"
 FUND = "fundamentals"
@@ -150,6 +151,7 @@ class Pack:
         self.tables: list[dict] = []
         self.as_of = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self.notes: list[str] = []          # data notes printed at the top of the report
+        self.filings: list[dict] = []       # latest NSE filings with PDF text (chapter 6)
 
     def add(self, fid, label, value, unit, basis, section, source,
             computed_from=None) -> str | None:
@@ -189,6 +191,7 @@ class Pack:
                                    for k, v in sorted(UNCOVERED.items())],
             "fact_counts_by_section": dict(sorted(by_sec.items())),
             "data_notes": list(self.notes),
+            "filings": list(self.filings),
         }
 
 
@@ -1341,6 +1344,12 @@ def build(store: Store, token: str, live: bool = True) -> Pack | None:
     cf = store.by_isin("company_facts.parquet", isin, symbol)
     mcap = pd.to_numeric(cf.iloc[0].get("mcap_cr"), errors="coerce") if not cf.empty else None
     ND.build_dynamics(pack, store, st, None if mcap is None or pd.isna(mcap) else float(mcap))
+    # 2026-10-18: the fraud score explained, the latest guidance, the newest filings (orders)
+    NX.fraud_breakdown(pack, store)
+    NX.guidance_facts(pack, store)
+    if live:
+        pack.filings = NX.recent_filings(symbol, log=log)
+        NX.add_filings(pack, pack.filings)
     if live_view:
         # every statements-sourced fact now came from the live page, not the stored file
         live_src = {"kind": "statements", "table": f"screener.in/company/{symbol} (live)",

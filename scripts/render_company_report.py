@@ -42,43 +42,80 @@ from render_narrative_deck import _src_str, _fmt, DISCLAIMER
 
 # (title, story sections, deep-dive keys). Deep-dive keys: "0.n" = Layer 0, "1.n" = Layer 1.
 CHAPTERS: list[tuple[str, list[int], list[str]]] = [
-    ("The business", [2, 9, 6, 10, 12], ["0.1", "0.2", "0.4", "0.5"]),
+    ("The business", [2, 9, 6, 10, 12], ["0.1", "0.2"]),
+    ("Where it sells and to whom — geography and clients", [], []),
+    ("Supply chain — inputs, suppliers and costs", [], ["0.4"]),
+    ("Right to win — technology, approvals, complexity, moat", [], ["0.5"]),
     ("How the business has evolved", [1, 5, 8, 3], []),
-    ("What is changing", [11, 27], ["0.3", "0.6", "0.8"]),
+    ("Recent updates — orders and filings, tested against guidance", [11, 27, 37, 38],
+     ["0.3", "0.6", "0.8"]),
     ("The financial picture — income statement, balance sheet, cash flow",
      [18, 30, 19, 7], ["1.2", "1.3"]),
     ("Can it fund its growth?", [31], ["1.8"]),
-    ("Fraud scan", [], ["1.5", "1.6"]),
-    ("Promoter quality", [4], []),
+    ("Fraud scan — what the score is made of", [36], ["1.5", "1.6"]),
+    ("The auditor's view", [], []),
+    ("What the notes to accounts reveal", [], []),
+    ("Promoter quality and the board", [4], []),
     ("Financial shenanigans check", [], ["1.4"]),
     ("Research, global learnings and management interaction", [14, 16, 17, 20], []),
     ("Industry scenario", [15, 21, 25], ["0.9"]),
+    ("Competitive forces — Porter's five forces", [], ["0.9"]),
     ("Valuation check", [33, 34, 32, 35, 22], []),
     ("Risks — and what could prove this reading wrong", [23, 24], ["0.7"]),
 ]
-# What each chapter covers (the user's list, 2026-10-05). Given to the chapter writer.
+# Which annual-report / call / presentation passages each chapter receives as its own SOURCE
+# DOCUMENTS (narrative_extras.TOPICS); "filings" = the latest NSE filings with their PDF text.
+CHAPTER_TOPICS: list[str | None] = [
+    None, "geo", "supply", "moat", None, "filings", None, None, None, "auditor", "notes",
+    "board", "notes", None, None, "porter", None, None]
+# What each chapter covers (user lists 2026-10-05 and 2026-10-18). Given to the chapter writer.
 CHAPTER_BRIEFS: list[str] = [
     "What the company does and how it makes money: products, customers, markets, plants, "
     "and what drives volume, price and mix.",
+    "Where revenue comes from: domestic versus export, the key countries or regions, and "
+    "who the customers are — named customers, concentration (top customers' share) and "
+    "long-term contracts, as far as the filings disclose them.",
+    "The supply chain: key raw materials and starting materials, where they come from "
+    "(import dependence, China), supplier concentration, how input costs move and whether "
+    "they can be passed on, and inventory or logistics constraints.",
+    "The company's right to win: the technology, chemistry or process complexity it masters, "
+    "regulatory approvals and filings it holds (e.g. USFDA, EU GMP, DMFs, ANDAs), "
+    "certifications, scale or cost position, and what a new competitor would need to copy. "
+    "Name each advantage and the evidence for it; say plainly where the evidence is thin.",
     "How the business has evolved over the years: its eras, how scale, mix and margins "
     "changed, and why.",
-    "What is changing now: capacity and capex, new products or markets, mix shift, "
-    "management's stated plans, and recent filings or news.",
+    "The latest updates, MOST PROMINENTLY any order wins, contracts, approvals or capacity "
+    "milestones in the recent filings: what each is, its type (e.g. CDMO, API supply, "
+    "domestic formulations, devices), customer and value where stated — and test each "
+    "against what management guided on the latest calls (FACT TABLE guidance): does it "
+    "support the guidance, fall short, or say nothing about it?",
     "What the income statement, balance sheet and cash flow look like over the years: "
     "growth, margins, returns, debt, working capital and cash from operations.",
     "Whether growth can be funded internally: tie the three statements together - does cash "
     "from operations cover capex, working capital and dividends, or does it need debt or "
     "new equity?",
-    "Fraud scan: red flags from the fraud tracker, exchange surveillance, auditors and "
-    "governance. If nothing is flagged, say so plainly.",
-    "Promoter quality: holding and pledges, remuneration, related-party dealings, capital "
-    "allocation, and whether management did what it said.",
+    "Fraud scan: explain what the fraud score is made of, component by component (the FACT "
+    "TABLE and the breakdown table): what each check measures, what it found, and which "
+    "checks came back clean. Separate exchange surveillance (about trading) from accounting "
+    "or governance red flags. The reader must be able to judge the number, not just see it.",
+    "The auditor's view: who the statutory auditor is and for how long, the opinion "
+    "(clean, qualified, emphasis of matter), key audit matters, CARO remarks, and any "
+    "auditor change or resignation — from the annual report.",
+    "What the notes to accounts reveal: contingent liabilities, guarantees and commitments, "
+    "related-party transactions, changes in accounting policy, exceptional items, "
+    "impairments or write-offs, and anything that changes how the headline numbers read.",
+    "Promoter quality and the board: holding and pledges, remuneration, related-party "
+    "dealings, capital allocation, whether management did what it said — and the board: "
+    "size, independent and women directors, tenure, meeting attendance, committees.",
     "Financial shenanigans check: cash from operations versus profit, receivable and "
     "inventory days, other income, capitalised costs, one-offs and accounting changes.",
     "What research, global learnings and management interactions add: broker views, lessons "
     "from global peers, and what management said on calls versus what followed.",
     "The industry scenario: demand, pricing, policy, competition and where this company "
     "stands among its peers.",
+    "Porter's five forces for this company's industry, read from the evidence: rivalry, "
+    "threat of new entrants, buyer power, supplier power, threat of substitutes. Rate each "
+    "low / medium / high in `five_forces` with the evidence; this is the author's framework.",
     "Valuation check: today's multiples against the company's own year-end P/E history and "
     "its peers on every lens in the FACT TABLE (P/E, price / sales, price / EBITDA, price / "
     "book), then the bear / base / bull scenarios on each lens: say where each "
@@ -86,11 +123,13 @@ CHAPTER_BRIEFS: list[str] = [
     "company's own record — never call it a forecast or a target.",
     "Risks, and what could prove this reading wrong.",
 ]
+assert len(CHAPTERS) == len(CHAPTER_BRIEFS) == len(CHAPTER_TOPICS)
 # Tables printed INSIDE the flow (they are the chapter's argument); every other table goes
 # to Appendix B so a chapter never turns into a stack of tables.
 EXHIBITS = {"tbl.financials", "tbl.sensitivity_pe", "tbl.said_vs_delivered",
             "tbl.balance_cash", "tbl.cash_bridge", "tbl.pe_history", "tbl.scenarios",
-            "tbl.valuation_lenses", "tbl.scenario_assumptions", "tbl.scenario_lenses"}
+            "tbl.valuation_lenses", "tbl.scenario_assumptions", "tbl.scenario_lenses",
+            "tbl.fraud_breakdown", "tbl.guidance", "tbl.recent_filings"}
 # Deep-dive parts whose TABLES are shown as exhibits in the chaptered report: CFO vs PAT
 # (1.4), the weighted forensic score (1.6), earnings quality (1.8). Labelled as model-
 # extracted, because the deep dive's numbers are not mechanically checked.
@@ -284,23 +323,28 @@ def _plain_notes(text: str) -> str:
     return re.sub(r"[ \t]+\n", "\n", t).strip()
 
 
-def chapter_inputs(pack: dict, forensic_md: str = "", notes_chars: int = 6000) -> list[dict]:
-    """Per chapter: its facts, tables, gaps and deep-dive notes. A chapter with no facts,
-    no tables and no notes is left out HERE, before any model call (empty-chapter rule)."""
+def chapter_inputs(pack: dict, forensic_md: str = "", notes_chars: int = 6000,
+                   topic_sources: dict[str, dict[str, str]] | None = None) -> list[dict]:
+    """Per chapter: its facts, tables, gaps, deep-dive notes and topic passages (its own
+    SOURCE DOCUMENTS). A chapter with none of these is left out HERE, before any model call
+    (empty-chapter rule)."""
     dd = parse_forensic(forensic_md or "")
+    topic_sources = topic_sources or {}
     out = []
-    for n, ((title, secs, ddkeys), brief) in enumerate(zip(CHAPTERS, CHAPTER_BRIEFS), 1):
+    for n, ((title, secs, ddkeys), brief, topic) in enumerate(
+            zip(CHAPTERS, CHAPTER_BRIEFS, CHAPTER_TOPICS), 1):
+        tsrc = topic_sources.get(topic) or {} if topic else {}
         facts = [f for f in pack.get("facts", []) if f.get("section") in secs]
         tables = [t for t in pack.get("tables", []) if t.get("section") in secs]
         notes = "\n\n".join(_plain_notes(dd[k]) for k in ddkeys if dd.get(k))[:notes_chars]
         gaps = ([g["reason"] for g in pack.get("coverage_gaps", []) if g["section"] in secs]
                 + [u["reason"] for u in pack.get("uncovered_sections", [])
                    if u["section"] in secs])
-        if not (facts or tables or notes.strip()):
+        if not (facts or tables or notes.strip() or tsrc):
             continue
         out.append({"n": n, "id": f"ch{n}", "title": title, "brief": brief,
                     "sections": secs, "facts": facts, "tables": tables,
-                    "gaps": gaps, "notes": notes})
+                    "gaps": gaps, "notes": notes, "topic": topic, "topic_sources": tsrc})
     return out
 
 
@@ -383,7 +427,11 @@ COL_LABELS = {"revenue": "Revenue", "ebitda_incl_oi": "EBITDA incl. other income
               "exit_pe": "Exit P/E", "implied_mcap_cr": "Implied market cap (Rs Cr)",
               "return_pa_pct": "Return % a year", "lens": "Lens", "today": "Today",
               "low": "Low", "median": "Median", "high": "High", "years": "Years",
-              "multiple": "Multiple used", "ebitda_margin_pct": "EBITDA margin %"}
+              "multiple": "Multiple used", "ebitda_margin_pct": "EBITDA margin %",
+              "check": "Check", "what_it_measures": "What it measures", "reading": "Reading",
+              "status": "Status", "quarter": "Call", "metric": "Metric",
+              "guidance": "Guidance", "horizon": "Horizon", "date": "Date", "kind": "Type",
+              "subject": "What was filed"}
 
 
 def _col_label(c) -> str:
@@ -429,6 +477,13 @@ def render(pack: dict, narrative: dict | None = None, audit: dict | None = None,
             items = [_no_codes(x) for x in story.get(key) or [] if _no_codes(x)]
             if items:
                 front.append(f"**{label}**\n\n" + "\n".join(f"- {x}" for x in items))
+        # The newest business filings up front (user 2026-10-18: a recent order win must not
+        # be buried) — date + the exchange's own subject line; chapter 6 reads them in full.
+        rf = tables.get("tbl.recent_filings") or {}
+        if rf.get("rows"):
+            front.append("**Latest from the company**\n\n" + "\n".join(
+                f"- {r.get('date')} — {_no_codes(str(r.get('subject') or ''))[:170]}"
+                for r in rf["rows"][:3]))
         m = re.search(r"###\s*Forensic Risk View\s*\n(.*?)(?=\n###|\Z)",
                       dd.get("onepager", ""), re.S | re.I)
         if m and m.group(1).strip():
@@ -466,6 +521,19 @@ def render(pack: dict, narrative: dict | None = None, audit: dict | None = None,
             ch = bych.get(n) or {}
             body = _story_block(secs, ch, pack, links, refs) if ch else []
             body = [b for b in body if not re.fullmatch(r"\*\*\s*\*\*", b)]
+            # Key points (user 2026-10-18: "surface the takeaway from each section, it becomes
+            # easier to focus on 1-2 things"): the writer's 1-2 takeaways, boxed at the top.
+            keys = [_no_codes(x) for x in (ch.get("takeaways") or []) if _no_codes(x)][:2]
+            if keys and body:
+                body.insert(0, "> **Key points**\n>\n" + "\n".join(f"> - {k}" for k in keys))
+            forces = [f for f in (ch.get("five_forces") or []) if isinstance(f, dict)
+                      and f.get("force")]
+            if forces and body:
+                body.append("\n".join(
+                    ["**Porter's five forces — the author's reading**", "",
+                     "| Force | Strength | Why |", "| --- | --- | --- |"]
+                    + [f"| {_no_codes(f.get('force'))} | {_no_codes(f.get('strength'))} | "
+                       f"{_no_codes(f.get('why')).replace('|', '/')} |" for f in forces]))
             for s in secs:
                 for tid, t in tables.items():
                     if t.get("section") == s and tid in EXHIBITS and t.get("rows"):

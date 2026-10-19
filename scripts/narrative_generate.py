@@ -244,7 +244,11 @@ def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
                        "JSON object, with no prose and no markdown fence.")
             continue
 
-        prose = " ".join(str(out.get(k, "")) for k in ("takeaway", "body"))
+        # Everything printed is checked: the key-points box and the five-forces evidence too
+        prose = " ".join([str(out.get(k, "")) for k in ("takeaway", "body")]
+                         + [str(x) for x in (out.get("takeaways") or [])]
+                         + [str(f.get("why", "")) for f in (out.get("five_forces") or [])
+                            if isinstance(f, dict)])
         # Spans are checked FIRST so the ones that verify can license the numbers they
         # contain. A figure quoted from a filing is grounded even when it is not in the
         # computed fact table — but only if the surrounding span provably appears in
@@ -389,12 +393,12 @@ def _storyline(pool, pack: dict, chapters: list[dict], forensic_md: str, log=pri
 
 
 def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
-                    log=print) -> dict:
+                    log=print, topic_sources: dict[str, dict[str, str]] | None = None) -> dict:
     """The merged report's text: storyline + one gated chapter at a time. Chapters with
     nothing to write about are not called at all (render_company_report.chapter_inputs)."""
     import render_company_report as RCR
     pool, models = _writer_pool(log)
-    chapters = RCR.chapter_inputs(pack, forensic_md)
+    chapters = RCR.chapter_inputs(pack, forensic_md, topic_sources=topic_sources)
     cpack = RCR.chapter_pack(pack)
     log(f"  writing {len(chapters)} chapter(s): {[c['n'] for c in chapters]}"
         + (" — with the deep dive as analyst notes" if forensic_md else " — no deep dive"))
@@ -412,6 +416,11 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
     for i, ch in enumerate(chapters):
         p = plan.get(ch["n"], {})
         log(f"  [{i + 1}/{len(chapters)}] chapter {ch['n']}: {ch['title']}")
+        # The shared documents + THIS chapter's passages (auditor, notes, board, filings...).
+        # A passage never replaces a document's full text under the same id.
+        ch_sources = dict(sources)
+        for did, txt in (ch.get("topic_sources") or {}).items():
+            ch_sources.setdefault(did, txt)
         prompt = (tpl
                   .replace("{company}", f"{co['name']} ({co['symbol']} / {co['isin']}) — "
                                         f"an Indian listed company; all figures in Indian "
@@ -427,10 +436,10 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
                            else "(no computed figures for this chapter — write no numbers)")
                   .replace("{tables}", _tables_blob(ch["tables"]))
                   .replace("{notes}", ch["notes"] or "(none)")
-                  .replace("{sources}", _sources_blob(sources)))
+                  .replace("{sources}", _sources_blob(ch_sources)))
         subpack = {"facts": [f for f in cpack["facts"] if f.get("section") == ch["id"]],
                    "tables": [t for t in cpack["tables"] if t.get("section") == ch["id"]]}
-        res = _write_and_gate(pool, prompt, subpack, sources, ch["id"], ch["title"],
+        res = _write_and_gate(pool, prompt, subpack, ch_sources, ch["id"], ch["title"],
                               ch["gaps"], log, label="chapter")
         res.update({"id": ch["id"], "chapter": ch["n"], "sections": ch["sections"]})
         out.append(res)

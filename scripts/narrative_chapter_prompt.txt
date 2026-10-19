@@ -55,6 +55,12 @@ OUTPUT - STRICT JSON, NO MARKDOWN FENCE, NO PROSE OUTSIDE THE JSON
  "claims": [{"text": "<the claim>",
              "source_ref": {"doc_id": "<id from SOURCE DOCUMENTS>",
                             "evidence_span": "<verbatim substring of that document>"}}],
+ "takeaways": ["<the ONE or TWO things a reader must remember from this chapter — short,
+                plain sentences; numbers only from the FACT TABLE>"],
+ "five_forces": [<ONLY when the chapter asks for Porter's five forces, else []:
+                 {"force": "Rivalry | Threat of new entrants | Buyer power | Supplier power |
+                  Threat of substitutes", "strength": "low | medium | high",
+                  "why": "<one sentence of evidence>"}>],
  "counter_argument": "<the strongest honest objection to this chapter's reading, or \"\">",
  "not_disclosed": ["<what a reader would expect here that the record does not contain>"]}
 
@@ -82,5 +88,6 @@ Hand over to the next chapter with: {chapter_hand_off}
 === ANALYST NOTES (forensic deep dive - qualitative guidance only) ===
 {notes}
 
-=== SOURCE DOCUMENTS (for evidence_span; quote verbatim) ===
+=== SOURCE DOCUMENTS (for evidence_span; quote verbatim). Passages from the annual
+report, calls, presentations and recent exchange filings chosen for THIS chapter ===
 {sources}
