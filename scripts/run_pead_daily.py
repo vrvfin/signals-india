@@ -445,6 +445,28 @@ def main() -> None:
               if pf_isins and "isin" in reporters.columns else 0)
     html_b = _email_b_html(reporters, res, pead, sym_map, doc_by, pf_isins)
 
+    # O5 (user 2026-10-18): results vs price reaction over the last few days, so day-3
+    # and day-5 moves exist. A section of mail B, never a reason for it to fail.
+    react_imgs: list = []
+    try:
+        import results_reaction as RX
+        wk = _recent_reporters(res, hours=RX.LOOKBACK_DAYS * 24)
+        if not wk.empty:
+            _pf_wk = pf_isins
+            if not _pf_wk:
+                try:
+                    _pf_wk = {str(i).strip() for i in
+                              (load_portfolio_isins(drive, root_id) or set())}
+                except Exception:                      # noqa: BLE001
+                    _pf_wk = set()
+            if sym_map is None or not sym_map:
+                sym_map = _isin_symbol_map(drive, index_id)
+            react_html, react_imgs = RX.build(drive, root_id, res, wk, sym_map, _pf_wk, log)
+            if react_html and (html_b or "OPPORTUNITY" in react_html or "WARNING" in react_html):
+                html_b = (html_b or "") + react_html
+    except Exception as exc:                           # noqa: BLE001
+        log(f"  results-vs-reaction section FAILED ({type(exc).__name__}: {exc})")
+
     # ---- Email A: tomorrow's announcers, PF holdings first ----
     events = get_results_calendar(args.days_ahead)
     # The PF block is the reason to open this mail, but it must never be the reason the
@@ -477,7 +499,7 @@ def main() -> None:
             subj_b = (f"📊 Results last 24h vs guidance — {n_pf_b} PF holding"
                       f"{'' if n_pf_b == 1 else 's'} — {date.today()}" if n_pf_b
                       else f"📊 Results last 24h vs guidance — {date.today()}")
-            sent += send_email(subj_b, html_b)
+            sent += send_email(subj_b, html_b, inline_images=react_imgs or None)
         else:
             print("pead_guidance mail toggled OFF — skipped.")
     if html_a:
