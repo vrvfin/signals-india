@@ -1134,6 +1134,72 @@ def compute_exits_view(spells: pd.DataFrame, price_cache: dict, drive, ohlcv_id,
     return out[cols].sort_values("opportunity_pp", ascending=False, na_position="last")
 
 
+def sold_strong_flags(relook: pd.DataFrame, results: pd.DataFrame, price_cache: dict,
+                      drive, ohlcv_id, nifty, season_label: str) -> list[dict]:
+    """O8 part 2 (user 2026-10-24): a stock you SOLD that has now reported a STRONG
+    quarter AND made a STRONG move — the same two rules as the results-vs-reaction mail
+    (results_reaction.py, user-approved 2026-10-18): sales, PAT and EPS all > 30% YoY,
+    and the stock beat Nifty by >= +5% on day 1, 3 or 5. Only THIS season's result
+    (`season_label`, e.g. 'Sep 2026'). Display only — pf_exits.parquet is not changed
+    (Tijori Alerts reads it). Any failure -> []."""
+    out = []
+    if relook is None or relook.empty or results is None or results.empty or nifty is None:
+        return out
+    try:
+        import results_reaction as RX
+        need = {"isin", "latest_q", "metric"}
+        if not need <= set(results.columns):
+            return out
+        res = results[results["latest_q"].astype(str) == season_label]
+        for ev in relook.itertuples():
+            g = res[res["isin"].astype(str) == str(ev.isin)]
+            if g.empty:
+                continue
+            sales, pat, eps = (RX.yoy_of(g, "sales", "revenue"), RX.yoy_of(g, "net prof"),
+                               RX.yoy_of(g, "eps"))
+            if not RX.is_strong(sales, pat, eps):
+                continue
+            ts_col = "first_seen_at" if "first_seen_at" in g.columns else "scraped_at"
+            rdt = pd.to_datetime(g[ts_col], errors="coerce").min() if ts_col in g.columns else None
+            ser = load_close_series(drive, ohlcv_id, ev.symbol, price_cache)
+            if ser is None or rdt is None or pd.isna(rdt):
+                continue
+            rel = RX.reaction(ser, nifty, rdt)
+            if not rel or max(rel.values()) < RX.STRONG_MOVE:
+                continue
+            best = max(rel, key=lambda k: rel[k])
+            out.append({"symbol": ev.symbol, "sell_date": str(ev.sell_date)[:10],
+                        "weight_at_sell": ev.weight_at_sell, "sales": sales, "pat": pat,
+                        "eps": eps, "rel": rel, "best_day": best,
+                        "result_dt": str(pd.Timestamp(rdt).date())})
+    except Exception as e:                                   # noqa: BLE001
+        log(f"  sold-stock strong-results flag skipped ({str(e)[:70]})")
+        return []
+    return out
+
+
+def sold_strong_html(flags: list[dict]) -> str:
+    """The box above the relook table; '' when nothing qualifies. Pure."""
+    if not flags:
+        return ""
+    lis = []
+    for f in flags:
+        wt = ("" if f["weight_at_sell"] is None or pd.isna(f["weight_at_sell"])
+              else f" at {f['weight_at_sell']:.1f}%")
+        lis.append(
+            f"<li style='margin:2px 0'><b>{esc(f['symbol'])}</b> — sold {esc(f['sell_date'])}"
+            f"{wt}. Result {esc(f['result_dt'])}: sales {_pct(f['sales'])}, PAT "
+            f"{_pct(f['pat'])}, EPS {_pct(f['eps'])}; stock "
+            f"<b style='color:#1a7a3c'>{f['rel'][f['best_day']]:+.1f}% vs Nifty</b> by day "
+            f"{f['best_day']}.</li>")
+    return ("<div style='border:1px solid #f0d9a0;background:#fff8e6;padding:6px 10px;"
+            "margin:6px 0;font-size:12.5px'><b>&#128269; Sold, but now strong — worth a "
+            "relook</b><div style='color:#666;font-size:11.5px'>Strong results = sales, PAT "
+            "and EPS all &gt; 30% YoY this quarter; strong chart = beat Nifty by &ge; +5% "
+            "within 5 trading days of the result.</div>"
+            f"<ul style='margin:4px 0 0 18px;padding:0'>{''.join(lis)}</ul></div>")
+
+
 # ── Monthly cohorts: the frozen-basket counterfactual ────────────────────────
 
 def build_cohorts(snaps: pd.DataFrame, cohorts: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
@@ -1286,7 +1352,7 @@ def shrink_html(html: str) -> str:
 
 
 def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,
-               hold=None, matched=None, cohort_ret=None):
+               hold=None, matched=None, cohort_ret=None, sold_flags=None):
     H = []
     H.append(f"<h2 style='margin:0'>PF Decision Tracker — {asof}</h2>")
     H.append(f"<p style='color:#666;margin:2px 0 14px'>{len(pf)} holdings · "
@@ -1602,6 +1668,7 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
         cost = relook["opportunity_pp"].dropna()
         net = float(cost.sum()) if len(cost) else None
         H.append("<h3>7 · Relook: stocks you sold — what if you hadn't?</h3>")
+        H.append(sold_strong_html(sold_flags or []))
         H.append(
             "<p style='color:#888;font-size:12px'>Selling didn't park the money — it went "
             "back into this book. So each exit is judged against <b>your own PF</b> over the "
@@ -1926,8 +1993,20 @@ def main() -> None:
             "/ pf_exits / pf_spells / pf_cohort_returns.")
 
     # 6. Digest (HTML findings) + Excel workbook (detailed tables).
+    sold_flags = []
+    try:
+        import quarterly_table as _QT
+        import redflag_register as _RR
+        _pe = _RR.period_end(_QT.season_quarter())
+        sold_flags = sold_strong_flags(relook, results, price_cache, drive, ohlcv_id,
+                                       load_benchmark(drive, root_id, "NIFTY_50"),
+                                       _pe.strftime("%b %Y") if _pe else "")
+        log(f"  sold-stock relook: {len(sold_flags)} sold name(s) with strong results "
+            f"+ strong chart")
+    except Exception as e:                                   # noqa: BLE001
+        log(f"  sold-stock strong flag unavailable ({str(e)[:70]})")
     html = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook,
-                      decs, hold, matched, cohort_ret)
+                      decs, hold, matched, cohort_ret, sold_flags=sold_flags)
     # Gmail clips a message body past ~102 KB — surface the size instead of finding
     # out from a truncated mail.
     kb = len(html.encode("utf-8")) / 1024.0
@@ -1964,5 +2043,45 @@ def main() -> None:
     log("Done.")
 
 
+def _self_test() -> int:
+    """Sold-stock strong-results flag (O8 part 2) — prices injected via the cache."""
+    ok = fail = 0
+
+    def check(name, cond):
+        nonlocal ok, fail
+        ok, fail = (ok + 1, fail) if cond else (ok, fail + 1)
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+
+    d = pd.bdate_range("2026-10-12", periods=8)
+    nifty = pd.Series([100.0] * 8, index=d)
+    cache = {"WIN": pd.Series([100, 100, 100, 103, 107, 109, 110, 111], index=d, dtype=float),
+             "FLAT": pd.Series([100.0] * 8, index=d),
+             "WEAK": pd.Series([100, 100, 100, 110, 112, 113, 114, 115], index=d, dtype=float)}
+
+    def rr(isin, s, p, e):
+        return [{"isin": isin, "latest_q": "Sep 2026", "metric": m, "yoy_pct": v,
+                 "first_seen_at": str(d[2].date())}
+                for m, v in (("Sales", s), ("Net Profit", p), ("EPS in Rs", e))]
+    res = pd.DataFrame(rr("I1", 45, 60, 58) + rr("I2", 45, 60, 58) + rr("I3", 10, 5, 5))
+    relook = pd.DataFrame([
+        {"symbol": "WIN", "isin": "I1", "sell_date": "2026-05-01", "weight_at_sell": 2.5},
+        {"symbol": "FLAT", "isin": "I2", "sell_date": "2026-06-01", "weight_at_sell": 1.0},
+        {"symbol": "WEAK", "isin": "I3", "sell_date": "2026-07-01", "weight_at_sell": 1.0}])
+    fl = sold_strong_flags(relook, res, cache, None, None, nifty, "Sep 2026")
+    check("strong results + strong move -> flagged", [f["symbol"] for f in fl] == ["WIN"])
+    check("best day reported (day 5: 111 vs 100 = +11% vs Nifty)", fl and fl[0]["best_day"] == 5
+          and round(fl[0]["rel"][5]) == 11)
+    check("other season's result ignored",
+          sold_strong_flags(relook, res, cache, None, None, nifty, "Jun 2026") == [])
+    html = sold_strong_html(fl)
+    check("box names the stock, sale and the move", all(x in html for x in (
+        "WIN", "2026-05-01", "vs Nifty", "day 5")))
+    check("nothing qualifies -> no box", sold_strong_html([]) == "")
+    print(f"\npf_decision_tracker self-test: {ok} passed, {fail} failed")
+    return 1 if fail else 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(_self_test())
     main()
