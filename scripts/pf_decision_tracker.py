@@ -65,6 +65,10 @@ HORIZONS_M = [1, 2, 3, 6, 12]                # decision-scoring windows (months)
 FEAT_RET_COLS = {m: f"return_{lbl}_pct"
                  for m, lbl in {1: "1m", 2: "2m", 3: "3m", 6: "6m", 12: "12m"}.items()}
 LOCAL_OUT = Path(r"D:\EMA_Screener\Reports\signals-india\pf_tracker")   # dry-run preview
+# Review week from 2026-10-24 (user): send the full mail AND a trimmed copy. Set False
+# (or drop one) once the user has chosen.
+SEND_TRIMMED_COPY = True
+TRIMMED_RELOOK = 10        # trimmed copy: 10 costliest + 10 best exits (proposed, under review)
 
 # Output-ledger schemas (additive; stored in company_repo/_index/pf_tracker/).
 SNAP_COLS  = ["snapshot_date", "isin", "symbol", "name", "weight_pct", "source_file"]
@@ -1351,8 +1355,21 @@ def shrink_html(html: str) -> str:
     return html.replace("<td >", "<td>").replace("<th >", "<th>")
 
 
+def trim_relook(relook: pd.DataFrame, limit: int | None) -> tuple[pd.DataFrame, int]:
+    """(rows to show, rows hidden). None = all rows (the full mail). Otherwise the
+    `limit` costliest exits and the `limit` that saved the most, in cost order. Pure."""
+    if relook is None or relook.empty or limit is None or len(relook) <= 2 * limit:
+        return relook, 0
+    r = relook.sort_values("opportunity_pp", ascending=False, na_position="last")
+    known = r[r["opportunity_pp"].notna()]
+    keep = pd.concat([known.head(limit), known.tail(limit)])
+    keep = keep[~keep.index.duplicated()].sort_values("opportunity_pp", ascending=False)
+    return keep, len(relook) - len(keep)
+
+
 def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, decs,
-               hold=None, matched=None, cohort_ret=None, sold_flags=None):
+               hold=None, matched=None, cohort_ret=None, sold_flags=None,
+               relook_limit=None):
     H = []
     H.append(f"<h2 style='margin:0'>PF Decision Tracker — {asof}</h2>")
     H.append(f"<p style='color:#666;margin:2px 0 14px'>{len(pf)} holdings · "
@@ -1691,7 +1708,8 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                  "<th style='padding:2px 8px'>Your PF</th><th style='padding:2px 8px'>Idx</th>"
                  "<th style='padding:2px 8px'>Cost</th><th style='padding:2px 8px'>Held on</th>"
                  "<th style='padding:2px 8px'>YoY</th><th align='left'>Verdict</th></tr>")
-        for r in relook.itertuples():
+        _shown, _hidden = trim_relook(relook, relook_limit)
+        for r in _shown.itertuples():
             cc = "#c0392b" if (pd.notna(r.opportunity_pp) and r.opportunity_pp > 0) else "#1a7a3c"
             H.append(
                 f"<tr><td>{esc(r.symbol)}</td>"
@@ -1713,6 +1731,11 @@ def build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook, dec
                 f"{_pct(r.latest_yoy_pct)}</td>"
                 f"<td style='padding:2px 8px'>{esc(r.verdict)}</td></tr>")
         H.append("</table>")
+        if _hidden:
+            H.append(f"<p style='color:#888;font-size:12px;margin:4px 0'>Showing the "
+                     f"{relook_limit} costliest and the {relook_limit} best exits. "
+                     f"<b>{_hidden} more</b> are in the attached Excel (sheet "
+                     f"<i>Exits</i>); the net figure above covers all {len(relook)}.</p>")
 
     # 8) Monthly cohorts — has trading beaten leaving the book alone?
     if cohort_ret is not None and not cohort_ret.empty:
@@ -2024,9 +2047,24 @@ def main() -> None:
     xlsx_name = f"pf_tracker_{asof}.xlsx"
     XLSX_MIME = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+    # Review week (user 2026-10-24: "full mail and trimmed mail ... review it for a
+    # week"): the full mail is sent unchanged AND a trimmed copy whose sold-stock
+    # relook table shows only the TRIMMED_RELOOK costliest + best exits (that table was
+    # 70 of the 109 KB, past Gmail's ~102 KB clip). After the review, keep one.
+    html_trim = None
+    if SEND_TRIMMED_COPY:
+        html_trim = build_html(asof, wcol, pf, idx, periods, contrib, movers, score, relook,
+                               decs, hold, matched, cohort_ret, sold_flags=sold_flags,
+                               relook_limit=TRIMMED_RELOOK)
+        log(f"  trimmed copy {len(html_trim.encode('utf-8')) / 1024.0:.1f} KB "
+            f"(relook capped at {TRIMMED_RELOOK}+{TRIMMED_RELOOK})")
+
     if dry:
         LOCAL_OUT.mkdir(parents=True, exist_ok=True)
         (LOCAL_OUT / f"pf_tracker_preview_{asof}.html").write_text(html, encoding="utf-8")
+        if html_trim:
+            (LOCAL_OUT / f"pf_tracker_preview_{asof}_trimmed.html").write_text(
+                html_trim, encoding="utf-8")
         (LOCAL_OUT / xlsx_name).write_bytes(xlsx)
         log(f"[DRY-RUN] preview HTML + {xlsx_name} -> {LOCAL_OUT}")
         log(f"[DRY-RUN] index rows={len(idx)} decisions={len(decs)} "
@@ -2040,6 +2078,9 @@ def main() -> None:
         log(f"Mail '{MAIL_KEY}' toggled OFF — not sending.")
         return
     send_email(subject, html, attachments=[(xlsx_name, xlsx, XLSX_MIME)])
+    if html_trim:
+        send_email("✂ TRIMMED · " + subject, html_trim,
+                   attachments=[(xlsx_name, xlsx, XLSX_MIME)])
     log("Done.")
 
 
@@ -2077,6 +2118,13 @@ def _self_test() -> int:
     check("box names the stock, sale and the move", all(x in html for x in (
         "WIN", "2026-05-01", "vs Nifty", "day 5")))
     check("nothing qualifies -> no box", sold_strong_html([]) == "")
+    rl = pd.DataFrame({"symbol": [f"S{i}" for i in range(30)],
+                       "opportunity_pp": [float(i - 15) for i in range(30)]})
+    shown, hidden = trim_relook(rl, 10)
+    check("trim: 10 costliest + 10 best, 10 hidden", len(shown) == 20 and hidden == 10
+          and shown["opportunity_pp"].max() == 14 and shown["opportunity_pp"].min() == -15)
+    check("trim: None = full table (the full mail)", trim_relook(rl, None) == (rl, 0))
+    check("trim: small table untouched", trim_relook(rl.head(12), 10)[1] == 0)
     print(f"\npf_decision_tracker self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 
