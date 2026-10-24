@@ -249,7 +249,33 @@ def apply_unit_check(found: dict[str, dict], refs: dict[str, float], log=None) -
                         if f.get(k2) is not None:
                             f[k2] = f[k2] * factor
                 f[key] = newv
+        margin_check(f, log)
     return found
+
+
+def margin_check(f: dict, log=None) -> dict:
+    """An EBITDA / PAT figure that disagrees with its OWN stated margin by a clean ~10x /
+    ~100x / ~1000x is divided back (2026-10-24, same rule as extract_results.margin_fix).
+    Revenue is the anchor. Anything that is not a clean multiple is left alone. Pure
+    apart from mutating f."""
+    rev = f.get("revenue_cr")
+    if not rev or rev <= 0:
+        return f
+    for absk, pctk in (("pat_cr", "pat_margin_pct"), ("ebitda_cr", "ebitda_margin_pct")):
+        v, pct = f.get(absk), f.get(pctk)
+        if v is None or pct is None or abs(pct) < 0.5:
+            continue
+        ratio = (v / rev * 100.0) / pct
+        for k in (10.0, 100.0, 1000.0):
+            if 0.8 <= ratio / k <= 1.25:
+                f[absk] = v / k
+                f["units_note"] = (f.get("units_note", "") + f" {absk} ÷{k:g} (vs its "
+                                   f"{pct:g}% margin)").strip()
+                if log:
+                    log(f"  units: {f.get('symbol')} {absk} {v:g} -> {v / k:g} "
+                        f"(disagreed with its own {pct:g}% margin)")
+                break
+    return f
 
 
 def quarter_end(q) -> str:
@@ -461,6 +487,13 @@ def _self_test() -> int:
           "SYRMA" not in set(drop_impossible_quarters(dq, None)["symbol"]))
     check("empty frame passes through", drop_impossible_quarters(pd.DataFrame(), qq).empty)
 
+    mf = margin_check({"symbol": "X", "revenue_cr": 217.32, "pat_cr": 153.87,
+                       "pat_margin_pct": 7.08, "ebitda_cr": 39.74, "ebitda_margin_pct": 18.30})
+    check("margin check: lone 10x PAT divided back, consistent EBITDA kept",
+          abs(mf["pat_cr"] - 15.387) < 0.01 and mf["ebitda_cr"] == 39.74)
+    mo = margin_check({"symbol": "T", "revenue_cr": 217.32, "pat_cr": 214.51,
+                       "pat_margin_pct": 7.08})
+    check("margin check: not a clean multiple -> untouched", mo["pat_cr"] == 214.51)
     print(f"\nfiling_results self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 

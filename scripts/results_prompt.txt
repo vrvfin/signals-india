@@ -11,16 +11,26 @@ Scan the document to identify the reporting quarter and fiscal year (e.g., Q4 FY
 Use this as [QuarterYear] in the table header below.
 Also identify the prior year same quarter as [PriorYearQuarter] (e.g., Q4 FY25 for Q4 FY26).
 
+[UNITS — COPY, DO NOT CONVERT]
+Indian filings print amounts in different scales: "₹ in Crore", "₹ in Lakhs", "₹ in Million",
+"₹ in Thousands". Find the scale the filing states for its amounts and write it on its own line,
+exactly one of: [Unit] Crore | [Unit] Lakh | [Unit] Million | [Unit] Billion | [Unit] Thousand
+Copy every Revenue / EBITDA / PAT figure EXACTLY as printed in that scale. NEVER convert
+between scales and NEVER assume crore — the pipeline converts. If no scale is stated, write
+[Unit] Unknown.
+
 [OUTPUT SPECIFICATION]
 
 Financial Summary Table
 Create a pipe-separated markdown table exactly matching this column structure.
 Replace [QuarterYear] and [PriorYearQuarter] with the actual values identified above:
 
+[Unit] <the filing's scale>
+
 Metric | [QuarterYear] | [PriorYearQuarter] | YoY%
-Revenue (Cr) | | |
-EBITDA (Cr) | | |
-PAT (Cr) | | |
+Revenue | | |
+EBITDA | | |
+PAT | | |
 EPS (Rs) | | |
 EBITDA Margin % | | |
 PAT Margin % | | |
