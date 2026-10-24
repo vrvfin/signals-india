@@ -20,6 +20,8 @@ from __future__ import annotations
 import html as _html
 import sys
 
+import numpy as np
+
 import pandas as pd
 
 STRONG_YOY = 30.0          # user 2026-10-18: > 30% YoY on sales, PAT AND EPS
@@ -155,6 +157,96 @@ def section_html(rows: list[dict], chart_tags: dict | None = None) -> str:
 
 MAX_CHARTS = 4
 
+# ---- O7 fresh winners (user 2026-10-24: "build the mail as a section") ----------------
+# The SAME technical test the backtest ran (guru/fresh_winners_backtest.technical_flags),
+# imported, not copied, so the live rule is the tested rule.
+FW_WINDOW = 3              # trigger on one of the first 3 trading days from the result
+FW_RECENT = 3              # listed while the result is within the last 3 trading days
+FW_MIN_TURNOVER_CR = 1.0   # the backtest's liquidity floor (Guru daily screen's)
+FW_CHARTS = 4
+FW_RECORD = ("Backtest 2008-2026, 4,354 companies, 1,070 liquid trades: 3-month hit rate "
+             "62.6%, median +6.7% (+4.1% vs Nifty); out of sample (2023+) 63.1% / +7.2%; "
+             "worst 10% of trades about -20%. Strong results alone: 54.7% / +2.5%. "
+             "Before costs. Entry = next day's open.")
+
+
+def _fw_flags():
+    import os as _os
+    gdir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "guru")
+    if gdir not in sys.path:
+        sys.path.insert(0, gdir)
+    import fresh_winners_backtest as FW
+    return FW.technical_flags
+
+
+def pat_base_positive(comp_rows: pd.DataFrame) -> bool:
+    """Year-ago PAT > 0 (a loss turning into a profit is not 'growth' - backtest rule).
+    Unknown year-ago value -> True only when Screener itself gave a YoY. Pure."""
+    if comp_rows is None or comp_rows.empty:
+        return False
+    hit = comp_rows[comp_rows["metric"].astype(str).str.lower().str.contains("net prof", na=False)]
+    if hit.empty:
+        return False
+    yv = pd.to_numeric(hit.iloc[0].get("yearago_val"), errors="coerce")
+    if pd.notna(yv):
+        return bool(yv > 0)
+    return pd.notna(pd.to_numeric(hit.iloc[0].get("yoy_pct"), errors="coerce"))
+
+
+def fresh_trigger(px: pd.DataFrame, result_dt, technical_flags) -> dict | None:
+    """{'which', 'trigger_date', 'turnover_cr'} when the chart confirmed on one of the first
+    FW_WINDOW trading days from the result AND the result is within the last FW_RECENT
+    trading days of the price file; else None. Pure."""
+    if px is None or getattr(px, "empty", True) or result_dt is None:
+        return None
+    f = technical_flags(px[["date", "open", "high", "low", "close", "volume"]].copy())
+    dates = pd.to_datetime(f["date"]).values
+    i0 = int(np.searchsorted(dates, np.datetime64(pd.Timestamp(result_dt).normalize())))
+    if i0 >= len(f) or i0 < len(f) - FW_RECENT:
+        return None
+    for k in range(i0, min(i0 + FW_WINDOW, len(f))):
+        a, b = bool(f["A"].iat[k]), bool(f["B"].iat[k])
+        if a or b:
+            return {"which": "52-week high + base breakout" if a and b else
+                    "new 52-week high" if a else "60-day base breakout on 2x volume",
+                    "trigger_date": str(pd.Timestamp(dates[k]).date()),
+                    "turnover_cr": float(f["turnover_cr"].iat[k])
+                    if pd.notna(f["turnover_cr"].iat[k]) else None}
+    return None
+
+
+def fresh_html(winners: list[dict], chart_tags: dict | None = None) -> str:
+    """The 'Fresh winners' section; '' when there are none. Pure."""
+    if not winners:
+        return ""
+    chart_tags = chart_tags or {}
+    winners = sorted(winners, key=lambda r: (not r["pf"], r["sym"]))
+    th = "".join(f"<th style='padding:3px 6px;text-align:left'>{h}</th>" for h in (
+        "Stock", "Result", "Sales", "PAT", "EPS", "Chart signal", "On"))
+    trs, charts = [], []
+    for r in winners:
+        pf = (" <span style='background:#1f4d6b;color:#fff;border-radius:3px;"
+              "padding:0 4px;font-size:10px'>PF</span>" if r["pf"] else "")
+        cells = [f"<b>{_html.escape(r['sym'])}</b>{pf}<br><span style='color:#777;"
+                 f"font-size:11px'>{_html.escape(str(r['name'])[:30])}</span>",
+                 _html.escape(str(r["result_dt"])[:10]), _pct(r["sales"]), _pct(r["pat"]),
+                 _pct(r["eps"]), _html.escape(r["fresh"]["which"]),
+                 _html.escape(r["fresh"]["trigger_date"])]
+        trs.append("<tr>" + "".join(f"<td style='padding:3px 6px;border-top:1px solid #eee;"
+                                    f"font-size:12px'>{c}</td>" for c in cells) + "</tr>")
+        if r["sym"] in chart_tags:
+            charts.append(chart_tags[r["sym"]])
+    return (f"<h3 style='margin:16px 0 4px;font-size:15px'>&#127942; Fresh winners "
+            f"({len(winners)})</h3>"
+            f"<div style='font-size:12px;color:#555;margin-bottom:6px'>Strong results (sales, "
+            f"PAT and EPS all &gt; {STRONG_YOY:.0f}% YoY, profitable a year ago) AND, within "
+            f"{FW_WINDOW} trading days of the result, a new 52-week high or a close above the "
+            f"60-day high on &ge; 2x volume. Liquid names only (&ge; Rs "
+            f"{FW_MIN_TURNOVER_CR:g} cr/day). <i>{_html.escape(FW_RECORD)}</i></div>"
+            "<table cellspacing='0' style='border-collapse:collapse'>"
+            f"<tr style='background:#f4f6f8;font-size:12px'>{th}</tr>{''.join(trs)}</table>"
+            + "".join(charts))
+
 
 def build(drive, root_id: str, res: pd.DataFrame, reporters: pd.DataFrame,
           sym_map: dict, pf_isins: set, log=print) -> tuple[str, list]:
@@ -175,6 +267,11 @@ def build(drive, root_id: str, res: pd.DataFrame, reporters: pd.DataFrame,
         log("  reaction: no Nifty series — section skipped")
         return "", []
     rows, frames = [], {}
+    try:
+        _tf = _fw_flags()
+    except Exception as e:                                   # noqa: BLE001
+        _tf = None
+        log(f"  fresh winners: backtest rule unavailable ({str(e)[:60]})")
     for _, rep in reporters.iterrows():
         isin = str(rep.get("isin", ""))
         sym = sym_map.get(isin) or str(rep.get("slug", "")) or isin
@@ -189,10 +286,18 @@ def build(drive, root_id: str, res: pd.DataFrame, reporters: pd.DataFrame,
         except Exception:                                    # noqa: BLE001
             px = None
         rel = reaction(_closes(px), nifty, rep.get("result_dt"))
+        fresh = None
+        if strong and _tf is not None and pat_base_positive(comp):
+            try:
+                fresh = fresh_trigger(px, rep.get("result_dt"), _tf)
+            except Exception:                                # noqa: BLE001
+                fresh = None
+            if fresh and (fresh["turnover_cr"] or 0) < FW_MIN_TURNOVER_CR:
+                fresh = None
         rows.append({"sym": sym, "name": rep.get("company_name", ""), "qtr": rep.get("latest_q", ""),
                      "result_dt": rep.get("result_dt"), "sales": sales, "pat": pat, "eps": eps,
                      "strong": strong, "rel": rel, "flag": flag(strong, rel),
-                     "pf": isin in pf_isins})
+                     "pf": isin in pf_isins, "fresh": fresh})
         if px is not None:
             frames[sym] = (px, rep.get("result_dt"))
     images, tags = [], {}
@@ -211,10 +316,26 @@ def build(drive, root_id: str, res: pd.DataFrame, reporters: pd.DataFrame,
                 tags[r["sym"]] = mail_chart.img_tag(cid, r["sym"], width=560)
     except Exception as e:                                   # noqa: BLE001
         log(f"  reaction: charts skipped ({str(e)[:60]})")
+    winners = [r for r in rows if r.get("fresh")]
+    ftags = {}
+    try:
+        import mail_chart
+        for r in sorted(winners, key=lambda r: (not r["pf"], r["sym"]))[:FW_CHARTS]:
+            px, rd = frames.get(r["sym"], (None, None))
+            if px is None:
+                continue
+            png = mail_chart.render_png(px, f"{r['sym']} - fresh winner", days=250,
+                                        markers=[(str(pd.Timestamp(rd).date()), "result", "#8e44ad")])
+            if png:
+                cid = f"fresh_{r['sym']}"
+                images.append((cid, png))
+                ftags[r["sym"]] = mail_chart.img_tag(cid, r["sym"], width=560)
+    except Exception as e:                                   # noqa: BLE001
+        log(f"  fresh winners: charts skipped ({str(e)[:60]})")
     n_flag = sum(1 for r in rows if r["flag"])
     log(f"  reaction: {len(rows)} reporter(s), {sum(r['strong'] for r in rows)} strong, "
-        f"{n_flag} flagged, {len(images)} chart(s)")
-    return section_html(rows, tags), images
+        f"{n_flag} flagged, {len(winners)} fresh winner(s), {len(images)} chart(s)")
+    return fresh_html(winners, ftags) + section_html(rows, tags), images
 
 
 def _self_test() -> int:
@@ -251,6 +372,30 @@ def _self_test() -> int:
                           "result_dt": "2026-10-16", "sales": 46.3, "pat": 56.5, "eps": 56,
                           "strong": True, "rel": {1: 1.2}, "flag": "opportunity", "pf": True}])
     check("section shows the flag, PF chip and D1", all(x in html for x in ("OPPORTUNITY", "PF", "+1.2%")))
+    # ---- O7 fresh winners: the live check uses the backtest's own technical test ----
+    tf = _fw_flags()
+    n = 300
+    d = pd.bdate_range("2025-08-01", periods=n)
+    cl = np.full(n, 100.0)
+    cl[-2:] = 130.0                                        # new high on the last 2 days
+    px = pd.DataFrame({"date": d, "open": cl, "high": cl, "low": cl, "close": cl,
+                       "volume": np.full(n, 1e6)})
+    ft = fresh_trigger(px, d[-2], tf)
+    check("fresh: new 52-week high within 3 days of a recent result", ft is not None
+          and "52-week" in ft["which"] and ft["trigger_date"] == str(d[-2].date()))
+    check("fresh: result older than 3 trading days -> not listed",
+          fresh_trigger(px, d[-10], tf) is None)
+    flat = px.assign(close=100.0, open=100.0)
+    check("fresh: no chart signal -> none", fresh_trigger(flat, d[-2], tf) is None)
+    np_rows = pd.DataFrame([{"metric": "Net Profit", "yoy_pct": None, "latest_val": 5,
+                             "yearago_val": -2}])
+    check("fresh: loss a year ago is not growth", not pat_base_positive(np_rows))
+    fh = fresh_html([{"sym": "NETWEB", "name": "Netweb", "result_dt": "2026-10-24",
+                      "sales": 336, "pat": 335, "eps": 314, "pf": False,
+                      "fresh": {"which": "new 52-week high", "trigger_date": "2026-10-26"}}])
+    check("fresh section shows signal, numbers and the backtest record",
+          all(x in fh for x in ("Fresh winners (1)", "new 52-week high", "62.6%", "+336%")))
+    check("no winners -> no section", fresh_html([]) == "")
     print(f"\nresults_reaction self-test: {ok} passed, {fail} failed")
     return 1 if fail else 0
 
