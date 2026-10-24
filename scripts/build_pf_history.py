@@ -208,16 +208,86 @@ def _pc(x, nd=1):
     return "—" if x is None or pd.isna(x) else f"{x * 100:+.{nd}f}%"
 
 
+# ── odds vocabulary (user-approved 2026-10-20) ──────────────────────────────
+# Shown horizons: 1 month (20 trading days) and 3 months (60). The 5-day view is
+# still computed but not shown — mostly noise. A probability is ALWAYS written
+# "higher X of N times (P%)"; a price move is ALWAYS labelled "price change".
+SHOW_H = (20, 60)
+H_WORD = {20: "1 month later", 60: "3 months later"}
+HIGH_P, LOW_P, DECIDE_N = 75, 25, 10     # HIGH/LOW odds need >= DECIDE_N past cases
+
+
+def _odds(fwd, h):
+    """{label, k, n, p, median, worst} for one horizon. label is HIGH, LOW,
+    coin flip, leaning up, leaning down, few (n < THIN_N) or none."""
+    s = (fwd or {}).get(h) or {}
+    n = int(s.get("n") or 0)
+    if n == 0:
+        return {"label": "none", "n": 0}
+    p = float(s["pct_up"])
+    o = {"n": n, "p": p, "k": int(round(p * n / 100)), "median": s["median"],
+         "worst": s["worst"]}
+    if n < T.THIN_N:
+        o["label"] = "few"
+    elif n >= DECIDE_N and p >= HIGH_P:
+        o["label"] = "HIGH"
+    elif n >= DECIDE_N and p <= LOW_P:
+        o["label"] = "LOW"
+    elif 40 <= p <= 60:
+        o["label"] = "coin flip"
+    else:
+        o["label"] = "leaning up" if p > 60 else "leaning down"
+    return o
+
+
+_BADGE = {"HIGH": ('<span style="background:#1a7a3a;color:#fff;padding:0 6px;'
+                   'border-radius:4px;font-weight:800">🟢 HIGH ODDS of a rise</span>'),
+          "LOW": ('<span style="background:#c0392b;color:#fff;padding:0 6px;'
+                  'border-radius:4px;font-weight:800">🔴 LOW ODDS of a rise</span>')}
+
+
+def _odds_html(o):
+    if o["label"] == "none":
+        return "no past outcome yet"
+    if o["label"] == "few":
+        return f"too few past cases ({o['n']}) to judge"
+    word = _BADGE.get(o["label"]) or f"<i>{o['label']}</i>"
+    few = (f" <span style='color:#888'>(only {o['n']} cases)</span>"
+           if o["n"] < DECIDE_N and o["p"] >= HIGH_P or o["n"] < DECIDE_N and o["p"] <= LOW_P else "")
+    return (f"higher <b>{o['k']} of {o['n']} times ({o['p']:.0f}%)</b> {word}{few}"
+            f" · typical price change <b>{_pc(o['median'])}</b>"
+            f" · worst {_pc(o['worst'], 0)}")
+
+
+def _odds_lines(fwd):
+    return "".join(f'<div style="margin-left:14px"><b>{H_WORD[h]}:</b> '
+                   f'{_odds_html(_odds(fwd, h))}</div>' for h in SHOW_H)
+
+
 def _fwd_txt(fwd):
-    bits = []
-    for h in T.HORIZONS:
-        s = fwd.get(h) or {}
-        if not s.get("n"):
-            bits.append(f"{h}d: no outcome yet")
-            continue
-        bits.append(f"{h}d {_pc(s['median'])} median, up {s['pct_up']:.0f}% of the "
-                    f"time, worst {_pc(s['worst'], 0)} (n={s['n']})")
-    return " · ".join(bits)
+    """Plain-text odds, for --dry-run."""
+    out = []
+    for h in SHOW_H:
+        o = _odds(fwd, h)
+        if o["label"] in ("none", "few"):
+            out.append(f"{H_WORD[h]}: {'no outcome yet' if o['label'] == 'none' else 'too few cases (' + str(o['n']) + ')'}")
+        else:
+            out.append(f"{H_WORD[h]}: higher {o['k']} of {o['n']} times ({o['p']:.0f}%) "
+                       f"[{o['label']}], typical price change {_pc(o['median'])}, "
+                       f"worst {_pc(o['worst'], 0)}")
+    return " | ".join(out)
+
+
+def _rarity(f):
+    """'longest ever' / 'rare — more extreme than 96% of its past days' / 'normal'."""
+    if f.get("longer_before") == 0 and f.get("n") == 0:
+        return "<b>longest ever</b> for this stock"
+    p = f.get("pct")
+    if p is None:
+        return ""
+    e = max(p, 100 - p)
+    return (f"<b>rare</b>: more extreme than {e:.0f}% of its past days" if e >= 90
+            else "within this stock's normal range")
 
 
 def _pct_word(p):
@@ -329,6 +399,101 @@ def _box(title, color, body, bg):
             f'margin:4px 0;{_CSS}"><b style="color:{color}">{title}</b>{body}</div>')
 
 
+# ── the card's "story": the facts that matter today, as tracked items ────────
+def _labels(fwd):
+    return "|".join(_odds(fwd, h)["label"] for h in SHOW_H)
+
+
+def _ago(n):
+    return "today" if n == 0 else "1 session ago" if n == 1 else f"{n} sessions ago"
+
+
+def story_items(a):
+    """[{key, sig, desc, kind, side, fwd, ...}] — what the card says today.
+    `sig` is what must stay the same for the story to count as unchanged: the
+    odds LABELS (not the exact %), the quadrant word, the stage word."""
+    items = []
+    for f in a["unusual"]:
+        p = f.get("pct")
+        record = f.get("longer_before") == 0 and f.get("n") == 0
+        if record or (p is not None and (p >= 90 or p <= 10)):
+            items.append({"key": f"fact:{f['key']}", "sig": _labels(f["fwd"]),
+                          "desc": f["text"], "kind": "fact", "side": f.get("side"),
+                          "fwd": f["fwd"], "rarity": _rarity(f), "f": f})
+    for f in a["pat"]["fired"]:
+        items.append({"key": f"pat:{f['key']}:{f['date']}", "sig": _labels(f["fwd"]),
+                      "desc": f"{PATTERN_NAME[f['key']]} ({_ago(f['bars_ago'])})",
+                      "kind": "pattern", "side": f["side"], "fwd": f["fwd"],
+                      "rarity": f"done {f['n']} times before", "f": f})
+    for r in a["rel"]:
+        if r.get("quadrant"):
+            items.append({"key": f"quad:{r['label']}", "sig": r["quadrant"],
+                          "desc": f"vs {r['label']}: {r['quadrant']}", "kind": "rs"})
+        for hl, word in (("rs_52w_high", "HIGH"), ("rs_52w_low", "LOW")):
+            if r.get(hl):
+                items.append({"key": f"rs:{r['label']}:{hl}", "sig": "1", "kind": "rs",
+                              "desc": f"strength vs {r['label']} at a 52-week {word}",
+                              "side": "bull" if word == "HIGH" else "bear"})
+    if a["pat"].get("stage"):
+        items.append({"key": "stage", "sig": a["pat"]["stage"], "desc": a["pat"]["stage"],
+                      "kind": "stage"})
+    return items
+
+
+def decide_lines(items):
+    """Facts/patterns whose 1- or 3-month odds are HIGH or LOW (>= DECIDE_N cases)."""
+    out = []
+    for it in items:
+        if it["kind"] not in ("fact", "pattern"):
+            continue
+        for h in SHOW_H:
+            o = _odds(it["fwd"], h)
+            if o["label"] not in ("HIGH", "LOW"):
+                continue
+            way = ("odds favour a <b style='color:#1a7a3a'>RISE</b>" if o["label"] == "HIGH"
+                   else "odds favour a <b style='color:#c0392b'>FALL</b>")
+            out.append({"key": it["key"], "label": o["label"], "html":
+                        f"After <b>{it['desc']}</b>, this stock was higher <b>{H_WORD[h]}</b> "
+                        f"in <b>{o['k']} of {o['n']}</b> past cases ({o['p']:.0f}%) — {way}. "
+                        f"Typical price change {_pc(o['median'])}, worst {_pc(o['worst'], 0)}."})
+    return out
+
+
+STATE = os.path.join(ROOT, "guru", "data", "metrics", "pf_history_state.json")
+
+
+def load_state():
+    import json
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {"runs": {}}
+
+
+def save_state(state, data_date, cur):
+    """Keep one snapshot per DATA date (last 15). Re-running on the same data
+    date overwrites that date only, so it keeps comparing with the day before."""
+    import json
+    runs = state.setdefault("runs", {})
+    runs[data_date] = cur
+    for d in sorted(runs)[:-15]:
+        del runs[d]
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=0)
+
+
+def diff_story(prev_card, items):
+    """-> (new_or_changed keys, gone descs). prev_card None = no snapshot."""
+    cur = {it["key"]: it["sig"] for it in items}
+    if prev_card is None:
+        return set(cur), []
+    changed = {k for k, s in cur.items() if k not in prev_card or prev_card[k][0] != s}
+    gone = [v[1] for k, v in prev_card.items() if k not in cur]
+    return changed, gone
+
+
 def html_block(a):
     p, sym = a["pers"], a["sym"]
     yrs = p["years"]
@@ -338,25 +503,62 @@ def html_block(a):
                f'({yrs}y, from {p["first"]}) · <span style="color:#777">{a["note"]}</span>'
                + (f' · <b>{a["seg"]}</b>' if a["seg"] else "") + "</div>")
 
-    # verdict
-    if a["verdict"]:
-        items = "".join(
-            f'<li style="color:{_SIDE.get(v.get("side"))}"><b>'
-            f'{v.get("text") or PATTERN_NAME.get(v["key"], v["key"])}</b>'
-            + (f' — {_pct_word(v.get("pct"))}' if v.get("pct") is not None else "")
-            + (" (longest ever)" if v.get("longer_before") == 0 and v.get("n") == 0
-               else f' (seen {v["n"]}× before{", thin" if v.get("thin") else ""})' if "n" in v else "")
-            + "</li>" for v in a["verdict"])
-        out.append(_box("⚡ What stands out today", "#e65100",
-                        f'<ul style="margin:3px 0 2px 18px;padding:0">{items}</ul>'
-                        f'<div style="{_HOW}">Picked automatically: facts at/beyond the 90th or '
-                        f'10th percentile of this stock\'s own history, patterns that fired in '
-                        f'the last 10 sessions, and a relative-strength line at a 52-week '
-                        f'high/low. Most extreme first, max 3.</div>', "#fff3e0"))
+    items, changed = a["items"], a["changed"]
+    hl = 'class="today" '                             # yellow highlighter (gallery CSS)
+
+    # A) DECIDE — only HIGH/LOW odds with enough past cases
+    if a["decide"]:
+        rows = "".join(f'<li {hl if d["key"] in changed else ""}style="margin:3px 0">'
+                       f'{d["html"]}</li>' for d in a["decide"])
+        out.append(_box("🧭 Decide: the odds are lopsided", "#b71c1c",
+                        f'<ul style="margin:3px 0 2px 18px;padding:0">{rows}</ul>'
+                        f'<div style="{_HOW}">Shown only when this stock\'s own past, in '
+                        f'{DECIDE_N}+ similar cases, went the same way at least {HIGH_P}% of the '
+                        f'time (HIGH) or at most {LOW_P}% (LOW). Past outcomes, not a forecast.'
+                        f'</div>', "#ffebee"))
+
+    # B) WHAT CHANGED since the last snapshot
+    if a.get("first_run"):
+        out.append(f'<div style="{_HOW}">First run of the change tracker: everything is '
+                   f'shown. From the next trading day only changes are highlighted.</div>')
+    elif changed or a["gone"]:
+        lines = [f'<li class="today">{it["desc"]}'
+                 + (" — odds changed" if it["key"] in a.get("sig_changed", set()) else " — new")
+                 + "</li>" for it in items if it["key"] in changed]
+        lines += [f'<li style="color:#777">no longer: {g}</li>' for g in a["gone"]]
+        out.append(_box(f"🔔 Changed since {a['prev_date']}", "#e65100",
+                        f'<ul style="margin:3px 0 2px 18px;padding:0">{"".join(lines)}</ul>',
+                        "#fff8e1"))
+
+    # C) WHAT IT IS DOING NOW — each fact with its 1- and 3-month odds
+    now = [it for it in items if it["kind"] in ("fact", "pattern")]
+    if now:
+        rows = []
+        for it in now:
+            arrow = {"bull": "▲", "bear": "▼"}.get(it.get("side"), "•")
+            rows.append(
+                f'<div {hl if it["key"] in changed else ""}style="margin-top:5px">'
+                f'<b style="color:{_SIDE.get(it.get("side"))}">{arrow} {it["desc"]}</b>'
+                f' — {it["rarity"]}. <span style="color:#555">After the past cases:</span>'
+                f'{_odds_lines(it["fwd"])}'
+                + (f'<div style="margin-left:14px;color:#555">Similar stocks: {it["f"]["peer"]}</div>'
+                   if it["kind"] == "pattern" and it["f"].get("peer") else "")
+                + "</div>")
+        out.append(_box("📍 What it is doing now, and what usually followed", "#0b5394",
+                        "".join(rows) +
+                        f'<div style="{_HOW}">"Higher X of N times" = of the N past times '
+                        f'this stock was in the same situation, X ended higher that many '
+                        f'trading days later (1 month = 20 days, 3 months = 60). "Typical '
+                        f'price change" = the middle outcome. HIGH ≥ {HIGH_P}% and LOW ≤ '
+                        f'{LOW_P}% need {DECIDE_N}+ cases; under {T.THIN_N} cases = too few to '
+                        f'judge.</div>', "#eef4fb"))
     else:
-        out.append(_box("⚡ What stands out today", "#e65100",
-                        " — nothing extreme: every reading is inside this stock's normal range.",
-                        "#fff3e0"))
+        out.append(_box("📍 What it is doing now", "#0b5394",
+                        " — nothing rare and no new pattern: inside its normal range.",
+                        "#eef4fb"))
+
+    out.append('<details style="margin:4px 0"><summary style="cursor:pointer;font-size:12px;'
+               'color:#0b5394">Full detail and how each number is calculated</summary>')
 
     # 2) is now unusual
     if p["bars"] < T.MIN_BARS_HISTORY:
@@ -375,7 +577,7 @@ def html_block(a):
                 + (' <span style="background:#b0bec5;color:#fff;padding:0 5px;border-radius:4px;'
                    'font-size:10px">thin</span>' if f["thin"] and not (f.get("longer_before") == 0 and f["n"] == 0) else "")
                 + (f' · longer only {f["longer_before"]}×' if f.get("longer_before") else "")
-                + f'<div style="{_CSS};margin-left:14px">What happened next: {_fwd_txt(f["fwd"])}</div>'
+                + f'<div style="{_CSS}">After the past cases:{_odds_lines(f["fwd"])}</div>'
                 + f'<div style="{_HOW}">How: {_fact_how(f, yrs)}</div></div>')
         body = "".join(rows) + (
             f'<div style="{_HOW}">🔶 = at or beyond the 90th/10th percentile of its own '
@@ -395,10 +597,10 @@ def html_block(a):
         rows.append(
             f'<div style="margin-top:4px"><b style="color:{_SIDE[f["side"]]}">'
             f'{"▲" if f["side"] == "bull" else "▼"} {PATTERN_NAME[f["key"]]}</b> on {f["date"]} '
-            f'({f["bars_ago"]} sessions ago) · this stock did it <b>{f["n"]}×</b> before'
+            f'({_ago(f["bars_ago"])}) · this stock did it <b>{f["n"]}×</b> before'
             + (' <span style="background:#b0bec5;color:#fff;padding:0 5px;border-radius:4px;'
                'font-size:10px">thin</span>' if f["thin"] else "")
-            + f'<div style="{_CSS};margin-left:14px">What happened next (this stock): {_fwd_txt(f["fwd"])}</div>'
+            + f'<div style="{_CSS}">After the past cases (this stock):{_odds_lines(f["fwd"])}</div>'
             + (f'<div style="{_CSS};margin-left:14px">Similar stocks: {f["peer"]}</div>' if f.get("peer") else "")
             + f'<div style="{_HOW}">Rule: {PATTERN_HOW[f["key"]]}.'
             + (" Similar stocks = every tradable stock (20-day median turnover ≥ ₹1 Cr/day) "
@@ -479,6 +681,9 @@ def html_block(a):
             f'every count. A correction = a fall of 10%+ from a high before a new high; '
             f'recovery = days from its low back to a new high.</div>')
         out.append(_box("1 · How does this stock normally behave?", "#5d4037", body, "#f7f3f0"))
+    out.append("</details>")
+    if a.get("unchanged"):
+        out.append(f'<span class="nochg" data-since="{a["prev_date"]}"></span>')
     return "".join(out)
 
 
@@ -544,12 +749,39 @@ def main():
         if args.dry_run:
             print(text_report(a))
 
-    if args.dry_run:
-        log(f"DRY-RUN — {len(results)} stocks analysed; no page written.")
-        return
+    # ── story + change tracking: compare with the last snapshot of an EARLIER
+    # data date, so re-running on the same day keeps comparing with yesterday
+    lastbars = pd.Series([df["date"].max() for df in joined.values()])
+    data_date = str(lastbars.mode().iloc[0].date()) if len(lastbars) else ""
+    state = load_state()
+    earlier = sorted(d for d in state.get("runs", {}) if d < data_date)
+    prev_date = earlier[-1] if earlier else None
+    prev = state["runs"][prev_date] if prev_date else None
+    snapshot, n_changed = {}, 0
+    for a in results:
+        items = story_items(a)
+        prev_card = None if prev is None else prev.get(a["sym"])
+        changed, gone = diff_story(prev_card, items)
+        a.update(items=items, changed=changed, gone=gone, prev_date=prev_date,
+                 decide=decide_lines(items), first_run=prev is None,
+                 sig_changed={k for k in changed if prev_card and k in prev_card})
+        a["unchanged"] = prev is not None and not changed and not gone
+        n_changed += not a["unchanged"]
+        snapshot[a["sym"]] = {it["key"]: [it["sig"], it["desc"]] for it in items}
+        if args.dry_run:
+            print(f"  -> {a['sym']}: {len(a['decide'])} decide, "
+                  f"{'UNCHANGED' if a['unchanged'] else str(len(changed)) + ' changed, ' + str(len(gone)) + ' gone'}")
+    log(f"data date {data_date}; compared with {prev_date or 'nothing (first run)'}: "
+        f"{n_changed} of {len(results)} cards changed")
 
-    # most "interesting" first: more stand-out facts, then stronger pattern score
-    results.sort(key=lambda a: (-len(a["verdict"]), -abs(a["pat"]["score"])))
+    if args.dry_run:
+        log(f"DRY-RUN — {len(results)} stocks analysed; no page written, no snapshot saved.")
+        return
+    save_state(state, data_date, snapshot)
+
+    # changed cards first (Decide boxes on top), unchanged ones fold away
+    results.sort(key=lambda a: (a["unchanged"], -len(a["decide"]), -len(a["changed"]),
+                                -len(a["verdict"])))
     ranked = pd.DataFrame({"symbol": [a["sym"] for a in results],
                            "_pfname": [a["name"] for a in results]})
     annot = {a["sym"].upper(): html_block(a) for a in results}
@@ -558,15 +790,33 @@ def main():
     prelude = (
         '<div style="max-width:1100px;margin:0 auto 12px;font-size:12.5px;color:#333;'
         'background:#fff;border:1px solid #e3e7ee;border-radius:8px;padding:8px 12px;'
-        'line-height:1.55"><b>How to read this page.</b> Every number compares the stock '
-        'with its OWN past. For each fact: how rare today is (percentile), how many separate '
-        'times it happened before, and what the stock did 5, 20 and 60 trading days after '
-        'each of those times (median return, how often it was up, and the worst case). '
-        'Cards with the most stand-out facts come first. Sections run 2 → 4 (today), then '
-        '1 (the stock\'s normal behaviour, for reference). Past outcomes describe this '
-        'stock\'s history; they are not a forecast.</div>')
+        'line-height:1.55"><b>How to read this page.</b> Each stock is compared with its '
+        'OWN past. Odds are always written <b>"higher X of N times (P%)"</b>: of the N past '
+        'times it was in the same situation, X ended higher 1 month (20 trading days) or 3 '
+        'months (60) later. Price changes are always labelled <b>"price change"</b>. '
+        f'🟢 HIGH = higher ≥{HIGH_P}% of the time, 🔴 LOW = ≤{LOW_P}%, both needing '
+        f'{DECIDE_N}+ cases. <b>🧭 Decide</b> boxes appear only for those. '
+        + (f'<b>🔔 Only cards whose story changed since {prev_date} are open</b> '
+           f'({n_changed} of {len(results)}); the rest are folded at the bottom.'
+           if prev_date else '<b>First run of the change tracker</b>: all cards shown; '
+           'from the next trading day only changed cards are open.')
+        + ' Past outcomes, not a forecast.</div>')
     html = BG.build_html(ranked, joined, cards, mcap, args.timeframe_days,
                          title="📜 PF technical history", annot=annot, prelude=prelude)
+    # fold unchanged cards into one expandable line at the bottom (charts inside
+    # stay lazy: they draw when the section is opened and scrolled into view)
+    fold = ("<script>(function(){var cs=[].slice.call(document.querySelectorAll('.card'))"
+            ".filter(function(c){return c.querySelector('.nochg');});if(!cs.length)return;"
+            "var d=document.createElement('details');d.style.cssText='max-width:1100px;"
+            "margin:18px auto';var s=document.createElement('summary');s.style.cssText="
+            "'cursor:pointer;font-size:13px;padding:9px 12px;background:#eef1f5;"
+            "border-radius:6px';s.innerHTML='<b>No change since '+cs[0].querySelector('.nochg')"
+            ".dataset.since+' — '+cs.length+' stocks</b> (click to open): '+cs.map(function(c)"
+            "{var b=c.querySelector('.hd b');return b?b.textContent:'';}).join(', ');"
+            "d.appendChild(s);var g=document.createElement('div');g.className='grid';"
+            "g.style.marginTop='10px';cs.forEach(function(c){g.appendChild(c);});"
+            "d.appendChild(g);document.body.appendChild(d);})();</script>")
+    html = html.replace("</body></html>", fold + "</body></html>")
     out = args.out or os.path.join(ROOT, "gallery_pf_history.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
