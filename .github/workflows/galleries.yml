@@ -10,7 +10,8 @@ name: Chart galleries (after Phase 1)
 #
 # PRIVACY: the repo is public, so this log is public. The PF pages (holdings) are
 # built with ALL output suppressed and go to Drive only. There is NO artifact upload.
-# Pages that need the local 25y store / Zanger library stay local (not built here).
+# Pages that need the local 25y store / Zanger library stay local (not built here),
+# and so does gallery_sold.html (its builder is not committed yet).
 # Plan: .claude/plans/galleries-ci-fetch.md
 
 on:
@@ -101,14 +102,9 @@ jobs:
             if python scripts/build_gallery.py $args --no-open > /dev/null 2>&1; then
               echo "PF $args: ok"
             else
-              echo "PF $args: FAILED (output hidden - run pf_gallery.bat --local to see why)"; rc=1
+              echo "PF $args: FAILED (output hidden - run pf_gallery_local.bat to see why)"; rc=1
             fi
           done
-          if python scripts/build_sold_gallery.py --no-open > /dev/null 2>&1; then
-            echo "sold gallery: ok"
-          else
-            echo "sold gallery: FAILED (output hidden - run pf_gallery.bat --local to see why)"; rc=1
-          fi
           exit $rc
 
       - name: Publish to Drive
