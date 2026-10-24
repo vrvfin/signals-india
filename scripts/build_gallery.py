@@ -1056,6 +1056,16 @@ function mk(id){
  l50.setData((D[id]||{}).e50||[]);
  const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});
  vs.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}}); vs.setData((D[id]||{}).v||[]);
+ // Optional event marker — only build_sold_gallery.py sends one (the sell date);
+ // every other page has no .mk and this block never runs.
+ const M=(D[id]||{}).mk;
+ if(M){
+  cs.setMarkers([{time:M.t,position:'aboveBar',color:'#c62828',shape:'arrowDown',text:M.x||'SOLD'}]);
+  if(M.p!=null)cs.createPriceLine({price:M.p,color:'#c62828',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'sold'});
+  const vl=ch.addHistogramSeries({priceScaleId:'mk',color:'rgba(198,40,40,.45)',priceLineVisible:false,lastValueVisible:false});
+  vl.priceScale().applyOptions({scaleMargins:{top:0,bottom:0}});
+  vl.setData([{time:M.t,value:1}]);
+ }
  ch.timeScale().fitContent();
 }
 const io=new IntersectionObserver((es)=>{es.forEach(e=>{if(e.isIntersecting)mk(e.target.id.slice(2));});},{rootMargin:'300px'});
@@ -1155,7 +1165,7 @@ def _updated_banner(meta, annot_html):
 
 
 def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals gallery",
-               annot=None, resample=None, prelude="", failed_syms=None):
+               annot=None, resample=None, prelude="", failed_syms=None, marks=None):
     """`prelude` is optional page furniture rendered ABOVE the card grid (the
     watchlist summary table uses it). It defaults to "" and the placeholder sits
     flush against <div class="grid">, so every existing caller emits a
@@ -1163,9 +1173,15 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
 
     `failed_syms` are names whose OHLCV download FAILED this run (as opposed to
     not existing on Drive) — they render a red note instead of the benign
-    "no feed" one, so a network problem can never masquerade as missing data."""
+    "no feed" one, so a network problem can never masquerade as missing data.
+
+    `marks` is an optional {symbol: {"t": "YYYY-MM-DD", "p": price, "x": label}}
+    drawing ONE event line on that symbol's chart — a full-height vertical rule,
+    a ▼ marker and a dashed price line. build_sold_gallery.py passes the sell
+    date; every other caller passes nothing and the chart JS skips the block."""
     annot = annot or {}
     failed_syms = failed_syms or set()
+    marks = marks or {}
     card_html, data = [], {}
 
     # Freshness reference = the MODE of every symbol's last raw bar, i.e. what the
@@ -1233,6 +1249,17 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             card_html.append(f'<div class="card{upd_cls}">{meta}{note}</div>')
             continue
         data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
+        # Event marker, when the caller sent one. Snapped BACK to the last bar at
+        # or before the date so a non-trading day — or a weekly/monthly resample —
+        # still lands on a real candle instead of inventing a time point. A date
+        # older than the charted window simply draws nothing.
+        _mk = marks.get(s) or marks.get(s.upper())
+        if _mk and _mk.get("t"):
+            _t = str(_mk["t"])[:10]
+            _bars = [x["time"] for x in c if x["time"] <= _t]
+            if _bars:
+                data[str(j)]["mk"] = {"t": _bars[-1], "x": _mk.get("x", ""),
+                                      "p": _mk.get("p")}
         # Per-chart legend — the page-level note scrolls away on a long gallery,
         # so each chart says what its two lines are.
         legend = ('<div style="font-size:10.5px;color:#777;margin:2px 0 0">'
