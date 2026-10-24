@@ -43,6 +43,9 @@ from narrative_factpack import Store, resolve
 DEFAULT_LIMITS = {"concall": 6, "annual_report": 3, "presentation": 3, "rating": 2,
                   "results": 2}
 MAX_TEXT_CHARS = 400_000
+NOT_AN_ANNUAL_REPORT = re.compile(
+    r"newspaper|scrutini[sz]er|letter to (the )?members|notice|postal ballot|proceedings|"
+    r"voting result|book closure|record date", re.I)
 
 
 def _pdf_text(data: bytes) -> str:
@@ -67,14 +70,14 @@ def _pdf_text(data: bytes) -> str:
         return ""
 
 
-def _clean(t: str) -> str:
+def _clean(t: str, cap: int | None = MAX_TEXT_CHARS) -> str:
     """Collapse the artefacts PDF extraction leaves behind, WITHOUT destroying the exact
     wording — evidence_span matching happens against this text, so words and punctuation
     must survive verbatim. Only whitespace is normalised."""
     t = t.replace(" ", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()[:MAX_TEXT_CHARS]
+    return t.strip()[:cap] if cap else t.strip()
 
 
 def queue_rows(store: Store, isin: str, symbol: str,
@@ -83,6 +86,14 @@ def queue_rows(store: Store, isin: str, symbol: str,
     if q.empty:
         return q
     q = q[q["status"].astype(str).isin(["done", "superseded"])].copy()
+    # Notices filed under the annual-report category are NOT the annual report (Morepen
+    # 2026-10-18: a newspaper publication and the AGM scrutinizer's report were read as its
+    # two latest "annual reports", so the real one never reached the writer). The queue
+    # itself is left as it is — this only chooses what to read.
+    if "title" in q.columns:
+        notice = (q["doc_type"].astype(str) == "annual_report") & \
+            q["title"].astype(str).str.contains(NOT_AN_ANNUAL_REPORT, na=False)
+        q = q[~notice]
     q["_d"] = pd.to_datetime(q["announcement_date"], errors="coerce")
     q = q.sort_values("_d", ascending=False)
     lim = limits or DEFAULT_LIMITS
@@ -131,10 +142,18 @@ def build(store: Store, token: str, cache_dir: Path | None = None,
                 manifest.append(rec)
                 log(f"    {did}: re-fetch FAILED (url dead or unreachable)")
                 continue
-            txt = _clean(_pdf_text(data))
+            raw = _pdf_text(data)
+            txt = _clean(raw)
             rec["status"] = "fetched" if txt else "no_text_extracted"
             if cached and txt:
                 cached.write_text(txt, encoding="utf-8")
+                # Annual reports run past the cap: the auditor's report and the notes
+                # to accounts sit in the second half. The FULL text is kept beside the
+                # capped one for the company report's passages (2026-10-19); what
+                # build() returns — and so what any extractor sends — is unchanged.
+                if str(row.get("doc_type")) == "annual_report":
+                    (cache_dir / f"{did}.full.txt").write_text(_clean(raw, cap=None),
+                                                               encoding="utf-8")
         rec["chars"] = len(txt)
         if not txt:
             rec["status"] = rec["status"] or "empty"

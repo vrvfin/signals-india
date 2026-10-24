@@ -210,6 +210,7 @@ def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
     Gates 1 and 2 on it and regenerate ONCE with the failures fed back. Shared so
     the chapter writer gets exactly the grounding the section writer has."""
     attempt, findings, out = 0, [], None
+    unreadable: list[str] = []          # model of each attempt that was not valid JSON
     # Keep the BEST attempt, not the last. A retry that returns unparseable output is
     # strictly worse than a first attempt that parsed with gate failures — overwriting
     # with the later garbage silently emptied real sections.
@@ -223,13 +224,18 @@ def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
     while attempt < 2:
         attempt += 1
         try:
-            raw = pool.call_text(prompt, f"narrative_s{uid}",
-                                 max_output_tokens=MAX_OUTPUT_TOKENS)
+            if hasattr(pool, "_pool"):          # BucketPool says which model answered
+                raw, used = pool._pool.call_text(prompt,
+                                                 max_output_tokens=MAX_OUTPUT_TOKENS)
+            else:
+                raw, used = pool.call_text(prompt, f"narrative_s{uid}",
+                                           max_output_tokens=MAX_OUTPUT_TOKENS), ""
         except Exception as e:
             log(f"    {label} {uid}: generation failed — {str(e)[:140]}")
             return {"id": uid, "title": title,
                     "takeaway": "", "body": "", "claims": [],
-                    "not_disclosed": gaps, "error": str(e)[:200]}
+                    "not_disclosed": gaps, "error": str(e)[:200],
+                    "unparseable_models": unreadable}
         out = _parse(raw)
         if out is not None:
             # The model sometimes REWRITES the id it was given ("scale-history" for 5); the
@@ -237,14 +243,20 @@ def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
             # (Morepen 2026-10-04: 5 and 19). The section number is ours, not the model's.
             out["id"] = uid
         if out is None:
-            log(f"    {label} {uid}: unparseable JSON on attempt {attempt}")
+            unreadable.append(used)
+            log(f"    {label} {uid}: unparseable JSON on attempt {attempt}"
+                + (f" ({used})" if used else ""))
             findings = [VG.Finding("parse", "fail", uid,
                                    "response was not valid JSON")]
             prompt += ("\n\nYour previous response was not valid JSON. Return ONLY the "
                        "JSON object, with no prose and no markdown fence.")
             continue
 
-        prose = " ".join(str(out.get(k, "")) for k in ("takeaway", "body"))
+        # Everything printed is checked: the key-points box and the five-forces evidence too
+        prose = " ".join([str(out.get(k, "")) for k in ("takeaway", "body")]
+                         + [str(x) for x in (out.get("takeaways") or [])]
+                         + [str(f.get("why", "")) for f in (out.get("five_forces") or [])
+                            if isinstance(f, dict)])
         # Spans are checked FIRST so the ones that verify can license the numbers they
         # contain. A figure quoted from a filing is grounded even when it is not in the
         # computed fact table — but only if the surrounding span provably appears in
@@ -280,6 +292,7 @@ def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
                "takeaway": "", "body": "", "claims": []}
     out["gate_findings"] = [f.__dict__ for f in findings]
     out["gate_failed"] = True
+    out["unparseable_models"] = unreadable
     out["attempts"] = attempt_used
     log(f"    {label} {uid}: KEPT WITH FLAGS (best of {attempt} attempts was #"
         f"{attempt_used}, {len([f for f in findings if f.severity == 'fail'])} "
@@ -354,17 +367,17 @@ def _storyline(pool, pack: dict, chapters: list[dict], forensic_md: str, log=pri
                                                for c in chapters))
               .replace("{fact_table}", _fact_table(pack["facts"]))
               .replace("{notes}", notes or "(no deep dive for this copy)"))
-    best = None
+    best, unreadable = None, []
     for attempt in (1, 2):
         try:
-            raw = pool.call_text(prompt, "narrative_storyline",
-                                 max_output_tokens=MAX_OUTPUT_TOKENS)
+            raw, used = pool._pool.call_text(prompt, max_output_tokens=MAX_OUTPUT_TOKENS)
         except Exception as e:
             log(f"    storyline: generation failed — {str(e)[:140]}")
             break
         out = _parse(raw)
         if out is None:
-            log(f"    storyline: unparseable JSON on attempt {attempt}")
+            unreadable.append(used)
+            log(f"    storyline: unparseable JSON on attempt {attempt} ({used})")
             prompt += ("\n\nYour previous response was not valid JSON. Return ONLY the "
                        "JSON object, with no prose and no markdown fence.")
             continue
@@ -382,24 +395,36 @@ def _storyline(pool, pack: dict, chapters: list[dict], forensic_md: str, log=pri
                    + "\nRewrite it with ONLY numbers from the FACT TABLE, or none.")
     if best is None:
         return {"one_page": "", "business_dynamics": [], "financial_dynamics": [],
-                "watch": [], "chapters": [], "failed": True}
+                "watch": [], "chapters": [], "failed": True,
+                "unparseable_models": unreadable}
     out, n_hard = best
     out["gate_failed"] = bool(n_hard)
     return out
 
 
 def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
-                    log=print) -> dict:
+                    log=print, topic_sources: dict[str, dict[str, str]] | None = None) -> dict:
     """The merged report's text: storyline + one gated chapter at a time. Chapters with
     nothing to write about are not called at all (render_company_report.chapter_inputs)."""
     import render_company_report as RCR
     pool, models = _writer_pool(log)
-    chapters = RCR.chapter_inputs(pack, forensic_md)
+    chapters = RCR.chapter_inputs(pack, forensic_md, topic_sources=topic_sources)
     cpack = RCR.chapter_pack(pack)
     log(f"  writing {len(chapters)} chapter(s): {[c['n'] for c in chapters]}"
         + (" — with the deep dive as analyst notes" if forensic_md else " — no deep dive"))
     log("  [storyline]")
     story = _storyline(pool, pack, chapters, forensic_md, log)
+    sbad = story.get("unparseable_models") or []
+    if story.get("failed") and len(sbad) >= 2 and len(set(sbad)) == 1 and sbad[0]:
+        left = [m for m in models if m != sbad[0]]
+        if left:
+            log(f"    {sbad[0]} returned no readable storyline — dropped for this run")
+            from _extractor_base import GeminiKeyPool
+            first = pool
+            pool = GeminiKeyPool(first._pool.keys, left)
+            pool._pool.model_overload_keys = first._pool.model_overload_keys
+            story = _storyline(pool, pack, chapters, forensic_md, log)
+            models = left
     plan = {int(c.get("n", 0)): c for c in story.get("chapters") or []
             if str(c.get("n", "")).isdigit()}
     story_txt = "\n".join(
@@ -409,9 +434,16 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
     tpl = (Path(_HERE) / CHAPTER_PROMPT_FILE).read_text(encoding="utf-8")
     co = pack["company"]
     out, prev = [], "(this is the first chapter)"
+    dropped: set[str] = set()
+    pools: list = []
     for i, ch in enumerate(chapters):
         p = plan.get(ch["n"], {})
         log(f"  [{i + 1}/{len(chapters)}] chapter {ch['n']}: {ch['title']}")
+        # The shared documents + THIS chapter's passages (auditor, notes, board, filings...).
+        # A passage never replaces a document's full text under the same id.
+        ch_sources = dict(sources)
+        for did, txt in (ch.get("topic_sources") or {}).items():
+            ch_sources.setdefault(did, txt)
         prompt = (tpl
                   .replace("{company}", f"{co['name']} ({co['symbol']} / {co['isin']}) — "
                                         f"an Indian listed company; all figures in Indian "
@@ -427,11 +459,30 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
                            else "(no computed figures for this chapter — write no numbers)")
                   .replace("{tables}", _tables_blob(ch["tables"]))
                   .replace("{notes}", ch["notes"] or "(none)")
-                  .replace("{sources}", _sources_blob(sources)))
+                  .replace("{sources}", _sources_blob(ch_sources)))
         subpack = {"facts": [f for f in cpack["facts"] if f.get("section") == ch["id"]],
                    "tables": [t for t in cpack["tables"] if t.get("section") == ch["id"]]}
-        res = _write_and_gate(pool, prompt, subpack, sources, ch["id"], ch["title"],
+        res = _write_and_gate(pool, prompt, subpack, ch_sources, ch["id"], ch["title"],
                               ch["gaps"], log, label="chapter")
+        # A model that returns unreadable output on BOTH attempts is dropped for the rest
+        # of the run and the chapter is re-written on the next model (19 Oct CI:
+        # gemini-3-flash-preview thought until max_output_tokens on every chapter —
+        # 11.5k of 12k, 30.7k of 32k — and 17 of 18 chapters came back empty). Same idea
+        # as the pool's 503 breaker; gemini_pool.py itself is not changed.
+        bad = res.get("unparseable_models") or []
+        if not str(res.get("body") or "").strip() and len(bad) >= 2 and len(set(bad)) == 1 \
+                and bad[0]:
+            dropped.add(bad[0])
+            left = [m for m in models if m not in dropped]
+            if left:
+                log(f"    {bad[0]} returned no readable chapter — dropped for this run; "
+                    f"re-writing chapter {ch['n']} on {left[0]}")
+                pools.append(pool)
+                from _extractor_base import GeminiKeyPool
+                pool = GeminiKeyPool(pool._pool.keys, left)
+                pool._pool.model_overload_keys = pools[0]._pool.model_overload_keys
+                res = _write_and_gate(pool, prompt, subpack, ch_sources, ch["id"],
+                                      ch["title"], ch["gaps"], log, label="chapter")
         res.update({"id": ch["id"], "chapter": ch["n"], "sections": ch["sections"]})
         out.append(res)
         paras = [x for x in str(res.get("body") or "").split("\n") if x.strip()]
@@ -441,7 +492,8 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
             time.sleep(INTER_CALL_SLEEP)
     flagged = sum(1 for s in out if s.get("gate_failed"))
     from model_registry import record_usage          # busy demotion sees these models
-    record_usage(pool, "narrative_writer", "narrative", log=log)
+    for pl in pools + [pool]:
+        record_usage(pl, "narrative_writer", "narrative", log=log)
     return {"company": co, "layout": "chapters", "storyline": story, "sections": out,
             "generator_model": models[0],
             "sections_with_unresolved_gate_failures": flagged}

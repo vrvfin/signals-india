@@ -49,6 +49,7 @@ import narrative_generate as GEN
 import narrative_preflight as PRE
 import narrative_sources as SRC
 import render_company_report as REPORT  # ONE merged file: story + deep dive (2026-10-17)
+import narrative_extras as NX           # topic passages + filings (2026-10-18)
 import format_deepdive_pdf as FMT     # PDF + file naming shared with the deep dive
 
 INDEX_FILE = "narrative_index.parquet"
@@ -245,6 +246,19 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     if not args.no_sources:
         sources, manifest = SRC.build(store, token, cache_dir=cache, log=log)
     chosen = _pick_sources(sources, manifest)
+    # Per-chapter passages (user 2026-10-18: auditor, notes to accounts, board, geography
+    # and clients, supply chain, right to win, competitive forces) cut from ALL fetched
+    # documents, plus the latest NSE filings with their PDF text (orders, approvals).
+    full = dict(sources)                         # full annual-report text when cached
+    for did in list(full):
+        fp = cache / f"{did}.full.txt"
+        if fp.exists():
+            full[did] = fp.read_text(encoding="utf-8", errors="ignore")
+    topic_src = {tp: NX.excerpts(full, tp) for tp in NX.TOPICS}
+    topic_src["filings"] = {f["doc_id"]: f["text"] for f in d.get("filings") or []
+                            if f.get("text")}
+    log("  chapter passages: " + ", ".join(f"{tp} {len(v)} doc(s)"
+                                           for tp, v in topic_src.items()))
     log(f"  {len(sources)} fetched, {len(chosen)} sent to the model: {list(chosen)}")
     (outdir / f"sources_{co['symbol']}.json").write_text(
         json.dumps(chosen), encoding="utf-8")
@@ -272,7 +286,7 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
         if args.sections:          # old per-section writer, kept for targeted reruns
             nar = GEN.generate(d, chosen, args.sections, log=log)
         else:
-            nar = GEN.generate_report(d, chosen, forensic, log=log)
+            nar = GEN.generate_report(d, chosen, forensic, log=log, topic_sources=topic_src)
     except Exception as e:
         log(f"  generation FAILED: {str(e)[:200]}")
         if args.debug:
@@ -310,7 +324,14 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
             # Screener statements rather than in any filing in the document bundle.
             # A chapter is checked against ITS chapter's figures: the fact pack is re-keyed
             # from story sections to chapter ids, or the auditor would see an empty table.
-            audit = audit_report(adj, secs, chosen,
+            # The auditor sees what the writers saw: the shared documents + every
+            # chapter's passages (else a claim from an annual-report passage reads as
+            # NOT_IN_SOURCE).
+            audit_src = dict(chosen)
+            for v in topic_src.values():
+                for did, txt in v.items():
+                    audit_src.setdefault(did, txt)
+            audit = audit_report(adj, secs, audit_src,
                                  factpack=(REPORT.chapter_pack(d)
                                            if nar.get("layout") == "chapters" else d))
             if getattr(adj, "_gem", None) is not None:    # Gemini audit: log its models
@@ -342,6 +363,10 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
     # with nothing to say left out, sources as numbered references in the appendix. The
     # Drive file keeps its company_narrative_* name, so narrative_index readers are unchanged.
     links = {m["doc_id"]: m for m in (manifest or []) if m.get("doc_id")}
+    for f in d.get("filings") or []:
+        links.setdefault(f["doc_id"], {"title": f"{f.get('kind', '')}: "
+                                                f"{f.get('subject', '')}"[:110],
+                                       "url": f.get("url", "")})
     md = REPORT.render(d, nar, audit, nar.get("forensic_report") or "", links)
     md_p.write_text(md, encoding="utf-8")
     html_doc = FMT._build_full_html(co["name"], co["symbol"], co["isin"], md,
