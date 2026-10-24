@@ -9,7 +9,8 @@ gallery_sync.py — move the chart galleries between CI and this PC via Drive.
 
 Only pages whose data is all on Drive are built in CI. Pages that need this PC's
 local stores (25y price history, Zanger library) stay local and are not handled here:
-market_state.html, gallery_zanger.html, gallery_pf_history.html.
+market_state.html, gallery_zanger.html, gallery_pf_history.html — and gallery_sold.html,
+whose builder is not committed yet.
 
 Privacy: the repo is public. The PF pages (holdings) are built in CI with their output
 suppressed (galleries.yml) and go to Drive only — never to a GitHub artifact.
@@ -60,7 +61,8 @@ PAGES = {
     "gallery_pf.html":                 {"sets": ["pf"], "cmd": BG + ["--mode", "pf", "--resample", "D"]},
     "gallery_pf_weekly.html":          {"sets": ["pf"], "cmd": BG + ["--mode", "pf", "--resample", "W"]},
     "gallery_pf_monthly.html":         {"sets": ["pf"], "cmd": BG + ["--mode", "pf", "--resample", "M"]},
-    "gallery_sold.html":               {"sets": ["pf"], "cmd": ["scripts/build_sold_gallery.py"]},
+    # gallery_sold.html stays LOCAL: scripts/build_sold_gallery.py is not committed
+    # (exists on the PC only), so CI cannot build it.
 }
 
 
