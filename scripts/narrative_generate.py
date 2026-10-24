@@ -300,20 +300,44 @@ def _write_and_gate(pool, prompt: str, subpack: dict, sources: dict[str, str],
     return out
 
 
-def _writer_pool(log=print):
-    """(pool, models) for the writer: FREE_POOL keys, models from the registry."""
+def _health_check(pool, log=print) -> None:
+    """Model first, then key — the two checks the concall extractor runs at start-up
+    (extract_concall: probe_models, then prime_pool_from_health):
+      1. STEP A model health: ping each model, drop the ones that are down right now.
+      2. Bucket health: from gemini_usage.parquet, mark dead keys and key+model pairs
+         already out of daily quota, so no call is spent rediscovering them.
+    Best-effort: a failed check never stops the report."""
+    try:
+        pool._pool.probe_models()
+    except Exception as e:
+        log(f"  model check skipped ({str(e)[:80]})")
+    try:
+        from model_registry import _drive_index
+        from _extractor_base import prime_pool_from_health
+        prime_pool_from_health(pool, *_drive_index())
+    except Exception as e:
+        log(f"  key check skipped ({str(e)[:80]})")
+
+
+def _writer_pool(log=print, models: list[str] | None = None, check: bool = True):
+    """(pool, models) for the writer: FREE_POOL keys, models from the registry (or the
+    given list), then the model and key checks. `models` returned = the ones still
+    alive after the model check."""
     keys = load_keys(os.environ, prefix="FREE_POOL") or \
         load_keys(os.environ, prefix="GEMINI_API_KEY")
     if not keys:
         raise RuntimeError("no Gemini keys — set FREE_POOL_n or GEMINI_API_KEY_n")
     from _extractor_base import GeminiKeyPool
     from model_registry import pick, overload_keys
-    models = pick("WRITE", GEN_MODELS, log=log)
+    models = list(models or pick("WRITE", GEN_MODELS, log=log))
     pool = GeminiKeyPool(keys, models)
     # Give-up rule scales with the keys (a third of them, not 3) — set on THIS pool only,
     # so the shared GeminiKeyPool / Phase-2 extractors are untouched. 2026-10-03: with 3,
     # two models were dropped after 3 busy replies each and 10 of 20 sections came back empty.
     pool._pool.model_overload_keys = overload_keys(len(keys))
+    if check:
+        _health_check(pool, log)
+        models = [m for m in models if m in set(pool._pool.models)] or models
     log(f"  writer pool: {len(keys)} key(s) · {len(models)} model(s) · a model is dropped "
         f"after busy replies on {pool._pool.model_overload_keys} keys")
     return pool, models
@@ -436,6 +460,7 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
     out, prev = [], "(this is the first chapter)"
     dropped: set[str] = set()
     pools: list = []
+    jobs: list = []                     # (prompt, subpack, sources, chapter) per chapter
     for i, ch in enumerate(chapters):
         p = plan.get(ch["n"], {})
         log(f"  [{i + 1}/{len(chapters)}] chapter {ch['n']}: {ch['title']}")
@@ -462,6 +487,7 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
                   .replace("{sources}", _sources_blob(ch_sources)))
         subpack = {"facts": [f for f in cpack["facts"] if f.get("section") == ch["id"]],
                    "tables": [t for t in cpack["tables"] if t.get("section") == ch["id"]]}
+        jobs.append((prompt, subpack, ch_sources, ch))
         res = _write_and_gate(pool, prompt, subpack, ch_sources, ch["id"], ch["title"],
                               ch["gaps"], log, label="chapter")
         # A model that returns unreadable output on BOTH attempts is dropped for the rest
@@ -490,11 +516,39 @@ def generate_report(pack: dict, sources: dict[str, str], forensic_md: str = "",
             prev = paras[-1]
         if i < len(chapters) - 1:
             time.sleep(INTER_CALL_SLEEP)
+    # Capacity failures (no model / key left — 20 Oct CI: all 108 buckets parked, chapters
+    # 12-18 never written and the report went out silently short). Re-run the model check
+    # and then the key check on a FRESH pool and retry only those chapters, once.
+    unwritten_i = [i for i, s in enumerate(out)
+                   if s.get("error") and not str(s.get("body") or "").strip()]
+    if unwritten_i or story.get("failed"):
+        log(f"  not written: chapter(s) {[out[i]['chapter'] for i in unwritten_i]}"
+            + (" + storyline" if story.get("failed") else "")
+            + " — re-checking models, then keys, and retrying once")
+        pools.append(pool)
+        pool, models = _writer_pool(log, models=[m for m in models if m not in dropped])
+        if story.get("failed"):
+            story = _storyline(pool, pack, chapters, forensic_md, log)
+        for i in unwritten_i:
+            prompt, subpack, ch_sources, ch = jobs[i]
+            log(f"  [retry] chapter {ch['n']}: {ch['title']}")
+            res = _write_and_gate(pool, prompt, subpack, ch_sources, ch["id"], ch["title"],
+                                  ch["gaps"], log, label="chapter")
+            res.update({"id": ch["id"], "chapter": ch["n"], "sections": ch["sections"]})
+            out[i] = res
+    unwritten = [{"n": s["chapter"], "title": jobs[i][3]["title"],
+                  "reason": str(s.get("error") or "")[:160]}
+                 for i, s in enumerate(out)
+                 if s.get("error") and not str(s.get("body") or "").strip()]
+    if unwritten:
+        log(f"  STILL NOT WRITTEN after the retry: {[u['n'] for u in unwritten]} — the "
+            f"report names them on its front page")
     flagged = sum(1 for s in out if s.get("gate_failed"))
     from model_registry import record_usage          # busy demotion sees these models
     for pl in pools + [pool]:
         record_usage(pl, "narrative_writer", "narrative", log=log)
     return {"company": co, "layout": "chapters", "storyline": story, "sections": out,
+            "unwritten_chapters": unwritten,
             "generator_model": models[0],
             "sections_with_unresolved_gate_failures": flagged}
 

@@ -481,7 +481,14 @@ def run_one(store: FP.Store, token: str, args) -> dict | None:
                 f"<p>Attachment: <b>{att[0]}</b>. The .md is on Drive "
                 f"(company_repo/{co['isin']}/).</p>"
                 f"{pdf_note}")
-            ok = send_email(f"Company report — {co['name']} ({co['symbol']})", body,
+            gone = nar.get("unwritten_chapters") or []
+            if gone:
+                body = (f"<p style='color:#c33'><b>Incomplete:</b> not written in this run "
+                        f"(no model capacity left after a retry): "
+                        + "; ".join(u["title"] for u in gone)
+                        + ". Re-run the report to complete it.</p>") + body
+            ok = send_email(f"Company report{' (incomplete)' if gone else ''} — "
+                            f"{co['name']} ({co['symbol']})", body,
                             attachments=[att])
             log("  mailed" if ok else "  mail SKIPPED (GMAIL_USER / "
                                       "GMAIL_APP_PASSWORD not set)")
