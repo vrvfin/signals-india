@@ -462,7 +462,8 @@ def main() -> None:
             if sym_map is None or not sym_map:
                 sym_map = _isin_symbol_map(drive, index_id)
             react_html, react_imgs = RX.build(drive, root_id, res, wk, sym_map, _pf_wk, log)
-            if react_html and (html_b or "OPPORTUNITY" in react_html or "WARNING" in react_html):
+            if react_html and (html_b or "OPPORTUNITY" in react_html or "WARNING" in react_html
+                               or "Fresh winners" in react_html):
                 html_b = (html_b or "") + react_html
     except Exception as exc:                           # noqa: BLE001
         log(f"  results-vs-reaction section FAILED ({type(exc).__name__}: {exc})")
