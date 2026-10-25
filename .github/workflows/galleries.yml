@@ -10,8 +10,8 @@ name: Chart galleries (after Phase 1)
 #
 # PRIVACY: the repo is public, so this log is public. The PF pages (holdings) are
 # built with ALL output suppressed and go to Drive only. There is NO artifact upload.
-# Pages that need the local 25y store / Zanger library stay local (not built here),
-# and so does gallery_sold.html (its builder is not committed yet).
+# PF technical history (local 25y store) and Zanger (local library + images) are built
+# by the PC task and published to the same Drive folder (gallery_sync publish --owner pc).
 # Plan: .claude/plans/galleries-ci-fetch.md
 
 on:
@@ -92,6 +92,16 @@ jobs:
         continue-on-error: true
         run: python guru/build_guru_gallery.py --no-open
 
+      # market state: its two deep local inputs (breadth table + pre-2016 macro history)
+      # are pushed to Drive by the PC's GalleriesRefresh task; pulled into the same paths
+      # the builder reads (builder unchanged — it renders without them, just shallower)
+      - name: Market state (inputs from Drive)
+        if: env.GURU_ONLY != 'true'
+        continue-on-error: true
+        run: |
+          python scripts/gallery_sync.py inputs-pull
+          python scripts/build_market_state_html.py --no-open
+
       # ---- PF pages: output fully suppressed (public log), result line only ----
       - name: PF galleries (output hidden)
         if: env.GURU_ONLY != 'true'
@@ -105,12 +115,17 @@ jobs:
               echo "PF $args: FAILED (output hidden - run pf_gallery_local.bat to see why)"; rc=1
             fi
           done
+          if python scripts/build_sold_gallery.py --no-open > /dev/null 2>&1; then
+            echo "sold gallery: ok"
+          else
+            echo "sold gallery: FAILED (output hidden - run pf_gallery_local.bat to see why)"; rc=1
+          fi
           exit $rc
 
       - name: Publish to Drive
         run: |
           if [ "$GURU_ONLY" = "true" ]; then
-            python scripts/gallery_sync.py publish --since "$SINCE" --only gallery_guru.html
+            python scripts/gallery_sync.py publish --owner ci --since "$SINCE" --only gallery_guru.html
           else
-            python scripts/gallery_sync.py publish --since "$SINCE"
+            python scripts/gallery_sync.py publish --owner ci --since "$SINCE"
           fi
