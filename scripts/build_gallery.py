@@ -852,7 +852,9 @@ def _ann_pdf_link(attachment) -> str:
     a = str(attachment or "").strip()
     if not a or a.lower() in ("nan", "none"):
         return ""
-    return (f' <a href="{_BSE_ATTACH}{a}" target="_blank" rel="noopener" '
+    # NSE-sourced filings (2026-10-25) store the FULL link; BSE ones a file name.
+    href = a if a.startswith("http") else f"{_BSE_ATTACH}{a}"
+    return (f' <a href="{href}" target="_blank" rel="noopener" '
             f'style="color:#0b5394;font-weight:700;text-decoration:none;'
             f'font-size:11px">[PDF]</a>')
 
