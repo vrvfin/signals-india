@@ -63,6 +63,10 @@ jobs:
     concurrency:
       group: mgmt-interviews-poll
       cancel-in-progress: false
+    # actions: write is for the PF-mail dispatcher below (starts pf_daily_mails on time).
+    permissions:
+      contents: read
+      actions: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -72,6 +76,20 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+
+      # PF-MAIL CLOCK (user 2026-10-25: "manage it with any of the existing jobs"). GitHub
+      # ran pf_daily_mails 3x/day, 4-5 h late; this poll job stays up ~5.5 h and its four
+      # runs cover nearly the whole day. A background loop starts pf_daily_mails when a slot
+      # (09:05/12:05/15:05/18:05/21:05 IST) passes with no run since. Standard library only,
+      # independent of the interview code below; it dies with the job. Scheduled loops only.
+      - name: PF-mail dispatcher (background)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          nohup python scripts/dispatch_due.py --loop-min 340 --every-min 5 \
+            > dispatch_due.log 2>&1 &
+          echo "dispatcher started (pid $!)"
 
       - name: Write credentials (.env)
         env:
@@ -106,6 +124,10 @@ jobs:
           else
             python scripts/fetch_mgmt_interviews.py --poll --loop-min 340 --every-min 30
           fi
+
+      - name: PF-mail dispatcher log
+        if: always() && github.event_name == 'schedule'
+        run: cat dispatch_due.log 2>/dev/null || echo "(no dispatcher log)"
 
   run:
     if: >-
