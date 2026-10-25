@@ -502,6 +502,13 @@ def render(pack: dict, narrative: dict | None = None, audit: dict | None = None,
         L += ["## The story on one page", ""] + sum(([b, ""] for b in front), [])
     for n in pack.get("data_notes") or []:
         L += [f"*Data note: {n}*", ""]
+    # A chapter that could not be written is NEVER silently missing (20 Oct: 7 of 18
+    # vanished when the model pool ran dry). Named here; re-run to complete.
+    gone = (narrative or {}).get("unwritten_chapters") or []
+    if gone:
+        L += ["> **Incomplete report.** Not written in this run (no model capacity left "
+              "after a retry): " + "; ".join(f"{u['title']}" for u in gone)
+              + ". Re-run the report to complete it.", ""]
     if audit:
         s = audit.get("summary") or {}
         L += [(f"*Independent audit: {s.get('verified', 0)} of {s.get('total', 0)} claims "
