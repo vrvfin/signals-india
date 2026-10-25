@@ -1,23 +1,32 @@
 r"""
-galleries_home.py — ONE page for every chart gallery, refreshed only when there is
-something new.
+galleries_home.py — ONE page for every chart gallery; Drive is the single source.
 
-  refresh   1) fetch the CI-built pages that are newer than yours (gallery_sync fetch, seconds)
-            2) build locally: any CI page missing/failed in Drive, and the local-only pages
-               (market state, Zanger, PF history, sold) — but ONLY when new Phase 1 data has
-               arrived since you last built them (marker = the CI full run's build time)
-            3) write galleries_home.html (menu + one viewer) and open it — one tab
+  refresh   (gallery_all.bat / pf_gallery.bat — a click) NEVER builds anything:
+            1) decide whether today's run is needed (IST, user rule 2026-10-25):
+                 Sat/Sun                  -> take the latest automatically
+                 weekday before 16:00     -> take the latest (yesterday's) automatically
+                 weekday from 16:00       -> today's run on Drive? download it. If not, ask:
+                                             [Y] open the latest now  [W] wait for today's
+                                             [N] cancel   (Enter = Y; after 18:00 it says
+                                             today's run is later than usual)
+            2) download the pages newer than yours (skipped when Drive has nothing new)
+            3) write galleries_home.html (menu + one viewer) and open ONE tab
+  task      (GalleriesRefresh scheduled task, --hidden: weekdays 18:30-23:30 every 30 min
+            + at logon, catches up when the PC was off):
+            1) market-state inputs: rebuild the breadth table (self-skips) and push it +
+               the deep macro history to Drive, so CI can build market_state.html
+            2) download the CI pages
+            3) build the PC-only pages (Zanger, PF technical history) when today's CI run
+               is newer than them, and PUBLISH them to Drive (gallery_sync --owner pc)
+            4) rewrite galleries_home.html (no browser)
 
-A page whose local build failed for this marker is not retried on every click (a slow
-failure would make every click slow); `--force` retries.
-
-Run by gallery_all.bat / pf_gallery.bat (click) and by the GalleriesRefresh scheduled
-task (weekdays 18:30 IST + at logon, catches up when the PC was off) with --hidden:
-no console windows, output to logs/galleries_refresh.log.
+"Today's run" = the latest CI build of the market pages (manifest) is dated today, IST.
+A PC page whose build failed for a run is not retried until the next run (--force).
 
 Usage:
-    python scripts/galleries_home.py refresh [--focus all|pf] [--no-open] [--hidden] [--force] [--dry-run]
-    python scripts/galleries_home.py home    [--focus all|pf] [--no-open]     # page only, no Drive
+    python scripts/galleries_home.py refresh [--focus all|pf] [--no-open] [--yes] [--at "YYYY-MM-DD HH:MM"] [--dry-run]
+    python scripts/galleries_home.py task --hidden [--force] [--dry-run]
+    python scripts/galleries_home.py home [--focus all|pf] [--no-open]
 Plan: .claude/plans/galleries-ci-fetch.md
 """
 from __future__ import annotations
@@ -27,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import datetime, timezone
 
@@ -36,20 +46,14 @@ if _SCRIPTS_DIR not in sys.path:
 import gallery_sync as GS                           # noqa: E402  (loads .env)
 
 ROOT = GS.ROOT
+IST = GS.IST
 HOME = "galleries_home.html"
 LOG = os.path.join(ROOT, "logs", "galleries_refresh.log")
 STATE = os.path.join(ROOT, "logs", "galleries_state.json")
 HIDDEN = False
+CHECK_FROM, LATE_FROM = 16, 18                      # IST hours (user rule)
+WAIT_POLL_S, WAIT_MAX_H = 120, 3
 
-# pages built on THIS PC only (need the local 25y store / Zanger library, or an
-# uncommitted builder)
-LOCAL = {
-    "market_state.html":       [["guru/build_market_breadth.py"],
-                                ["scripts/build_market_state_html.py", "--no-open"]],
-    "gallery_zanger.html":     [["guru/patterns/build_pattern_gallery.py", "--no-open"]],
-    "gallery_pf_history.html": [["scripts/build_pf_history.py", "--no-open"]],
-    "gallery_sold.html":       [["scripts/build_sold_gallery.py", "--no-open"]],
-}
 # menu order + labels
 MENU = [
     ("Market", "market_state.html", "Market state (macro)"),
@@ -84,24 +88,22 @@ def _utc(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
 
 
-def _run(page, cmds) -> bool:
-    """run a page's local build command(s); hidden mode: no console, output to the log."""
-    kw = {"cwd": ROOT}
-    if HIDDEN:
-        kw.update(stdout=sys.stdout, stderr=subprocess.STDOUT,
-                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    exe = sys.executable.replace("pythonw.exe", "python.exe")
-    for c in cmds:
-        log(f"  building {page}: {' '.join(c)}")
-        if subprocess.run([exe] + c, **kw).returncode != 0:
-            log(f"  FAILED: {page}")
-            return False
-    for src_page, spec in GS.PAGES.items():           # Darvas writes under guru/darvas/
-        if src_page == page and spec.get("local_out"):
-            with open(os.path.join(ROOT, spec["local_out"]), "rb") as a, \
-                 open(os.path.join(ROOT, page), "wb") as b:
-                b.write(a.read())
-    return True
+def _fmt(t):
+    return t.astimezone(IST).strftime("%a %d %b, %H:%M IST") if t else "-"
+
+
+def _state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:                                  # noqa: BLE001
+        return {}
+
+
+def _save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1)
 
 
 def _manifest():
@@ -122,76 +124,160 @@ def _manifest():
     return man
 
 
-def _marker(man):
-    """time new Phase 1 data reached Drive = the CI full run's build time (the guru-only
-    re-render later in the evening does not count)."""
-    v = man.get("pages", {}).get("gallery.html", {})
-    return _utc(v.get("built_at_utc")) if v.get("status") == "ok" else None
+def latest_run(man):
+    """time of the latest CI build of the market pages = when today's Phase 1 data
+    became charts (the guru-only re-render later in the evening does not count)."""
+    ts = [_utc(v.get("built_at_utc")) for p, v in man.get("pages", {}).items()
+          if v.get("status") == "ok" and v.get("builder", "ci") == "ci"
+          and p != "gallery_guru.html" and v.get("built_at_utc")]
+    return max(ts) if ts else None
 
 
-def _state():
+def _gh_status() -> str:
+    """one info line on today's Phase 1 / chart build from GitHub, when gh works."""
+    def last(wf):
+        r = subprocess.run(["gh", "run", "list", "--workflow", wf, "--limit", "1", "--json",
+                            "status,conclusion,createdAt,updatedAt"], cwd=ROOT,
+                           capture_output=True, text=True, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        runs = json.loads(r.stdout or "[]") if r.returncode == 0 else []
+        return runs[0] if runs else None
     try:
-        with open(STATE, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:                                  # noqa: BLE001
-        return {}
+        p1, gal = last("daily.yml"), last("galleries.yml")
+    except Exception:                                  # noqa: BLE001  gh missing / offline
+        return ""
+    if not p1:
+        return ""
+    today = datetime.now(IST).date()
+    started = _utc(p1["createdAt"])
+    if started.astimezone(IST).date() != today:
+        return "Phase 1 has not started today (GitHub)."
+    if p1["status"] != "completed":
+        return f"Phase 1 is still running (started {started.astimezone(IST):%H:%M} IST)."
+    if p1["conclusion"] != "success":
+        return f"Phase 1 finished today with '{p1['conclusion']}' — charts will not be rebuilt."
+    done = _utc(p1["updatedAt"]).astimezone(IST)
+    if gal and gal["status"] != "completed" and _utc(gal["createdAt"]) >= _utc(p1["updatedAt"]):
+        return f"Phase 1 finished {done:%H:%M} IST; the charts are being built now."
+    return f"Phase 1 finished {done:%H:%M} IST."
 
 
-def refresh(force: bool, dry_run: bool) -> dict:
-    man = {}
+def decide(man, now, assume_yes: bool) -> str:
+    """-> 'go' (download what is there and open) or 'cancel'. May wait for today's run."""
+    run = latest_run(man)
+    if now.weekday() >= 5:
+        log(f"weekend — opening the latest run ({_fmt(run)})"); return "go"
+    if now.hour < CHECK_FROM:
+        log(f"before {CHECK_FROM}:00 IST — opening the latest run ({_fmt(run)})"); return "go"
+    if run and run.astimezone(IST).date() == now.date():
+        log(f"today's run is on Drive ({_fmt(run)})"); return "go"
+    late = now.hour >= LATE_FROM
+    print()
+    print("  Today's charts are not on Drive yet"
+          + (" — later than usual (Phase 1 or the chart build may have failed)." if late else "."))
+    print(f"  Latest available: {_fmt(run)}")
+    info = _gh_status()
+    if info:
+        print(f"  {info}")
+    print("  [Y] open the latest now   [W] wait and open today's when ready   [N] cancel")
+    if assume_yes or not sys.stdin or not sys.stdin.isatty():
+        print("  -> Y (no prompt)"); return "go"
     try:
-        man = _manifest()
-    except Exception as e:                             # noqa: BLE001  offline: local only
-        log(f"Drive unreachable ({str(e)[:80]}) — showing the pages already on this PC")
-    marker = _marker(man)
-    log(f"new Phase 1 data marker (CI full run): {GS._ist(marker.isoformat()) if marker else '-'}")
+        ans = (input("  Choice (Enter = Y): ").strip().upper() or "Y")[:1]
+    except EOFError:
+        ans = "Y"
+    if ans == "N":
+        return "cancel"
+    if ans != "W":
+        return "go"
+    print(f"  Waiting for today's run (checking every {WAIT_POLL_S // 60} min, up to "
+          f"{WAIT_MAX_H} h; Ctrl+C stops waiting and opens the latest) ...")
+    end = time.time() + WAIT_MAX_H * 3600
+    try:
+        while time.time() < end:
+            time.sleep(WAIT_POLL_S)
+            man.clear(); man.update(_manifest())
+            run = latest_run(man)
+            if run and run.astimezone(IST).date() == datetime.now(IST).date():
+                log(f"today's run arrived ({_fmt(run)})"); return "go"
+            log(f"  not yet — {_gh_status() or 'still waiting'}")
+        log("gave up waiting — opening the latest run")
+    except KeyboardInterrupt:
+        log("stopped waiting — opening the latest run")
+    return "go"
+
+
+def download(man, force=False, dry_run=False):
     st = _state()
     seen = {"manifest": man.get("built_at_utc"), "darvas": man.get("_darvas_modified")}
     missing = [p for p in GS.PAGES if not os.path.exists(os.path.join(ROOT, p))]
-    if man and (force or missing or st.get("_fetched") != seen):
+    if force or missing or st.get("_fetched") != seen:
         for which in ("all", "pf"):
             GS.fetch(which, dry_run=dry_run, no_open=True, no_fallback=True)
         if not dry_run:
             st["_fetched"] = seen
-    elif man:
-        log("Drive has nothing newer since the last fetch — skipping the download step")
+            _save_state(st)
+    else:
+        log("Drive has nothing newer since the last download — nothing to fetch")
 
-    mk = marker.isoformat() if marker else "none"
-    todo = []
-    for page, spec in GS.PAGES.items():                # CI page missing/failed in Drive
-        v = man.get("pages", {}).get(page)
-        if man and "drive" not in spec and (not v or v.get("status") != "ok"):
-            todo.append((page, [spec["cmd"] + (["--no-open"] if "darvas" not in spec["cmd"][0] else [])]))
-        elif "drive" in spec and not os.path.exists(os.path.join(ROOT, page)):
-            todo.append((page, [spec["cmd"]]))
-    for page, cmds in LOCAL.items():                   # local pages: stale vs the marker
-        t = _mtime(page)
-        if t is None or (marker and t < marker):
-            todo.append((page, cmds))
-    plan = []
-    for page, cmds in todo:
-        done = st.get(page, {})
-        if not force and done.get("marker") == mk:     # already tried for this data
-            log(f"  skip {page}: already built for this data"
-                + ("" if done.get("ok") else " and it FAILED (use --force to retry)"))
-            continue
-        plan.append((page, cmds))
-    if not plan:
-        log("nothing to build — every page is up to date for the latest data")
-    for page, cmds in plan:
-        if dry_run:
-            log(f"  WOULD build {page}: {' | '.join(' '.join(c) for c in cmds)}")
-            continue
-        st[page] = {"marker": mk, "ok": _run(page, cmds)}
+
+def _run(page, cmds) -> bool:
+    """run a build command (task mode): no console window, output to the log."""
+    kw = {"cwd": ROOT}
+    if HIDDEN:
+        kw.update(stdout=sys.stdout, stderr=subprocess.STDOUT,
+                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    exe = sys.executable.replace("pythonw.exe", "python.exe")
+    for c in cmds:
+        log(f"  building {page}: {' '.join(c)}")
+        if subprocess.run([exe] + c, **kw).returncode != 0:
+            log(f"  FAILED: {page}")
+            return False
+    return True
+
+
+def task(force: bool, dry_run: bool) -> dict:
+    t0 = time.time()
+    # 1) market-state inputs for CI (breadth self-skips when already newer than the store)
     if not dry_run:
-        os.makedirs(os.path.dirname(STATE), exist_ok=True)
-        with open(STATE, "w", encoding="utf-8") as fh:
-            json.dump(st, fh, indent=1)
+        _run("market breadth table", [["guru/build_market_breadth.py"]])
+    GS.inputs_push(dry_run)
+    # 2) CI pages
+    man = _manifest()
+    run = latest_run(man)
+    log(f"latest CI run: {_fmt(run)}")
+    download(man, force, dry_run)
+    # 3) PC-only pages: rebuild when the CI run is newer than them, then publish
+    st, mk, built = _state(), (run.isoformat() if run else "none"), []
+    for page, spec in GS.PAGES.items():
+        if GS._builder(spec) != "pc":
+            continue
+        t = _mtime(page)
+        if t is not None and (run is None or t >= run):
+            continue                                   # already built for this run
+        if not force and st.get(page, {}).get("marker") == mk:
+            log(f"  skip {page}: already tried for this run"
+                + ("" if st[page].get("ok") else " and it FAILED (--force retries)"))
+            continue
+        if dry_run:
+            log(f"  WOULD build + publish {page}"); continue
+        ok = _run(page, [spec["cmd"] + ["--no-open"]])
+        st[page] = {"marker": mk, "ok": ok}
+        if ok:
+            built.append(page)
+    if not dry_run:
+        _save_state(st)
+        if built:
+            GS.publish(t0, False, only=built, owner="pc")
+            man = _manifest()
+    if not built:
+        log("no PC page needed a rebuild")
     return man
 
 
-def write_home(man: dict, focus: str) -> str:
+def write_home(man: dict, focus: str | None) -> str:
     st = _state()
+    run = latest_run(man) if man else None
     items = []
     for group, page, label in MENU:
         t = _mtime(page)
@@ -199,17 +285,28 @@ def write_home(man: dict, focus: str) -> str:
         built = _utc(v.get("built_at_utc")) if v.get("status") == "ok" else None
         if page == "gallery_darvas.html":               # own Drive file, not in the manifest
             built = _utc(man.get("_darvas_modified")) if man else None
-        src = "CI" if built and t and t >= built else "this PC"
-        when = built if src == "CI" and built else t
-        failed = st.get(page, {}).get("ok") is False
+        pc = GS._builder(GS.PAGES.get(page, {})) == "pc"
+        who = "this PC" if pc else "CI"
+        when = built if built and t and t >= built else t
+        old = bool(run and when and when.astimezone(IST).date() < run.astimezone(IST).date())
+        bad = v.get("status") == "failed" or (pc and st.get(page, {}).get("ok") is False)
         items.append({"g": group, "f": page, "l": label, "ok": t is not None,
                       "when": GS._ist(when.isoformat()) if when else "not built",
-                      "src": src, "bad": failed})
+                      "src": who, "bad": bad, "old": old})
+    now = datetime.now(IST)
+    if run and run.astimezone(IST).date() == now.date():
+        banner = f"Today's run · built {run.astimezone(IST):%H:%M} IST"
+    elif run:
+        banner = f"Latest run: {_fmt(run)}" + ("" if now.weekday() >= 5 or now.hour < CHECK_FROM
+                                               else " · today's not ready yet")
+    else:
+        banner = "Drive not reachable — pages already on this PC"
     first = next((i["f"] for i in items if i["g"] == ("Portfolio" if focus == "pf" else "Market") and i["ok"]),
                  items[0]["f"])
     html = (_TPL.replace("__ITEMS__", json.dumps(items))
             .replace("__FOCUS__", json.dumps(first if focus else ""))
-            .replace("__NOW__", datetime.now().strftime("%d %b %Y %H:%M")))
+            .replace("__BANNER__", banner)
+            .replace("__NOW__", now.strftime("%d %b %Y %H:%M")))
     out = os.path.join(ROOT, HOME)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
@@ -221,43 +318,45 @@ _TPL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Chart galleries</title>
 <style>
- :root{--bg:#f4f6f9;--panel:#fff;--ink:#1d2433;--mute:#6b7280;--line:#e3e7ee;--acc:#1a3d6e;--accbg:#e8eef8;--bad:#b42318;--badbg:#fdecea}
- @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#11151c;--panel:#181d26;--ink:#e6e9ef;--mute:#9aa3b2;--line:#2a313d;--acc:#8fb4ff;--accbg:#22304a;--bad:#ff8a80;--badbg:#3a1f1f}}
- :root[data-theme="dark"]{--bg:#11151c;--panel:#181d26;--ink:#e6e9ef;--mute:#9aa3b2;--line:#2a313d;--acc:#8fb4ff;--accbg:#22304a;--bad:#ff8a80;--badbg:#3a1f1f}
+ :root{--bg:#f4f6f9;--panel:#fff;--ink:#1d2433;--mute:#6b7280;--line:#e3e7ee;--acc:#1a3d6e;--accbg:#e8eef8;--bad:#b42318;--badbg:#fdecea;--warn:#8a5300;--warnbg:#fff4e0}
+ @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#11151c;--panel:#181d26;--ink:#e6e9ef;--mute:#9aa3b2;--line:#2a313d;--acc:#8fb4ff;--accbg:#22304a;--bad:#ff8a80;--badbg:#3a1f1f;--warn:#f2c46b;--warnbg:#3a2f1a}}
+ :root[data-theme="dark"]{--bg:#11151c;--panel:#181d26;--ink:#e6e9ef;--mute:#9aa3b2;--line:#2a313d;--acc:#8fb4ff;--accbg:#22304a;--bad:#ff8a80;--badbg:#3a1f1f;--warn:#f2c46b;--warnbg:#3a2f1a}
  *{box-sizing:border-box} html,body{height:100%;margin:0}
  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);display:flex}
  nav{width:250px;flex:none;background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:10px 8px}
- nav h1{font-size:15px;margin:2px 8px 2px} nav .sub{font-size:11px;color:var(--mute);margin:0 8px 10px}
+ nav h1{font-size:15px;margin:2px 8px 2px} nav .sub{font-size:11px;color:var(--mute);margin:0 8px 6px}
+ nav .run{font-size:11.5px;margin:0 8px 8px;padding:4px 7px;border-radius:5px;background:var(--accbg)}
  nav h2{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:14px 8px 4px}
  nav button{display:block;width:100%;text-align:left;border:0;background:none;color:inherit;padding:6px 8px;border-radius:6px;cursor:pointer;font:inherit}
  nav button:hover{background:var(--accbg)} nav button.on{background:var(--accbg);box-shadow:inset 3px 0 0 var(--acc)}
  nav button b{display:block;font-size:13px;font-weight:600} nav button span{font-size:11px;color:var(--mute)}
- nav button.bad span{color:var(--bad)} nav button:disabled{opacity:.45;cursor:default}
+ nav button.old span{color:var(--warn)} nav button.bad span{color:var(--bad)} nav button:disabled{opacity:.45;cursor:default}
  main{flex:1;display:flex;flex-direction:column;min-width:0}
  .bar{display:flex;gap:10px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--panel);font-size:12px;color:var(--mute)}
  .bar a{color:var(--acc)} .bar strong{color:var(--ink);font-size:13px}
  iframe{flex:1;border:0;width:100%;background:#fff}
  @media (max-width:700px){body{flex-direction:column} nav{width:auto;max-height:40vh;border-right:0;border-bottom:1px solid var(--line)}}
 </style></head><body>
-<nav id="nav"><h1>Chart galleries</h1><div class="sub">Page written __NOW__</div></nav>
+<nav id="nav"><h1>Chart galleries</h1><div class="sub">Page written __NOW__</div><div class="run">__BANNER__</div></nav>
 <main><div class="bar"><strong id="ttl"></strong><span id="meta"></span><a id="pop" href="#" target="_blank">open in its own tab &#8599;</a></div>
 <iframe id="view" title="gallery"></iframe></main>
 <script>
 const I=__ITEMS__, FOCUS=__FOCUS__, nav=document.getElementById('nav');
 let g='';
+function note(it){return (it.old?' · older data':'')+(it.bad?' · last build FAILED':'');}
 I.forEach(it=>{
   if(it.g!==g){g=it.g;const h=document.createElement('h2');h.textContent=g;nav.appendChild(h);}
   const b=document.createElement('button');b.dataset.f=it.f;b.disabled=!it.ok;
-  if(it.bad)b.classList.add('bad');
+  if(it.bad)b.classList.add('bad'); else if(it.old)b.classList.add('old');
   b.innerHTML='<b></b><span></span>';b.querySelector('b').textContent=it.l;
-  b.querySelector('span').textContent=it.ok?(it.when+' · '+it.src+(it.bad?' · last build FAILED':'')):'not built yet';
+  b.querySelector('span').textContent=it.ok?(it.when+' · '+it.src+note(it)):'not built yet';
   b.onclick=()=>show(it.f);nav.appendChild(b);
 });
 function show(f){
   const it=I.find(x=>x.f===f); if(!it||!it.ok)return;
   document.getElementById('view').src=f;
   document.getElementById('ttl').textContent=it.l;
-  document.getElementById('meta').textContent='updated '+it.when+' · built by '+it.src+(it.bad?' · last build FAILED, showing the older copy':'');
+  document.getElementById('meta').textContent='updated '+it.when+' · built by '+it.src+note(it);
   document.getElementById('pop').href=f;
   nav.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.f===f));
   try{localStorage.setItem('gal_last',f)}catch(e){}
@@ -270,14 +369,16 @@ show((I.find(x=>x.f===start&&x.ok)||I.find(x=>x.ok)||{}).f);
 def main():
     global HIDDEN
     ap = argparse.ArgumentParser(description="one page for all chart galleries")
-    ap.add_argument("cmd", choices=["refresh", "home"])
+    ap.add_argument("cmd", choices=["refresh", "task", "home"])
     ap.add_argument("--focus", choices=["all", "pf"], default=None,
                     help="open on the market (all) or portfolio (pf) section")
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--yes", action="store_true", help="never prompt; take the latest run")
+    ap.add_argument("--at", help='pretend the IST clock is "YYYY-MM-DD HH:MM" (testing the time rule)')
     ap.add_argument("--hidden", action="store_true",
                     help="scheduled-task mode: no console windows, output to logs/galleries_refresh.log")
-    ap.add_argument("--force", action="store_true", help="retry pages whose build failed for this data")
-    ap.add_argument("--dry-run", action="store_true", help="show what would be fetched/built; write nothing")
+    ap.add_argument("--force", action="store_true", help="task: retry PC pages that failed for this run")
+    ap.add_argument("--dry-run", action="store_true", help="show what would happen; write nothing")
     a = ap.parse_args()
     if a.hidden:
         HIDDEN = True
@@ -286,16 +387,27 @@ def main():
             os.replace(LOG, LOG + ".old")
         sys.stdout = sys.stderr = open(LOG, "a", encoding="utf-8", buffering=1)
         log("=" * 20 + " scheduled refresh")
+        if a.cmd == "refresh":                          # old task command line
+            a.cmd = "task"
     man = {}
-    if a.cmd == "refresh":
-        man = refresh(a.force, a.dry_run)
+    if a.cmd == "task":
+        man = task(a.force, a.dry_run)
         if a.dry_run:
-            log("DRY RUN: nothing downloaded, built or written"); return
-    else:
-        try:
-            man = _manifest()
-        except Exception:                              # noqa: BLE001
-            pass
+            log("DRY RUN: nothing downloaded, built, published or written"); return
+        write_home(man, None)
+        return
+    try:
+        man = _manifest()
+    except Exception as e:                             # noqa: BLE001  offline: local copies
+        log(f"Drive unreachable ({str(e)[:80]}) — showing the pages already on this PC")
+    if a.cmd == "refresh" and man:
+        now = (datetime.strptime(a.at, "%Y-%m-%d %H:%M").replace(tzinfo=IST) if a.at
+               else datetime.now(IST))
+        if decide(man, now, a.yes) == "cancel":
+            log("cancelled — nothing downloaded"); return
+        download(man, dry_run=a.dry_run)
+        if a.dry_run:
+            log("DRY RUN: nothing downloaded or written"); return
     out = write_home(man, a.focus)
     if not a.no_open:
         webbrowser.open("file:///" + out.replace("\\", "/"))
