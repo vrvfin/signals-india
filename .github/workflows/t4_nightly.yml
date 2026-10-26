@@ -225,9 +225,14 @@ jobs:
       # Self-gating: exits silently when nothing reported in the window, and a
       # per-season ledger (quarter_teardown_mailed.parquet) means each holding is
       # mailed once. Runs after ingest_fundamentals has refreshed statements.
-      - name: Quarterly teardown mail (clean PAT + early warnings, last 24h)
+      # PER COMPANY, not one combined mail (user 2026-10-26: "why did i not get individual
+      # results break down mail? ather and apl came in single mail"). This step is usually
+      # the FIRST to see a day's reporters (pf_daily_mails starts hours late), so its old
+      # combined mail pre-empted the per-company ones. Same call as pf_daily_mails and
+      # results_watch; the per_company ledger rows stop any repeat between the three.
+      - name: Quarterly teardown mails (per company, last 26h)
         if: always()
-        run: python scripts/quarter_teardown.py --daily
+        run: python scripts/quarter_teardown.py --per-company --since-hours 26
         continue-on-error: true
 
       - name: PF daily focus mail (what changed, why it matters, what to check)
