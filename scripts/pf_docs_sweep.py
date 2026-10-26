@@ -317,6 +317,48 @@ def is_audio_link(title: str, url: str = "") -> bool:
     return bool(_AUDIO_TEXT_RE.search(t))
 
 
+# Screener's company page appends its own one-line summary to a filing's label:
+# "Outcome of Board Meeting 23 Oct - Board allotted 44,000 equity shares ...".
+_SUMMARY_RE = re.compile(r"\b\d{1,2}\s+[A-Za-z]{3}[a-z]*\.?(?:\s+\d{4})?\s+-\s+(.+)$")
+_RESULTS_WORD_RE = re.compile(
+    # No bare "FY26": it is in "FY26 report" (an AGM item) and "auditors for FY 2026-27".
+    r"(?i)result|quarter|\bq[1-4]\b|q[1-4]\s*fy|\bh[12]\b|half[- ]?year|"
+    r"revenue|sales|profit|\bpat\b|ebitda|earnings|financials|\bloss\b|margin|"
+    r"turnover|income")
+# Filing LABELS that are never the results document, even when their text mentions
+# results: a notice of the earnings call, the AGM outcome. classify() lets these
+# through because its IGNORE is overridden by "financial result".
+# NOT newspaper ads: a results ad prints the results table, and was KENNAMET's only
+# Q4 FY26 source (measured 2026-10-25) - dropping it would lose the quarter.
+_NOT_RESULTS_LABEL_RE = re.compile(r"(?i)-\s*intimation\b|outcome of agm|trading window")
+
+
+def not_results_by_summary(title, doc_type: str = "") -> bool:
+    """True when a 'results'-typed filing's own summary shows it is something else. Pure.
+
+    classify() types every "Outcome of Board Meeting" and every "Press Release" as
+    results, because that is how Screener labels them. Measured 2026-10-25: 111 of the
+    sweep's 144 queued results rows were read and gave NO figures - allotments, warrant
+    conversions, AGM and auditor decisions, acquisitions, launches, awards (FREDUN 23 Oct:
+    "Board allotted 44,000 equity shares ... after conversion of 14,667 warrants").
+
+    Only the SUMMARY is read, never the label: the label is the thing that misleads. No
+    summary (a bare "Outcome of Board Meeting") means we cannot tell, so it is kept - a
+    real result must never be lost to this gate."""
+    if str(doc_type or "") != "results":
+        return False
+    m = _SUMMARY_RE.search(str(title or ""))
+    label = str(title or "")[:m.start()] if m else str(title or "")
+    if _NOT_RESULTS_LABEL_RE.search(label):
+        return True
+    if not m:
+        return False
+    summary = m.group(1).strip()
+    if len(summary) < 12:          # "ago", a stray date - no real summary to judge
+        return False
+    return not _RESULTS_WORD_RE.search(summary)
+
+
 def parse_date(text: str, today: datetime | None = None) -> str:
     """Screener document label -> ISO date. Three shapes, in priority order:
 
@@ -925,6 +967,13 @@ def main() -> None:
             miss = [d for d in miss if d not in _notice]
             log(f"  - {sym:<14} dropped {len(_notice)} meeting notice(s) "
                 f"(an intimation of a future call / board meeting is not the document)")
+        # ...nor a board outcome / press release whose own summary is not about results
+        # (2026-10-25: 111 of 144 swept 'results' rows gave no figures).
+        _notres = [d for d in miss if not_results_by_summary(d.get("title"), d.get("doc_type"))]
+        if _notres:
+            miss = [d for d in miss if d not in _notres]
+            log(f"  - {sym:<14} dropped {len(_notres)} non-results filing(s) "
+                f"(summary names no results)")
         if miss:
             per_company[sym] = miss
             for d in miss:
@@ -1229,6 +1278,66 @@ def _self_test() -> int:
               {"doc_type": "results", "title": "T", "announcement_date": "2026-05-11"},
               {"doc_type": "presentation", "title": "T", "announcement_date": "2026-05-11"},
           ])) == 2)
+
+    # ---- a 'results' filing whose own summary is about something else (real titles,
+    # processing_queue 2026-10-25) is dropped; anything results-shaped or unsummarised
+    # is kept.
+    nr = not_results_by_summary
+    check("warrant allotment outcome is not results",
+          nr("Board Meeting Outcome for Outcome Of Board Meeting Dated 23Rd October, 2026 "
+             "23 Oct - Board allotted 44,000 equity shares on 23 Oct 2026 after "
+             "conversion of 14,667 warrants post 1:2 bonus issue.", "results"))
+    check("product-launch press release is not results",
+          nr("Announcement under Regulation 30 (LODR)-Press Release / Media Release "
+             "29 Aug - Ather launched Konarc scooter, 5th-gen Bedrock batteries.",
+             "results"))
+    check("AGM / auditor outcome is not results",
+          nr("Outcome of Board Meeting 3 Sep - Board approved AGM on 30 September 2026, "
+             "book closure, auditor reappointment.", "results"))
+    check("a results press release is KEPT",
+          not nr("Announcement under Regulation 30 (LODR)-Press Release / Media Release "
+                 "12 Aug - Q1FY27 revenue rose 33% to INR 10,213 million; PAT up 39%.",
+                 "results"))
+    check("an outcome approving results is KEPT",
+          not nr("Board Meeting Outcome for Outcome Of The Board Meeting Held On "
+                 "19.10.2026 19 Oct - Standalone and consolidated Q2 and half-year "
+                 "FY2026-27 unaudited financial results approved", "results"))
+    check("an operational-update press release naming the quarter is KEPT",
+          not nr("Press Release 5 Oct - The Press Release - Raymond Realty Limited - "
+                 "Key Operational Updates - Q2 FY27.", "results"))
+    check("a bare label with no summary is KEPT (cannot tell)",
+          not nr("Outcome of Board Meeting", "results"))
+    check("'2 Sep ago' is not a summary",
+          not nr("Please Find Attached Consolidated And Standalone Unaudited Financial "
+                 "Results For The Quarter Ended June 30, 2026. 2 Sep ago", "results"))
+    check("AGM-items outcome naming 'FY26 report' is not results",
+          nr("Outcome of Board Meeting 24 Aug - Board approved FY26 report, reappointed "
+             "CMD for five years, and set AGM for 25 Sep 2026.", "results"))
+    check("a newspaper ad of results is KEPT (it carries the table)",
+          not nr("Announcement under Regulation 30 (LODR)-Newspaper Publication 7 Oct - "
+             "Newspaper Publication in respect of statement of Unaudited Standalone "
+             "Financial Results", "results"))
+    check("earnings-call intimation is not results",
+          nr("Announcement under Regulation 30 (LODR)-Analyst / Investor Meet - "
+             "Intimation 19 Oct - Earnings Call details for unaudited financial results",
+             "results"))
+    check("AGM outcome is not results",
+          nr("Shareholder Meeting / Postal Ballot-Outcome of AGM 28 Sep - Uniparts held "
+             "its 32nd AGM; shareholders considered dividends, audited results.",
+             "results"))
+    check("only results rows are judged",
+          not nr("Outcome of Board Meeting 3 Sep - Board approved AGM.", "presentation"))
+    # The Phase-2 results feed keeps its own copy of IGNORE (it imports nothing from
+    # here); the two must not drift.
+    import ingest_company_docs as _icd
+    check("Phase-2 results-feed ignore list == IGNORE",
+          set(_icd.RESULTS_FEED_IGNORE) == set(IGNORE))
+    check("Phase-2 feed drops AGM voting results",
+          _icd.results_feed_ignored("Shareholders meeting", "results"))
+    check("Phase-2 feed keeps a board outcome",
+          not _icd.results_feed_ignored("Outcome of Board Meeting", "results"))
+    check("Phase-2 feed: other feeds untouched",
+          not _icd.results_feed_ignored("Shareholders meeting", "concall"))
 
     # THE CONCALL WINDOW: its digest file means "today", so its lookback must be
     # narrower than every other type's. See _self_test_window().
