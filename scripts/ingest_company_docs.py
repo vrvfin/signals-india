@@ -89,6 +89,25 @@ LOOKBACK_DAYS = 30     # Ingest anything on page 1 dated within this many days.
 # re-listed in the ~20:00 IST run is caught; 12h missed those >12h-apart pairs).
 RECENT_DEDUP_HOURS = 24
 
+# Screener's /announcements/results/ page is not results-only: it also lists AGM voting
+# results ("Shareholders meeting"), trading-window closures and newspaper ads, and every
+# item on it was queued as doc_type 'results'. Measured 2026-10-25: 7 of this feed's 12
+# PF results rows were read and gave no figures (AIMTRON 24 Oct: NSE AGM voting letter,
+# mailed as "filed, numbers pending"). Same phrases as pf_docs_sweep.IGNORE - its
+# self-test asserts the two lists stay equal. RESULTS FEED ONLY; other feeds unchanged.
+RESULTS_FEED_IGNORE = ("newspaper publication", "shareholders meeting", "agm notice",
+                       "general updates", "trading window", "share transfer")
+
+
+def results_feed_ignored(title: str, doc_type: str) -> bool:
+    """True for a results-feed item that is plainly not a results filing. Pure."""
+    if doc_type != "results":
+        return False
+    low = (title or "").lower()
+    if any(k in low for k in ("outcome of board meeting", "financial result")):
+        return False
+    return any(k in low for k in RESULTS_FEED_IGNORE)
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
@@ -455,7 +474,7 @@ def main() -> None:
     new_rows = []
     counts = {"seen": 0, "new": 0, "downloaded": 0, "skipped_old": 0,
               "dup": 0, "dup_recent": 0, "download_fail": 0, "ingest_error": 0,
-              "skipped_nonpf": 0}
+              "skipped_nonpf": 0, "skipped_notresults": 0}
 
     for feed_name, cfg in feeds.items():
         src = cfg.get("path") or f"filter {cfg.get('filter_id')}"
@@ -500,6 +519,10 @@ def main() -> None:
                 if (a["doc_type"] != "concall" and portfolio_isins
                         and isin not in portfolio_isins):
                     counts["skipped_nonpf"] += 1
+                    continue
+
+                if results_feed_ignored(a["title"], a["doc_type"]):
+                    counts["skipped_notresults"] += 1
                     continue
 
                 counts["new"] += 1
@@ -560,6 +583,7 @@ def main() -> None:
     print(f"Same doc <{RECENT_DEDUP_HOURS}h (re-list): {counts['dup_recent']}  (skipped — date-shift guard)")
     print(f"Outside lookback window: {counts['skipped_old']}")
     print(f"Non-PF (non-concall)   : {counts['skipped_nonpf']}  (skipped — extractor is PF-only)")
+    print(f"Not results (results feed): {counts['skipped_notresults']}  (AGM / trading window / ads)")
     print(f"New documents queued   : {counts['new']}")
     print(f"  PDFs downloaded      : {counts['downloaded']}")
     print(f"  download failures    : {counts['download_fail']}")

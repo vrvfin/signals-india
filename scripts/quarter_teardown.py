@@ -1669,13 +1669,88 @@ def filed_awaiting_numbers(queue, pf, season: str, hours: float | None,
             continue
         sym, name = by_isin.get(isin, ("", ""))
         e = out.setdefault(isin, {"isin": isin, "symbol": sym, "name": name,
-                                  "filed_on": r["_d"], "title": "", "deck": False})
+                                  "filed_on": r["_d"], "title": "", "deck": False,
+                                  # 2026-10-25: the mail named the filing and nothing
+                                  # else — no link, no reason the numbers are missing.
+                                  "pdf_url": "", "deck_url": "", "status": "",
+                                  "last_error": "", "attempts": "", "category": ""})
         e["filed_on"] = max(e["filed_on"], r["_d"])
         if str(r["doc_type"]) == "presentation":
             e["deck"] = True
+            e["deck_url"] = e["deck_url"] or _txt(r.get("pdf_url"))
         elif not e["title"]:
-            e["title"] = str(r.get("title") or "")[:90]
+            e["title"] = _txt(r.get("title"))[:300]
+            e["pdf_url"] = _txt(r.get("pdf_url"))
+            e["status"] = _txt(r.get("status")).lower()
+            e["last_error"] = _txt(r.get("last_error"))
+            e["attempts"] = _txt(r.get("attempts")).removesuffix(".0")
+            e["category"] = " / ".join(x for x in (_txt(r.get("exch_category")),
+                                                   _txt(r.get("exch_subcategory"))) if x)
     return sorted(out.values(), key=lambda x: x["filed_on"], reverse=True)
+
+
+def _txt(v) -> str:
+    """A queue/ledger cell as plain text: None, NaN and pd.NA all read as ''. Pure."""
+    try:
+        if v is None or pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip()
+
+
+ANN_LEDGER = "announcement_ledger.parquet"          # read-only here
+ANN_COLS = ["isin", "ann_date", "headline", "summary", "event_type", "direction",
+            "attachment"]
+
+
+def announcement_summaries(ledger, rows: list[dict]) -> dict:
+    """isin -> {headline, summary, event_type, direction, attachment} from the
+    announcement pipeline's own ledger, for each pending filing. Pure.
+
+    Match: same ISIN, ann_date within +-1 day of the filing date. Two filings that
+    day -> prefer event_type 'results', then the one that has a summary, then the
+    newest. The headline is returned too so a mismatch is visible in the mail."""
+    if ledger is None or getattr(ledger, "empty", True) or not rows:
+        return {}
+    if "isin" not in ledger.columns or "ann_date" not in ledger.columns:
+        return {}
+    L = ledger.copy()
+    L["_i"] = L["isin"].astype(str).str.strip()
+    L["_d"] = pd.to_datetime(L["ann_date"].astype(str).str.slice(0, 10), errors="coerce")
+    out = {}
+    for r in rows:
+        try:
+            d = pd.Timestamp(r["filed_on"])
+        except Exception:
+            continue
+        m = L[(L["_i"] == r["isin"]) & ((L["_d"] - d).abs() <= pd.Timedelta(days=1))]
+        if m.empty:
+            continue
+        m = m.assign(
+            _res=m.get("event_type", pd.Series(index=m.index, dtype=object))
+                  .map(lambda v: _txt(v).lower() == "results"),
+            _sum=m.get("summary", pd.Series(index=m.index, dtype=object))
+                  .map(lambda v: bool(_txt(v))))
+        b = m.sort_values(["_res", "_sum", "_d"], ascending=False).iloc[0]
+        out[r["isin"]] = {k: _txt(b.get(k)) for k in
+                          ("headline", "summary", "event_type", "direction", "attachment")}
+    return out
+
+
+def _why_no_numbers(r: dict) -> str:
+    """Plain-English reason the filing has no numbers in the mail, from the queue. Pure."""
+    s = r.get("status") or ""
+    if s == "error":
+        n = f", attempt {r['attempts']}" if r.get("attempts") else ""
+        return (f"we tried to read the filing and failed{n}: "
+                f"{(r.get('last_error') or 'no reason recorded')[:160]}")
+    if s == "done":
+        return ("the filing was read, but Screener has not published the quarter, so the "
+                "teardown waits for it")
+    if s == "superseded":
+        return "a richer copy of this filing replaced it; numbers follow from that one"
+    return "queued — not read yet; numbers follow in a later run"
 
 
 PENDING_SENT = "teardown_pending_sent.parquet"      # new 2026-10-18, additive
@@ -1704,24 +1779,49 @@ def render_awaiting(rows: list[dict]) -> str:
     reported must be visible on the day it reports, even before the figures land."""
     if not rows:
         return ""
-    body = "".join(
-        "<tr>"
-        f"<td><b>{esc(r['symbol'] or r['isin'], 18)}</b></td>"
-        f"<td>{esc(r['name'], 44)}</td>"
-        f"<td>{esc(r['filed_on'], 12)}</td>"
-        f"<td>{'&#128202; deck too' if r['deck'] else ''}</td>"
-        f"<td>{esc(r['title'], 80)}</td></tr>" for r in rows)
+
+    def _a(url, label):
+        return (f"<a href='{esc(url, 600)}' style='color:#1a5fb4'>{label}</a>"
+                if url.startswith("http") else "")
+
+    def _block(r):
+        ann = r.get("ann") or {}
+        pdf = r.get("pdf_url") or ann.get("attachment") or ""
+        links = " &middot; ".join(x for x in (_a(pdf, "Open filing (PDF)"),
+                                              _a(r.get("deck_url") or "", "Open deck"))
+                                  if x)
+        if ann.get("summary"):
+            says = esc(ann["summary"], 700)
+            tag = " &middot; ".join(esc(x, 20) for x in (ann.get("event_type"),
+                                                         ann.get("direction")) if x)
+            if tag:
+                says = f"<span style='color:#7a8791'>[{tag}]</span> {says}"
+            if ann.get("headline") and ann["headline"] != r.get("title"):
+                says += (f"<div style='color:#7a8791;font-size:11.5px'>summary of: "
+                         f"{esc(ann['headline'], 160)}</div>")
+        else:
+            says = ("<i>No summary of this filing yet &mdash; open the PDF to read "
+                    "it.</i>")
+        line = "margin:3px 0;font-size:13px"
+        return (
+            f"<div style='border-left:4px solid #9c5c0d;padding:6px 10px;margin:8px 0 12px;"
+            f"font-family:Arial,Helvetica,sans-serif;color:#222'>"
+            f"<div style='font-size:14px'><b>{esc(r['symbol'] or r['isin'], 18)}</b> "
+            f"&middot; {esc(r['name'], 60)} &middot; filed {esc(r['filed_on'], 12)}"
+            + (f" <span style='color:#7a8791;font-size:12px'>({esc(r['category'], 60)})"
+               f"</span>" if r.get("category") else "") + "</div>"
+            f"<div style='{line}'><b>What it is:</b> {esc(r['title'], 300) or '&mdash;'}"
+            + (f" &nbsp;{links}" if links else "") + "</div>"
+            f"<div style='{line}'><b>What it says:</b> {says}</div>"
+            f"<div style='{line}'><b>Why no numbers here yet:</b> "
+            f"{esc(_why_no_numbers(r), 220)}</div></div>")
+
     return (
         _h(f"&#9888; Filed &mdash; numbers not on Screener yet ({len(rows)})",
            "These PF holdings have filed results with the exchange. Screener has not "
            "published the figures, so a teardown would have to guess at the quarter and "
            "is deliberately withheld — but the filing itself is not hidden.")
-        + f"<table border='1' cellpadding='6' cellspacing='0' "
-          f"style='border-collapse:collapse;margin:6px 0 14px;border-color:#ddd;"
-          f"font:13px Arial,Helvetica,sans-serif;color:#222'>"
-          f"<thead><tr style='background:#9c5c0d;color:#fff;text-align:left'>"
-          f"<th>Company</th><th>Name</th><th>Filed</th><th></th><th>Filing</th></tr>"
-          f"</thead><tbody>{body}</tbody></table>")
+        + "".join(_block(r) for r in rows))
 
 
 def render_filing(d: dict) -> str:
@@ -2777,6 +2877,16 @@ def main() -> None:
             if awaiting:
                 log(f"  filed but numbers pending: "
                     f"{', '.join(a['symbol'] or a['isin'] for a in awaiting)}")
+                # What each filing SAYS, from the announcement pipeline's ledger
+                # (read-only). Its own try: a miss leaves link + reason in the mail.
+                try:
+                    _anns = announcement_summaries(
+                        _lp2(drive, idx, ANN_LEDGER, ANN_COLS), awaiting)
+                    for a in awaiting:
+                        a["ann"] = _anns.get(a["isin"], {})
+                    log(f"  pending summaries found: {len(_anns)}/{len(awaiting)}")
+                except Exception as e:
+                    log(f"  WARNING: announcement summaries unavailable ({str(e)[:70]})")
         except Exception as e:
             log(f"  WARNING: could not compute pending filings ({str(e)[:70]})")
 
