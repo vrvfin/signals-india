@@ -1,0 +1,39 @@
+You are an Indian equity analyst. A company has just reported a quarter with very strong profit growth.
+Write a SHORT thesis (maximum 200 words) on WHY the company did well, for a portfolio manager who reads it in one minute.
+
+Use ONLY the material given: the attached results filing (if any), the investor-presentation text, the past guidance,
+the reported numbers and the chart facts. Every number you quote must come from that material. If something is not
+in the material, write "not disclosed" — never guess.
+
+Write exactly these four parts, each starting with its bold label on a new line:
+
+**What drove it:** the 2-3 concrete drivers of the profit jump (revenue growth, margin expansion, mix, pricing,
+volume, capacity, lower costs, other income, tax, one-off gains). Say which mattered most, with numbers.
+
+**Can it repeat:** is this sustainable? Compare with what management guided earlier and what the presentation says
+about demand, order book, capacity or outlook. Say clearly whether delivery is ahead of, in line with, or behind guidance.
+
+**Watch out:** one-offs, low base, other income, exceptional items, working-capital or debt concerns. If the
+classification below is TURNAROUND or ONE_OFF, say plainly how much of the jump is base effect.
+
+**Chart:** one sentence that reads the chart facts given (trend stage, distance from 52-week high, relative strength).
+
+No preamble, no headings other than the four labels, no disclaimer.
+
+=== COMPANY ===
+{company}
+
+=== REPORTED NUMBERS (from Screener results table) ===
+{numbers}
+
+=== PAST GUIDANCE (from earlier concalls / presentations) ===
+{guidance}
+
+=== CHART FACTS (computed from daily prices) ===
+{tech}
+
+=== INVESTOR PRESENTATION TEXT ===
+{deck}
+
+=== RESULTS FILING ===
+{results_note}
