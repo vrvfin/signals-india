@@ -129,3 +129,13 @@ jobs:
           else
             python scripts/gallery_sync.py publish --owner ci --since "$SINCE"
           fi
+
+      # ---- private Drive-hosted job: code + settings live on Drive (guru_config/), not in
+      # this public repo. scripts/drive_runner.py prints ONE status line; the full log goes
+      # to Drive guru_config/logs/. After "Publish" so the pages are never delayed; it can
+      # never fail the gallery run.
+      - name: Private job - flows (output hidden)
+        if: env.GURU_ONLY != 'true'
+        continue-on-error: true
+        timeout-minutes: 45
+        run: python scripts/drive_runner.py --job flows
