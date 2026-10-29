@@ -45,6 +45,7 @@ import quarterly_table as QT
 import redflag_register as RR
 import ar_scorecard as ARS
 import deck_teardown as DT
+import peer_check as PC
 import filing_results as FR
 import season_summary as SS
 import results_day_guidance as RDG
@@ -1400,6 +1401,12 @@ def block_season(d: dict) -> str:
               "mail — this page is the financial view.") + inner
 
 
+def block_peers(d: dict) -> str:
+    """Peer check (O8, 2026-10-18): rank vs the T9 peer group this quarter. main() fills
+    d["peers"]; absent -> no block."""
+    return PC.render(d.get("peers") or {})
+
+
 def block_docs(d: dict) -> str:
     """Step 6: this quarter's concall + results release and this FY's annual report,
     condensed, each with its NEW / RECENT badge (teardown_docs). Filled by main()."""
@@ -1444,7 +1451,7 @@ def render(d: dict, stmts: pd.DataFrame, rich: bool = True) -> str:
     body = (block_a(d) + block_b(d) + block_ladder(d, stmts) + block_h1(d, rich)
             + block_financials(d)
             + block_h2(d) + block_deck(d) + block_d(d) + block_progress(d)
-            + block_docs(d) + block_season(d))
+            + block_peers(d) + block_docs(d) + block_season(d))
     foot = (
         f"<div style='margin-top:22px;padding-top:12px;border-top:1px solid #ddd;"
         f"font-size:11.5px;color:{MUTED};line-height:1.6'>"
@@ -2725,6 +2732,30 @@ def main() -> None:
         _ar_fy, _win = None, None
         log(f"  WARNING: document summaries unavailable ({str(e)[:70]})")
 
+    # Peer check (O8): classification + Screener results, read once per run.
+    _peer_src = {}
+    try:
+        from _extractor_base import find_file as _ff, download_bytes as _db
+        _cf = _ff(drive, idx, "company_classification.csv")
+        _peer_src["cls"] = (pd.read_csv(io.BytesIO(_db(drive, _cf)), dtype=str).fillna("")
+                            if _cf else pd.DataFrame())
+        _rf = _ff(drive, idx, "results.parquet")
+        _peer_src["res"] = pd.read_parquet(io.BytesIO(_db(drive, _rf))) if _rf else pd.DataFrame()
+        _pe = RR.period_end(season)
+        _peer_src["q"] = _pe.strftime("%b %Y") if _pe else ""
+    except Exception as e:
+        log(f"  WARNING: peer check unavailable ({str(e)[:70]})")
+
+    def _peers(d):
+        """Fill d['peers'] for the peer block. Silent on failure - the block is extra."""
+        if not _peer_src.get("q"):
+            return
+        try:
+            d["peers"] = PC.peer_table(d["isin"], _peer_src["cls"], _peer_src["res"],
+                                       _peer_src["q"])
+        except Exception as e:
+            log(f"  {d.get('symbol')}: peer check skipped ({str(e)[:60]})")
+
     def _docs(d):
         """Fill d['docs'] / d['doc_texts']. Silent on failure - the block is extra."""
         if _ar_fy is None or _queue_all is None or _queue_all.empty:
@@ -2827,6 +2858,7 @@ def main() -> None:
                 f"({_prev} -> {_cur}) — re-sending")
         _progress(d, stmts)
         _docs(d)
+        _peers(d)
         html = render(d, stmts, rich=args.html)
         if len(html.encode("utf-8")) > MAX_HTML_BYTES and d.get("progress") is not None:
             # D2 is the newest block; it gives way first rather than tipping the
