@@ -63,6 +63,7 @@ MENU = [
     ("Market", "gallery_drops.html", "Recent drops (7d)"),
     ("Market", "gallery_ipo.html", "Recent IPOs (1y)"),
     ("Market", "gallery_guru.html", "Guru screen"),
+    ("Market", "gallery_setups.html", "Top-20 setups"),
     ("Market", "gallery_darvas.html", "Darvas boxes"),
     ("Market", "gallery_zanger.html", "Zanger patterns"),
     ("Market", "gallery_guidance_watchlist.html", "Guidance watchlist"),

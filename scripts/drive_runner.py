@@ -132,13 +132,23 @@ def main():
         status = "DRY-OK" if code == 0 else status
     try:
         if drive is not None:
-            cfg_id = get_or_create_subfolder(drive, os.environ["GDRIVE_FOLDER_ID"], FOLDER)
-            logs_id = get_or_create_subfolder(drive, cfg_id, "logs")
-            upload_bytes(drive, logs_id, log_name, log, "text/plain")
+            # a FRESH client: the first one sat idle for the whole job (2026-10-30: a 19-min
+            # job ended in log=upload-failed) — plus the repo's transient-error retry
+            from drive_io import drive_call
+            box = {"d": get_drive()}
+
+            def reconnect():
+                box["d"] = get_drive()
+
+            def up():
+                d = box["d"]
+                cfg_id = get_or_create_subfolder(d, os.environ["GDRIVE_FOLDER_ID"], FOLDER)
+                upload_bytes(d, get_or_create_subfolder(d, cfg_id, "logs"), log_name, log, "text/plain")
+            drive_call(up, on_reconnect=reconnect, label="runner log")
         else:
             log_name = "not-uploaded"
-    except Exception:
-        log_name = "upload-failed"
+    except Exception as e:                       # the class name only: no detail in public
+        log_name = f"upload-failed({e.__class__.__name__})"
     print(console_line(a.job, fp, status, time.time() - t0, log_name), flush=True)
     sys.exit(code)
 

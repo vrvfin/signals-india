@@ -52,7 +52,9 @@ BG = ["scripts/build_gallery.py"]
 
 # page -> which set fetches it + its build command. builder: "ci" (default, galleries.yml)
 # or "pc" (built + published by the PC's GalleriesRefresh task). "drive" overrides where
-# the copy lives (Darvas is published by darvas_gallery.yml).
+# the copy lives (Darvas is published by darvas_gallery.yml). "late": built by a LATER job
+# of galleries.yml (after the market pages) and published there with --only; the main
+# publish leaves its manifest entry alone instead of marking it failed.
 PAGES = {
     "market_state.html":               {"sets": ["all", "pf"], "cmd": ["scripts/build_market_state_html.py"]},
     "gallery.html":                    {"sets": ["all"], "cmd": BG + ["--view", "full"] + MCAP},
@@ -61,6 +63,10 @@ PAGES = {
     "gallery_ipo.html":                {"sets": ["all"], "cmd": BG + ["--view", "ipo"] + MCAP},
     "gallery_guidance_watchlist.html": {"sets": ["all"], "cmd": BG + ["--mode", "watchlist"] + MCAP},
     "gallery_guru.html":               {"sets": ["all"], "cmd": ["guru/build_guru_gallery.py"]},
+    # private Drive-hosted job (scripts/drive_runner.py --job setups_top20); its local
+    # fallback needs the private code on this PC
+    "gallery_setups.html":             {"sets": ["all"], "late": True,
+                                        "cmd": ["guru/build_setups_gallery.py", "--from-drive"]},
     "gallery_new_today.html":          {"sets": ["all"], "cmd": BG + ["--view", "new"] + MCAP},
     "gallery_tracker.html":            {"sets": ["all", "pf"], "cmd": ["scripts/build_tracker_html.py"]},
     "gallery_darvas.html":             {"sets": ["all"], "drive": ("_daily", "darvas_gallery.html"),
@@ -140,6 +146,8 @@ def publish(since: float, dry_run: bool, only: list[str] | None = None,
     for page, spec in PAGES.items():
         if "drive" in spec or _builder(spec) != owner or (only and page not in only):
             continue                                  # Darvas: own workflow
+        if spec.get("late") and not only:
+            continue                                  # its own later job publishes it
         mine.append(page)
         p = os.path.join(ROOT, page)
         fresh = os.path.exists(p) and os.path.getmtime(p) >= since
