@@ -257,6 +257,62 @@ def build_watchlist(drive, min_turnover_cr: float = 1.0):
 
 # ---------------------------------------------------------------- discovery
 
+# NSE corporate announcements (2026-10-25) — the FALLBACK for a day BSE returns nothing.
+# BSE's announcement API has answered 403 from the PC and from CI since ~24 Sep 2026; this
+# pipeline then saw zero filings and said only "nothing to summarise" for a month. NSE
+# serves the whole market for a date (601 filings on 23 Oct) with the ISIN and the full
+# PDF link. Rows are shaped like BSE rows (SCRIP_CD via ISIN -> bse_code, the watchlist
+# key), so everything downstream is unchanged. Fallback per DAY, not both: the same
+# filing carries different ids and headlines on the two exchanges, so taking both would
+# summarise it twice. NSE cannot see companies listed ONLY on BSE.
+NSE_ANN_API = "https://www.nseindia.com/api/corporate-announcements"
+NSE_HDR = {"User-Agent": API_HDR["User-Agent"], "Accept": "*/*",
+           "Accept-Language": "en-US,en;q=0.9"}
+# BSE files transcripts / call recordings / presentations under their own sub-categories,
+# which EXCLUDE_PAT drops (Phase 2 owns them). NSE files all of them under ONE category
+# ("Analysts/Institutional Investor Meet/Con. Call Updates", 55 of 121 on 23 Oct) and only
+# the subject says which — so the subject decides the sub-category here.
+_NSE_PHASE2_DOC = re.compile(r"(?i)\b(transcript|recording|audio|video|presentation)")
+
+
+def fetch_day_announcements_nse(d: date, isin_to_code: dict) -> list[dict]:
+    """ALL NSE filings for day d, as BSE-shaped rows. A filing whose ISIN has no BSE code
+    in the universe cannot be on the (bse_code-keyed) watchlist, so it is skipped."""
+    ds = d.strftime("%d-%m-%Y")
+    try:
+        s = requests.Session()
+        s.headers.update(NSE_HDR)
+        s.get("https://www.nseindia.com", timeout=15)          # bootstrap cookies
+        r = s.get(NSE_ANN_API, params={"index": "equities", "from_date": ds,
+                                       "to_date": ds}, timeout=40)
+        if r.status_code != 200:
+            log(f"  NSE announcements {d}: HTTP {r.status_code}")
+            return []
+        rows = r.json()
+        rows = rows if isinstance(rows, list) else rows.get("data", [])
+    except Exception as e:
+        log(f"  NSE announcements {d}: fetch failed ({str(e)[:70]})")
+        return []
+    out = []
+    for a in rows:
+        code = isin_to_code.get(str(a.get("sm_isin") or "").strip())
+        if not code:
+            continue
+        kind = str(a.get("desc") or "").strip()
+        subj = str(a.get("attchmntText") or "").strip()
+        m = _NSE_PHASE2_DOC.search(subj) if kind.startswith("Analysts/") else None
+        t = pd.to_datetime(str(a.get("an_dt") or ""), format="%d-%b-%Y %H:%M:%S",
+                           errors="coerce")
+        out.append({"SCRIP_CD": code, "NEWSID": f"NSE{a.get('seq_id')}",
+                    "NEWS_DT": (t.strftime("%Y-%m-%dT%H:%M:%S") if pd.notna(t)
+                                else d.isoformat()),
+                    "NEWSSUB": subj or kind, "HEADLINE": kind,
+                    "ATTACHMENTNAME": str(a.get("attchmntFile") or "").strip(),
+                    "CATEGORYNAME": kind,
+                    "SUBCATNAME": f"Earnings call {m.group(1).lower()}" if m else ""})
+    return out
+
+
 def fetch_day_announcements(d: date, max_pages: int = 30) -> list[dict]:
     """ALL market-wide filings for day d (strScrip='' + date), paginated."""
     out, s = [], requests.Session()
@@ -268,6 +324,8 @@ def fetch_day_announcements(d: date, max_pages: int = 30) -> list[dict]:
                   "strScrip": "", "strType": "C"}
         try:
             r = s.get(ANN_API, params=params, timeout=40)
+            if r.status_code != 200 and pageno == 1:
+                log(f"  BSE announcements {d}: HTTP {r.status_code}")
             rows = r.json().get("Table", []) if r.status_code == 200 else []
         except Exception as e:
             log(f"  page {pageno} fetch failed: {str(e)[:60]}"); break
@@ -353,8 +411,10 @@ def percompany_scan_codes(drive, meta: dict, top_n: int,
 
 
 def _download_pdf(attachment: str) -> bytes | None:
-    """Fetch the announcement PDF from BSE (Live then His host). None on failure."""
-    for base in ATTACH_HOSTS:
+    """Fetch the announcement PDF: a full link (NSE rows) as is, else BSE (Live then His
+    host). None on failure."""
+    full = str(attachment).startswith("http")
+    for base in ([""] if full else ATTACH_HOSTS):
         try:
             r = requests.get(base + attachment,
                              headers={"User-Agent": API_HDR["User-Agent"],
@@ -450,16 +510,21 @@ def main() -> None:
     d = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
     lookback = max(1, args.lookback_days)
     days = [d - timedelta(days=i) for i in range(lookback)]
-    log(f"BSE announcements for {days[-1]}..{d} ({lookback}d)  "
+    log(f"Exchange announcements (BSE, NSE fallback) for {days[-1]}..{d} ({lookback}d)  "
         f"mode={'DRY-RUN' if args.dry_run else 'LIVE'}")
 
     order, meta, n_pf = build_watchlist(drive, min_turnover_cr=args.min_turnover)
     wl_codes = set(order)
 
+    isin_to_code = {v[0]: k for k, v in meta.items() if v[0]}
     rows = []
     for dd in days:
         day_rows = fetch_day_announcements(dd)
-        log(f"market-wide filings on {dd}: {len(day_rows)}")
+        src = "BSE"
+        if not day_rows:
+            day_rows = fetch_day_announcements_nse(dd, isin_to_code)
+            src = "NSE (BSE returned none)"
+        log(f"market-wide filings on {dd}: {len(day_rows)}  [{src}]")
         rows.extend(day_rows)
 
     # A (2026-07-01): PER-COMPANY guaranteed fetch for PF + top-N by market cap (strScrip),
@@ -519,6 +584,11 @@ def main() -> None:
             seen_h.add(_hkey(lr["scrip_cd"], lr["ann_date"], lr["headline"]))
     uniq, xdup_n = [], 0
     for k in new:
+        # NSE ids are unique per filing, and NSE subjects are generic ("X has informed the
+        # Exchange about General Updates") — two DIFFERENT filings share one (23 Oct: 15
+        # such groups, 32 PDFs). The newsid check above is their dedup.
+        if k["newsid"].startswith("NSE"):
+            uniq.append(k); continue
         hk = _hkey(k["scrip_cd"], k["ann_date"], k["headline"])
         if hk in seen_h:
             xdup_n += 1; continue
