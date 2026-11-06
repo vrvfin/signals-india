@@ -891,6 +891,18 @@ _NEWS_DIRECT_MIN = 3
 # first, so recent momentum decides between names with equal strategy counts.
 _RANK_RETURNS = ("1m", "3m", "6m", "12m")
 
+
+def _high_band(dh):
+    """Nearness-to-52w-high band for the signals sort (user 2026-10-31): the
+    SAME cut-offs as the card's chip (_dh_chip), so the order matches the
+    colours. 3 = at high (>= -0.5%), 2 = within 5%, 1 = 5-15% off, 0 = deeper.
+    Bands, not the raw %, so strategy count still decides inside a band — on
+    the exact number two names almost never tie. Missing -> NaN (ranks last)."""
+    if dh is None or pd.isna(dh):
+        return float("nan")
+    v = float(dh)
+    return 3 if v >= -0.5 else 2 if v >= -5 else 1 if v >= -15 else 0
+
 _LISTICLE_PAT = re.compile(
     r"(\b\d+\s+(?:stocks?|shares?|picks?|multibagger|smallcap|midcap|largecap)"
     r"|\bstocks? to (?:buy|watch|sell)|\btop \d+|\bportfolio\b|\bbuy or sell\b"
@@ -1543,14 +1555,21 @@ def _select_signals(drive, args, exch):
                 conv[col] = conv["symbol"].astype(str).map(rmap)
             else:
                 conv[col] = float("nan")
+        if "dist_from_52w_high_pct" in feats.columns:
+            dmap = dict(zip(fsym, pd.to_numeric(feats["dist_from_52w_high_pct"],
+                                                errors="coerce")))
+            conv["_hi_band"] = conv["symbol"].astype(str).map(dmap).map(_high_band)
 
-    # RANKING: most strategies first, then the return ladder 1m > 3m > 6m > 12m
-    # (each is a tiebreak for the one before it). best_score is deliberately NOT
+    # RANKING: nearest the 52w high first (by band, see _high_band), then most
+    # strategies, then the return ladder 1m > 3m > 6m > 12m (each is a tiebreak
+    # for the one before it). Without the features column the band is skipped
+    # and the order is the old strategies-first one. best_score is deliberately NOT
     # used — it is the max RAW score across strategies whose units differ
     # (RS rank 0-100 vs streak DAYS vs raw 3m return %), so it silently favoured
     # whichever strategy happened to emit big numbers.
-    sort_cols = ["n_strategies"] + [f"return_{lb}_pct" for lb in _RANK_RETURNS
-                                    if f"return_{lb}_pct" in conv.columns]
+    sort_cols = (["_hi_band"] if "_hi_band" in conv.columns else []) \
+        + ["n_strategies"] + [f"return_{lb}_pct" for lb in _RANK_RETURNS
+                              if f"return_{lb}_pct" in conv.columns]
     conv = conv.sort_values(sort_cols, ascending=[False] * len(sort_cols),
                             na_position="last")
     conv["_exch"] = conv["symbol"].astype(str).map(exch).fillna("NSE")
