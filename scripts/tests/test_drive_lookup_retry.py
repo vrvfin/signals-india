@@ -12,6 +12,8 @@ test_drive_lookup_retry.py — offline checks for the Phase 1 Drive retry (no Dr
   4. strategy_pead scan, on a fake Drive: a refused read recovers; a missing file, a corrupt
      file (pyarrow's plain OSError) and a detector error are counted and skipped; a read that
      never comes back stops the scan and fails the step without publishing a partial list
+  5. gallery_sync._drive (chart publish, galleries.yml): the company_repo lookup waits out a
+     rate-limit 403; a permission 403 still fails at once
 
 Run:
     python scripts/tests/test_drive_lookup_retry.py
@@ -425,10 +427,45 @@ def test_pead_scan():
           next((ln for ln in log.splitlines() if "STOPPED" in ln), "no line")[:160])
 
 
+# ----------------------------------------------------------------- 5 gallery_sync
+def test_gallery_sync_drive():
+    """The one bare lookup in gallery_sync: on 2026-11-09 (galleries run 42660520815) the
+    rate-limit 403 on it crashed "Publish the setups page"."""
+    print("5. gallery_sync._drive (chart publish, galleries.yml)")
+    import _extractor_base as eb
+    import gallery_sync
+    sleeps = []
+    real = (drive_io.time.sleep, eb.get_drive, eb.get_or_create_subfolder)
+    drive_io.time.sleep = sleeps.append
+    got, raised = None, False
+    limited = Flaky([http_error(403, "rateLimitExceeded", QUOTA_MSG)], result="REPO")
+    denied = Flaky([http_error(403, "insufficientPermissions")], result="REPO")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            eb.get_drive, eb.get_or_create_subfolder = (lambda: "D"), limited
+            try:
+                got = gallery_sync._drive()
+            except HttpError:
+                pass
+            eb.get_or_create_subfolder = denied
+            try:
+                gallery_sync._drive()
+            except HttpError:
+                raised = True
+    finally:
+        drive_io.time.sleep, eb.get_drive, eb.get_or_create_subfolder = real
+    check("a rate-limit 403 on the company_repo lookup is waited out",
+          got is not None and got[:2] == ("D", "REPO") and limited.calls == 2,
+          f"calls={limited.calls} waits={sleeps}")
+    check("the helper handed to callers is unchanged", got is not None and got[2] is limited)
+    check("a permission 403 still fails at once", raised and denied.calls == 1, f"calls={denied.calls}")
+
+
 if __name__ == "__main__":
     test_classify()
     test_retrying()
     test_coverage()
     test_pead_scan()
+    test_gallery_sync_drive()
     print(f"\n{len(_FAILS)} failure(s)" + (": " + "; ".join(_FAILS) if _FAILS else ""))
     sys.exit(len(_FAILS))

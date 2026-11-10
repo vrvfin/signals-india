@@ -111,8 +111,12 @@ def log(m):
 
 def _drive():
     from _extractor_base import get_drive, get_or_create_subfolder
+    from drive_io import drive_call
     d = get_drive()
-    repo = get_or_create_subfolder(d, os.environ["GDRIVE_FOLDER_ID"], "company_repo")
+    # retried like every other lookup in this file: on 2026-11-09 a per-minute Drive
+    # rate limit (403) on this one bare call crashed "Publish the setups page"
+    root = os.environ["GDRIVE_FOLDER_ID"]
+    repo = drive_call(lambda: get_or_create_subfolder(d, root, "company_repo"), label="company_repo")
     return d, repo, get_or_create_subfolder
 
 
