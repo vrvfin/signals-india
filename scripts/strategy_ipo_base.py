@@ -65,6 +65,9 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, upload_bytes)
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
+# _extractor_base is shared with Phase 2, so its helpers are wrapped here only
+get_or_create_subfolder, find_file = retrying(get_or_create_subfolder), retrying(find_file)
 from strategy_common import base_quality_score
 
 # ─────────────────────────────── CONFIG ─────────────────────────────────────

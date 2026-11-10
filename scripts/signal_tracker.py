@@ -66,6 +66,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from dotenv import load_dotenv
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
@@ -233,6 +234,7 @@ def _drive():
     return get_drive()
 
 
+@retrying
 def _folder(drive, *names):
     from _extractor_base import get_or_create_subfolder
     fid = os.environ["GDRIVE_FOLDER_ID"]
@@ -241,6 +243,7 @@ def _folder(drive, *names):
     return fid
 
 
+@retrying
 def _read_csv(drive, folder_id, name):
     from _extractor_base import find_file, download_bytes
     fid = find_file(drive, folder_id, name)
@@ -368,6 +371,7 @@ def main() -> int:
 
     ohlcv_id = _folder(drive, "data", "ohlcv")
     from _extractor_base import find_file, download_bytes
+    find_file = retrying(find_file)      # shared helper: wrapped here, not in _extractor_base
 
     syms = sorted(opens["symbol"].astype(str).unique())
     if args.limit:

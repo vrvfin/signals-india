@@ -51,6 +51,10 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              RateLimitExhausted)  # Stage 3 event tags · alt fallback
 from gemini_pool import (BucketPool, load_keys, AllBucketsExhausted,
                          FatalCallError)
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
+# _extractor_base is shared with Phase 2, so its helpers are wrapped here only
+get_or_create_subfolder, find_file, load_portfolio_isins = (
+    retrying(get_or_create_subfolder), retrying(find_file), retrying(load_portfolio_isins))
 from guidance_value import USDINR                    # order-value currency (2026-08-15)
 from order_value import parse_order_value            # prose fallback for the same
 

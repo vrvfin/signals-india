@@ -34,6 +34,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:   # drive_io sits next to this file
+    sys.path.insert(0, _SCRIPTS_DIR)
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -125,6 +129,7 @@ def _retry(fn, *a, what: str = "drive call", tries: int = 4, **kw):
             _t.sleep(wait)
 
 
+@retrying
 def get_or_create_subfolder(drive, parent_id: str, name: str) -> str:
     q = (f"name='{name}' and '{parent_id}' in parents "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
@@ -136,6 +141,7 @@ def get_or_create_subfolder(drive, parent_id: str, name: str) -> str:
     return drive.files().create(body=meta, fields="id").execute()["id"]
 
 
+@retrying
 def list_files_in_folder(drive, folder_id: str) -> dict[str, str]:
     out: dict[str, str] = {}
     page_token = None
@@ -153,6 +159,7 @@ def list_files_in_folder(drive, folder_id: str) -> dict[str, str]:
     return out
 
 
+@retrying
 def find_file(drive, folder_id: str, name: str) -> str | None:
     q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
     found = drive.files().list(q=q, fields="files(id)").execute().get("files", [])

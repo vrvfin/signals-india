@@ -23,6 +23,7 @@ load_dotenv(os.path.join(os.path.dirname(_HERE), ".env"))
 import pandas as pd
 from ingest_company_docs import get_drive, get_or_create_subfolder, find_file, download_bytes
 from _extractor_base import load_parquet, load_portfolio_isins, save_parquet
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 from mailer import send_email
 
 try:                                                       # deep-dive news feed (C) —
@@ -274,12 +275,16 @@ def main():
     args = ap.parse_args()
 
     drive = get_drive(); root = os.environ["GDRIVE_FOLDER_ID"]
-    repo = get_or_create_subfolder(drive, root, "company_repo")
-    idx = get_or_create_subfolder(drive, repo, "_index")
+    # Retried here, not in the helpers: load_pf is imported by a dozen PF scripts,
+    # and the others live in shared files (ingest_company_docs, _extractor_base).
+    _subfolder, _load_parquet, _load_pf = (retrying(get_or_create_subfolder),
+                                           retrying(load_parquet), retrying(load_pf))
+    repo = _subfolder(drive, root, "company_repo")
+    idx = _subfolder(drive, repo, "_index")
 
-    ledger = load_parquet(drive, idx, "announcement_ledger.parquet", LEDGER_COLS)
-    research = load_parquet(drive, idx, "research_index.parquet", RESEARCH_COLS)
-    pf = load_pf(drive, root, idx)
+    ledger = _load_parquet(drive, idx, "announcement_ledger.parquet", LEDGER_COLS)
+    research = _load_parquet(drive, idx, "research_index.parquet", RESEARCH_COLS)
+    pf = _load_pf(drive, root, idx)
     if args.limit_companies:
         pf = pf[:args.limit_companies]
     # D — sector taxonomy for the FDA (pharma) / RBI (finance) gate. Fail-soft: if the

@@ -52,6 +52,7 @@ if _SCRIPTS_DIR not in sys.path:
 
 import pandas as pd
 from dotenv import load_dotenv
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
@@ -284,6 +285,7 @@ def fetch_actions(start: date, end: date) -> tuple[dict, str]:
         return {}, f"failed ({str(e)[:60]})"
 
 
+@retrying
 def _files_with_mtime(drive, folder_id) -> dict:
     out, tok = {}, None
     while True:
@@ -323,6 +325,7 @@ def main() -> None:
                  f"names Yahoo keeps fresh")
 
     from _extractor_base import get_drive, find_file, download_bytes
+    find_file = retrying(find_file)      # shared helper: wrapped here, not in _extractor_base
     from fetch_bse_eod_api import _folder, _merge_bars, _thread_drive, _today_ist
     from ingest_ohlcv import NSE_OWNED
     from fetch_bse_eod_api import JUNCTION_TOL
