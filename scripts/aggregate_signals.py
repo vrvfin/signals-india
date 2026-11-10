@@ -45,6 +45,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -82,6 +83,7 @@ def get_drive():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+@retrying
 def get_or_create_subfolder(drive, parent_id, name):
     q = (f"name='{name}' and '{parent_id}' in parents "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
@@ -93,18 +95,21 @@ def get_or_create_subfolder(drive, parent_id, name):
     return drive.files().create(body=meta, fields="id").execute()["id"]
 
 
+@retrying
 def find_file(drive, folder_id, name):
     q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
     found = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
     return found[0]["id"] if found else None
 
 
+@retrying
 def list_subfolders(drive, parent_id):
     q = (f"'{parent_id}' in parents and "
          f"mimeType='application/vnd.google-apps.folder' and trashed=false")
     return drive.files().list(q=q, fields="files(id,name)").execute().get("files", [])
 
 
+@retrying
 def list_files_in_folder(drive, folder_id):
     out = {}
     page_token = None
@@ -122,26 +127,26 @@ def list_files_in_folder(drive, folder_id):
     return out
 
 
-def download_csv(drive, file_id):
+@retrying
+def _fetch_bytes(drive, file_id) -> bytes:
+    """One file's bytes from Drive. Only the FETCH is retried: parsing stays outside,
+    because pyarrow raises a plain OSError for a corrupt parquet footer and drive_io
+    would mistake that for a dropped connection."""
     request = drive.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
-    fh.seek(0)
-    return pd.read_csv(fh)
+    return fh.getvalue()
+
+
+def download_csv(drive, file_id):
+    return pd.read_csv(io.BytesIO(_fetch_bytes(drive, file_id)))
 
 
 def download_parquet(drive, file_id):
-    request = drive.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-    return pd.read_parquet(fh)
+    return pd.read_parquet(io.BytesIO(_fetch_bytes(drive, file_id)))
 
 
 def upload_csv(drive, folder_id, filename, df, existing_id=None):

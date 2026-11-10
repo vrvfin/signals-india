@@ -46,6 +46,10 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 from bse_http import bse_session
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, upload_bytes, log)
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
+# _extractor_base is shared with Phase 2, so its helpers are wrapped here, for this
+# script only (and for fetch_nse_sme_eod, which borrows _folder).
+get_or_create_subfolder, find_file = retrying(get_or_create_subfolder), retrying(find_file)
 
 OHLCV_LIVE = "data/ohlcv"
 OHLCV_BSE = "data/ohlcv_bse"
@@ -90,6 +94,7 @@ def _folder(drive, parts: str) -> str:
     return fid
 
 
+@retrying
 def _list_folder(drive, folder_id: str) -> dict:
     out, tok = {}, None
     while True:

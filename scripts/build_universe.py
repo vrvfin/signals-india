@@ -38,6 +38,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:   # drive_io sits next to this file
+    sys.path.insert(0, _SCRIPTS_DIR)
+from drive_io import retrying, drive_call, LOOKUP_ATTEMPTS  # Drive reads wait out a short outage / rate limit
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
@@ -119,11 +123,14 @@ def fetch_bse_only_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.DataFr
         idx = get_or_create_subfolder(drive, repo, "_index")
         q = (f"name='company_universe.csv' and '{idx}' in parents "
              f"and trashed=false")
-        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        files = drive_call(lambda: drive.files().list(q=q, fields="files(id)").execute(),
+                           attempts=LOOKUP_ATTEMPTS,
+                           label="company_universe.csv").get("files", [])
         if not files:
             log("  company_universe.csv not found — BSE-only names skipped.")
             return pd.DataFrame(columns=cols)
-        raw = drive.files().get_media(fileId=files[0]["id"]).execute()
+        raw = drive_call(lambda: drive.files().get_media(fileId=files[0]["id"]).execute(),
+                         attempts=LOOKUP_ATTEMPTS, label="company_universe.csv")
         uni = pd.read_csv(io.BytesIO(raw)).fillna("")
     except Exception as e:
         log(f"  BSE-only fetch failed ({str(e)[:80]}) — skipped.")
@@ -202,11 +209,14 @@ def fetch_nse_emerge_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.Data
         idx = get_or_create_subfolder(drive, repo, "_index")
         q = (f"name='company_universe.csv' and '{idx}' in parents "
              f"and trashed=false")
-        files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+        files = drive_call(lambda: drive.files().list(q=q, fields="files(id)").execute(),
+                           attempts=LOOKUP_ATTEMPTS,
+                           label="company_universe.csv").get("files", [])
         if not files:
             log("  company_universe.csv not found — NSE Emerge names skipped.")
             return pd.DataFrame(columns=cols)
-        raw = drive.files().get_media(fileId=files[0]["id"]).execute()
+        raw = drive_call(lambda: drive.files().get_media(fileId=files[0]["id"]).execute(),
+                         attempts=LOOKUP_ATTEMPTS, label="company_universe.csv")
         uni = pd.read_csv(io.BytesIO(raw)).fillna("")
     except Exception as e:
         log(f"  NSE Emerge fetch failed ({str(e)[:80]}) — skipped.")
@@ -232,6 +242,7 @@ def fetch_nse_emerge_rows(drive, folder_id: str, nse_isins: set[str]) -> pd.Data
     return out[cols].reset_index(drop=True)
 
 
+@retrying
 def get_or_create_subfolder(drive, parent_id: str, name: str) -> str:
     """Find a child folder by name, or create it."""
     q = (f"name='{name}' and '{parent_id}' in parents "

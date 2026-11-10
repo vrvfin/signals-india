@@ -23,9 +23,11 @@ live Phase-2 / backfill path keeps byte-identical behaviour (CLAUDE.md rules 3+5
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
+import re
 import sys
 import shutil
 import socket
@@ -84,9 +86,37 @@ def log(msg: str) -> None:
 
 # ---------------------------------------------------------------- retry ----
 
+# A 403 is normally permanent (no permission, file not shared). Google's
+# per-minute quota is the exception: "Quota exceeded for quota metric 'Total
+# Query Cost' and limit 'Units per minute per user'" arrives as a 403 with reason
+# rateLimitExceeded, and it clears when the minute rolls over. 2026-10-05 it
+# dropped 536 stocks from features; 2026-11-09 it killed PEAD's folder lookup and
+# aggregate_signals' download, and Phase 1 went red. Decided by the REASON in the
+# error body, not the status: dailyLimitExceeded, storageQuotaExceeded and
+# insufficientPermissions are 403s too, and waiting fixes none of them.
+_RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
+
+
+def _http_reasons(exc) -> set:
+    """The errors[].reason values of a googleapiclient HttpError."""
+    reasons = set()
+    try:
+        body = json.loads((getattr(exc, "content", b"") or b"").decode("utf-8", "ignore"))
+        err = body.get("error", {}) if isinstance(body, dict) else {}
+        for item in (err.get("errors") or []) if isinstance(err, dict) else []:
+            if isinstance(item, dict) and item.get("reason"):
+                reasons.add(str(item["reason"]))
+    except Exception:                                # noqa: BLE001 - not JSON
+        pass
+    if not reasons:   # no JSON body: the "Details" text of str(e) still names it
+        reasons.update(re.findall(r"'reason': '(\w+)'", str(exc)))
+    return reasons
+
+
 def _classify(exc) -> tuple[bool, str]:
     """-> (is_transient, short_reason). Permanent errors fail fast: retrying a
-    401/403/404 just burns the backoff and hides a real problem."""
+    401/403/404 just burns the backoff and hides a real problem. The one 403
+    that is retried is Google's per-minute rate limit (see _RATE_LIMIT_REASONS)."""
     if HttpError is not None and isinstance(exc, HttpError):
         status = getattr(getattr(exc, "resp", None), "status", None)
         try:
@@ -95,10 +125,17 @@ def _classify(exc) -> tuple[bool, str]:
             return False, "HTTP ?"
         if 500 <= status < 600 or status == 429:
             return True, f"HTTP {status}"
+        if status == 403 and _http_reasons(exc) & _RATE_LIMIT_REASONS:
+            return True, "HTTP 403 rate limit"
         return False, f"HTTP {status}"
     if isinstance(exc, _TRANSIENT):
         return True, type(exc).__name__
     return False, type(exc).__name__
+
+
+def is_transient(exc) -> bool:
+    """True when drive_call would have retried this error."""
+    return _classify(exc)[0]
 
 
 def drive_call(fn, attempts: int = 5, on_reconnect=None, label: str = ""):
@@ -127,6 +164,35 @@ def drive_call(fn, attempts: int = 5, on_reconnect=None, label: str = ""):
                 except Exception as re_err:          # reconnect is best-effort
                     log(f"  reconnect failed ({type(re_err).__name__}) - retrying anyway")
             time.sleep(wait)
+
+
+# Phase 1's Drive lookups and reads. 2026-11-06 Drive answered every files.list
+# with a 500 after ~30 s for ~7.5 minutes (11:22-11:29:30 UTC). PEAD's first
+# lookup came at 11:22:55, so it needed ~7 minutes of patience; drive_call's
+# default 5 tries gives up after ~3.4 min of 30 s hangs. 10 tries wait
+# 2+5+15+30x6 = 202 s: ~3.4 min when Drive fails fast, ~8.4 min when every call
+# hangs 30 s as it did that day.
+LOOKUP_ATTEMPTS = 10
+
+
+def retrying(fn, attempts: int = LOOKUP_ATTEMPTS):
+    """Wrap a READ-ONLY Drive helper (find_file, get_or_create_subfolder,
+    list_files_in_folder, a bytes download ...) so every call goes through
+    drive_call. No retry logic of its own: same classifier, same backoff.
+
+    Wrap the fetch, not the parse: pyarrow raises a plain OSError for a corrupt
+    parquet footer, which _classify would take for a dropped connection.
+
+    get_or_create_subfolder is safe to wrap whole: a retry lists again first, so
+    a folder whose create landed before a 5xx is found, not created twice (the
+    same look-again rule as compute_features.upload_parquet)."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        # (drive, parent, NAME): label with the name; never with a bare Drive id
+        name = args[2] if len(args) > 2 and isinstance(args[2], str) else ""
+        label = f"{fn.__name__} {name}".strip()
+        return drive_call(lambda: fn(*args, **kwargs), attempts=attempts, label=label)
+    return wrapped
 
 
 # ---------------------------------------------------------------- cache ----

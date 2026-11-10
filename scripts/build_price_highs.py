@@ -60,6 +60,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from dotenv import load_dotenv
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 
 load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
@@ -119,6 +120,8 @@ def phase1_symbols() -> pd.DataFrame | None:
     try:
         from _extractor_base import (get_drive, get_or_create_subfolder,
                                      find_file, download_bytes)
+        # shared helpers: wrapped here, not in _extractor_base
+        get_or_create_subfolder, find_file = retrying(get_or_create_subfolder), retrying(find_file)
         d = get_drive()
         uid = get_or_create_subfolder(d, os.environ["GDRIVE_FOLDER_ID"], "universe")
         fid = find_file(d, uid, "master_list.csv")
@@ -211,6 +214,7 @@ def _drive():
     return get_drive()
 
 
+@retrying
 def _index_folder(drive):
     from _extractor_base import get_or_create_subfolder
     root = os.environ["GDRIVE_FOLDER_ID"]
@@ -220,6 +224,9 @@ def _index_folder(drive):
 
 def load_table(drive) -> pd.DataFrame | None:
     from _extractor_base import find_file, download_bytes
+    # shared helpers: wrapped here, not in _extractor_base. The parse below stays
+    # outside the retry (a corrupt parquet raises a plain OSError).
+    find_file, download_bytes = retrying(find_file), retrying(download_bytes)
     fid = find_file(drive, _index_folder(drive), TABLE)
     if not fid:
         return None
@@ -312,6 +319,8 @@ def main() -> int:
             print(f"{TABLE} not on Drive yet — run --seed first")
             return 1
         from _extractor_base import get_or_create_subfolder, find_file, download_bytes
+        # shared helpers: wrapped here, not in _extractor_base
+        get_or_create_subfolder, find_file = retrying(get_or_create_subfolder), retrying(find_file)
         root = os.environ["GDRIVE_FOLDER_ID"]
         fid = find_file(drive, get_or_create_subfolder(drive, root, "features"),
                         "latest.parquet")

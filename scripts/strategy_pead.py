@@ -32,6 +32,7 @@ import os
 import sys
 import re
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:   # drive_io sits next to this file
+    sys.path.insert(0, _SCRIPTS_DIR)
+from drive_io import retrying, is_transient  # Drive reads wait out a short outage / rate limit
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -98,6 +103,7 @@ def _thread_drive():
     return d
 
 
+@retrying
 def get_or_create_subfolder(drive, parent_id, name):
     q = (f"name='{name}' and '{parent_id}' in parents "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
@@ -109,6 +115,7 @@ def get_or_create_subfolder(drive, parent_id, name):
     return drive.files().create(body=meta, fields="id").execute()["id"]
 
 
+@retrying
 def list_files_in_folder(drive, folder_id):
     out, page_token = {}, None
     while True:
@@ -124,32 +131,33 @@ def list_files_in_folder(drive, folder_id):
     return out
 
 
+@retrying
 def find_file(drive, folder_id, name):
     q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
     found = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
     return found[0]["id"] if found else None
 
 
-def download_parquet(drive, file_id):
+@retrying
+def _fetch_bytes(drive, file_id) -> bytes:
+    """One file's bytes from Drive. Only the FETCH is retried: parsing stays outside,
+    because pyarrow raises a plain OSError for a corrupt parquet footer and drive_io
+    would mistake that for a dropped connection."""
     request = drive.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     d = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         _, done = d.next_chunk()
-    fh.seek(0)
-    return pd.read_parquet(fh)
+    return fh.getvalue()
+
+
+def download_parquet(drive, file_id):
+    return pd.read_parquet(io.BytesIO(_fetch_bytes(drive, file_id)))
 
 
 def download_csv(drive, file_id):
-    request = drive.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    d = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = d.next_chunk()
-    fh.seek(0)
-    return pd.read_csv(fh)
+    return pd.read_csv(io.BytesIO(_fetch_bytes(drive, file_id)))
 
 
 def upload_csv(drive, folder_id, filename, df, existing_id=None):
@@ -383,14 +391,37 @@ def main():
     workers = max(1, args.workers)
     log(f"PEAD candidates: {len(work)} | anchored={use_anchor} | workers: {workers}")
 
+    # A price file Drive still refuses after download_parquet's full retry budget
+    # means Drive is really down: stop reading (every other stock would burn the
+    # same budget) and fail the step, rather than publish a partial list as today's
+    # PEAD. Any other error (a detector error, a missing or corrupt file) skips that
+    # stock as before, but is now counted: the old bare `except` hid every refused
+    # read, e.g. during the 9 Nov rate-limit burst.
+    drive_down = threading.Event()
+    unread, skipped, not_scanned = [], [], []      # (symbol, why) / symbols
+
     def _scan(item):
         sym, anchor_dt, fid = item
+        if drive_down.is_set():
+            not_scanned.append(sym)
+            return sym, anchor_dt, None
         d = drive if workers == 1 else _thread_drive()
         try:
-            ohlcv = download_parquet(d, fid)
+            raw = _fetch_bytes(d, fid)           # retried; the parse below is not
+        except Exception as e:
+            why = f"{type(e).__name__}: {str(e)[:100]}"
+            if is_transient(e):
+                drive_down.set()
+                unread.append((sym, why))
+            else:
+                skipped.append((sym, why))
+            return sym, anchor_dt, None
+        try:
+            ohlcv = pd.read_parquet(io.BytesIO(raw))
             fn = detect_pead_at if use_anchor else detect_pead
             return sym, anchor_dt, fn(sym, ohlcv, anchor_dt, today_dt)
-        except Exception:
+        except Exception as e:
+            skipped.append((sym, f"{type(e).__name__}: {str(e)[:100]}"))
             return sym, anchor_dt, None
 
     if workers == 1:
@@ -398,6 +429,17 @@ def main():
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             scanned = [f.result() for f in as_completed([pool.submit(_scan, it) for it in work])]
+
+    if skipped:
+        kinds = Counter(why.split(":")[0] for _, why in skipped)
+        log(f"PEAD scan: {len(skipped)} stock(s) skipped {dict(kinds)} - first: "
+            + "; ".join(f"{s} ({why})" for s, why in skipped[:3]))
+    if drive_down.is_set():
+        log(f"PEAD scan STOPPED: Drive still refused a price read after the full retry "
+            f"budget ({unread[0][0]}: {unread[0][1]}). {len(unread)} read(s) failed that "
+            f"way and {len(not_scanned)} stock(s) were not scanned. Not publishing a "
+            f"partial PEAD list.")
+        sys.exit(1)
 
     rows = []
     for sym, anchor_dt, pead in scanned:

@@ -50,11 +50,15 @@ load_dotenv(os.path.join(os.path.dirname(_SCRIPTS_DIR), ".env"))
 
 from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              download_bytes, save_parquet, log)
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
+# _extractor_base is shared with Phase 2, so its helpers are wrapped here only
+get_or_create_subfolder, find_file = retrying(get_or_create_subfolder), retrying(find_file)
 
 WINDOW_DAYS = 183          # ~6 months
 DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.csv$")
 
 
+@retrying
 def _list_dated(drive, folder_id) -> list[tuple[str, str]]:
     """Return [(date_str, file_id)] for every YYYY-MM-DD.csv snapshot."""
     out, tok = [], None

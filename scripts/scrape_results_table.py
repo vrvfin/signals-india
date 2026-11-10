@@ -35,6 +35,11 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+import sys
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:   # drive_io sits next to this file
+    sys.path.insert(0, _SCRIPTS_DIR)
+from drive_io import retrying  # Drive reads wait out a short outage / rate limit
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 RESULTS_URL = "https://www.screener.in/results/latest/"
@@ -106,6 +111,7 @@ def get_drive():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+@retrying
 def get_or_create_subfolder(drive, parent_id, name):
     q = (f"name='{name}' and '{parent_id}' in parents "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
@@ -117,6 +123,7 @@ def get_or_create_subfolder(drive, parent_id, name):
     return drive.files().create(body=meta, fields="id").execute()["id"]
 
 
+@retrying
 def find_file(drive, folder_id, name):
     q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
     found = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
