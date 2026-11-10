@@ -16,7 +16,8 @@ Outputs:
   company_repo/_index/announcement_ledger.parquet   (dedup + audit, own ledger)
   company_repo/_daily/daily_update_summary_<DDMMMYY>.md   (daily digest)
   company_repo/<isin>/company_page.md   (append an "Announcements" section)
-  PDFs: company_repo/<isin>/documents/  (2-day retention, golden rule)
+  PDFs: company_repo/<isin>/documents/  (2-day retention, golden rule: deleted by the
+        Drive-wide cleanup that Phase 2 and the backfill run, not by this script)
 
 Usage:
   python scripts/ingest_announcements.py --dry-run          # discovery + counts, no writes/Gemini
@@ -738,13 +739,12 @@ def main() -> None:
     log(f"DONE: summarised={len(done_rows)} fail={fail}")
 
     # ---- 2-day PDF retention (global golden rule) ----
-    try:
-        import subprocess
-        subprocess.run([sys.executable, os.path.join(_SCRIPTS_DIR,
-                        "cleanup_company_docs.py"), "--retain-days", "2"],
-                       check=False, timeout=900)
-    except Exception as e:
-        log(f"  retention cleanup call failed ({str(e)[:60]}) — run cleanup_company_docs.py")
+    # No cleanup call here (user 2026-11-10: an approved exception to "every pipeline
+    # that stores PDFs runs the cleanup itself"). cleanup_company_docs.py walks the
+    # WHOLE Drive tree (~8,800 folders, 7-29 min), so the 15-min limit this call had
+    # killed it mid-walk and cost Phase 1 15 minutes (run 42799767723). Phase 2 and the
+    # backfill run the same Drive-wide cleanup ~30 times a day, weekends included, and
+    # it deletes the PDFs stored above as well.
 
 
 def _prune_daily(drive, daily_id, today: date) -> None:
