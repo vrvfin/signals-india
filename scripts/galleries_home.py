@@ -67,6 +67,7 @@ MENU = [
     ("Market", "gallery_darvas.html", "Darvas boxes"),
     ("Market", "gallery_zanger.html", "Zanger patterns"),
     ("Market", "gallery_guidance_watchlist.html", "Guidance watchlist"),
+    ("Market", "gallery_pat_growth.html", "PAT growth (latest quarter)"),
     ("Market", "gallery_tracker.html", "Decision tracker"),
     ("Portfolio", "gallery_pf.html", "PF daily"),
     ("Portfolio", "gallery_pf_weekly.html", "PF weekly"),

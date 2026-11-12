@@ -24,9 +24,14 @@ WHAT IT REUSES
 DESIGN NOTES THAT MATTER
 ------------------------
 * date_added is PINNED per (isin, quarter): seeded from the earliest processed_at
-  of that key's qualifying rows and carried forward on every later run, so a
-  re-run never bumps a name to the top and --backfill does not stamp all of
-  history with one date. Idiom copied from earnings_calendar.persist_calendar.
+  of ANY revenue/PAT row of that company in the staleness window, qualifying or
+  not, and carried forward on every later run, so a re-run never bumps a name to
+  the top and --backfill does not stamp all of history with one date. Idiom
+  copied from earnings_calendar.persist_calendar.
+* guidance_date is what "newest guidance first" sorts on, because date_added can
+  be a quarter older than the statement that qualified (AEROFLEX: a 2 Nov concall
+  with date_added 4 Sep, measured 2026-11-05). It is the filing date of the
+  winning statement's document and is recalculated on every run, never pinned.
 * in_prev_quarter means the previous CALENDAR quarter (q_idx - 1), not "the
   previous row for this ISIN" -- a name qualifying in Q1FY26 and again in Q1FY27
   has in_prev_quarter=False and n_quarters=2. Reading a gap as continuity is the
@@ -94,6 +99,8 @@ GW_COLS = [
     # --- run bookkeeping ----------------------------------------------------
     "min_cagr_used", "max_stale_q_used", "tracking_from", "date_added_source",
     "first_qualified_at", "last_seen_at", "as_of",
+    # --- the winning statement itself (older rows: None until re-scored) -------
+    "guidance_date", "guidance_quarter",
 ]
 
 GUIDANCE_NAME = "guidance_tracker.parquet"
@@ -518,9 +525,40 @@ def _apply_cumulative(w: dict, guid_q: pd.DataFrame, isin: str) -> None:
     w["cagr_pct"] = ((tgt / base) ** (1.0 / yrs) - 1.0) * 100.0
 
 
+def doc_date_map(queue: pd.DataFrame) -> dict:
+    """doc_id -> announcement date (YYYY-MM-DD), from the ONE global queue."""
+    if queue is None or queue.empty \
+            or not {"doc_id", "announcement_date"} <= set(queue.columns):
+        return {}
+    dates = pd.to_datetime(queue["announcement_date"], errors="coerce")
+    return {str(d): dt.strftime("%Y-%m-%d")
+            for d, dt in zip(queue["doc_id"], dates) if pd.notna(dt)}
+
+
+def guidance_date(doc_id, doc_dates: dict, doc_proc: dict):
+    """Filing date of the winning statement's document; its earliest processed_at
+    when the queue has no date for it; None when neither exists."""
+    d = str(doc_id or "")
+    return doc_dates.get(d) or (str(doc_proc[d])[:10] if doc_proc.get(d) else None)
+
+
+def fill_guidance_dates(df: pd.DataFrame, doc_dates: dict) -> pd.DataFrame:
+    """Date the rows this run did not re-score. A name that stopped qualifying stays
+    in the table (only --rebuild removes it), so without this it would keep sorting
+    on date_added forever (MONOLITH: a 2 Oct concall showing 29 Jul)."""
+    if df is None or df.empty or not doc_dates:
+        return df
+    out = df.copy()
+    blank = ~out["guidance_date"].astype(str).str.fullmatch(r"\d{4}-\d{2}-\d{2}")
+    out.loc[blank, "guidance_date"] = (out.loc[blank, "source_doc_id"].astype(str)
+                                       .map(doc_dates.get))
+    return out
+
+
 def build_rows(winners: dict, ident: dict, cred_by: dict, quarter: str,
                proc_by: dict, qsrc_by: dict, args, now: str,
-               base_meta: dict | None = None, pf_isins=None) -> list:
+               base_meta: dict | None = None, pf_isins=None,
+               doc_dates: dict | None = None, doc_proc: dict | None = None) -> list:
     """One GW_COLS dict per qualifying company."""
     rows = []
     for isin, w in winners.items():
@@ -579,6 +617,9 @@ def build_rows(winners: dict, ident: dict, cred_by: dict, quarter: str,
             "first_qualified_at": now,
             "last_seen_at": now,
             "as_of": now,
+            "guidance_date": guidance_date(w.get("source_doc_id"),
+                                           doc_dates or {}, doc_proc or {}),
+            "guidance_quarter": QT.norm_q(w.get("quarter")),
         })
     return rows
 
@@ -816,6 +857,7 @@ def main() -> int:                                            # noqa: C901
     log(f"scoring {len(quarters)} quarter(s): {', '.join(quarters)}")
 
     all_rows, all_rejects = [], []
+    doc_dates = doc_date_map(queue)
     for q in quarters:
         qo = QT.q_order(q)
         win = rp[(rp["_qo"] <= qo) & (rp["_qo"] >= qo - args.max_stale_q)]
@@ -847,16 +889,19 @@ def main() -> int:                                            # noqa: C901
                                 or w["validation"]["verdict"] in
                                 {a.upper() for a in allow})}
 
-        proc_by, qsrc_by = {}, {}
+        proc_by, qsrc_by, doc_proc = {}, {}, {}
         for r in win.itertuples(index=False):
             k = (str(r.isin), q)
             p = str(getattr(r, "processed_at", "") or "")
             if p and (k not in proc_by or p < proc_by[k]):
                 proc_by[k] = p
             qsrc_by.setdefault(k, getattr(r, "quarter_source", "table_a"))
+            d = str(getattr(r, "source_doc_id", "") or "")
+            if p and d and (d not in doc_proc or p < doc_proc[d]):
+                doc_proc[d] = p
 
         rows = build_rows(kept, ident, cred_by, q, proc_by, qsrc_by, args,
-                          _now(), b_meta, pf_isins)
+                          _now(), b_meta, pf_isins, doc_dates, doc_proc)
         all_rows.extend(rows)
         for isin, lst in rejects.items():
             for x in lst:
@@ -883,7 +928,7 @@ def main() -> int:                                            # noqa: C901
     if args.rebuild:
         log(f"  rebuild: {n_before} rows -> {len(combined)} "
             f"({max(0, n_before - len(combined))} dropped as no longer qualifying)")
-    combined = recompute_history(combined, guid)
+    combined = fill_guidance_dates(recompute_history(combined, guid), doc_dates)
 
     log(f"watchlist: {len(combined)} rows · {combined['isin'].nunique() if not combined.empty else 0} "
         f"companies · {combined['quarter'].nunique() if not combined.empty else 0} quarters "
@@ -902,7 +947,8 @@ def main() -> int:                                            # noqa: C901
         if not combined.empty:
             top = combined.sort_values(["date_added", "cagr_pct"],
                                        ascending=[False, False]).head(20)
-            cols = ["date_added", "nse_symbol", "bse_code", "quarter", "cagr_pct",
+            cols = ["guidance_date", "guidance_quarter", "date_added", "nse_symbol",
+                    "bse_code", "quarter", "cagr_pct",
                     "score_metric", "score_rule", "validation_verdict",
                     "in_prev_quarter", "n_quarters", "base_ttm_cr",
                     "base_suspect"]
@@ -1000,6 +1046,48 @@ def _self_test() -> int:
     chk("prev had guidance", g2["prev_quarter_had_guidance"], True)
 
     chk("schema stable", list(out.columns), GW_COLS)
+
+    # guidance_date: the queue's filing date first, then the document's own earliest
+    # processed_at, then nothing -- never another document's date
+    q = pd.DataFrame({"doc_id": ["D1", "D2"],
+                      "announcement_date": ["2026-11-02 10:30:00", "not a date"]})
+    dd = doc_date_map(q)
+    chk("queue date normalised", dd, {"D1": "2026-11-02"})
+    chk("no queue", doc_date_map(pd.DataFrame()), {})
+    chk("queue wins", guidance_date("D1", dd, {"D1": "2026-11-03T01:00:00"}),
+        "2026-11-02")
+    chk("processed_at fallback", guidance_date("D2", dd, {"D2": "2026-10-28T05:00:00"}),
+        "2026-10-28")
+    chk("unknown doc", guidance_date("D3", dd, {"D2": "2026-10-28T05:00:00"}), None)
+    chk("blank doc", guidance_date(None, dd, {}), None)
+
+    # unlike date_added, guidance_date follows the current winner on a re-run
+    old3 = pd.DataFrame([{**row("I1", "Q2FY27", "2026-09-04"),
+                          "guidance_date": "2026-09-04",
+                          "guidance_quarter": "Q1FY27"}])
+    fresh3 = pd.DataFrame([{**row("I1", "Q2FY27", "2026-11-02", "run_date"),
+                            "guidance_date": "2026-11-02",
+                            "guidance_quarter": "Q2FY27"}])
+    comb5, _, _ = upsert_watchlist(old3, fresh3, now)
+    chk("date_added still pinned", comb5.iloc[0]["date_added"], "2026-09-04")
+    chk("guidance_date not pinned", comb5.iloc[0]["guidance_date"], "2026-11-02")
+    chk("guidance_quarter not pinned", comb5.iloc[0]["guidance_quarter"], "Q2FY27")
+
+    # a row this run did not re-score still gets its filing date, an existing date
+    # is left alone, and an unknown document stays blank (and survives a parquet
+    # round trip, the way a real save does)
+    filled = fill_guidance_dates(pd.DataFrame([
+        {**base, "isin": "I1", "source_doc_id": "D1", "guidance_date": None},
+        {**base, "isin": "I2", "source_doc_id": "D1", "guidance_date": "2026-10-01"},
+        {**base, "isin": "I3", "source_doc_id": "D9", "guidance_date": None},
+    ]), dd)
+    chk("not re-scored gets a date", filled.iloc[0]["guidance_date"], "2026-11-02")
+    chk("existing date kept", filled.iloc[1]["guidance_date"], "2026-10-01")
+    chk("unknown doc stays blank", pd.isna(filled.iloc[2]["guidance_date"]), True)
+    buf = io.BytesIO()
+    filled[["isin", "source_doc_id", "guidance_date"]].to_parquet(buf)
+    buf.seek(0)
+    chk("parquet round trip", pd.read_parquet(buf)["guidance_date"].iloc[0], "2026-11-02")
 
     for f in fails:
         print("FAIL " + f)
