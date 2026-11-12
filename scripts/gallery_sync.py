@@ -62,6 +62,7 @@ PAGES = {
     "gallery_drops.html":              {"sets": ["all"], "cmd": BG + ["--view", "drops"] + MCAP},
     "gallery_ipo.html":                {"sets": ["all"], "cmd": BG + ["--view", "ipo"] + MCAP},
     "gallery_guidance_watchlist.html": {"sets": ["all"], "cmd": BG + ["--mode", "watchlist"] + MCAP},
+    "gallery_pat_growth.html":         {"sets": ["all"], "cmd": BG + ["--mode", "pat_growth"] + MCAP},
     "gallery_guru.html":               {"sets": ["all"], "cmd": ["guru/build_guru_gallery.py"]},
     # private Drive-hosted job (scripts/drive_runner.py --job setups_top20); its local
     # fallback needs the private code on this PC

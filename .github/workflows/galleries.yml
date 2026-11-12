@@ -81,6 +81,10 @@ jobs:
         if: env.GURU_ONLY != 'true'
         continue-on-error: true
         run: python scripts/build_gallery.py --mode watchlist --min-mcap 150 --no-open
+      - name: PAT growth gallery
+        if: env.GURU_ONLY != 'true'
+        continue-on-error: true
+        run: python scripts/build_gallery.py --mode pat_growth --min-mcap 150 --no-open
       - name: New today
         if: env.GURU_ONLY != 'true'
         continue-on-error: true

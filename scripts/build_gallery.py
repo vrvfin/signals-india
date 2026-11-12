@@ -35,6 +35,7 @@ import os
 import sys
 import webbrowser
 from datetime import date, datetime, timedelta
+from html import escape
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPTS_DIR not in sys.path:
@@ -50,6 +51,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
                              find_latest_portfolio_file, isin_symbol_map)
 from drive_io import drive_call, ParquetCache
 import gradation as G
+import quarterly_table as QT
 
 # Tolerance for "how far behind the market may a series be". Mirrors
 # OHLCV_MAX_STALE_DAYS in pipeline_healthcheck.py:52 — 4 calendar days is too
@@ -1793,6 +1795,21 @@ def _wl_pre_tracking(r) -> bool:
     return _q_order(prev) < _q_order(tf)
 
 
+def _wl_guided_on(wl) -> pd.Series:
+    """The date a row's winning guidance statement was filed, as YYYY-MM-DD.
+
+    date_added can't sort "newest guidance first": it is pinned to the first time
+    ANY revenue or PAT row of that company entered the two-quarter window, so
+    AEROFLEX's 2 Nov concall showed as 4 Sep (measured 2026-11-05). Rows built
+    before guidance_date existed fall back to date_added.
+    """
+    added = wl["date_added"].astype(str)
+    if "guidance_date" not in wl.columns:
+        return added
+    guided = wl["guidance_date"].astype(str)
+    return guided.where(guided.str.fullmatch(r"\d{4}-\d{2}-\d{2}"), added)
+
+
 def _wl_pf_cell(v) -> str:
     """Do I already own this? None means no holdings file was on Drive, which is
     UNKNOWN -- it must not render as a confident No."""
@@ -1813,6 +1830,17 @@ def _wl_num(v, dp=0):
     return "" if f != f else f"{f:,.{dp}f}"
 
 
+def _wl_guided_cell(r) -> str:
+    """Filing date, plus the statement's own quarter when an older concall is what
+    qualified this row for the page's quarter (--max-stale-q)."""
+    text = str(r.get("_guided_on") or r.get("date_added") or "")
+    own = str(r.get("guidance_quarter") or "")
+    if re.fullmatch(r"Q[1-4]FY\d{2}", own) \
+            and own != str(r.get("quarter") or "").replace(" ", ""):
+        text += f' <span style="color:#a66300">(from {own})</span>'
+    return text
+
+
 def _wl_table(wl) -> str:
     """The 100-row summary above the cards.
 
@@ -1822,7 +1850,7 @@ def _wl_table(wl) -> str:
     """
     if wl is None or wl.empty:
         return ""
-    head = ["#", "PF", "Symbol", "Company", "ISIN", "BSE", "Qtr", "Added",
+    head = ["#", "PF", "Both", "Symbol", "Company", "ISIN", "BSE", "Qtr", "Guided", "Added",
             "CAGR%", "Metric", "Src", "Horizon", "Base ₹cr", "Evidence",
             "#Stmts", "Prev-Q", "#Qtrs", "Streak", "Cred"]
     th = "".join(
@@ -1862,12 +1890,14 @@ def _wl_table(wl) -> str:
         cells = [
             f"{j + 1}",
             _wl_pf_cell(r.get("in_pf")),
+            _both_cell(r.get("both")),
             f'<a href="#ch{j}" style="color:#1a3d6e;font-weight:700;'
             f'text-decoration:none">{sym}</a>',
             str(r.get("nse_name") or r.get("company_name") or "")[:34],
             str(r.get("isin") or ""),
             str(r.get("bse_code") or ""),
             str(r.get("quarter") or ""),
+            _wl_guided_cell(r),
             str(r.get("date_added") or ""),
             f'<span style="{css};font-weight:800;padding:0 4px;border-radius:3px">'
             f'{_wl_num(cag, 0)}%</span>',
@@ -1916,14 +1946,15 @@ def _wl_annot(wl) -> dict:
                  f'🎯 Guided CAGR ~{cag:.0f}%'
                  f'<span style="font-weight:500;opacity:.85"> · {detail}'
                  f' · {r.get("value_type") or ""} · {r.get("horizon_fy") or ""}'
-                 f'</span></div>') if pd.notna(cag) else ""
+                 f'</span>{_q_chip(r.get("quarter"))}</div>') if pd.notna(cag) else ""
 
         bits = []
         if r.get("in_pf") is True:
             bits.append('<span style="background:#1a7a3a;color:#fff;padding:1px 7px;'
                         'border-radius:6px;font-weight:800">◉ IN PF</span>')
-        bits += [f'📅 added {r.get("date_added") or ""}'
-                 + (_fresh_badge(str(r.get("date_added") or "")) or ""),
+        bits += [f'📅 guided {_wl_guided_cell(r)}'
+                 + (_fresh_badge(str(r.get("_guided_on") or r.get("date_added") or ""))
+                    or ""),
                  f'<b>{r.get("quarter") or ""}</b>']
         if r.get("in_prev_quarter"):
             bits.append('<span style="color:#1a7a3a;font-weight:700">'
@@ -1959,21 +1990,367 @@ def _wl_annot(wl) -> dict:
             bits.append(f'cred {cs:.1f}')
         line2 = (f'<div style="font-size:12px;color:#333;margin:2px 0;'
                  f'line-height:1.6">{" · ".join(bits)}</div>')
-        out[sym] = line1 + line2
+        out[sym] = line1 + _both_line(r.get("both")) + line2
+    return out
+
+
+# ─────────────────────── PAT growth (--mode pat_growth) ──────────────────────
+# Latest-quarter PAT above 50% YoY and up QoQ, most recently reported first
+# (user 2026-11-05). Built from results.parquet, not screener_grades: grades has
+# no quarter or date, and financials_derived behind it can lag a quarter.
+PAT_GROWTH_MIN_YOY = 50.0
+PAT_GROWTH_COLS = ["isin", "slug", "company_name", "quarter", "reported",
+                   "pat", "pat_prev", "pat_yearago", "yoy_pct", "qoq_pct", "source"]
+
+
+def _pat_from_statements(fin3, qd, skip, label, names=None) -> pd.DataFrame:
+    """Quarterly Net Profit from financials_3stmt for companies that results.parquet
+    does not list for this quarter. Read-only. Measured 11 Nov 2026: results.parquet
+    lacked 580 Sep-2026 reporters that financials_3stmt held, 104 of them passing.
+
+      * ONE basis per company: consolidated where the quarter has it, else
+        standalone, so a company's three figures never mix bases.
+      * The date is when the statements were read (scraped_at), which runs about
+        two days after the result itself; the page says so.
+      * A company results.parquet already has for this quarter is never added
+        again, whatever its own figures say.
+    """
+    cols = ["isin", "slug", "company_name", "quarter", "reported", "_ts",
+            "pat", "pat_prev", "pat_yearago", "source"]
+    empty = pd.DataFrame(columns=cols)
+    need = {"isin", "symbol", "line_item", "period", "period_type", "value",
+            "scraped_at"}
+    if fin3 is None or fin3.empty or not need <= set(fin3.columns) or pd.isna(qd):
+        return empty
+    per = {k: (qd + pd.DateOffset(months=m)).strftime("%b %Y")
+           for k, m in (("pat", 0), ("pat_prev", -3), ("pat_yearago", -12))}
+    f = fin3[(fin3["period_type"].astype(str).str.strip().str.lower() == "quarterly")
+             & (fin3["line_item"].astype(str).str.strip().str.lower() == "net profit")
+             & fin3["period"].astype(str).str.strip().isin(per.values())].copy()
+    f["isin"] = f["isin"].astype(str).str.strip()
+    f["period"] = f["period"].astype(str).str.strip()
+    f = f[~f["isin"].str.lower().isin(["", "nan", "none", "<na>"])
+          & ~f["isin"].isin(skip)]
+    if f.empty:
+        return empty
+    f["_b"] = (f["basis"].astype(str).str.strip().str.lower()
+               if "basis" in f.columns else "consolidated")
+    latest = f[f["period"] == per["pat"]]
+    pick = (latest.assign(_r=(latest["_b"] != "consolidated").astype(int))
+            .sort_values("_r", kind="mergesort")
+            .drop_duplicates("isin")[["isin", "_b"]])
+    f = f.merge(pick, on=["isin", "_b"])
+    if f.empty:
+        return empty
+    f["_v"] = pd.to_numeric(f["value"], errors="coerce")
+    f["_ts"] = pd.to_datetime(f["scraped_at"].astype(str).str[:19], errors="coerce")
+    f = f.sort_values("_ts", kind="mergesort")
+    val = (f.dropna(subset=["_v"])
+           .groupby(["isin", "period"])["_v"].last().unstack("period")
+           .reindex(columns=list(per.values())))
+    val.columns = list(per.keys())
+    head = (f[f["period"] == per["pat"]].drop_duplicates("isin", keep="last")
+            .set_index("isin")[["symbol", "_ts"]])
+    out = val.join(head, how="inner").reset_index()
+    if out.empty:
+        return empty
+    names = names or {}
+    sym = out["symbol"].astype(str).str.strip()
+    out["slug"] = sym.where(~sym.str.lower().isin(["", "nan", "none", "<na>"]),
+                            out["isin"])
+
+    def _name(i, fallback):
+        n = names.get(i)
+        return n.strip() if isinstance(n, str) and n.strip() else fallback
+    out["company_name"] = [_name(i, s) for i, s in zip(out["isin"], out["slug"])]
+    out["quarter"] = label
+    out["reported"] = ((out["_ts"] + pd.Timedelta(hours=5, minutes=30))
+                       .dt.strftime("%Y-%m-%d").fillna(""))
+    out["source"] = "statements"
+    return out[cols]
+
+
+def pat_growth_rows(results, quarter="auto", fin3=None, names=None):
+    """(rows, quarter label) for the PAT growth page. Pure: no Drive, no HTML.
+
+    ONE quarter only, never mixed. Growth comes from the PAT levels because
+    Screener leaves the Net profit yoy_pct blank (flag_growth_surge) and the
+    stored figure is rounded.
+
+      * A year-ago loss or blank is left out: YoY can't be calculated (user
+        decision 2026-11-05).
+      * A previous-quarter loss counts as QoQ up, because PAT did rise. qoq_pct
+        stays blank for it and the page says "loss → profit" instead of a %.
+      * 'HY-Sep 2026' half-year rows fail the date parse on purpose: six months
+        against six months is not a quarter.
+      * results.parquet picks the quarter. `fin3` (financials_3stmt) then adds the
+        companies results.parquet lacks for that same quarter, under the same rules
+        (_pat_from_statements); `names` is ISIN -> company name for those rows.
+    """
+    empty = pd.DataFrame(columns=PAT_GROWTH_COLS)
+    need = {"slug", "isin", "company_name", "metric", "latest_q", "latest_val",
+            "prev_val", "yearago_val", "first_seen_at", "scraped_at"}
+    if results is None or results.empty or not need <= set(results.columns):
+        return empty, ""
+    df = results[results["metric"].astype(str).str.strip().str.lower()
+                 .str.contains("net prof")].copy()
+    df["_qd"] = pd.to_datetime(df["latest_q"], format="%b %Y", errors="coerce")
+    df = df.dropna(subset=["_qd"])
+    if df.empty:
+        return empty, ""
+    df["quarter"] = df["latest_q"].map(QT.qtr_label)
+    if str(quarter).lower() == "auto":
+        df = df[df["_qd"] == df["_qd"].max()]
+    else:
+        df = df[df["quarter"].map(QT.norm_q) == QT.norm_q(quarter)]
+    if df.empty:
+        return empty, ""
+    label = str(df["quarter"].iloc[0])
+
+    # first_seen_at = when the daily scrape first saw this result; naive UTC
+    def stamp(col):
+        return pd.to_datetime(df[col].astype(str).str[:19], errors="coerce")
+    df["_ts"] = stamp("first_seen_at").fillna(stamp("scraped_at"))
+    df["reported"] = ((df["_ts"] + pd.Timedelta(hours=5, minutes=30))
+                      .dt.strftime("%Y-%m-%d").fillna(""))
+
+    # Blank ISINs (REITs and others outside the universe) stay on the list, keyed
+    # by slug, so they can't collapse into one "" group.
+    isin = df["isin"].astype(str).str.strip()
+    df["isin"] = isin.where(~isin.str.lower().isin(["", "nan", "none", "<na>"]), "")
+    df["_key"] = df["isin"].where(df["isin"] != "", df["slug"].astype(str))
+    df = (df.sort_values("_ts", na_position="first", kind="mergesort")
+          .drop_duplicates("_key", keep="last"))
+
+    for col, new in (("latest_val", "pat"), ("prev_val", "pat_prev"),
+                     ("yearago_val", "pat_yearago")):
+        df[new] = pd.to_numeric(df[col], errors="coerce")
+    df["source"] = "results"
+    n_results = len(df)
+    extra = _pat_from_statements(fin3, df["_qd"].iloc[0], set(df["isin"]) - {""},
+                                 label, names)
+    if not extra.empty:
+        df = pd.concat([df, extra], ignore_index=True)
+    n_reported = len(df)
+    df = df[df["pat_yearago"] > 0].copy()
+    n_no_base = n_reported - len(df)
+    df["yoy_pct"] = (df["pat"] - df["pat_yearago"]) / df["pat_yearago"] * 100.0
+    df = df[(df["yoy_pct"] > PAT_GROWTH_MIN_YOY) & (df["pat"] > df["pat_prev"])].copy()
+    df["qoq_pct"] = ((df["pat"] - df["pat_prev"]) / df["pat_prev"] * 100.0
+                     ).where(df["pat_prev"] > 0)
+    log(f"  PAT growth {label}: {n_reported} reported ({n_results} in results + "
+        f"{n_reported - n_results} more from statements) · {n_no_base} left out for a "
+        f"year-ago loss or blank · {len(df)} pass")
+    out = df.sort_values(["reported", "yoy_pct", "slug"],
+                         ascending=[False, False, True], kind="mergesort")
+    return out[PAT_GROWTH_COLS].reset_index(drop=True), label
+
+
+_Q_MONTHS = {1: ("Apr", "Jun", -1), 2: ("Jul", "Sep", -1),
+             3: ("Oct", "Dec", -1), 4: ("Jan", "Mar", 0)}
+
+
+def _q_display(label, months=True) -> str:
+    """'Q2FY27' / 'Q2 FY27' -> 'Q2 FY27 (Jul–Sep 2026)'; anything else as given.
+    Both pages write the quarter this one way (user 2026-11-11: highlight it)."""
+    m = re.fullmatch(r"Q([1-4])FY([0-9]{2})", str(label or "").replace(" ", "").upper())
+    if not m:
+        return str(label or "")
+    q, fy = int(m.group(1)), 2000 + int(m.group(2))
+    a, b, off = _Q_MONTHS[q]
+    short = f"Q{q} FY{fy % 100:02d}"
+    return f"{short} ({a}–{b} {fy + off})" if months else short
+
+
+def _q_chip(label) -> str:
+    """The quarter as a white pill inside a card's dark header bar."""
+    if not str(label or "").strip():
+        return ""
+    return (f'<span style="background:#fff;color:#0d2f5c;border-radius:4px;'
+            f'padding:0 6px;margin-left:8px;font-weight:800">'
+            f'{escape(_q_display(label, months=False))}</span>')
+
+
+def _quarter_banner(label, line) -> str:
+    """Big quarter strip at the top of the PAT growth and guidance pages."""
+    return (f'<div style="max-width:1100px;margin:0 auto 10px;padding:10px 16px;'
+            f'background:#0d2f5c;color:#fff;border-radius:8px;font-size:22px;'
+            f'font-weight:800">📅 {escape(_q_display(label))}'
+            f'<span style="font-size:14px;font-weight:500;opacity:.9"> · '
+            f'{escape(line)}</span></div>')
+
+
+def _wl_pick_quarter(wl, quarter="auto"):
+    """(guidance_watchlist rows of ONE quarter, that quarter); auto = the newest."""
+    if wl is None or wl.empty or "quarter" not in wl.columns:
+        return _EMPTY, ""
+    wl = wl.copy()
+    wl["_qo"] = wl["quarter"].map(_q_order)
+    q = (str(wl.sort_values("_qo")["quarter"].iloc[-1])
+         if str(quarter).lower() == "auto" else quarter)
+    return (wl[wl["quarter"].astype(str).str.replace(" ", "")
+               == str(q).replace(" ", "")], q)
+
+
+def _both_from_guidance(wl_q, q) -> dict:
+    """ISIN -> what the guidance page says, for the PAT page's 'both lists' badge."""
+    out = {}
+    if wl_q is None or wl_q.empty or "isin" not in wl_q.columns:
+        return out
+    for _, r in wl_q.iterrows():
+        i = str(r.get("isin") or "").strip()
+        if not i or i.lower() in ("nan", "none"):
+            continue
+        cag = pd.to_numeric(r.get("cagr_pct"), errors="coerce")
+        met = str(r.get("score_metric") or "").strip().lower() or "growth"
+        out[i] = (f"guidance {_q_display(q, months=False)}: {met} ~{cag:.0f}%/yr guided"
+                  if pd.notna(cag) else f"guidance {_q_display(q, months=False)}")
+    return out
+
+
+def _both_from_pat(pg, q) -> dict:
+    """ISIN -> what the PAT page says, for the guidance page's 'both lists' badge."""
+    out = {}
+    if pg is None or pg.empty:
+        return out
+    for _, r in pg.iterrows():
+        i = str(r.get("isin") or "").strip()
+        if not i:
+            continue
+        out[i] = (f"PAT {_q_display(q, months=False)}: +{r['yoy_pct']:,.0f}% YoY, "
+                  f"QoQ {_pg_qoq_text(r)}")
+    return out
+
+
+def _both_cell(txt) -> str:
+    if not isinstance(txt, str) or not txt:
+        return ""
+    return (f'<span title="{escape(txt)}" style="background:#f5c518;color:#222;'
+            f'font-weight:800;padding:0 6px;border-radius:3px;white-space:nowrap">'
+            f'⭐ both</span>')
+
+
+def _both_line(txt) -> str:
+    if not isinstance(txt, str) or not txt:
+        return ""
+    return (f'<div style="background:#f5c518;color:#222;border-radius:6px;'
+            f'padding:3px 10px;font-size:12.5px;font-weight:800;margin:3px 0">'
+            f'⭐ ON BOTH LISTS · {escape(txt)}</div>')
+
+
+def _isin_names(uni) -> dict:
+    """ISIN -> company name from universe/master_list.csv."""
+    if uni is None or uni.empty or not {"isin", "name"} <= set(uni.columns):
+        return {}
+    u = uni.dropna(subset=["isin"])
+    return dict(zip(u["isin"].astype(str).str.strip(), u["name"].astype(str).str.strip()))
+
+
+def _pg_cr(v):
+    """₹ cr with decimals only where they matter: small-cap PAT is often below 1."""
+    try:
+        return _wl_num(v, 2 if abs(float(v)) < 100 else 0)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _pg_qoq_text(r):
+    q = pd.to_numeric(r.get("qoq_pct"), errors="coerce")
+    if pd.notna(q):
+        return f"+{q:,.0f}%"
+    return "loss → profit" if r.get("pat_prev") < 0 else "from nil"
+
+
+def _pg_table(pg) -> str:
+    """The summary above the cards. The three PAT levels sit next to the % so a
+    large YoY on a tiny base is visible rather than hidden behind a filter."""
+    head = ["#", "PF", "Both", "Symbol", "Company", "Qtr", "Reported", "PAT ₹cr",
+            "Prev-Q ₹cr", "Yr-ago ₹cr", "YoY", "QoQ"]
+    th = "".join(
+        f'<th style="position:sticky;top:0;background:#1a3d6e;color:#fff;'
+        f'font-size:11px;padding:4px 6px;text-align:left;white-space:nowrap">{h}</th>'
+        for h in head)
+    rows = []
+    for j, (_, r) in enumerate(pg.iterrows()):
+        sym = str(r.get("symbol") or "")
+        sym_cell = (f'<a href="#ch{j}" style="color:#1a3d6e;font-weight:700;'
+                    f'text-decoration:none">{sym}</a>' if sym else
+                    f'<span style="color:#777" title="not in the tracked universe, '
+                    f'so no chart">{escape(str(r.get("slug") or ""))}</span>')
+        yoy = pd.to_numeric(r.get("yoy_pct"), errors="coerce")
+        qoq = pd.to_numeric(r.get("qoq_pct"), errors="coerce")
+        qoq_css = G.cell_css(G.grade_growth(qoq)) if pd.notna(qoq) else ""
+        cells = [
+            f"{j + 1}",
+            _wl_pf_cell(r.get("in_pf")),
+            _both_cell(r.get("both")),
+            sym_cell,
+            escape(str(r.get("company_name") or ""))[:34],
+            str(r.get("quarter") or ""),
+            str(r.get("reported") or "") + (
+                '<span style="color:#a66300" title="from the full statements: date '
+                'they were read, usually ~2 days after the result"> *</span>'
+                if r.get("source") == "statements" else ""),
+            _pg_cr(r.get("pat")),
+            _pg_cr(r.get("pat_prev")),
+            _pg_cr(r.get("pat_yearago")),
+            f'<span style="{G.cell_css(G.grade_growth(yoy))};font-weight:800;'
+            f'padding:0 4px;border-radius:3px">+{yoy:,.0f}%</span>',
+            f'<span style="{qoq_css};font-weight:700;padding:0 4px;'
+            f'border-radius:3px">{_pg_qoq_text(r)}</span>',
+        ]
+        tds = "".join(f'<td style="font-size:11.5px;padding:3px 6px;'
+                      f'border-bottom:1px solid #eef1f5;white-space:nowrap">{c}</td>'
+                      for c in cells)
+        rows.append(f"<tr>{tds}</tr>")
+    return ('<div style="max-width:1100px;margin:0 auto 16px">'
+            '<div class="card" style="overflow-x:auto;max-height:70vh;'
+            'overflow-y:auto">'
+            f'<table><thead><tr>{th}</tr></thead><tbody>{"".join(rows)}'
+            '</tbody></table></div></div>')
+
+
+def _pg_annot(pg) -> dict:
+    """SYMBOL -> the two lines under each card header. They carry their own
+    quarter because the PAT chips below come from financials_derived, which can
+    still be a quarter behind results."""
+    out = {}
+    for _, r in pg.iterrows():
+        sym = str(r.get("symbol") or "").upper()
+        if not sym:
+            continue
+        line1 = (f'<div style="background:#0d2f5c;color:#fff;border-radius:6px;'
+                 f'padding:4px 10px;font-size:13px;font-weight:700;margin:3px 0">'
+                 f'📈 PAT YoY +{r["yoy_pct"]:,.0f}% · QoQ {_pg_qoq_text(r)}'
+                 f'{_q_chip(r["quarter"])}</div>')
+        bits = []
+        if r.get("in_pf") is True:
+            bits.append('<span style="background:#1a7a3a;color:#fff;padding:1px 7px;'
+                        'border-radius:6px;font-weight:800">◉ IN PF</span>')
+        when = (f'📅 statements read {r["reported"]} (result usually ~2 days earlier)'
+                if r.get("source") == "statements" else f'📅 reported {r["reported"]}')
+        bits += [when + (_fresh_badge(r["reported"]) or ""),
+                 f'PAT ₹{_pg_cr(r["pat"])} cr',
+                 f'prev qtr ₹{_pg_cr(r["pat_prev"])} cr',
+                 f'year ago ₹{_pg_cr(r["pat_yearago"])} cr']
+        out[sym] = line1 + _both_line(r.get("both")) + (f'<div style="font-size:12px;color:#333;margin:2px 0;'
+                            f'line-height:1.6">{" · ".join(bits)}</div>')
     return out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["signals", "pf", "guidance", "watchlist"],
+    ap.add_argument("--mode", choices=["signals", "pf", "guidance", "watchlist",
+                                       "pat_growth"],
                     default="signals",
                     help="signals=ranked signal gallery; pf=portfolio holdings; "
                          "guidance=top companies by implied guidance CAGR; "
                          "watchlist=the running >50%%-CAGR guidance watchlist "
                          "(needs build_guidance_watchlist.py first), newest "
-                         "idea first.")
+                         "idea first; pat_growth=latest-quarter PAT above 50%% "
+                         "YoY and up QoQ, most recently reported first.")
     ap.add_argument("--quarter", default="auto",
-                    help="watchlist mode: which quarter to show "
+                    help="watchlist + pat_growth modes: which quarter to show "
                          "(default auto = the newest present in the table)")
     ap.add_argument("--min-cagr", type=float, default=0.0,
                     help="watchlist mode: extra CAGR floor on top of whatever "
@@ -2147,26 +2524,31 @@ def main():
             log("No guidance_watchlist.parquet — run "
                 "scripts/build_guidance_watchlist.py first.")
             return
-        wl = wl.copy()
-        wl["_qo"] = wl["quarter"].map(_q_order)
-        q = (str(wl.sort_values("_qo")["quarter"].iloc[-1])
-             if args.quarter.lower() == "auto" else args.quarter)
+        wl, q = _wl_pick_quarter(wl, args.quarter)
         # ONE quarter only, and that is structural rather than a preference: the
         # table holds one row per (isin, quarter), so a multi-quarter view would
         # render the same symbol — and the same chart — two or three times.
-        wl = wl[wl["quarter"].astype(str).str.replace(" ", "")
-                == str(q).replace(" ", "")]
         if args.min_cagr > 0 and "cagr_pct" in wl.columns:
             wl = wl[pd.to_numeric(wl["cagr_pct"], errors="coerce") >= args.min_cagr]
         wl = _mcap_floor(wl, [str(s or t or "") for s, t in
                               zip(wl.get("symbol", ""), wl.get("nse_symbol", ""))],
                          mcap_map, args.min_mcap)
         top = args.max if args.max > 0 else 100
-        # newest idea on top; CAGR breaks a same-day tie so the order is stable
-        wl = wl.sort_values(["date_added", "cagr_pct"], ascending=[False, False],
+        # newest guidance on top; CAGR breaks a same-day tie so the order is stable
+        wl["_guided_on"] = _wl_guided_on(wl)
+        wl = wl.sort_values(["_guided_on", "cagr_pct"], ascending=[False, False],
                             na_position="last").head(top).reset_index(drop=True)
         if wl.empty:
             log(f"Nothing in the watchlist for {q}."); return
+        # 'on both lists': the same PAT test the PAT growth page uses (its own
+        # quarter, written on the badge), matched by ISIN
+        pg_all, pq = pat_growth_rows(
+            _read_parquet(drive, idx, "results.parquet"), "auto",
+            fin3=_read_parquet(drive, idx, "financials_3stmt.parquet"),
+            names=_isin_names(uni))
+        pmap = _both_from_pat(pg_all, pq)
+        wl["both"] = [pmap.get(str(i or "").strip(), "") for i in wl["isin"]]
+        n_both = int((wl["both"] != "").sum())
         ranked = wl.copy()
         ranked["symbol"] = [str(s or t or "") for s, t in
                             zip(wl.get("symbol", ""), wl.get("nse_symbol", ""))]
@@ -2177,12 +2559,59 @@ def main():
         prelude = _wl_table(wl)
         floor = wl["min_cagr_used"].dropna()
         floor = float(floor.iloc[0]) if len(floor) else args.min_cagr
+        prelude = _quarter_banner(
+            q, f"management guided revenue or PAT above {floor:.0f}%/yr, "
+               f"transcript-checked · {len(wl)} companies"
+               + (f" · {n_both} also on the PAT growth page" if n_both else "")) + prelude
         n_pf = int(wl["in_pf"].fillna(False).sum()) if "in_pf" in wl.columns else 0
         title = (f"🎯 GUIDANCE WATCHLIST — {q} — management guided "
                  f"revenue or PAT above {floor:.0f}%/yr — transcript-checked "
                  f"— newest guidance first"
-                 + (f" — {n_pf} already in PF" if n_pf else ""))
-        log(f"  {len(wl)} names in the watchlist for {q}")
+                 + (f" — {n_pf} already in PF" if n_pf else "")
+                 + (f" — ⭐ {n_both} also on PAT growth" if n_both else ""))
+        log(f"  {len(wl)} names in the watchlist for {q} ({n_both} also on PAT growth)")
+
+    elif args.mode == "pat_growth":
+        out_default = "gallery_pat_growth.html"
+        pg, q = pat_growth_rows(_read_parquet(drive, idx, "results.parquet"),
+                                args.quarter,
+                                fin3=_read_parquet(drive, idx, "financials_3stmt.parquet"),
+                                names=_isin_names(uni))
+        if pg.empty:
+            log("No company passes the PAT growth filter."); return
+        isin2sym = isin_symbol_map(uni, grades, guidance)
+        pg["symbol"] = [isin2sym.get(i, "") if i else "" for i in pg["isin"]]
+        pg = _mcap_floor(pg, pg["symbol"].tolist(), mcap_map, args.min_mcap)
+        if args.max > 0:
+            pg = pg.head(args.max)
+        pg = pg.reset_index(drop=True)
+        pf_isins = load_portfolio_isins(drive, os.environ["GDRIVE_FOLDER_ID"])
+        # None = unknown (no holdings file, or a blank ISIN), not a confident No
+        pg["in_pf"] = [None if pf_isins is None or not i else i in pf_isins
+                       for i in pg["isin"]]
+        wl_q, gq = _wl_pick_quarter(_read_parquet(drive, idx, "guidance_watchlist.parquet"))
+        gmap = _both_from_guidance(wl_q, gq)
+        pg["both"] = [gmap.get(i, "") if i else "" for i in pg["isin"]]
+        n_both = int((pg["both"] != "").sum())
+        n_stmt = int((pg["source"] == "statements").sum())
+        ranked = pg.copy()
+        # a name with no resolvable symbol still belongs on the list — _pfname
+        # makes it render as a LABELLED card instead of "(unknown)"
+        ranked["_pfname"] = pg["company_name"].map(lambda v: escape(str(v or "")))
+        annot = _pg_annot(pg)
+        prelude = _quarter_banner(
+            q, f"PAT up more than {PAT_GROWTH_MIN_YOY:.0f}% on the year and up on the "
+               f"quarter · {len(pg)} companies"
+               + (f" ({n_stmt} from the full statements, marked *)" if n_stmt else "")
+               + (f" · {n_both} also on the guidance page" if n_both else "")
+        ) + _pg_table(pg)
+        n_pf = sum(1 for v in pg["in_pf"] if v is True)
+        title = (f"📈 PAT GROWTH — {q} — PAT above {PAT_GROWTH_MIN_YOY:.0f}% YoY "
+                 f"and up QoQ — most recently reported first"
+                 + (f" — {n_pf} already in PF" if n_pf else "")
+                 + (f" — ⭐ {n_both} also on guidance" if n_both else ""))
+        n_nosym = int((pg["symbol"] == "").sum())
+        log(f"  {len(pg)} names for {q} ({n_nosym} with no symbol, shown name-only)")
 
     else:  # signals
         if args.view == "drops":
