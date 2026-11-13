@@ -52,6 +52,7 @@ from _extractor_base import (get_drive, get_or_create_subfolder, find_file,
 from drive_io import drive_call, ParquetCache
 import gradation as G
 import quarterly_table as QT
+import chart_ma_filter as MAF
 
 # Tolerance for "how far behind the market may a series be". Mirrors
 # OHLCV_MAX_STALE_DAYS in pipeline_healthcheck.py:52 — 4 calendar days is too
@@ -1031,6 +1032,27 @@ def _ohlc_arrays(odf, days, resample=None):
     return candles, vols, ema20, ema50
 
 
+DMA_LINE_N = 10     # thin purple line on every DAILY chart (user 2026-11-12)
+
+
+def _sma_line(odf, times, n=DMA_LINE_N):
+    """The n-day simple average of the daily close at each charted bar time, worked
+    out on the WHOLE price history so the line starts at the first visible bar.
+    -> [{"time", "value"}]; [] when there is nothing to draw. Separate from
+    _ohlc_arrays, whose 4-value return several mail scripts unpack."""
+    if odf is None or odf.empty or not times or not {"date", "close"} <= set(odf.columns):
+        return []
+    d = odf.sort_values("date")
+    ma = pd.to_numeric(d["close"], errors="coerce").rolling(n).mean()
+    by_t = dict(zip(d["date"].astype(str).str[:10], ma))
+    out = []
+    for t in times:
+        v = by_t.get(t)
+        if v is not None and pd.notna(v):
+            out.append({"time": t, "value": round(float(v), 2)})
+    return out
+
+
 _TPL = """<!doctype html><html><head><meta charset="utf-8">
 <title>Signals gallery __DATE__</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -1070,6 +1092,8 @@ function mk(id){
  l20.setData((D[id]||{}).e20||[]);
  const l50=ch.addLineSeries({color:'#FF6D00',lineWidth:2,priceLineVisible:false,lastValueVisible:false});
  l50.setData((D[id]||{}).e50||[]);
+ const m10=(D[id]||{}).m10;
+ if(m10&&m10.length){ch.addLineSeries({color:'#8E24AA',lineWidth:1,priceLineVisible:false,lastValueVisible:false}).setData(m10);}
  const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});
  vs.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}}); vs.setData((D[id]||{}).v||[]);
  // Optional event marker — only build_sold_gallery.py sends one (the sell date);
@@ -1220,6 +1244,10 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         _NEW_FROM = mkt_date
     for j, (_, rr) in enumerate(ranked.iterrows()):
         s = str(rr.get("symbol", "") or "")
+        # chart_ma_filter.drop_cards keeps each card's row number on the full list,
+        # so a page whose table links "#ch<row>" still lands on the right card
+        _cid = pd.to_numeric(rr.get("_card_id"), errors="coerce")
+        cid = int(_cid) if pd.notna(_cid) else j
         pfname = str(rr.get("_pfname", "") or "")          # PF holding name (raw list)
         c, v, e20, e50 = (_ohlc_arrays(omap.get(s, _EMPTY), days, resample=resample)
                           if s else ([], [], [], []))
@@ -1228,7 +1256,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         if not s:
             label = pfname or "(unknown)"
             card_html.append(
-                f'<div class="card"><div class="hd">{j + 1}. <b>{label}</b></div>'
+                f'<div class="card"><div class="hd">{cid + 1}. <b>{label}</b></div>'
                 f'<div style="font-size:12px;color:#999;padding:8px 2px">'
                 f'Not in the tracked universe (delisted / suspended / non-equity).'
                 f'</div></div>')
@@ -1239,7 +1267,7 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
         # shows its grades/quarterly/guidance instead of being blanked out).
         nmj = cards.name_by.get(s.upper(), "") or pfname
         meta = "".join(x for x in [
-            f'<div class="hd">{j + 1}. <b>{s}</b>'
+            f'<div class="hd">{cid + 1}. <b>{s}</b>'
             + (f' <span class="nm">{nmj}</span>' if nmj else "")
             + _decision_chip(rr.get("decision"), rr.get("n_buy"), rr.get("n_vote"))
             + _stale_chip(bar_dates.get(s), mkt_date)
@@ -1264,7 +1292,9 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
                     f'No chart/price data for this name (no OHLCV feed).</div>')
             card_html.append(f'<div class="card{upd_cls}">{meta}{note}</div>')
             continue
-        data[str(j)] = {"c": c, "v": v, "e20": e20, "e50": e50}
+        data[str(cid)] = {"c": c, "v": v, "e20": e20, "e50": e50}
+        if not resample:          # a 10-DAY line belongs on daily candles only
+            data[str(cid)]["m10"] = _sma_line(omap.get(s, _EMPTY), [x["time"] for x in c])
         # Event marker, when the caller sent one. Snapped BACK to the last bar at
         # or before the date so a non-trading day — or a weekly/monthly resample —
         # still lands on a real candle instead of inventing a time point. A date
@@ -1274,16 +1304,19 @@ def build_html(ranked, omap, cards: Cards, mcap_map, days, title="📊 Signals g
             _t = str(_mk["t"])[:10]
             _bars = [x["time"] for x in c if x["time"] <= _t]
             if _bars:
-                data[str(j)]["mk"] = {"t": _bars[-1], "x": _mk.get("x", ""),
+                data[str(cid)]["mk"] = {"t": _bars[-1], "x": _mk.get("x", ""),
                                       "p": _mk.get("p")}
         # Per-chart legend — the page-level note scrolls away on a long gallery,
         # so each chart says what its two lines are.
         legend = ('<div style="font-size:10.5px;color:#777;margin:2px 0 0">'
                   'Candles + volume · <b style="color:#2962FF">━ EMA20</b> '
                   '(short-term trend) · <b style="color:#FF6D00">━ EMA50</b> '
-                  '(medium-term trend)</div>')
+                  '(medium-term trend)'
+                  + ('' if resample else
+                     ' · <b style="color:#8E24AA">━ 10 DMA</b> (10-day average)')
+                  + '</div>')
         card_html.append(f'<div class="card{upd_cls}">{meta}{legend}'
-                         f'<div class="chart" id="ch{j}"></div></div>')
+                         f'<div class="chart" id="ch{cid}"></div></div>')
     now = datetime.now()
     n_behind = sum(1 for d in bar_dates.values() if mkt_date and d < mkt_date)
     banner = _freshness_banner(mkt_date, now.date(), n_behind, len(bar_dates))
@@ -1891,8 +1924,10 @@ def _wl_table(wl) -> str:
             f"{j + 1}",
             _wl_pf_cell(r.get("in_pf")),
             _both_cell(r.get("both")),
-            f'<a href="#ch{j}" style="color:#1a3d6e;font-weight:700;'
-            f'text-decoration:none">{sym}</a>',
+            (f'<span style="color:#1a3d6e;font-weight:700">{sym}</span>{r.get("_ma_tag")}'
+             if r.get("_ma_tag") else
+             f'<a href="#ch{j}" style="color:#1a3d6e;font-weight:700;'
+             f'text-decoration:none">{sym}</a>'),
             str(r.get("nse_name") or r.get("company_name") or "")[:34],
             str(r.get("isin") or ""),
             str(r.get("bse_code") or ""),
@@ -2277,6 +2312,9 @@ def _pg_table(pg) -> str:
                     f'text-decoration:none">{sym}</a>' if sym else
                     f'<span style="color:#777" title="not in the tracked universe, '
                     f'so no chart">{escape(str(r.get("slug") or ""))}</span>')
+        if sym and r.get("_ma_tag"):
+            sym_cell = (f'<span style="color:#1a3d6e;font-weight:700">{sym}</span>'
+                        f'{r.get("_ma_tag")}')
         yoy = pd.to_numeric(r.get("yoy_pct"), errors="coerce")
         qoq = pd.to_numeric(r.get("qoq_pct"), errors="coerce")
         qoq_css = G.cell_css(G.grade_growth(qoq)) if pd.notna(qoq) else ""
@@ -2377,6 +2415,10 @@ def main():
                          "mode is never filtered.")
     ap.add_argument("--max", type=int, default=0,
                     help="cap chart count (0=all; guidance mode defaults to 100)")
+    ap.add_argument("--chart-ma", type=int, default=MAF.CHART_MA_N,
+                    help="hide the chart of a non-PF stock at or below its N-day simple "
+                         "average (Phase 1 stores 10/20/50/200); 0 = show every chart. "
+                         "Signals (not drops), watchlist and pat_growth pages only.")
     ap.add_argument("--out", default="")
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -2461,6 +2503,16 @@ def main():
     # degrades to the pre-existing card when it is.
     opens_df = _load_open_signals(drive)
     feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+    ma_hide_pre = None          # set by a mode whose own table marks the hidden rows
+    _pf_memo = []
+
+    def _pf():
+        """PF symbols for the chart filter, loaded once (None = unknown: hide nothing)."""
+        if not _pf_memo:
+            _pf_memo.append(MAF.pf_symbols(drive, isin_symbol_map(uni, grades, guidance)))
+            log("  chart filter: PF symbols "
+                + ("unknown, nothing hidden" if _pf_memo[0] is None else str(len(_pf_memo[0]))))
+        return _pf_memo[0]
 
     if args.mode == "pf":
         title, out_default = "💼 Portfolio (PF) charts", "gallery_pf.html"
@@ -2555,6 +2607,11 @@ def main():
         # a name with no resolvable symbol still belongs on the list — _pfname
         # makes it render as a LABELLED card instead of "(unknown)"
         ranked["_pfname"] = wl.get("nse_name", wl.get("company_name", ""))
+        if args.chart_ma > 0:
+            ma_hide_pre = MAF.hidden(ranked["symbol"], feats_g, _pf(), args.chart_ma)
+            wl["_ma_tag"] = [MAF.table_tag(args.chart_ma)
+                             if str(s).strip().upper() in ma_hide_pre else ""
+                             for s in ranked["symbol"]]
         annot = _wl_annot(wl)
         prelude = _wl_table(wl)
         floor = wl["min_cagr_used"].dropna()
@@ -2562,7 +2619,9 @@ def main():
         prelude = _quarter_banner(
             q, f"management guided revenue or PAT above {floor:.0f}%/yr, "
                f"transcript-checked · {len(wl)} companies"
-               + (f" · {n_both} also on the PAT growth page" if n_both else "")) + prelude
+               + (f" · {n_both} also on the PAT growth page" if n_both else "")
+               + (f" · {len(ma_hide_pre)} charts hidden (below {args.chart_ma} DMA, not in PF)"
+                  if ma_hide_pre else "")) + prelude
         n_pf = int(wl["in_pf"].fillna(False).sum()) if "in_pf" in wl.columns else 0
         title = (f"🎯 GUIDANCE WATCHLIST — {q} — management guided "
                  f"revenue or PAT above {floor:.0f}%/yr — transcript-checked "
@@ -2594,6 +2653,11 @@ def main():
         pg["both"] = [gmap.get(i, "") if i else "" for i in pg["isin"]]
         n_both = int((pg["both"] != "").sum())
         n_stmt = int((pg["source"] == "statements").sum())
+        if args.chart_ma > 0:
+            ma_hide_pre = MAF.hidden(pg["symbol"], feats_g, _pf(), args.chart_ma)
+            pg["_ma_tag"] = [MAF.table_tag(args.chart_ma)
+                             if str(s).strip().upper() in ma_hide_pre else ""
+                             for s in pg["symbol"]]
         ranked = pg.copy()
         # a name with no resolvable symbol still belongs on the list — _pfname
         # makes it render as a LABELLED card instead of "(unknown)"
@@ -2604,6 +2668,8 @@ def main():
                f"quarter · {len(pg)} companies"
                + (f" ({n_stmt} from the full statements, marked *)" if n_stmt else "")
                + (f" · {n_both} also on the guidance page" if n_both else "")
+               + (f" · {len(ma_hide_pre)} charts hidden (below {args.chart_ma} DMA, not in PF)"
+                  if ma_hide_pre else "")
         ) + _pg_table(pg)
         n_pf = sum(1 for v in pg["in_pf"] if v is True)
         title = (f"📈 PAT GROWTH — {q} — PAT above {PAT_GROWTH_MIN_YOY:.0f}% YoY "
@@ -2665,6 +2731,17 @@ def main():
 
     if ranked.empty:
         log("Nothing to render."); return
+    # ---- chart filter (scripts/chart_ma_filter.py, user 2026-11-12): a non-PF stock
+    # keeps its chart only above its N-day average; the page's table stays whole.
+    # Not the PF pages (all PF), not Recent drops (names falling off the lists).
+    if args.chart_ma > 0 and (args.mode in ("watchlist", "pat_growth")
+                              or (args.mode == "signals" and args.view != "drops")):
+        ma_hide = (ma_hide_pre if ma_hide_pre is not None
+                   else MAF.hidden(ranked["symbol"], feats_g, _pf(), args.chart_ma))
+        ranked = MAF.drop_cards(ranked, ma_hide)
+        title += MAF.note(len(ma_hide), args.chart_ma)
+        log(f"  chart filter: {len(ma_hide)} charts hidden (below {args.chart_ma} DMA, "
+            f"not in PF); {len(ranked)} cards left")
     syms = [s for s in ranked["symbol"].tolist() if s]      # skip name-only entries
     log(f"  {len(ranked)} cards selected (mode={args.mode}); {len(syms)} chartable")
 

@@ -49,7 +49,7 @@ load_dotenv(Path(ROOT) / ".env")           # Drive credential paths (CI writes t
 
 from detector import find_boxes, summarize  # noqa: E402
 from daily_screen import tech_metrics       # noqa: E402  guru/daily_screen.py, unchanged
-from build_gallery import _ohlc_arrays      # noqa: E402  scripts/build_gallery.py, unchanged
+from build_gallery import _ohlc_arrays, _sma_line  # noqa: E402  scripts/build_gallery.py, unchanged
 
 TOP_PCTILE = 0.90          # top 10% by 12m return (user 2026-10-18)
 CHART_BARS = 260           # ~1 trading year on the chart
@@ -115,7 +115,8 @@ _TPL = r"""<!doctype html><html><head><meta charset="utf-8">
 <h1>Darvas boxes &middot; top 10% by 12-month return</h1>
 <div class="sub">Prices as of __DATE__ &middot; __N__ stocks (12m return &ge; __CUT__%) &middot;
 mcap &ge; 100 cr, turnover &ge; 1 cr/day &middot; boxes: 3-day Darvas confirmation &middot;
-<span style="color:#e65100">orange = current box</span>, red dashed = broken</div>
+<span style="color:#e65100">orange = current box</span>, red dashed = broken &middot;
+<span style="color:#8e24aa">purple line = 10 DMA</span></div>
 <div class="bar" id="flt"></div>
 <div class="grid" id="grid"></div>
 <script>
@@ -148,6 +149,7 @@ function mk(i){
   const ln=e=>s.r.map((a,j)=>e[j]==null?null:{time:a[0],value:e[j]}).filter(Boolean);
   ch.addLineSeries({color:'#2962ff',lineWidth:1,priceLineVisible:false,lastValueVisible:false}).setData(ln(s.e20));
   ch.addLineSeries({color:'#ff9800',lineWidth:1,priceLineVisible:false,lastValueVisible:false}).setData(ln(s.e50));
+  ch.addLineSeries({color:'#8e24aa',lineWidth:1,priceLineVisible:false,lastValueVisible:false}).setData(ln(s.m10||[]));
   const vs=ch.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'v'});
   ch.priceScale('v').applyOptions({scaleMargins:{top:.82,bottom:0}});
   vs.setData(s.r.map(a=>({time:a[0],value:a[5],color:a[4]>=a[1]?'#26a69a':'#ef5350'})));
@@ -181,7 +183,23 @@ F.forEach(([n,fn],k)=>{const b=document.createElement('button');b.textContent=n;
 </script></body></html>"""
 
 
-def build_html(top: pd.DataFrame, as_of: str, cut: float) -> str:
+def _ma_filter(top: pd.DataFrame):
+    """(top without the hidden stocks, how many were hidden). A non-PF stock keeps its
+    chart only above its 20 DMA (scripts/chart_ma_filter.py, user 2026-11-12)."""
+    import chart_ma_filter as MAF
+    import build_gallery as BG
+    from _extractor_base import isin_symbol_map
+    d = BG._drive()
+    uni = BG._read_csv(d, BG._folder(d, "universe"), "master_list.csv")
+    grades = BG._read_parquet(d, BG._folder(d, "company_repo/_index"), "screener_grades.parquet")
+    hide = MAF.hidden(top["symbol"], MAF.load_features(d),
+                      MAF.pf_symbols(d, isin_symbol_map(uni, grades)))
+    log(f"chart filter: {len(hide)} hidden (below {MAF.CHART_MA_N} DMA, not in PF)")
+    keep = ~top["symbol"].astype(str).str.strip().str.upper().isin(hide)
+    return top[keep].reset_index(drop=True), len(hide)
+
+
+def build_html(top: pd.DataFrame, as_of: str, cut: float, n_hidden: int = 0) -> str:
     data = []
     for r in top.itertuples(index=False):
         df = pd.read_parquet(os.path.join(LIVE, f"{r.symbol}.parquet"))
@@ -196,6 +214,8 @@ def build_html(top: pd.DataFrame, as_of: str, cut: float) -> str:
         candles, vols = rows, None
         e20 = [e20m.get(x[0]) for x in rows]
         e50 = [e50m.get(x[0]) for x in rows]
+        m10m = {x["time"]: x["value"] for x in _sma_line(df, [x[0] for x in rows])}
+        m10 = [m10m.get(x[0]) for x in rows]
         for b in r.boxes:
             for k in ("top", "bottom"):
                 if b[k] is not None:
@@ -206,8 +226,9 @@ def build_html(top: pd.DataFrame, as_of: str, cut: float) -> str:
                      "resistance": None if pd.isna(r.resistance) else r.resistance,
                      "support": None if pd.isna(r.support) else r.support,
                      "last_bar": r.last_bar, "stale": bool(r.stale),
-                     "boxes": r.boxes, "r": candles, "e20": e20, "e50": e50})
-    return (_TPL.replace("__DATE__", as_of).replace("__N__", str(len(top)))
+                     "boxes": r.boxes, "r": candles, "e20": e20, "e50": e50, "m10": m10})
+    shown = str(len(top)) + (f" (+{n_hidden} hidden: below 20 DMA, not in PF)" if n_hidden else "")
+    return (_TPL.replace("__DATE__", as_of).replace("__N__", shown)
             .replace("__CUT__", f"{cut:.0f}")
             .replace("__DATA__", json.dumps(data, separators=(",", ":"), default=str)))
 
@@ -275,7 +296,10 @@ def main():
     print(top[["symbol", "ret_12m_pct", "state", "staircase", "n_boxes", "resistance",
                "support"]].head(20).to_string(index=False))
 
-    html = build_html(top, as_of, cut)
+    n_hidden = 0
+    if not a.dry_run:                          # dry run = no Drive at all
+        top, n_hidden = _ma_filter(top)
+    html = build_html(top, as_of, cut, n_hidden)
     out = os.path.join(HERE, OUT_NAME)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)

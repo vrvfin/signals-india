@@ -43,7 +43,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # Indicator config
 EMAS = [10, 20, 50, 100, 200]
-SMAS = [20, 50, 200]
+SMAS = [10, 20, 50, 200]   # 10 added 2026-11-12 (user: the 10 DMA)
 RETURN_LOOKBACKS = {"1m": 21, "2m": 42, "3m": 63, "6m": 126, "12m": 252}
 
 # Long-horizon high windows, in YEARS. Deliberately explicit rather than a single
@@ -415,7 +415,7 @@ def compute_features_one(symbol: str, df: pd.DataFrame) -> dict | None:
     # ---- MA extension (TECH_EXTENSION) -------------------------------------
     # % ABOVE the moving average, not just the above/below booleans below. The
     # highest-median-return family in guru/backtest/family_lift.parquet.
-    for n in (20, 50, 200):
+    for n in (10, 20, 50, 200):
         ma = smas[n].iloc[-1]
         feat[f"price_vs_ma_{n}"] = ((close.iloc[-1] / ma - 1) * 100
                                     if pd.notna(ma) and ma > 0 else np.nan)
