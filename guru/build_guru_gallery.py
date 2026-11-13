@@ -43,6 +43,7 @@ load_dotenv(Path(ROOT) / ".env")
 
 # The shared gallery, used strictly read-only.
 import build_gallery as BG
+import chart_ma_filter as MAF
 
 PICKS = "guru_picks.parquet"
 
@@ -385,6 +386,15 @@ def main():
     ann = BG._read_parquet(drive, idx, "announcement_ledger.parquet")
     res_idx = BG._read_parquet(drive, idx, "research_index.parquet")
 
+    # chart filter (scripts/chart_ma_filter.py): a non-PF pick keeps its chart only
+    # above its 20 DMA; the picks table above the cards stays whole
+    hide = MAF.hidden(ranked["symbol"], MAF.load_features(drive),
+                      MAF.pf_symbols(drive, BG.isin_symbol_map(uni, grades, guidance)))
+    if hide:
+        ranked = MAF.drop_cards(ranked, hide)
+        syms = [s for s in ranked["symbol"].tolist() if s]
+        title += MAF.note(len(hide))
+    log(f"  chart filter: {len(hide)} charts hidden (below {MAF.CHART_MA_N} DMA, not in PF)")
     log(f"downloading OHLCV for {len(syms)} names…")
     ohlcv_failed = set()
     omap = BG._bulk_parquet(drive, BG._folder(drive, "data/ohlcv"), syms,
