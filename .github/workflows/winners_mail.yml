@@ -1,0 +1,77 @@
+name: Winner journeys mail (Drive outbox, 19:00 IST)
+
+# Mails ONE Winner Journeys cue-card deck a day: the oldest deck the PC queued in the PRIVATE
+# Drive outbox (guru_config/winners_outbox: mail HTML + inline charts + outbox.json) that is not
+# yet in the sent ledger (_sent.json), so a deck is never mailed twice. The sender is a private
+# Drive job run by scripts/drive_runner.py with --max 1 (set in the private jobs.json): this
+# PUBLIC log shows one status line, the job's own output goes to Drive guru_config/logs/.
+# An empty outbox = nothing sent.
+#
+#   cron 19:00 IST (the house mail time)   -> sends the next waiting deck
+#   manual run, mode = dry                 -> lists what it would send; mails nothing
+#   push to feat/winners-mail (TEMPORARY)  -> dry-run test of this PR; removed before merge
+#
+# Plan: .claude/plans/winner-journeys-mail.md (local).
+
+on:
+  schedule:
+    - cron: "30 13 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live = send the next waiting deck, dry = list only"
+        type: choice
+        options: [live, dry]
+        default: live
+  push:
+    branches: [feat/winners-mail]
+
+concurrency:
+  group: winners-mail
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODE: ${{ github.event_name == 'push' && 'dry' || github.event.inputs.mode || 'live' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Write credentials from secrets
+        env:
+          GDRIVE_FOLDER_ID:                ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET_JSON }}
+          GDRIVE_OAUTH_TOKEN_JSON:         ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+        run: |
+          mkdir -p _sec
+          printf '%s' "$GDRIVE_OAUTH_CLIENT_SECRET_JSON" > _sec/cs.json
+          printf '%s' "$GDRIVE_OAUTH_TOKEN_JSON"        > _sec/tk.json
+          {
+            echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID"
+            echo "GDRIVE_OAUTH_CLIENT_SECRET_PATH=$PWD/_sec/cs.json"
+            echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
+          } > .env
+
+      - name: Send the next waiting deck (private Drive job)
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:       ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          echo "mode: $MODE"
+          if [ "$MODE" = "dry" ]; then
+            python scripts/drive_runner.py --job winners_mail --extra=--dry-run
+          else
+            python scripts/drive_runner.py --job winners_mail
+          fi
