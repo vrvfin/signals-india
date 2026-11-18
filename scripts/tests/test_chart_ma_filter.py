@@ -1,10 +1,12 @@
 r"""
-test_chart_ma_filter.py — offline checks for the 20 DMA chart filter and the 10-day SMA.
+test_chart_ma_filter.py — offline checks for the EMA20 chart filter and the 10-day SMA.
 
 Plain python, no pytest (repo convention). Synthetic data only: no Drive, no network.
 
-  1. chart_ma_filter.hidden: above kept; at or below hidden; PF never hidden; a blank,
-     a missing stock, an unknown PF list, n=0 or a missing column hide nothing
+  1. chart_ma_filter.hidden: close above the EMA kept; at or below hidden; PF never
+     hidden; an unknown PF list or n=0 hide nothing; a stock with no features value uses
+     its own prices (>= N closes, else kept; a failed read keeps it); the line matches
+     the blue chart line and Phase 1's ema_20
   2. drop_cards keeps each card's row number (_card_id)
   3. build_html: a dropped card leaves a gap in the anchors, the others keep their row
      numbers and payload keys; an empty list still renders
@@ -40,20 +42,71 @@ def chk(label, got, want):
         FAILS.append(f"{label}: got {got!r}, want {want!r}")
 
 
-# 1. the rule
+# 1. the rule: close vs the blue EMA line
 feats = pd.DataFrame({"symbol": ["UP", "FLAT", "DOWN", "PFDOWN", "BLANK", "low"],
-                      "price_vs_ma_20": [3.2, 0.0, -1.5, -9.0, None, -2.0],
-                      "price_vs_ma_10": [-0.5, 1.0, 2.0, -1.0, 1.0, 1.0]})
+                      "close": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+                      "ema_20": [96.0, 100.0, 101.0, 110.0, None, 102.0],
+                      "ema_10": [101.0, 99.0, 98.0, 101.0, 99.0, 99.0],
+                      # the OLD rule's column says the opposite for UP/DOWN: must be ignored
+                      "price_vs_ma_20": [-3.2, 0.0, 1.5, -9.0, None, -2.0]})
 syms = ["UP", "FLAT", "DOWN", "PFDOWN", "BLANK", "NOFEAT", "", None, "Low"]
 chk("rule", MAF.hidden(syms, feats, {"PFDOWN"}), {"FLAT", "DOWN", "LOW"})
-chk("10-day column", MAF.hidden(syms, feats, set(), n=10), {"UP", "PFDOWN"})
+chk("10-day line", MAF.hidden(syms, feats, set(), n=10), {"UP", "PFDOWN"})
 chk("PF unknown = nothing hidden", MAF.hidden(syms, feats, None), set())
 chk("n=0 = off", MAF.hidden(syms, feats, set(), n=0), set())
-chk("no such column = nothing", MAF.hidden(syms, feats, set(), n=50), set())
-chk("no features = nothing", MAF.hidden(syms, pd.DataFrame(), set()), set())
-chk("note", MAF.note(3), " — 3 charts hidden (below 20 DMA, not in PF)")
+chk("no such column, no prices = nothing", MAF.hidden(syms, feats, set(), n=50), set())
+chk("no features, no prices = nothing", MAF.hidden(syms, pd.DataFrame(), set()), set())
+chk("note", MAF.note(3), " — 3 charts hidden (below the EMA20 line, not in PF)")
 chk("no note when none hidden", MAF.note(0), "")
-chk("table tag names the average", "below 10 DMA" in MAF.table_tag(10), True)
+chk("table tag names the line", "below EMA10" in MAF.table_tag(10), True)
+
+
+def px(closes):
+    return pd.DataFrame({"date": pd.bdate_range("2026-10-01", periods=len(closes)),
+                         "close": closes})
+
+
+falling = px(list(np.linspace(120, 100, 30)))          # last close under its EMA
+rising = px(list(np.linspace(100, 120, 30)))           # last close over its EMA
+book = {"NOFEAT": falling, "BLANK": falling, "NEWUP": rising, "SHORT": px([1.0] * 5 + [0.5] * 14),
+        "PFNEW": falling}
+asked = []
+
+
+def prices(sym):
+    asked.append(sym)
+    if sym == "BROKEN":
+        raise RuntimeError("drive down")
+    return book.get(sym)
+
+
+got = MAF.hidden(syms + ["NEWUP", "SHORT", "BROKEN", "NOFILE", "PFNEW", "nofeat"], feats,
+                 {"PFDOWN", "PFNEW"}, prices=prices)
+chk("own prices fill the gaps", got, {"FLAT", "DOWN", "LOW", "NOFEAT", "BLANK"})
+chk("own prices read only for gaps, never for PF",
+    sorted(set(asked)), ["BLANK", "BROKEN", "NEWUP", "NOFEAT", "NOFILE", "SHORT", "nofeat"])
+chk("19 closes = too few, kept", MAF.ema_last(book["SHORT"]), None)
+chk("own prices for a missing column", MAF.hidden(["UP"], feats, set(), n=5,
+                                                   prices=lambda s: falling), {"UP"})
+
+# the default price source is the Drive load_features() last read
+_real = MAF.drive_prices
+MAF.drive_prices = lambda d: (lambda s: falling if d == "DRIVE" else None)
+MAF._LAST_DRIVE[:] = ["DRIVE"]
+chk("default prices = load_features' Drive", MAF.hidden(["NOFEAT"], feats, set()), {"NOFEAT"})
+MAF._LAST_DRIVE[:] = []
+chk("no Drive read yet = no fallback", MAF.hidden(["NOFEAT"], feats, set()), set())
+MAF.drive_prices = _real
+
+# the line is the blue chart line and Phase 1's ema_20
+long = px(list(100 + 10 * np.sin(np.arange(300) / 9.0)))
+long["open"] = long["high"] = long["low"] = long["close"]
+long["volume"] = 1000
+_, _, e20_line, _ = BG._ohlc_arrays(long, 252)
+close_, e20_ = MAF.ema_last(long)
+chk("= the blue chart line", round(e20_, 2), e20_line[-1]["value"])
+fx = CF.compute_features_one("T", long)
+chk("= Phase 1 ema_20", (round(e20_, 6), close_), (round(fx["ema_20"], 6), fx["close"]))
 
 # 2. row numbers survive the drop
 r = pd.DataFrame({"symbol": ["A", "B", "C", "D"]})
@@ -103,14 +156,14 @@ pg = pd.DataFrame({"isin": ["I1", "I2"], "slug": ["AAA", "BBB"], "company_name":
                    "_ma_tag": ["", MAF.table_tag()]})
 t = BG._pg_table(pg)
 chk("PAT table: both rows", (">AAA</a>" in t, ">BBB</span>" in t), (True, True))
-chk("PAT table: hidden row unlinked + noted", ('href="#ch1"' in t, "below 20 DMA" in t),
+chk("PAT table: hidden row unlinked + noted", ('href="#ch1"' in t, "below EMA20" in t),
     (False, True))
 wl = pd.DataFrame({"isin": ["I1", "I2"], "nse_symbol": ["AAA", "BBB"], "quarter": "Q2FY27",
                    "cagr_pct": [60.0, 70.0], "score_metric": "revenue",
                    "date_added": "2026-11-01", "_ma_tag": [MAF.table_tag(), ""]})
 t = BG._wl_table(wl)
 chk("guidance table: hidden row unlinked + noted",
-    ('href="#ch0"' in t, 'href="#ch1"' in t, "below 20 DMA" in t), (False, True, True))
+    ('href="#ch0"' in t, 'href="#ch1"' in t, "below EMA20" in t), (False, True, True))
 
 # 5. the 10-day simple average in Phase 1 features
 df = bars(260)

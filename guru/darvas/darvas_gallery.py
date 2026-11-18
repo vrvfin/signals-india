@@ -185,7 +185,7 @@ F.forEach(([n,fn],k)=>{const b=document.createElement('button');b.textContent=n;
 
 def _ma_filter(top: pd.DataFrame):
     """(top without the hidden stocks, how many were hidden). A non-PF stock keeps its
-    chart only above its 20 DMA (scripts/chart_ma_filter.py, user 2026-11-12)."""
+    chart only above its 20-day EMA, the blue line (scripts/chart_ma_filter.py)."""
     import chart_ma_filter as MAF
     import build_gallery as BG
     from _extractor_base import isin_symbol_map
@@ -194,7 +194,7 @@ def _ma_filter(top: pd.DataFrame):
     grades = BG._read_parquet(d, BG._folder(d, "company_repo/_index"), "screener_grades.parquet")
     hide = MAF.hidden(top["symbol"], MAF.load_features(d),
                       MAF.pf_symbols(d, isin_symbol_map(uni, grades)))
-    log(f"chart filter: {len(hide)} hidden (below {MAF.CHART_MA_N} DMA, not in PF)")
+    log(f"chart filter: {len(hide)} hidden ({MAF.why()}, not in PF)")
     keep = ~top["symbol"].astype(str).str.strip().str.upper().isin(hide)
     return top[keep].reset_index(drop=True), len(hide)
 
@@ -227,7 +227,7 @@ def build_html(top: pd.DataFrame, as_of: str, cut: float, n_hidden: int = 0) -> 
                      "support": None if pd.isna(r.support) else r.support,
                      "last_bar": r.last_bar, "stale": bool(r.stale),
                      "boxes": r.boxes, "r": candles, "e20": e20, "e50": e50, "m10": m10})
-    shown = str(len(top)) + (f" (+{n_hidden} hidden: below 20 DMA, not in PF)" if n_hidden else "")
+    shown = str(len(top)) + (f" (+{n_hidden} hidden: below the EMA20 line, not in PF)" if n_hidden else "")
     return (_TPL.replace("__DATE__", as_of).replace("__N__", shown)
             .replace("__CUT__", f"{cut:.0f}")
             .replace("__DATA__", json.dumps(data, separators=(",", ":"), default=str)))
