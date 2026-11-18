@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MODE: ${{ github.event_name == 'push' && 'dry' || github.event.inputs.mode || 'live' }}
+      MODE: ${{ github.event_name == 'push' && (contains(github.event.head_commit.message, '[live-test]') && 'live' || 'dry') || github.event.inputs.mode || 'live' }}
     steps:
       - uses: actions/checkout@v4
 
