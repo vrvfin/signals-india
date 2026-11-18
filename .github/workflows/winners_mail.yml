@@ -71,7 +71,7 @@ jobs:
         run: |
           echo "mode: $MODE"
           if [ "$MODE" = "dry" ]; then
-            python scripts/drive_runner.py --job winners_mail --extra "--dry-run"
+            python scripts/drive_runner.py --job winners_mail --extra=--dry-run
           else
             python scripts/drive_runner.py --job winners_mail
           fi
