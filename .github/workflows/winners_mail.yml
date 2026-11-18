@@ -1,13 +1,15 @@
 name: Winner journeys mail (Drive outbox, 19:00 IST)
 
-# Mails the Winner Journeys cue-card decks that the PC built and queued in the PRIVATE Drive
-# outbox (guru_config/winners_outbox: mail HTML + inline charts + outbox.json; sent ledger
-# _sent.json, so a deck is never mailed twice). The sender is a private Drive job run by
-# scripts/drive_runner.py: this PUBLIC log shows one status line, the job's own output goes to
-# Drive guru_config/logs/. An empty outbox = nothing sent.
+# Mails ONE Winner Journeys cue-card deck a day: the oldest deck the PC queued in the PRIVATE
+# Drive outbox (guru_config/winners_outbox: mail HTML + inline charts + outbox.json) that is not
+# yet in the sent ledger (_sent.json), so a deck is never mailed twice. The sender is a private
+# Drive job run by scripts/drive_runner.py with --max 1 (set in the private jobs.json): this
+# PUBLIC log shows one status line, the job's own output goes to Drive guru_config/logs/.
+# An empty outbox = nothing sent.
 #
-#   cron 19:00 IST (the house mail time)   -> sends every deck not yet sent
+#   cron 19:00 IST (the house mail time)   -> sends the next waiting deck
 #   manual run, mode = dry                 -> lists what it would send; mails nothing
+#   push to feat/winners-mail (TEMPORARY)  -> dry-run test of this PR; removed before merge
 #
 # Plan: .claude/plans/winner-journeys-mail.md (local).
 
@@ -17,10 +19,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "live = send waiting decks, dry = list only"
+        description: "live = send the next waiting deck, dry = list only"
         type: choice
         options: [live, dry]
         default: live
+  push:
+    branches: [feat/winners-mail]
 
 concurrency:
   group: winners-mail
@@ -30,6 +34,8 @@ jobs:
   send:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      MODE: ${{ github.event_name == 'push' && 'dry' || github.event.inputs.mode || 'live' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,13 +63,13 @@ jobs:
             echo "GDRIVE_OAUTH_TOKEN_PATH=$PWD/_sec/tk.json"
           } > .env
 
-      - name: Send waiting decks (private Drive job)
+      - name: Send the next waiting deck (private Drive job)
         env:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL:       ${{ secrets.NOTIFY_EMAIL }}
-          MODE:               ${{ github.event.inputs.mode || 'live' }}
         run: |
+          echo "mode: $MODE"
           if [ "$MODE" = "dry" ]; then
             python scripts/drive_runner.py --job winners_mail --extra "--dry-run"
           else
