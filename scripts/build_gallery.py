@@ -2416,8 +2416,9 @@ def main():
     ap.add_argument("--max", type=int, default=0,
                     help="cap chart count (0=all; guidance mode defaults to 100)")
     ap.add_argument("--chart-ma", type=int, default=MAF.CHART_MA_N,
-                    help="hide the chart of a non-PF stock at or below its N-day simple "
-                         "average (Phase 1 stores 10/20/50/200); 0 = show every chart. "
+                    help="hide the chart of a non-PF stock at or below its N-day EMA "
+                         "(the blue line at 20; Phase 1 stores 10/20/50/100/200, a stock "
+                         "with no row uses its own prices); 0 = show every chart. "
                          "Signals (not drops), watchlist and pat_growth pages only.")
     ap.add_argument("--out", default="")
     ap.add_argument("--no-open", action="store_true")
@@ -2503,6 +2504,7 @@ def main():
     # degrades to the pre-existing card when it is.
     opens_df = _load_open_signals(drive)
     feats_g = _read_parquet(drive, _folder(drive, "features"), "latest.parquet")
+    ma_prices = MAF.drive_prices(drive)   # own prices for a stock features has no row for
     ma_hide_pre = None          # set by a mode whose own table marks the hidden rows
     _pf_memo = []
 
@@ -2608,7 +2610,8 @@ def main():
         # makes it render as a LABELLED card instead of "(unknown)"
         ranked["_pfname"] = wl.get("nse_name", wl.get("company_name", ""))
         if args.chart_ma > 0:
-            ma_hide_pre = MAF.hidden(ranked["symbol"], feats_g, _pf(), args.chart_ma)
+            ma_hide_pre = MAF.hidden(ranked["symbol"], feats_g, _pf(), args.chart_ma,
+                                     prices=ma_prices)
             wl["_ma_tag"] = [MAF.table_tag(args.chart_ma)
                              if str(s).strip().upper() in ma_hide_pre else ""
                              for s in ranked["symbol"]]
@@ -2620,7 +2623,7 @@ def main():
             q, f"management guided revenue or PAT above {floor:.0f}%/yr, "
                f"transcript-checked · {len(wl)} companies"
                + (f" · {n_both} also on the PAT growth page" if n_both else "")
-               + (f" · {len(ma_hide_pre)} charts hidden (below {args.chart_ma} DMA, not in PF)"
+               + (f" · {len(ma_hide_pre)} charts hidden ({MAF.why(args.chart_ma)}, not in PF)"
                   if ma_hide_pre else "")) + prelude
         n_pf = int(wl["in_pf"].fillna(False).sum()) if "in_pf" in wl.columns else 0
         title = (f"🎯 GUIDANCE WATCHLIST — {q} — management guided "
@@ -2654,7 +2657,8 @@ def main():
         n_both = int((pg["both"] != "").sum())
         n_stmt = int((pg["source"] == "statements").sum())
         if args.chart_ma > 0:
-            ma_hide_pre = MAF.hidden(pg["symbol"], feats_g, _pf(), args.chart_ma)
+            ma_hide_pre = MAF.hidden(pg["symbol"], feats_g, _pf(), args.chart_ma,
+                                     prices=ma_prices)
             pg["_ma_tag"] = [MAF.table_tag(args.chart_ma)
                              if str(s).strip().upper() in ma_hide_pre else ""
                              for s in pg["symbol"]]
@@ -2668,7 +2672,7 @@ def main():
                f"quarter · {len(pg)} companies"
                + (f" ({n_stmt} from the full statements, marked *)" if n_stmt else "")
                + (f" · {n_both} also on the guidance page" if n_both else "")
-               + (f" · {len(ma_hide_pre)} charts hidden (below {args.chart_ma} DMA, not in PF)"
+               + (f" · {len(ma_hide_pre)} charts hidden ({MAF.why(args.chart_ma)}, not in PF)"
                   if ma_hide_pre else "")
         ) + _pg_table(pg)
         n_pf = sum(1 for v in pg["in_pf"] if v is True)
@@ -2731,16 +2735,17 @@ def main():
 
     if ranked.empty:
         log("Nothing to render."); return
-    # ---- chart filter (scripts/chart_ma_filter.py, user 2026-11-12): a non-PF stock
-    # keeps its chart only above its N-day average; the page's table stays whole.
+    # ---- chart filter (scripts/chart_ma_filter.py, user 2026-11-12 / 18): a non-PF stock
+    # keeps its chart only above its N-day EMA (the blue line); the page's table stays whole.
     # Not the PF pages (all PF), not Recent drops (names falling off the lists).
     if args.chart_ma > 0 and (args.mode in ("watchlist", "pat_growth")
                               or (args.mode == "signals" and args.view != "drops")):
         ma_hide = (ma_hide_pre if ma_hide_pre is not None
-                   else MAF.hidden(ranked["symbol"], feats_g, _pf(), args.chart_ma))
+                   else MAF.hidden(ranked["symbol"], feats_g, _pf(), args.chart_ma,
+                                   prices=ma_prices))
         ranked = MAF.drop_cards(ranked, ma_hide)
         title += MAF.note(len(ma_hide), args.chart_ma)
-        log(f"  chart filter: {len(ma_hide)} charts hidden (below {args.chart_ma} DMA, "
+        log(f"  chart filter: {len(ma_hide)} charts hidden ({MAF.why(args.chart_ma)}, "
             f"not in PF); {len(ranked)} cards left")
     syms = [s for s in ranked["symbol"].tolist() if s]      # skip name-only entries
     log(f"  {len(ranked)} cards selected (mode={args.mode}); {len(syms)} chartable")
